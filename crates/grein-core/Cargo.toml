@@ -1,0 +1,17 @@
+[package]
+name = "grein-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core conversation DAG engine, SQLite persistence, and anchor parser for grein"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+pulldown-cmark.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

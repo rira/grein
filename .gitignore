@@ -1,0 +1,21 @@
+# Rust build targets
+/target/
+**/*.rs.bk
+
+# Grein local state & session databases
+/.grein/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Worktrees created by grein
+/.grein/worktrees/
+/.grein/shadow/
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
