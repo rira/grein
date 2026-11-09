@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "grein", version, about = "Agentic TUI Manager with DAG Context Trees")]
+#[command(
+    name = "grein",
+    version,
+    about = "Agentic TUI Manager with DAG Context Trees"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

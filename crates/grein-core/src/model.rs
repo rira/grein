@@ -1,16 +1,97 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+macro_rules! define_id {
+    ($name:ident) => {
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Default,
+            Serialize,
+            Deserialize,
+        )]
+        #[repr(transparent)]
+        #[serde(transparent)]
+        pub struct $name(pub Uuid);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::now_v7())
+            }
+            pub fn new_v7() -> Self {
+                Self(Uuid::now_v7())
+            }
+            pub fn now_v7() -> Self {
+                Self(Uuid::now_v7())
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = Uuid;
+            fn deref(&self) -> &Uuid {
+                &self.0
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(u: Uuid) -> Self {
+                Self(u)
+            }
+        }
+
+        impl From<$name> for Uuid {
+            fn from(id: $name) -> Self {
+                id.0
+            }
+        }
+
+        impl std::borrow::Borrow<Uuid> for $name {
+            fn borrow(&self) -> &Uuid {
+                &self.0
+            }
+        }
+
+        impl PartialEq<Uuid> for $name {
+            fn eq(&self, other: &Uuid) -> bool {
+                &self.0 == other
+            }
+        }
+
+        impl PartialEq<$name> for Uuid {
+            fn eq(&self, other: &$name) -> bool {
+                self == &other.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+    };
+}
+
+define_id!(NodeId);
+define_id!(ThreadId);
+define_id!(AnchorId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorRole {
+    #[default]
     User,
     Assistant,
     System,
     ToolResult,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Anchor {
     pub level: u8,
     pub title: String,
@@ -18,23 +99,112 @@ pub struct Anchor {
     pub line_number: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationNode {
-    pub id: Uuid,
-    pub parent_id: Option<Uuid>,
+    pub id: NodeId,
+    pub parent_id: Option<NodeId>,
     pub role: AuthorRole,
     pub content: String,
-    pub anchors: Vec<Anchor>,
-    pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl ConversationNode {
+    pub fn new(
+        id: impl Into<NodeId>,
+        parent_id: Option<impl Into<NodeId>>,
+        role: AuthorRole,
+        content: String,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            parent_id: parent_id.map(Into::into),
+            role,
+            content,
+        }
+    }
+
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
     Streaming,
     Executing,
     PermissionRequired,
     AwaitingInput,
+    #[default]
     Idle,
     Error,
+}
+
+pub type ThreadLifecycleState = ThreadStatus;
+pub type ThreadState = ThreadStatus;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Thread {
+    pub id: ThreadId,
+    pub parent_node_id: NodeId,
+    pub head_node_id: NodeId,
+    pub anchor_id: AnchorId,
+    pub active_leaf_id: NodeId,
+    pub leaf_node_id: NodeId,
+    pub status: ThreadStatus,
+    pub state: ThreadLifecycleState,
+}
+
+impl Thread {
+    pub fn new(
+        id: impl Into<ThreadId>,
+        parent_node_id: impl Into<NodeId>,
+        anchor_id: impl Into<AnchorId>,
+        active_leaf_id: impl Into<NodeId>,
+        status: ThreadStatus,
+    ) -> Self {
+        let p = parent_node_id.into();
+        let a = active_leaf_id.into();
+        Self {
+            id: id.into(),
+            parent_node_id: p,
+            head_node_id: p,
+            anchor_id: anchor_id.into(),
+            active_leaf_id: a,
+            leaf_node_id: a,
+            status,
+            state: status,
+        }
+    }
+
+    pub fn id(&self) -> ThreadId {
+        self.id
+    }
+
+    pub fn parent_node_id(&self) -> NodeId {
+        self.parent_node_id
+    }
+
+    pub fn head_node_id(&self) -> NodeId {
+        self.head_node_id
+    }
+
+    pub fn anchor_id(&self) -> AnchorId {
+        self.anchor_id
+    }
+
+    pub fn active_leaf_id(&self) -> NodeId {
+        self.active_leaf_id
+    }
+
+    pub fn leaf_node_id(&self) -> NodeId {
+        self.leaf_node_id
+    }
+
+    pub fn status(&self) -> ThreadStatus {
+        self.status
+    }
+
+    pub fn state(&self) -> ThreadStatus {
+        self.state
+    }
 }
