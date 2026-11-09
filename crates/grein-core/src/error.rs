@@ -13,4 +13,10 @@ pub enum CoreError {
 
     #[error("Thread not found: {0}")]
     ThreadNotFound(String),
+
+    #[error("Cycle detected in DAG: {0}")]
+    CycleDetected(String),
+
+    #[error("Dangling parent node: {0}")]
+    DanglingParent(String),
 }
