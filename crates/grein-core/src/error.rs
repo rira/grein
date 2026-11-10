@@ -19,4 +19,13 @@ pub enum CoreError {
 
     #[error("Dangling parent node: {0}")]
     DanglingParent(String),
+
+    #[error("Blackboard entry not found: {0}")]
+    BlackboardEntryNotFound(String),
+
+    #[error("Scratchpad limit exceeded: limit={limit}, attempted={attempted}")]
+    ScratchpadLimitExceeded { limit: usize, attempted: usize },
+
+    #[error("Sync error: {0}")]
+    SyncError(String),
 }

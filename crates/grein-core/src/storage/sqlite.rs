@@ -1,6 +1,8 @@
+use crate::blackboard::{BlackboardEntry, BlackboardEntryKind};
 use crate::error::CoreError;
 use crate::model::{
-    Anchor, AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadStatus,
+    Anchor, AnchorId, AuthorRole, BlackboardEntryId, ConversationNode, NodeId, Thread, ThreadId,
+    ThreadStatus,
 };
 use rusqlite::{params, Connection};
 use std::borrow::Borrow;
@@ -84,7 +86,17 @@ impl SqliteStorage {
                 PRIMARY KEY (node_id, anchor_id),
                 FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
                 FOREIGN KEY (anchor_id) REFERENCES anchors(id) ON DELETE CASCADE
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS blackboard_entries (
+                id TEXT PRIMARY KEY NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_blackboard_entries_key ON blackboard_entries(key);
+            CREATE INDEX IF NOT EXISTS idx_blackboard_entries_kind ON blackboard_entries(kind);",
         )?;
         tx.commit()?;
         Ok(())
@@ -476,6 +488,107 @@ impl SqliteStorage {
         self.get_thread(thread_id)?
             .map(|t| t.status)
             .ok_or_else(|| CoreError::ThreadNotFound(id_str))
+    }
+
+    pub fn insert_blackboard_entry(&self, entry: &BlackboardEntry) -> Result<(), CoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO blackboard_entries (id, key, value, kind, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                key = excluded.key,
+                value = excluded.value,
+                kind = excluded.kind,
+                created_at = excluded.created_at",
+            params![
+                entry.id.to_string(),
+                entry.key,
+                entry.value,
+                entry.kind.as_str(),
+                entry.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_blackboard_entry(&self, key: &str) -> Result<Option<BlackboardEntry>, CoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, key, value, kind, created_at FROM blackboard_entries WHERE key = ?1",
+        )?;
+        let mut rows = stmt.query(params![key])?;
+
+        if let Some(row) = rows.next()? {
+            let id_str: String = row.get(0)?;
+            let key_str: String = row.get(1)?;
+            let value_str: String = row.get(2)?;
+            let kind_str: String = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+
+            let id = BlackboardEntryId(Uuid::parse_str(&id_str).map_err(|e| {
+                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                ))
+            })?);
+            let kind = kind_str.parse::<BlackboardEntryKind>()?;
+
+            Ok(Some(BlackboardEntry {
+                id,
+                key: key_str,
+                value: value_str,
+                kind,
+                created_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_blackboard_entries(&self) -> Result<Vec<BlackboardEntry>, CoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, key, value, kind, created_at FROM blackboard_entries ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            let key_str: String = row.get(1)?;
+            let value_str: String = row.get(2)?;
+            let kind_str: String = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+            Ok((id_str, key_str, value_str, kind_str, created_at))
+        })?;
+
+        let mut entries = Vec::new();
+        for r in rows {
+            let (id_str, key_str, value_str, kind_str, created_at) = r?;
+            let id = BlackboardEntryId(Uuid::parse_str(&id_str).map_err(|e| {
+                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                ))
+            })?);
+            let kind = kind_str.parse::<BlackboardEntryKind>()?;
+            entries.push(BlackboardEntry {
+                id,
+                key: key_str,
+                value: value_str,
+                kind,
+                created_at,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn delete_blackboard_entry(&self, key: &str) -> Result<bool, CoreError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "DELETE FROM blackboard_entries WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(affected > 0)
     }
 }
 
