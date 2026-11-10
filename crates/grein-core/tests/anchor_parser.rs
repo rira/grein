@@ -1,4 +1,4 @@
-use grein_core::anchor::{parse_anchors, Anchor, AnchorKind, AnchorParser};
+use grein_core::anchor::{parse_anchors, AnchorKind, AnchorParser};
 
 #[test]
 fn test_extract_markdown_headings_all_levels() {
