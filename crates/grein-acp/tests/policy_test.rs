@@ -18,9 +18,7 @@ fn test_parse_policy_from_toml() {
     assert!(policy
         .allowed_command_prefixes()
         .contains(&"cargo check".to_string()));
-    assert!(policy
-        .denied_commands()
-        .contains(&"rm -rf /".to_string()));
+    assert!(policy.denied_commands().contains(&"rm -rf /".to_string()));
 }
 
 #[test]
@@ -34,20 +32,20 @@ fn test_policy_evaluate_tool_and_command_allowlist() {
     let policy = SecurityPolicy::from_toml(toml_content).unwrap();
 
     // Tool allowed
-    assert_eq!(
-        policy.evaluate_tool("read_file"),
-        PolicyDecision::Allowed
-    );
+    assert_eq!(policy.evaluate_tool("read_file"), PolicyDecision::Allowed);
 
     // Tool not explicitly allowed
-    assert_eq!(
-        policy.evaluate_tool("write_file"),
-        PolicyDecision::Prompt
-    );
+    assert_eq!(policy.evaluate_tool("write_file"), PolicyDecision::Prompt);
 
     // Command allowed by prefix
-    assert_eq!(policy.evaluate_command("cargo test -p grein-acp"), PolicyDecision::Allowed);
-    assert_eq!(policy.evaluate_command("git status"), PolicyDecision::Allowed);
+    assert_eq!(
+        policy.evaluate_command("cargo test -p grein-acp"),
+        PolicyDecision::Allowed
+    );
+    assert_eq!(
+        policy.evaluate_command("git status"),
+        PolicyDecision::Allowed
+    );
 
     // Command denied explicitly
     assert_eq!(
@@ -85,8 +83,14 @@ fn test_load_and_merge_global_and_local_policies() {
         .expect("Failed to load merged policies");
 
     // Both tools from global and local should be present
-    assert_eq!(merged_policy.evaluate_tool("read_file"), PolicyDecision::Allowed);
-    assert_eq!(merged_policy.evaluate_tool("write_file"), PolicyDecision::Allowed);
+    assert_eq!(
+        merged_policy.evaluate_tool("read_file"),
+        PolicyDecision::Allowed
+    );
+    assert_eq!(
+        merged_policy.evaluate_tool("write_file"),
+        PolicyDecision::Allowed
+    );
 
     // Both command prefixes should be recognized
     assert_eq!(
@@ -105,7 +109,7 @@ fn test_invalid_policy_toml_returns_error() {
     let result = SecurityPolicy::from_toml(invalid_toml);
     assert!(result.is_err());
     match result.unwrap_err() {
-        PolicyError::ParseError(_) => {},
+        PolicyError::ParseError(_) => {}
         other => panic!("Expected PolicyError::ParseError, got: {:?}", other),
     }
 }

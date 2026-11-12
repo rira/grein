@@ -75,7 +75,8 @@ impl SecurityPolicy {
 
         for prefix in &self.allowed_command_prefixes {
             let p = prefix.trim();
-            if trimmed == p || trimmed.starts_with(&format!("{p} ")) || trimmed.starts_with(prefix) {
+            if trimmed == p || trimmed.starts_with(&format!("{p} ")) || trimmed.starts_with(prefix)
+            {
                 return PolicyDecision::Allowed;
             }
         }
@@ -109,8 +110,8 @@ impl SecurityPolicy {
 
         if let Some(path) = global_path {
             let p = path.as_ref();
-            let content = std::fs::read_to_string(p)
-                .map_err(|e| PolicyError::IoError(e.to_string()))?;
+            let content =
+                std::fs::read_to_string(p).map_err(|e| PolicyError::IoError(e.to_string()))?;
             let loaded = Self::from_toml(&content)?;
             policy.merge(loaded);
         } else if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -125,8 +126,8 @@ impl SecurityPolicy {
 
         if let Some(path) = local_path {
             let p = path.as_ref();
-            let content = std::fs::read_to_string(p)
-                .map_err(|e| PolicyError::IoError(e.to_string()))?;
+            let content =
+                std::fs::read_to_string(p).map_err(|e| PolicyError::IoError(e.to_string()))?;
             let loaded = Self::from_toml(&content)?;
             policy.merge(loaded);
         } else {
