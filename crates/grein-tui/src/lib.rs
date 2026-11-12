@@ -1,2 +1,4 @@
+pub mod scheduler;
 pub mod status;
-pub mod tree_widget;
+
+pub use scheduler::{PriorityScheduler, ScheduledTask, TaskPriority};
