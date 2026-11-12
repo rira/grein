@@ -1,168 +1,125 @@
-use std::cell::RefCell;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use grein_tui::diff_card::{DiffCard, DiffCardAction};
+use grein_tui::pager::{MockPagerRunner, PagerRunner};
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::widgets::Widget;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-// We assert the contract for Composer and ExternalEditorRunner in grein_tui
-use grein_tui::composer::{Composer, ComposerAction, ComposerEvent, KeyCode, KeyModifiers};
-use grein_tui::editor::{EditorError, ExternalEditorRunner};
+#[test]
+fn test_contextual_reply_anchor_badge_rendering() {
+    let anchor = "#### 2. Ingress Routing";
+    let diff_card = DiffCard::builder()
+        .reply_anchor(anchor)
+        .diff_content("diff --git a/src/main.rs b/src/main.rs\n+println!(\"hello\");")
+        .build();
 
-#[derive(Clone, Default)]
-struct MockTerminalSuspender {
-    suspended: Rc<RefCell<bool>>,
-    resumed: Rc<RefCell<bool>>,
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 10));
+    diff_card.render_badge(&mut buffer, Rect::new(0, 0, 60, 1));
+
+    let rendered_line: String = (0..buffer.area.width)
+        .map(|x| buffer.get(x, 0).symbol())
+        .collect();
+
+    assert!(
+        rendered_line.contains("[Replying to: #### 2. Ingress Routing]"),
+        "Expected contextual reply badge to contain targeted anchor format, got: {}",
+        rendered_line
+    );
 }
 
-impl MockTerminalSuspender {
-    fn new() -> Self {
-        Self::default()
-    }
+#[test]
+fn test_compact_diff_preview_card_syntax_highlight_lines() {
+    let raw_diff = r#"--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn existing() {}
++fn added_feature() {}
+-fn removed_legacy() {}
+"#;
+
+    let card = DiffCard::builder()
+        .diff_content(raw_diff)
+        .max_preview_lines(5)
+        .build();
+
+    let preview_lines = card.preview_lines();
+    assert!(
+        !preview_lines.is_empty(),
+        "Preview lines should not be empty"
+    );
+
+    // Verify compact truncation
+    assert!(
+        preview_lines.len() <= 5,
+        "Preview lines must honor max preview boundary"
+    );
+
+    // Verify syntax tag/style categorization for additions and deletions
+    let has_addition = preview_lines.iter().any(|line| line.is_addition());
+    let has_deletion = preview_lines.iter().any(|line| line.is_deletion());
+    assert!(
+        has_addition,
+        "Expected at least one addition line with syntax distinction"
+    );
+    assert!(
+        has_deletion,
+        "Expected at least one deletion line with syntax distinction"
+    );
 }
 
-#[derive(Clone)]
-struct MockEditorRunner {
-    suspender: MockTerminalSuspender,
-    file_transform: Rc<dyn Fn(&Path) -> Result<(), EditorError>>,
-    executed_path: Rc<RefCell<Option<PathBuf>>>,
-}
+#[test]
+fn test_diff_preview_card_o_key_suspends_terminal_and_delegates_to_pager() {
+    let diff_content = "diff --git a/a.rs b/a.rs\n+let x = 42;";
+    let pager_invoked = Arc::new(AtomicBool::new(false));
+    let terminal_suspended = Arc::new(AtomicBool::new(false));
 
-impl MockEditorRunner {
-    fn new(
-        suspender: MockTerminalSuspender,
-        transform: impl Fn(&Path) -> Result<(), EditorError> + 'static,
-    ) -> Self {
-        Self {
-            suspender,
-            file_transform: Rc::new(transform),
-            executed_path: Rc::new(RefCell::new(None)),
+    let mock_pager = MockPagerRunner::new({
+        let pager_invoked = Arc::clone(&pager_invoked);
+        let terminal_suspended = Arc::clone(&terminal_suspended);
+        move |payload: &str| {
+            assert_eq!(payload, diff_content);
+            assert!(
+                terminal_suspended.load(Ordering::SeqCst),
+                "Terminal must be suspended before invoking pager"
+            );
+            pager_invoked.store(true, Ordering::SeqCst);
+            Ok(())
         }
-    }
-}
-
-impl ExternalEditorRunner for MockEditorRunner {
-    fn run_editor(&self, file_path: &Path) -> Result<(), EditorError> {
-        // Assert terminal was suspended before running editor
-        assert!(
-            *self.suspender.suspended.borrow(),
-            "Terminal must be suspended before external editor is invoked"
-        );
-        assert!(
-            !*self.suspender.resumed.borrow(),
-            "Terminal must not be resumed while external editor is running"
-        );
-
-        *self.executed_path.borrow_mut() = Some(file_path.to_path_buf());
-        (self.file_transform)(file_path)
-    }
-}
-
-#[test]
-fn test_ctrl_e_spawns_external_editor_and_repopulates_composer() {
-    let suspender = MockTerminalSuspender::new();
-    let suspender_clone = suspender.clone();
-
-    let editor_runner = MockEditorRunner::new(suspender.clone(), |scratch_file: &Path| {
-        // Verify initial draft was written to the scratch file
-        let current_content =
-            fs::read_to_string(scratch_file).map_err(|e| EditorError::Io(e.to_string()))?;
-        assert_eq!(current_content, "Draft before editing");
-
-        // Simulate user editing and saving in $EDITOR
-        fs::write(scratch_file, "Draft updated from external editor")
-            .map_err(|e| EditorError::Io(e.to_string()))?;
-        Ok(())
     });
 
-    let mut composer = Composer::with_editor_runner(editor_runner.clone()).with_terminal_hooks(
-        {
-            let s = suspender_clone.clone();
-            move || *s.suspended.borrow_mut() = true
-        },
-        {
-            let s = suspender_clone.clone();
-            move || *s.resumed.borrow_mut() = true
-        },
-    );
+    let mut card = DiffCard::builder()
+        .diff_content(diff_content)
+        .pager_runner(mock_pager)
+        .build();
 
-    composer.set_buffer("Draft before editing");
-    assert_eq!(composer.buffer(), "Draft before editing");
+    // Key event 'o' to open in pager
+    let key_event = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+    let action = card.handle_key(key_event, || {
+        terminal_suspended.store(true, Ordering::SeqCst);
+    });
 
-    // Dispatch Ctrl+E
-    let event = ComposerEvent::Key {
-        code: KeyCode::Char('e'),
-        modifiers: KeyModifiers::CONTROL,
-    };
-
-    let action = composer
-        .handle_event(event)
-        .expect("Handling Ctrl+E must succeed");
-
-    assert_eq!(action, ComposerAction::EditorExited);
-    assert_eq!(
-        composer.buffer(),
-        "Draft updated from external editor",
-        "Composer buffer must be re-populated with edited file contents"
-    );
-
-    // Assert terminal lifecycle was respected
+    assert_eq!(action, DiffCardAction::OpenedPager);
     assert!(
-        *suspender.suspended.borrow(),
-        "Terminal must have been suspended"
+        terminal_suspended.load(Ordering::SeqCst),
+        "Terminal suspension callback must be triggered"
     );
     assert!(
-        *suspender.resumed.borrow(),
-        "Terminal must have been resumed on editor exit"
-    );
-
-    // Assert temporary scratch file has been cleaned up
-    let executed_path = editor_runner
-        .executed_path
-        .borrow()
-        .clone()
-        .expect("Editor runner must have captured scratch file path");
-    assert!(
-        !executed_path.exists(),
-        "Scratch file must be cleaned up after composer re-population"
+        pager_invoked.load(Ordering::SeqCst),
+        "External diff pager must be invoked with diff payload"
     );
 }
 
 #[test]
-fn test_ctrl_e_retains_draft_if_editor_returns_error() {
-    let suspender = MockTerminalSuspender::new();
-    let editor_runner = MockEditorRunner::new(suspender.clone(), |_scratch_file: &Path| {
-        Err(EditorError::ExecutionFailed("editor crashed".to_string()))
+fn test_diff_preview_card_ignores_unrelated_key() {
+    let card = DiffCard::builder().diff_content("+new code").build();
+
+    let key_event = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+    let action = card.handle_key(key_event, || {
+        panic!("Terminal should not suspend on unrelated key")
     });
 
-    let mut composer = Composer::with_editor_runner(editor_runner).with_terminal_hooks(
-        {
-            let s = suspender.clone();
-            move || *s.suspended.borrow_mut() = true
-        },
-        {
-            let s = suspender.clone();
-            move || *s.resumed.borrow_mut() = true
-        },
-    );
-
-    composer.set_buffer("Preserved draft content");
-
-    let event = ComposerEvent::Key {
-        code: KeyCode::Char('e'),
-        modifiers: KeyModifiers::CONTROL,
-    };
-
-    let result = composer.handle_event(event);
-    assert!(
-        result.is_err(),
-        "Expected failure when external editor fails"
-    );
-    assert_eq!(
-        composer.buffer(),
-        "Preserved draft content",
-        "Original buffer must be retained if editor execution fails"
-    );
-    assert!(
-        *suspender.resumed.borrow(),
-        "Terminal must be resumed even upon editor failure"
-    );
+    assert_eq!(action, DiffCardAction::Ignored);
 }

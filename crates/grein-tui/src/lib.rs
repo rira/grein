@@ -1,2 +1,2 @@
-pub mod composer;
-pub mod editor;
+pub mod diff_card;
+pub mod pager;
