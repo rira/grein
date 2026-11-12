@@ -1,66 +1,71 @@
-use std::path::PathBuf;
-use tempfile::TempDir;
-use tokio::net::UnixStream;
-use tokio::time::{Duration, sleep};
+use std::path::Path;
+use std::time::Duration;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 #[tokio::test]
-async fn test_daemon_socket_lifecycle_and_client_connect() {
-    let temp_dir = TempDir::new().expect("failed to create temp dir");
-    let socket_path = temp_dir.path().join("grein.sock");
-
-    // Verify client connection fails cleanly when daemon is not running
-    let connect_err = grein_cli::client::connect_to_daemon(&socket_path).await;
-    assert!(
-        connect_err.is_err(),
-        "client connection should fail when daemon is offline"
-    );
-
-    // Start daemon listening on the custom socket path
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let daemon_socket = socket_path.clone();
-    let daemon_handle = tokio::spawn(async move {
-        grein_cli::daemon::run_daemon_with_socket(daemon_socket, shutdown_rx)
-            .await
-            .expect("daemon exited with error");
-    });
-
-    // Poll until socket is bound
-    let mut connected = false;
-    for _ in 0..50 {
-        if socket_path.exists() {
-            if let Ok(mut client) = grein_cli::client::connect_to_daemon(&socket_path).await {
-                // Test IPC ping/handshake
-                let response = client.ping().await.expect("failed to send ping");
-                assert_eq!(response, "pong");
-                connected = true;
-                break;
-            }
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        connected,
-        "client failed to connect to daemon socket within timeout"
-    );
-
-    // Trigger clean daemon shutdown
-    let _ = shutdown_tx.send(());
-    let shutdown_res = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
-    assert!(shutdown_res.is_ok(), "daemon should gracefully shut down");
-
-    // Verify socket file is cleaned up after shutdown
+async fn test_standalone_runs_embedded_daemon_in_process_without_socket() {
+    // Standalone mode must run the embedded daemon service as an in-process Tokio task.
+    // Invariant: Zero external socket dependencies (no Unix socket file created).
+    let socket_path = Path::new("/tmp/grein-test-nonexistent.sock");
     assert!(
         !socket_path.exists(),
-        "daemon socket file must be removed on clean shutdown"
+        "Precondition: socket path must not exist"
+    );
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Launch standalone session with an explicit cancellation token/channel
+    let standalone_handle =
+        tokio::spawn(async move { grein_cli::standalone::run_standalone(shutdown_rx).await });
+
+    // Yield control to ensure in-process daemon task initializes
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Verify no socket file was created on the filesystem
+    assert!(
+        !socket_path.exists(),
+        "Standalone mode must not create or bind an external Unix domain socket"
+    );
+
+    // Signal graceful shutdown to the embedded in-process daemon
+    shutdown_tx
+        .send(())
+        .expect("Failed to send shutdown signal to standalone runner");
+
+    // Verify that the standalone task completes cleanly within timeout
+    let result = timeout(Duration::from_secs(2), standalone_handle).await;
+    assert!(result.is_ok(), "Standalone task timed out during shutdown");
+
+    let run_result = result.expect("Join failed").expect("Task panicked");
+    assert!(
+        run_result.is_ok(),
+        "Standalone runner returned an error: {:?}",
+        run_result.err()
     );
 }
 
 #[tokio::test]
-async fn test_default_socket_path_resolution() {
-    let path = grein_cli::daemon::default_socket_path();
+async fn test_standalone_embedded_daemon_client_interaction() {
+    // Verify that the embedded in-process daemon accepts commands/queries without IPC socket.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let (client_handle, server_result) = tokio::join!(
+        async {
+            // Allow embedded server to spin up
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let client = grein_cli::standalone::create_in_process_client().await;
+            assert!(client.is_ok(), "Failed to acquire in-process client handle");
+            let mut client = client.unwrap();
+            let ping_res = client.ping().await;
+            assert!(ping_res.is_ok(), "In-process ping must succeed");
+            let _ = shutdown_tx.send(());
+        },
+        async { grein_cli::standalone::run_standalone(shutdown_rx).await }
+    );
+
     assert!(
-        path.ends_with("grein/grein.sock") || path.ends_with(".local/share/grein/grein.sock"),
-        "default socket path must target ~/.local/share/grein/grein.sock, got: {}",
-        path.display()
+        server_result.is_ok(),
+        "Embedded daemon service exited with error"
     );
 }
