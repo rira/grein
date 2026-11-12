@@ -1,2 +1,3 @@
-pub mod focus;
 pub mod status;
+
+pub use status::*;

@@ -1,25 +1,6 @@
-use crate::focus::FocusManager;
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ThreadId(String);
-
-impl ThreadId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for ThreadId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
+/// Domain status enum representing thread lifecycle stages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadStatus {
     Streaming,
@@ -30,108 +11,323 @@ pub enum ThreadStatus {
     Error,
 }
 
-impl ThreadStatus {
-    pub fn glyph(&self) -> &'static str {
-        match self {
-            Self::Streaming => "⠋",
-            Self::ExecutingTool => "⚙",
-            Self::PermissionRequired => "⚠️",
-            Self::AwaitingInput => "💬",
-            Self::Idle => "✓",
-            Self::Error => "✖",
-        }
-    }
-
-    pub fn ascii_fallback(&self) -> &'static str {
-        match self {
-            Self::Streaming => "[*]",
-            Self::ExecutingTool => "[>]",
-            Self::PermissionRequired => "[!]",
-            Self::AwaitingInput => "[?]",
-            Self::Idle => "[-]",
-            Self::Error => "[x]",
-        }
-    }
-}
-
+/// State model for thread visual status indicator
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackgroundEvent {
-    StreamStarted {
-        thread_id: ThreadId,
-    },
-    StreamCompleted {
-        thread_id: ThreadId,
-    },
-    ToolExecutionStarted {
-        thread_id: ThreadId,
-        tool_name: String,
-    },
-    ToolExecutionFinished {
-        thread_id: ThreadId,
-        tool_name: String,
-    },
-    PermissionRequired {
-        thread_id: ThreadId,
-        request_id: String,
-    },
-    AwaitingInput {
-        thread_id: ThreadId,
-    },
-    Error {
-        thread_id: ThreadId,
-        message: String,
-    },
+pub struct ThreadIndicatorState {
+    pub status: ThreadStatus,
+    pub is_dirty: bool,
+    pub has_unread_events: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ThreadStatusRegistry {
-    statuses: HashMap<ThreadId, ThreadStatus>,
+/// Rendering mode for TUI display
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    Unicode,
+    Ascii,
 }
 
-impl ThreadStatusRegistry {
+/// Renders the symbolic status glyph corresponding to the thread status and render mode
+pub fn render_status_glyph(status: ThreadStatus, mode: RenderMode) -> &'static str {
+    match (status, mode) {
+        (ThreadStatus::Streaming, RenderMode::Unicode) => "⠋",
+        (ThreadStatus::Streaming, RenderMode::Ascii) => "[*]",
+        (ThreadStatus::ExecutingTool, RenderMode::Unicode) => "⚙",
+        (ThreadStatus::ExecutingTool, RenderMode::Ascii) => "[>]",
+        (ThreadStatus::PermissionRequired, RenderMode::Unicode) => "⚠️",
+        (ThreadStatus::PermissionRequired, RenderMode::Ascii) => "[!]",
+        (ThreadStatus::AwaitingInput, RenderMode::Unicode) => "💬",
+        (ThreadStatus::AwaitingInput, RenderMode::Ascii) => "[?]",
+        (ThreadStatus::Idle, RenderMode::Unicode) => "✓",
+        (ThreadStatus::Idle, RenderMode::Ascii) => "[-]",
+        (ThreadStatus::Error, RenderMode::Unicode) => "✖",
+        (ThreadStatus::Error, RenderMode::Ascii) => "[x]",
+    }
+}
+
+/// Formats the full thread indicator string with unread prefix and dirty suffix
+pub fn render_thread_indicator(state: &ThreadIndicatorState, mode: RenderMode) -> String {
+    let prefix = if state.has_unread_events {
+        match mode {
+            RenderMode::Unicode => "● ",
+            RenderMode::Ascii => "* ",
+        }
+    } else {
+        ""
+    };
+
+    let glyph = render_status_glyph(state.status, mode);
+    let suffix = if state.is_dirty { "*" } else { "" };
+
+    format!("{prefix}{glyph}{suffix}")
+}
+
+/// Concurrency task representation for thread execution scheduling
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    pub task_id: u64,
+    pub thread_id: u64,
+    pub payload: String,
+}
+
+/// Concurrency priority scheduler ensuring focused thread tasks take precedence over background tasks
+pub struct PriorityScheduler {
+    focused_thread_id: Arc<Mutex<Option<u64>>>,
+    queue: Arc<Mutex<Vec<Task>>>,
+}
+
+impl Default for PriorityScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PriorityScheduler {
     pub fn new() -> Self {
         Self {
-            statuses: HashMap::new(),
+            focused_thread_id: Arc::new(Mutex::new(None)),
+            queue: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn set_status(&mut self, thread_id: ThreadId, status: ThreadStatus) {
-        self.statuses.insert(thread_id, status);
+    pub fn set_focused_thread(&self, thread_id: Option<u64>) {
+        let mut focused = self.focused_thread_id.lock().unwrap();
+        *focused = thread_id;
     }
 
-    pub fn status_for(&self, thread_id: &ThreadId) -> Option<ThreadStatus> {
-        self.statuses.get(thread_id).copied()
+    pub fn schedule(&self, task: Task) {
+        let mut q = self.queue.lock().unwrap();
+        q.push(task);
     }
 
-    pub fn handle_event(&mut self, event: &BackgroundEvent, _focus_manager: &mut FocusManager) {
-        // Invariant: Background stream completions, finished tool runs, or alerts
-        // must NEVER preempt keyboard focus from the active input composer.
+    pub fn pop_next(&self) -> Option<Task> {
+        let mut q = self.queue.lock().unwrap();
+        let focused = *self.focused_thread_id.lock().unwrap();
+
+        if let Some(target_thread) = focused {
+            if let Some(pos) = q.iter().position(|t| t.thread_id == target_thread) {
+                return Some(q.remove(pos));
+            }
+        }
+
+        if !q.is_empty() {
+            Some(q.remove(0))
+        } else {
+            None
+        }
+    }
+}
+
+/// UI focus targets within the TUI workspace
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    InputComposer,
+    ThreadNavigator,
+    PermissionModal,
+}
+
+/// Asynchronous background events that may affect UI state
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundEvent {
+    StreamCompleted { thread_id: u64 },
+    ToolFinished { thread_id: u64 },
+    PermissionAlert { thread_id: u64, prompt: String },
+}
+
+/// Focus controller enforcing the strict focus non-stealing invariant
+pub struct UiFocusController {
+    pub current_focus: FocusTarget,
+    pub is_user_typing: bool,
+    pub pending_permissions: Vec<(u64, String)>,
+}
+
+impl Default for UiFocusController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UiFocusController {
+    pub fn new() -> Self {
+        Self {
+            current_focus: FocusTarget::ThreadNavigator,
+            is_user_typing: false,
+            pending_permissions: Vec::new(),
+        }
+    }
+
+    pub fn handle_background_event(&mut self, event: BackgroundEvent) {
         match event {
-            BackgroundEvent::StreamStarted { thread_id } => {
-                self.statuses
-                    .insert(thread_id.clone(), ThreadStatus::Streaming);
+            BackgroundEvent::StreamCompleted { .. } | BackgroundEvent::ToolFinished { .. } => {
+                // Background completions never steal focus regardless of state
             }
-            BackgroundEvent::StreamCompleted { thread_id } => {
-                self.statuses.insert(thread_id.clone(), ThreadStatus::Idle);
-            }
-            BackgroundEvent::ToolExecutionStarted { thread_id, .. } => {
-                self.statuses
-                    .insert(thread_id.clone(), ThreadStatus::ExecutingTool);
-            }
-            BackgroundEvent::ToolExecutionFinished { thread_id, .. } => {
-                self.statuses.insert(thread_id.clone(), ThreadStatus::Idle);
-            }
-            BackgroundEvent::PermissionRequired { thread_id, .. } => {
-                self.statuses
-                    .insert(thread_id.clone(), ThreadStatus::PermissionRequired);
-            }
-            BackgroundEvent::AwaitingInput { thread_id } => {
-                self.statuses
-                    .insert(thread_id.clone(), ThreadStatus::AwaitingInput);
-            }
-            BackgroundEvent::Error { thread_id, .. } => {
-                self.statuses.insert(thread_id.clone(), ThreadStatus::Error);
+            BackgroundEvent::PermissionAlert { thread_id, prompt } => {
+                self.pending_permissions.push((thread_id, prompt));
+                // Focus non-stealing invariant: If user is actively typing in composer, do not divert focus
+                if !self.is_user_typing && self.current_focus != FocusTarget::InputComposer {
+                    self.current_focus = FocusTarget::PermissionModal;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_symbolic_status_glyph_renderings_unicode_and_ascii() {
+        let statuses = [
+            (ThreadStatus::Streaming, "⠋", "[*]"),
+            (ThreadStatus::ExecutingTool, "⚙", "[>]"),
+            (ThreadStatus::PermissionRequired, "⚠️", "[!]"),
+            (ThreadStatus::AwaitingInput, "💬", "[?]"),
+            (ThreadStatus::Idle, "✓", "[-]"),
+            (ThreadStatus::Error, "✖", "[x]"),
+        ];
+
+        for (status, expected_unicode, expected_ascii) in statuses {
+            assert_eq!(
+                render_status_glyph(status, RenderMode::Unicode),
+                expected_unicode,
+                "Failed unicode rendering for status {status:?}"
+            );
+            assert_eq!(
+                render_status_glyph(status, RenderMode::Ascii),
+                expected_ascii,
+                "Failed ascii fallback rendering for status {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_thread_indicator_with_dirty_suffix_and_unread_prefix() {
+        let clean_idle = ThreadIndicatorState {
+            status: ThreadStatus::Idle,
+            is_dirty: false,
+            has_unread_events: false,
+        };
+        assert_eq!(
+            render_thread_indicator(&clean_idle, RenderMode::Unicode),
+            "✓"
+        );
+        assert_eq!(
+            render_thread_indicator(&clean_idle, RenderMode::Ascii),
+            "[-]"
+        );
+
+        let dirty_running = ThreadIndicatorState {
+            status: ThreadStatus::ExecutingTool,
+            is_dirty: true,
+            has_unread_events: false,
+        };
+        assert_eq!(
+            render_thread_indicator(&dirty_running, RenderMode::Unicode),
+            "⚙*"
+        );
+        assert_eq!(
+            render_thread_indicator(&dirty_running, RenderMode::Ascii),
+            "[>]*"
+        );
+
+        let unread_and_dirty = ThreadIndicatorState {
+            status: ThreadStatus::PermissionRequired,
+            is_dirty: true,
+            has_unread_events: true,
+        };
+        assert_eq!(
+            render_thread_indicator(&unread_and_dirty, RenderMode::Unicode),
+            "● ⚠️*"
+        );
+        assert_eq!(
+            render_thread_indicator(&unread_and_dirty, RenderMode::Ascii),
+            "* [!]*"
+        );
+    }
+
+    #[test]
+    fn test_concurrency_priority_scheduler_prefers_focused_thread() {
+        let scheduler = PriorityScheduler::new();
+
+        scheduler.schedule(Task {
+            task_id: 1,
+            thread_id: 100,
+            payload: "bg_task_1".to_string(),
+        });
+        scheduler.schedule(Task {
+            task_id: 2,
+            thread_id: 200,
+            payload: "bg_task_2".to_string(),
+        });
+        scheduler.schedule(Task {
+            task_id: 3,
+            thread_id: 200,
+            payload: "focused_task_3".to_string(),
+        });
+
+        scheduler.set_focused_thread(Some(200));
+
+        let first = scheduler.pop_next().expect("Task should be popped");
+        assert_eq!(first.task_id, 2);
+        assert_eq!(first.thread_id, 200);
+
+        let second = scheduler.pop_next().expect("Task should be popped");
+        assert_eq!(second.task_id, 3);
+        assert_eq!(second.thread_id, 200);
+
+        let third = scheduler.pop_next().expect("Task should be popped");
+        assert_eq!(third.task_id, 1);
+        assert_eq!(third.thread_id, 100);
+
+        assert!(scheduler.pop_next().is_none());
+    }
+
+    #[test]
+    fn test_focus_non_stealing_invariant_while_user_typing() {
+        let mut ui = UiFocusController::new();
+        ui.current_focus = FocusTarget::InputComposer;
+        ui.is_user_typing = true;
+
+        ui.handle_background_event(BackgroundEvent::StreamCompleted { thread_id: 99 });
+        assert_eq!(
+            ui.current_focus,
+            FocusTarget::InputComposer,
+            "Stream completion must not steal focus from active composer"
+        );
+
+        ui.handle_background_event(BackgroundEvent::ToolFinished { thread_id: 99 });
+        assert_eq!(
+            ui.current_focus,
+            FocusTarget::InputComposer,
+            "Tool execution completion must not steal focus from active composer"
+        );
+
+        ui.handle_background_event(BackgroundEvent::PermissionAlert {
+            thread_id: 99,
+            prompt: "Grant fs:write lease?".to_string(),
+        });
+        assert_eq!(
+            ui.current_focus,
+            FocusTarget::InputComposer,
+            "Permission alert MUST NOT steal focus while user is typing"
+        );
+        assert_eq!(ui.pending_permissions.len(), 1);
+    }
+
+    #[test]
+    fn test_focus_transitions_when_user_not_typing() {
+        let mut ui = UiFocusController::new();
+        ui.current_focus = FocusTarget::ThreadNavigator;
+        ui.is_user_typing = false;
+
+        ui.handle_background_event(BackgroundEvent::PermissionAlert {
+            thread_id: 42,
+            prompt: "Execute command?".to_string(),
+        });
+        assert_eq!(
+            ui.current_focus,
+            FocusTarget::PermissionModal,
+            "Permission alert may focus modal when user is idle/navigating"
+        );
     }
 }
