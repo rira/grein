@@ -1,80 +1,118 @@
-use clap::Parser;
-use grein_cli::args::{Cli, Command};
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use grein_cli::discovery::{
+    AcpAgent, AcpAgentKind, discover_acp_agents, resolve_agents_configuration,
+};
 
 #[test]
-fn test_standalone_mode_default_when_no_subcommand() {
-    let args = ["grein"];
-    let cli =
-        Cli::try_parse_from(args).expect("Default standalone invocation must parse successfully");
+fn test_first_run_discovery_inspects_path_for_acp_agents() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
+
+    let agy_path = bin_dir.join("agy");
+    let claude_path = bin_dir.join("claude");
+
+    File::create(&agy_path).expect("failed to create agy binary mock");
+    File::create(&claude_path).expect("failed to create claude binary mock");
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&agy_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&agy_path, perms).unwrap();
+
+        let mut perms = fs::metadata(&claude_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&claude_path, perms).unwrap();
+    }
+
+    let search_path = bin_dir.to_str().expect("valid utf-8 path");
+    let discovered = discover_acp_agents(Some(search_path));
+
+    assert_eq!(discovered.len(), 2);
     assert!(
-        cli.command.is_none() || matches!(cli.command, Some(Command::Standalone { .. })),
-        "No subcommand should resolve to standalone mode"
+        discovered
+            .iter()
+            .any(|a| a.kind == AcpAgentKind::Agy && a.executable_path == agy_path)
+    );
+    assert!(
+        discovered
+            .iter()
+            .any(|a| a.kind == AcpAgentKind::Claude && a.executable_path == claude_path)
     );
 }
 
 #[test]
-fn test_daemon_subcommand_defaults() {
-    let args = ["grein", "daemon"];
-    let cli = Cli::try_parse_from(args).expect("Daemon subcommand must parse successfully");
-    match cli.command {
-        Some(Command::Daemon(args)) => {
-            assert!(
-                args.socket.is_none()
-                    || args.socket == Some(PathBuf::from("~/.local/share/grein/grein.sock"))
-            );
-        }
-        other => panic!("Expected Command::Daemon, got {:?}", other),
+fn test_first_run_discovery_returns_empty_when_no_agents_found() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
+
+    let other_bin = bin_dir.join("unrelated-tool");
+    File::create(&other_bin).expect("failed to create unrelated tool");
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&other_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&other_bin, perms).unwrap();
     }
+
+    let search_path = bin_dir.to_str().expect("valid utf-8 path");
+    let discovered = discover_acp_agents(Some(search_path));
+
+    assert!(discovered.is_empty());
 }
 
 #[test]
-fn test_daemon_subcommand_with_custom_socket() {
-    let args = ["grein", "daemon", "--socket", "/tmp/test-grein.sock"];
-    let cli =
-        Cli::try_parse_from(args).expect("Daemon with custom socket flag must parse successfully");
-    match cli.command {
-        Some(Command::Daemon(args)) => {
-            assert_eq!(args.socket, Some(PathBuf::from("/tmp/test-grein.sock")));
-        }
-        other => panic!("Expected Command::Daemon, got {:?}", other),
+fn test_first_run_discovery_ignores_non_executable_files() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
+
+    let agy_path = bin_dir.join("agy");
+    File::create(&agy_path).expect("failed to create agy mock");
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&agy_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&agy_path, perms).unwrap();
     }
+
+    let search_path = bin_dir.to_str().expect("valid utf-8 path");
+    let discovered = discover_acp_agents(Some(search_path));
+
+    #[cfg(unix)]
+    assert!(discovered.is_empty());
 }
 
 #[test]
-fn test_attach_subcommand_defaults() {
-    let args = ["grein", "attach"];
-    let cli = Cli::try_parse_from(args).expect("Attach subcommand must parse successfully");
-    match cli.command {
-        Some(Command::Attach(args)) => {
-            assert!(
-                args.socket.is_none()
-                    || args.socket == Some(PathBuf::from("~/.local/share/grein/grein.sock"))
-            );
-        }
-        other => panic!("Expected Command::Attach, got {:?}", other),
-    }
-}
+fn test_resolve_agents_configuration_triggers_discovery_when_config_absent() {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let non_existent_config = temp_dir.path().join("non_existent_config.toml");
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
 
-#[test]
-fn test_attach_subcommand_with_custom_socket() {
-    let args = ["grein", "attach", "--socket", "/tmp/test-grein.sock"];
-    let cli =
-        Cli::try_parse_from(args).expect("Attach with custom socket flag must parse successfully");
-    match cli.command {
-        Some(Command::Attach(args)) => {
-            assert_eq!(args.socket, Some(PathBuf::from("/tmp/test-grein.sock")));
-        }
-        other => panic!("Expected Command::Attach, got {:?}", other),
+    let agy_path = bin_dir.join("agy");
+    File::create(&agy_path).expect("failed to create agy mock");
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&agy_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&agy_path, perms).unwrap();
     }
-}
 
-#[test]
-fn test_invalid_subcommand_fails_gracefully() {
-    let args = ["grein", "nonexistent"];
-    let result = Cli::try_parse_from(args);
-    assert!(
-        result.is_err(),
-        "Unrecognized subcommand must fail validation"
-    );
+    let search_path = bin_dir.to_str().expect("valid utf-8 path");
+    let result = resolve_agents_configuration(Some(&non_existent_config), Some(search_path));
+
+    assert!(result.is_ok());
+    let agents = result.unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].kind, AcpAgentKind::Agy);
+    assert_eq!(agents[0].executable_path, agy_path);
 }

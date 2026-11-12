@@ -1,23 +1,13 @@
 [package]
 name = "grein-cli"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "Command-line interface entrypoint for grein"
-
-[[bin]]
-name = "grein"
-path = "src/main.rs"
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
-grein-core.workspace = true
-grein-acp.workspace = true
-grein-workspace.workspace = true
-grein-tui.workspace = true
-clap.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-anyhow.workspace = true
+grein-core = { path = "../grein-core" }
+grein-acp = { path = "../grein-acp" }
+grein-workspace = { path = "../grein-workspace" }
+grein-tui = { path = "../grein-tui" }
+
+[dev-dependencies]
+tempfile = "3"
