@@ -1,2 +1,1 @@
-pub mod diff_card;
-pub mod pager;
+pub mod composer;

@@ -1,126 +1,192 @@
-use std::fmt;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::HashMap;
 
-use crate::editor::{EditorError, ExternalEditorRunner, SystemEditorRunner};
-pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ThreadId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl From<String> for ThreadId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ThreadDraftStore {
+    drafts: HashMap<ThreadId, String>,
+}
+
+impl ThreadDraftStore {
+    pub fn new() -> Self {
+        Self {
+            drafts: HashMap::new(),
+        }
+    }
+
+    pub fn save_draft(&mut self, thread_id: &ThreadId, draft: impl Into<String>) {
+        self.drafts.insert(thread_id.clone(), draft.into());
+    }
+
+    pub fn get_draft(&self, thread_id: &ThreadId) -> Option<&str> {
+        self.drafts.get(thread_id).map(|s| s.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalEditorHook {
+    initial_content: String,
+}
+
+impl ExternalEditorHook {
+    pub fn new(initial_content: impl Into<String>) -> Self {
+        Self {
+            initial_content: initial_content.into(),
+        }
+    }
+
+    pub fn initial_content(&self) -> &str {
+        &self.initial_content
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalPagerHook {
+    target_diff_id: String,
+}
+
+impl ExternalPagerHook {
+    pub fn new(target_diff_id: impl Into<String>) -> Self {
+        Self {
+            target_diff_id: target_diff_id.into(),
+        }
+    }
+
+    pub fn target_diff_id(&self) -> &str {
+        &self.target_diff_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ComposerMode {
+    #[default]
+    Normal,
+    DiffPreviewActive {
+        diff_id: String,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerAction {
     None,
-    EditorExited,
+    DispatchTurn(String),
+    SpawnExternalEditor(ExternalEditorHook),
+    SpawnDiffPager(ExternalPagerHook),
+    ClearReplyAnchor,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ComposerEvent {
-    Key {
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    },
+#[derive(Debug, Clone, Default)]
+pub struct Composer {
+    draft: String,
+    reply_anchor: Option<String>,
+    mode: ComposerMode,
 }
 
-impl From<KeyEvent> for ComposerEvent {
-    fn from(key: KeyEvent) -> Self {
-        Self::Key {
-            code: key.code,
-            modifiers: key.modifiers,
-        }
-    }
-}
-
-pub struct Composer<R = SystemEditorRunner> {
-    buffer: String,
-    editor_runner: R,
-    suspend_terminal: Box<dyn FnMut()>,
-    resume_terminal: Box<dyn FnMut()>,
-}
-
-impl<R: fmt::Debug> fmt::Debug for Composer<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Composer")
-            .field("buffer", &self.buffer)
-            .field("editor_runner", &self.editor_runner)
-            .finish()
-    }
-}
-
-impl Composer<SystemEditorRunner> {
+impl Composer {
     pub fn new() -> Self {
-        Self::with_editor_runner(SystemEditorRunner)
+        Self::default()
     }
-}
 
-impl Default for Composer<SystemEditorRunner> {
-    fn default() -> Self {
-        Self::new()
+    pub fn insert_text(&mut self, text: &str) {
+        self.draft.push_str(text);
     }
-}
 
-impl<R: ExternalEditorRunner> Composer<R> {
-    pub fn with_editor_runner(runner: R) -> Self {
-        Self {
-            buffer: String::new(),
-            editor_runner: runner,
-            suspend_terminal: Box::new(|| {}),
-            resume_terminal: Box::new(|| {}),
+    pub fn draft_text(&self) -> &str {
+        &self.draft
+    }
+
+    pub fn set_draft_text(&mut self, text: impl Into<String>) {
+        self.draft = text.into();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.draft.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.draft.clear();
+    }
+
+    pub fn set_reply_anchor(&mut self, anchor: Option<String>) {
+        self.reply_anchor = anchor;
+    }
+
+    pub fn clear_reply_anchor(&mut self) {
+        self.reply_anchor = None;
+    }
+
+    pub fn reply_badge_text(&self) -> Option<String> {
+        self.reply_anchor
+            .as_ref()
+            .map(|anchor| format!("[Replying to: {anchor}]"))
+    }
+
+    pub fn set_mode(&mut self, mode: ComposerMode) {
+        self.mode = mode;
+    }
+
+    pub fn mode(&self) -> &ComposerMode {
+        &self.mode
+    }
+
+    pub fn apply_editor_result(&mut self, text: impl Into<String>) {
+        self.draft = text.into();
+    }
+
+    pub fn handle_key(&mut self, event: KeyEvent) -> ComposerAction {
+        if event.kind != KeyEventKind::Press {
+            return ComposerAction::None;
         }
-    }
 
-    pub fn with_terminal_hooks<S, T>(mut self, suspend: S, resume: T) -> Self
-    where
-        S: FnMut() + 'static,
-        T: FnMut() + 'static,
-    {
-        self.suspend_terminal = Box::new(suspend);
-        self.resume_terminal = Box::new(resume);
-        self
-    }
-
-    pub fn buffer(&self) -> &str {
-        &self.buffer
-    }
-
-    pub fn set_buffer(&mut self, buffer: impl Into<String>) {
-        self.buffer = buffer.into();
-    }
-
-    pub fn handle_event(&mut self, event: ComposerEvent) -> Result<ComposerAction, EditorError> {
-        match event {
-            ComposerEvent::Key {
-                code: KeyCode::Char('e'),
-                modifiers,
-            } if modifiers.contains(KeyModifiers::CONTROL) => self.spawn_external_editor(),
-            _ => Ok(ComposerAction::None),
+        if let ComposerMode::DiffPreviewActive { ref diff_id } = self.mode {
+            if event.code == KeyCode::Char('o') && event.modifiers.is_empty() {
+                return ComposerAction::SpawnDiffPager(ExternalPagerHook::new(diff_id.clone()));
+            }
         }
-    }
 
-    fn spawn_external_editor(&mut self) -> Result<ComposerAction, EditorError> {
-        let temp_dir = std::env::temp_dir();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let scratch_path = temp_dir.join(format!("grein_composer_{pid}_{timestamp}.txt"));
-
-        fs::write(&scratch_path, &self.buffer).map_err(|e| EditorError::Io(e.to_string()))?;
-
-        (self.suspend_terminal)();
-        let editor_res = self.editor_runner.run_editor(&scratch_path);
-        (self.resume_terminal)();
-
-        match editor_res {
-            Ok(()) => {
-                let updated = fs::read_to_string(&scratch_path)
-                    .map_err(|e| EditorError::Io(e.to_string()))?;
-                let _ = fs::remove_file(&scratch_path);
-                self.buffer = updated;
-                Ok(ComposerAction::EditorExited)
+        match event.code {
+            KeyCode::Enter => {
+                if event.modifiers.contains(KeyModifiers::SHIFT)
+                    || event.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.draft.push('\n');
+                    ComposerAction::None
+                } else if event.modifiers.is_empty() {
+                    let dispatched = std::mem::take(&mut self.draft);
+                    ComposerAction::DispatchTurn(dispatched)
+                } else {
+                    ComposerAction::None
+                }
             }
-            Err(err) => {
-                let _ = fs::remove_file(&scratch_path);
-                Err(err)
+            KeyCode::Char('e') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                ComposerAction::SpawnExternalEditor(ExternalEditorHook::new(self.draft.clone()))
             }
+            KeyCode::Esc => ComposerAction::ClearReplyAnchor,
+            _ => ComposerAction::None,
         }
     }
 }

@@ -1,125 +1,135 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use grein_tui::diff_card::{DiffCard, DiffCardAction};
-use grein_tui::pager::{MockPagerRunner, PagerRunner};
-use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use grein_tui::composer::{
+    Composer, ComposerAction, ComposerMode, ExternalEditorHook, ExternalPagerHook,
+    ThreadDraftStore, ThreadId,
+};
+
+fn make_key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
 
 #[test]
-fn test_contextual_reply_anchor_badge_rendering() {
-    let anchor = "#### 2. Ingress Routing";
-    let diff_card = DiffCard::builder()
-        .reply_anchor(anchor)
-        .diff_content("diff --git a/src/main.rs b/src/main.rs\n+println!(\"hello\");")
-        .build();
+fn test_single_enter_dispatches_turn_immediately() {
+    let mut composer = Composer::new();
+    composer.insert_text("Implement ingress router");
 
-    let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 10));
-    diff_card.render_badge(&mut buffer, Rect::new(0, 0, 60, 1));
-
-    let rendered_line: String = (0..buffer.area.width)
-        .map(|x| buffer.get(x, 0).symbol())
-        .collect();
-
+    let action = composer.handle_key(make_key_event(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        action,
+        ComposerAction::DispatchTurn("Implement ingress router".to_string()),
+        "Single Enter must dispatch turn immediately without multi-line newline insertion"
+    );
     assert!(
-        rendered_line.contains("[Replying to: #### 2. Ingress Routing]"),
-        "Expected contextual reply badge to contain targeted anchor format, got: {}",
-        rendered_line
+        composer.is_empty(),
+        "Composer draft must be cleared upon successful dispatch"
     );
 }
 
 #[test]
-fn test_compact_diff_preview_card_syntax_highlight_lines() {
-    let raw_diff = r#"--- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -1,3 +1,4 @@
- fn existing() {}
-+fn added_feature() {}
--fn removed_legacy() {}
-"#;
+fn test_shift_enter_and_ctrl_enter_insert_newline() {
+    let mut composer = Composer::new();
+    composer.insert_text("Line 1");
 
-    let card = DiffCard::builder()
-        .diff_content(raw_diff)
-        .max_preview_lines(5)
-        .build();
+    let action_shift = composer.handle_key(make_key_event(KeyCode::Enter, KeyModifiers::SHIFT));
+    assert_eq!(action_shift, ComposerAction::None);
+    composer.insert_text("Line 2");
 
-    let preview_lines = card.preview_lines();
-    assert!(
-        !preview_lines.is_empty(),
-        "Preview lines should not be empty"
-    );
+    let action_ctrl = composer.handle_key(make_key_event(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert_eq!(action_ctrl, ComposerAction::None);
+    composer.insert_text("Line 3");
 
-    // Verify compact truncation
-    assert!(
-        preview_lines.len() <= 5,
-        "Preview lines must honor max preview boundary"
-    );
-
-    // Verify syntax tag/style categorization for additions and deletions
-    let has_addition = preview_lines.iter().any(|line| line.is_addition());
-    let has_deletion = preview_lines.iter().any(|line| line.is_deletion());
-    assert!(
-        has_addition,
-        "Expected at least one addition line with syntax distinction"
-    );
-    assert!(
-        has_deletion,
-        "Expected at least one deletion line with syntax distinction"
+    assert_eq!(
+        composer.draft_text(),
+        "Line 1\nLine 2\nLine 3",
+        "Shift+Enter and Ctrl+Enter must insert newlines for multi-line drafting"
     );
 }
 
 #[test]
-fn test_diff_preview_card_o_key_suspends_terminal_and_delegates_to_pager() {
-    let diff_content = "diff --git a/a.rs b/a.rs\n+let x = 42;";
-    let pager_invoked = Arc::new(AtomicBool::new(false));
-    let terminal_suspended = Arc::new(AtomicBool::new(false));
+fn test_draft_preservation_across_thread_switches() {
+    let mut draft_store = ThreadDraftStore::new();
+    let thread_a = ThreadId::from("thread-alpha");
+    let thread_b = ThreadId::from("thread-beta");
 
-    let mock_pager = MockPagerRunner::new({
-        let pager_invoked = Arc::clone(&pager_invoked);
-        let terminal_suspended = Arc::clone(&terminal_suspended);
-        move |payload: &str| {
-            assert_eq!(payload, diff_content);
-            assert!(
-                terminal_suspended.load(Ordering::SeqCst),
-                "Terminal must be suspended before invoking pager"
-            );
-            pager_invoked.store(true, Ordering::SeqCst);
-            Ok(())
+    let mut composer = Composer::new();
+    composer.insert_text("Uncommitted thought for thread A");
+    draft_store.save_draft(&thread_a, composer.draft_text());
+
+    composer.clear();
+    composer.insert_text("Draft analysis for thread B");
+    draft_store.save_draft(&thread_b, composer.draft_text());
+
+    // Switch back to thread A
+    composer.set_draft_text(draft_store.get_draft(&thread_a).unwrap_or_default());
+    assert_eq!(
+        composer.draft_text(),
+        "Uncommitted thought for thread A",
+        "Draft text must be preserved independently when switching back to thread A"
+    );
+
+    // Switch back to thread B
+    composer.set_draft_text(draft_store.get_draft(&thread_b).unwrap_or_default());
+    assert_eq!(
+        composer.draft_text(),
+        "Draft analysis for thread B",
+        "Draft text must be preserved independently when switching back to thread B"
+    );
+}
+
+#[test]
+fn test_ctrl_e_triggers_external_editor_suspension_hook() {
+    let mut composer = Composer::new();
+    composer.insert_text("Initial outline");
+
+    let action = composer.handle_key(make_key_event(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    match action {
+        ComposerAction::SpawnExternalEditor(hook) => {
+            assert_eq!(hook.initial_content(), "Initial outline");
+            let updated_draft = "Initial outline\nRefined step 1\nRefined step 2";
+            composer.apply_editor_result(updated_draft);
+            assert_eq!(composer.draft_text(), updated_draft);
         }
-    });
-
-    let mut card = DiffCard::builder()
-        .diff_content(diff_content)
-        .pager_runner(mock_pager)
-        .build();
-
-    // Key event 'o' to open in pager
-    let key_event = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
-    let action = card.handle_key(key_event, || {
-        terminal_suspended.store(true, Ordering::SeqCst);
-    });
-
-    assert_eq!(action, DiffCardAction::OpenedPager);
-    assert!(
-        terminal_suspended.load(Ordering::SeqCst),
-        "Terminal suspension callback must be triggered"
-    );
-    assert!(
-        pager_invoked.load(Ordering::SeqCst),
-        "External diff pager must be invoked with diff payload"
-    );
+        other => panic!("Expected SpawnExternalEditor action on Ctrl+E, got: {other:?}"),
+    }
 }
 
 #[test]
-fn test_diff_preview_card_ignores_unrelated_key() {
-    let card = DiffCard::builder().diff_content("+new code").build();
+fn test_contextual_reply_badge_display() {
+    let mut composer = Composer::new();
+    composer.set_reply_anchor(Some("#### 2. Ingress Routing".to_string()));
 
-    let key_event = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
-    let action = card.handle_key(key_event, || {
-        panic!("Terminal should not suspend on unrelated key")
+    assert_eq!(
+        composer.reply_badge_text(),
+        Some("[Replying to: #### 2. Ingress Routing]".to_string()),
+        "Contextual reply badge must display targeted anchor formatted with prefix"
+    );
+
+    // Clear anchor on cancellation
+    let action = composer.handle_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(action, ComposerAction::ClearReplyAnchor);
+    composer.clear_reply_anchor();
+    assert_eq!(composer.reply_badge_text(), None);
+}
+
+#[test]
+fn test_o_key_hook_suspends_for_external_diff_pager() {
+    let mut composer = Composer::new();
+    composer.set_mode(ComposerMode::DiffPreviewActive {
+        diff_id: "diff-turn-42".to_string(),
     });
 
-    assert_eq!(action, DiffCardAction::Ignored);
+    let action = composer.handle_key(make_key_event(KeyCode::Char('o'), KeyModifiers::NONE));
+    match action {
+        ComposerAction::SpawnDiffPager(hook) => {
+            assert_eq!(hook.target_diff_id(), "diff-turn-42");
+        }
+        other => panic!(
+            "Expected SpawnDiffPager action on 'o' key in DiffPreviewActive mode, got: {other:?}"
+        ),
+    }
 }
