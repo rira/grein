@@ -1,8 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use grein_tui::composer::{
-    Composer, ComposerAction, ComposerMode,
-    ThreadDraftStore, ThreadId,
-};
+use grein_tui::composer::{Composer, ComposerAction, ComposerMode, ThreadDraftStore, ThreadId};
 
 fn make_key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent {

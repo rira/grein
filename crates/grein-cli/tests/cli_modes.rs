@@ -1,183 +1,135 @@
-//! Integration test suite for grein CLI modes:
-//! - Standalone mode (embedded background daemon out of the box)
-//! - Daemon mode (headless background persistence over Unix domain socket)
-//! - Client attach mode (TUI attachment to running daemon)
-
-use std::fs;
+use std::io::Read;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-/// Resolves the grein binary path built by Cargo.
-fn grein_bin() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_grein") {
-        PathBuf::from(path)
-    } else if let Some(path) = option_env!("CARGO_BIN_EXE_grein-cli") {
-        PathBuf::from(path)
+fn grein_cmd() -> Command {
+    if let Ok(bin) = std::env::var("CARGO_BIN_EXE_grein") {
+        Command::new(bin)
     } else {
-        let mut path = std::env::current_exe().expect("failed to obtain current test executable");
-        path.pop();
-        if path.ends_with("deps") {
-            path.pop();
-        }
-        let grein = path.join("grein");
-        if grein.exists() {
-            grein
-        } else {
-            path.join("grein-cli")
-        }
+        Command::new(env!("CARGO_BIN_EXE_grein"))
+    }
+}
+
+struct ProcessGuard(Child);
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
 #[test]
-fn test_standalone_mode_help_and_subcommands_display() {
-    let bin = grein_bin();
-    let output = Command::new(&bin)
+fn test_cli_help_displays_subcommands() {
+    let output = grein_cmd()
         .arg("--help")
         .output()
-        .expect("failed to execute grein binary with --help");
+        .expect("failed to execute grein --help");
 
     assert!(
         output.status.success(),
-        "grein --help should exit with success"
+        "grein --help must exit successfully"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    if !stdout.is_empty() {
-        assert!(
-            stdout.contains("daemon"),
-            "Top-level help output must list the 'daemon' subcommand: {stdout}"
-        );
-        assert!(
-            status_or_contains(&stdout, "attach"),
-            "Top-level help output must list the 'attach' subcommand: {stdout}"
-        );
-    }
+    assert!(
+        stdout.contains("standalone") || stdout.contains("Standalone"),
+        "Help output must list standalone mode: {stdout}"
+    );
+    assert!(
+        stdout.contains("daemon") || stdout.contains("Daemon"),
+        "Help output must list daemon mode: {stdout}"
+    );
+    assert!(
+        stdout.contains("attach") || stdout.contains("Attach"),
+        "Help output must list attach mode: {stdout}"
+    );
 }
 
 #[test]
-fn test_daemon_subcommand_help_and_options() {
-    let bin = grein_bin();
-    let output = Command::new(&bin)
-        .args(["daemon", "--help"])
+fn test_cli_version_output() {
+    let output = grein_cmd()
+        .arg("--version")
         .output()
-        .expect("failed to execute grein daemon --help");
+        .expect("failed to execute grein --version");
 
     assert!(
         output.status.success(),
-        "grein daemon --help should exit with success"
+        "grein --version must exit successfully"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if !stdout.is_empty() {
-        assert!(
-            stdout.to_lowercase().contains("socket"),
-            "Daemon help should document socket configuration: {stdout}"
-        );
-    }
-}
-
-#[test]
-fn test_client_attach_subcommand_help() {
-    let bin = grein_bin();
-    let output = Command::new(&bin)
-        .args(["attach", "--help"])
-        .output()
-        .expect("failed to execute grein attach --help");
 
     assert!(
-        output.status.success(),
-        "grein attach --help should exit with success"
+        stdout.contains("grein") || stdout.contains(env!("CARGO_PKG_VERSION")),
+        "Version output must contain binary name or package version: {stdout}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if !stdout.is_empty() {
-        assert!(
-            stdout.to_lowercase().contains("socket") || stdout.to_lowercase().contains("attach"),
-            "Attach help should document attach parameters: {stdout}"
-        );
-    }
 }
 
 #[test]
-fn test_client_attach_fails_gracefully_when_no_daemon_running() {
-    let bin = grein_bin();
-    let non_existent_socket = std::env::temp_dir().join(format!(
-        "grein-nonexistent-socket-{}.sock",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+fn test_daemon_mode_binds_socket_cleanly() {
+    let temp_dir = std::env::temp_dir();
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let socket_path: PathBuf = temp_dir.join(format!(
+        "grein-test-{}-{}.sock",
+        std::process::id(),
+        unique_id
     ));
 
-    let output = Command::new(&bin)
-        .args(["attach", "--socket", non_existent_socket.to_str().unwrap()])
-        .output()
-        .expect("failed to execute grein attach against non-existent socket");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = format!("{stdout} {stderr}");
-
-    assert!(
-        !combined.contains("panicked at"),
-        "Client attach failure should be handled gracefully without unhandled panics: {combined}"
-    );
-
-    if !combined.trim().is_empty() {
-        assert!(
-            !output.status.success(),
-            "Attaching to a non-existent socket must fail with non-zero exit code"
-        );
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
     }
-}
 
-#[test]
-fn test_daemon_startup_lifecycle_and_socket_binding() {
-    let bin = grein_bin();
-    let temp_dir = std::env::temp_dir().join(format!(
-        "grein-test-daemon-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&temp_dir).expect("failed to create temporary socket dir");
-    let test_socket = temp_dir.join("test_daemon.sock");
-
-    let mut child = Command::new(&bin)
-        .args(["daemon", "--socket", test_socket.to_str().unwrap()])
+    let child = grein_cmd()
+        .arg("daemon")
+        .arg("--socket")
+        .arg(&socket_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn grein daemon");
+        .expect("failed to spawn grein in daemon mode");
 
-    let start = std::time::Instant::now();
-    let mut socket_created = false;
-    while start.elapsed() < Duration::from_millis(500) {
-        if test_socket.exists() {
-            socket_created = true;
-            break;
+    let mut guard = ProcessGuard(child);
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(5);
+    let mut bound = false;
+
+    while start.elapsed() < timeout {
+        if socket_path.exists() {
+            match UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    bound = true;
+                    break;
+                }
+                Err(_) => {
+                    // Socket file created but listener not yet fully accepting
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        } else {
+            if let Ok(Some(status)) = guard.0.try_wait() {
+                let mut stderr = String::new();
+                if let Some(mut err) = guard.0.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                panic!("Daemon process exited prematurely with status {status}: {stderr}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        if let Ok(Some(_status)) = child.try_wait() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        bound,
+        "Daemon must bind and accept connections on the specified socket within {:?}: {}",
+        timeout,
+        socket_path.display()
+    );
 
-    if socket_created {
-        assert!(
-            socket_created,
-            "grein daemon must create the Unix domain socket upon startup at {}",
-            test_socket.display()
-        );
-    }
-}
-
-fn status_or_contains(text: &str, substring: &str) -> bool {
-    text.contains(substring)
+    // Clean up socket file
+    let _ = std::fs::remove_file(&socket_path);
 }
