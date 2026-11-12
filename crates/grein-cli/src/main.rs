@@ -1,31 +1,34 @@
+mod daemon;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "grein", version, about = "Grein CLI - terminal AI workspace", long_about = None)]
+#[command(
+    name = "grein",
+    version,
+    about = "Grein CLI - Multi-Agent Terminal Development Environment"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
-enum Command {
-    /// Launch in standalone mode with embedded engine and TUI
+enum Commands {
+    /// Run standalone interactive TUI session with embedded engine
     Standalone,
-    /// Run Grein in headless daemon mode
+    /// Run headless Unix socket server
     Daemon {
-        /// Unix domain socket path to bind
-        #[arg(long, value_name = "SOCKET")]
-        socket: Option<PathBuf>,
-        /// Validate daemon configuration and socket path without running
-        #[arg(long)]
-        dry_run: bool,
+        /// Socket path for the daemon IPC
+        #[arg(long, default_value_os_t = daemon::default_socket_path())]
+        socket: PathBuf,
     },
-    /// Attach to an active Grein daemon session
+    /// Attach interactive TUI to a running daemon
     Attach {
-        /// Unix domain socket path of running daemon
-        #[arg(long, value_name = "SOCKET")]
-        socket: Option<PathBuf>,
+        /// Socket path for the daemon IPC
+        #[arg(long, default_value_os_t = daemon::default_socket_path())]
+        socket: PathBuf,
     },
 }
 
@@ -34,23 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Command::Standalone) => {
-            let _engine_task = tokio::spawn(async {});
+        None | Some(Commands::Standalone) => {
             grein_tui::run().await?;
         }
-        Some(Command::Daemon { socket, dry_run }) => {
-            if dry_run {
-                if let Some(path) = socket {
-                    if let Some(parent) = path.parent() {
-                        if !parent.as_os_str().is_empty() && !parent.exists() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                    }
-                }
-                return Ok(());
-            }
+        Some(Commands::Daemon { socket }) => {
+            daemon::run_daemon_with_socket(socket).await?;
         }
-        Some(Command::Attach { socket: _ }) => {
+        Some(Commands::Attach { socket: _ }) => {
             grein_tui::run().await?;
         }
     }

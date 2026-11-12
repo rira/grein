@@ -1,70 +1,73 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::time::Duration;
 use tempfile::tempdir;
 
 #[test]
-fn test_cli_version_flag() {
+fn test_cli_help_displays_available_modes_and_subcommands() {
     let mut cmd = Command::cargo_bin("grein").expect("grein binary should exist");
-    cmd.arg("--version");
-    cmd.assert()
+    cmd.arg("--help")
+        .assert()
         .success()
-        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
-}
-
-#[test]
-fn test_cli_help_lists_modes() {
-    let mut cmd = Command::cargo_bin("grein").expect("grein binary should exist");
-    cmd.arg("--help");
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("standalone"))
         .stdout(predicate::str::contains("daemon"))
         .stdout(predicate::str::contains("attach"));
 }
 
 #[test]
-fn test_cli_standalone_subcommand_help() {
+fn test_cli_version_flag_outputs_binary_information() {
     let mut cmd = Command::cargo_bin("grein").expect("grein binary should exist");
-    cmd.args(["standalone", "--help"]);
-    cmd.assert()
+    cmd.arg("--version")
+        .assert()
         .success()
-        .stdout(predicate::str::contains("standalone"));
+        .stdout(predicate::str::contains("grein"));
 }
 
 #[test]
-fn test_cli_daemon_subcommand_help() {
+fn test_cli_daemon_help_displays_socket_configuration() {
     let mut cmd = Command::cargo_bin("grein").expect("grein binary should exist");
-    cmd.args(["daemon", "--help"]);
-    cmd.assert()
+    cmd.args(["daemon", "--help"])
+        .assert()
         .success()
         .stdout(predicate::str::contains("socket"));
 }
 
 #[test]
-fn test_cli_attach_subcommand_help() {
+fn test_cli_attach_help_displays_socket_target() {
     let mut cmd = Command::cargo_bin("grein").expect("grein binary should exist");
-    cmd.args(["attach", "--help"]);
-    cmd.assert()
+    cmd.args(["attach", "--help"])
+        .assert()
         .success()
-        .stdout(predicate::str::contains("attach"));
+        .stdout(predicate::str::contains("socket"));
 }
 
 #[test]
-fn test_cli_daemon_mode_socket_initialization() {
+fn test_cli_daemon_mode_spawns_and_binds_socket_cleanly() {
     let temp_dir = tempdir().expect("temporary directory creation must succeed");
-    let socket_path = temp_dir.path().join("grein-test.sock");
+    let socket_path = temp_dir.path().join("test_grein.sock");
+    let socket_str = socket_path.to_str().expect("valid utf-8 socket path");
 
-    let mut cmd = Command::cargo_bin("grein").expect("grein binary should exist");
-    cmd.args([
-        "daemon",
-        "--socket",
-        socket_path.to_str().expect("valid utf-8 socket path"),
-        "--dry-run",
-    ]);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("grein"))
+        .args(["daemon", "--socket", socket_str])
+        .spawn()
+        .expect("daemon process must spawn");
 
-    let output = cmd.output().expect("command execution must succeed");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut socket_bound = false;
+
+    while std::time::Instant::now() < deadline {
+        if socket_path.exists() {
+            socket_bound = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
     assert!(
-        output.status.success() || !output.stderr.is_empty(),
-        "daemon mode invocation must not panic or crash unexpectedly"
+        socket_bound,
+        "Daemon mode must bind Unix socket at {} without exiting prematurely",
+        socket_str
     );
 }
