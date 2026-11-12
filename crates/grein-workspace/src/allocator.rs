@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::git::{GitRepository, MergeResult};
+use crate::teardown::{TeardownAction, TeardownOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThreadId(String);
@@ -16,132 +20,260 @@ impl ThreadId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorktreeState {
-    SharedInspection,
-    IsolatedWorktree(PathBuf),
-}
-
-#[derive(Debug)]
-pub enum WorktreeAllocationError {
-    NotAGitRepository(PathBuf),
-    GitCommandFailed(String),
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for WorktreeAllocationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotAGitRepository(p) => write!(f, "Not a git repository: {}", p.display()),
-            Self::GitCommandFailed(msg) => write!(f, "Git command failed: {msg}"),
-            Self::Io(err) => write!(f, "IO error: {err}"),
-        }
+impl<S: Into<String>> From<S> for ThreadId {
+    fn from(value: S) -> Self {
+        Self(value.into())
     }
 }
 
-impl std::error::Error for WorktreeAllocationError {}
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeMode {
+    SharedRead,
+    IsolatedWorktree,
+}
 
 #[derive(Debug, Clone)]
-pub struct LazyWorktreeAllocator {
-    repo_root: PathBuf,
-    allocated_worktrees: HashMap<ThreadId, PathBuf>,
+pub struct WorktreeAllocator {
+    repo: GitRepository,
 }
 
-impl LazyWorktreeAllocator {
-    pub fn new(repo_root: PathBuf) -> Self {
-        Self {
-            repo_root,
-            allocated_worktrees: HashMap::new(),
-        }
+impl WorktreeAllocator {
+    pub fn new(repo: GitRepository) -> Self {
+        Self { repo }
     }
 
-    pub fn state_for(&self, thread_id: &ThreadId) -> WorktreeState {
-        if let Some(path) = self.allocated_worktrees.get(thread_id) {
-            WorktreeState::IsolatedWorktree(path.clone())
-        } else {
-            WorktreeState::SharedInspection
-        }
-    }
-
-    pub fn is_allocated(&self, thread_id: &ThreadId) -> bool {
-        self.allocated_worktrees.contains_key(thread_id)
-    }
-
-    pub fn resolve_path_for_read(
-        &self,
-        thread_id: &ThreadId,
-    ) -> Result<PathBuf, WorktreeAllocationError> {
-        if let Some(path) = self.allocated_worktrees.get(thread_id) {
-            Ok(path.clone())
-        } else {
-            Ok(self.repo_root.clone())
-        }
-    }
-
-    pub fn ensure_allocated_for_mutation(
-        &mut self,
-        thread_id: &ThreadId,
-    ) -> Result<PathBuf, WorktreeAllocationError> {
-        if let Some(existing) = self.allocated_worktrees.get(thread_id) {
-            return Ok(existing.clone());
-        }
-
-        if !self.is_git_repository(&self.repo_root) {
-            return Err(WorktreeAllocationError::NotAGitRepository(
-                self.repo_root.clone(),
-            ));
-        }
-
+    pub fn open_session(&self, thread_id: ThreadId) -> Result<WorktreeSession, WorkspaceError> {
         let worktree_dir = self
-            .repo_root
+            .repo
+            .root()
             .join(".grein")
             .join("worktrees")
             .join(thread_id.as_str());
+        let branch_name = format!("worktree-{}", thread_id.as_str());
 
-        if let Some(parent) = worktree_dir.parent() {
-            fs::create_dir_all(parent).map_err(WorktreeAllocationError::Io)?;
+        Ok(WorktreeSession {
+            repo: self.repo.clone(),
+            thread_id,
+            worktree_dir,
+            branch_name,
+            mode: WorktreeMode::SharedRead,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WorktreeSession {
+    repo: GitRepository,
+    #[allow(dead_code)]
+    thread_id: ThreadId,
+    worktree_dir: PathBuf,
+    branch_name: String,
+    mode: WorktreeMode,
+}
+
+pub type Session = WorktreeSession;
+
+impl WorktreeSession {
+    pub fn mode(&self) -> WorktreeMode {
+        self.mode
+    }
+
+    pub fn working_directory(&self) -> &Path {
+        match self.mode {
+            WorktreeMode::SharedRead => self.repo.root(),
+            WorktreeMode::IsolatedWorktree => &self.worktree_dir,
+        }
+    }
+
+    pub fn transition_to_isolated_worktree(&mut self) -> Result<(), WorkspaceError> {
+        if self.mode == WorktreeMode::IsolatedWorktree {
+            return Ok(());
         }
 
-        let branch_name = format!("grein/{}", thread_id.as_str());
+        if let Some(parent) = self.worktree_dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let worktree_path_str = self
+            .worktree_dir
+            .to_str()
+            .ok_or(WorkspaceError::InvalidPath)?;
+
         let output = Command::new("git")
+            .current_dir(self.repo.root())
             .args([
                 "worktree",
                 "add",
-                "-b",
-                &branch_name,
-                worktree_dir.to_str().unwrap_or_default(),
+                "-B",
+                self.branch_name.as_str(),
+                worktree_path_str,
                 "HEAD",
             ])
-            .current_dir(&self.repo_root)
-            .output()
-            .map_err(WorktreeAllocationError::Io)?;
+            .output()?;
 
         if !output.status.success() {
-            return Err(WorktreeAllocationError::GitCommandFailed(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(WorkspaceError::GitError(stderr));
         }
 
-        self.allocated_worktrees
-            .insert(thread_id.clone(), worktree_dir.clone());
-
-        Ok(worktree_dir)
+        self.mode = WorktreeMode::IsolatedWorktree;
+        Ok(())
     }
 
-    fn is_git_repository(&self, path: &Path) -> bool {
-        if !path.exists() {
-            return false;
-        }
-        let output = Command::new("git")
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .current_dir(path)
-            .output();
+    pub fn commit(&self, message: &str) -> Result<(), WorkspaceError> {
+        let dir = self.working_directory();
 
-        match output {
-            Ok(out) => {
-                out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
-            }
-            Err(_) => false,
+        let add_output = Command::new("git")
+            .current_dir(dir)
+            .args(["add", "-A"])
+            .output()?;
+
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
+            return Err(WorkspaceError::GitError(stderr));
         }
+
+        let commit_output = Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-m", message])
+            .output()?;
+
+        if !commit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_output.stderr).to_string();
+            return Err(WorkspaceError::GitError(stderr));
+        }
+
+        Ok(())
+    }
+
+    pub fn merge_to_primary(&self) -> Result<MergeResult, WorkspaceError> {
+        let output = Command::new("git")
+            .current_dir(self.repo.root())
+            .args(["merge", self.branch_name.as_str()])
+            .output()?;
+
+        if output.status.success() {
+            Ok(MergeResult::Success)
+        } else {
+            let diff_output = Command::new("git")
+                .current_dir(self.repo.root())
+                .args(["diff", "--name-only", "--diff-filter=U"])
+                .output()?;
+
+            let files_str = String::from_utf8_lossy(&diff_output.stdout);
+            let conflicting_files: Vec<String> = files_str
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect();
+
+            let _ = Command::new("git")
+                .current_dir(self.repo.root())
+                .args(["merge", "--abort"])
+                .output();
+
+            Ok(MergeResult::Conflict { conflicting_files })
+        }
+    }
+
+    pub fn close(&mut self, action: TeardownAction) -> Result<TeardownOutcome, WorkspaceError> {
+        match action {
+            TeardownAction::AutoPruneClean => {
+                if self.mode == WorktreeMode::IsolatedWorktree {
+                    let status_output = Command::new("git")
+                        .current_dir(&self.worktree_dir)
+                        .args(["status", "--porcelain"])
+                        .output()?;
+
+                    let stdout = String::from_utf8_lossy(&status_output.stdout);
+                    if stdout.trim().is_empty() {
+                        let worktree_path_str = self
+                            .worktree_dir
+                            .to_str()
+                            .ok_or(WorkspaceError::InvalidPath)?;
+
+                        let _ = Command::new("git")
+                            .current_dir(self.repo.root())
+                            .args(["worktree", "remove", "--force", worktree_path_str])
+                            .output();
+
+                        let _ = Command::new("git")
+                            .current_dir(self.repo.root())
+                            .args(["branch", "-D", self.branch_name.as_str()])
+                            .output();
+
+                        if self.worktree_dir.exists() {
+                            let _ = fs::remove_dir_all(&self.worktree_dir);
+                        }
+
+                        self.mode = WorktreeMode::SharedRead;
+                        Ok(TeardownOutcome::Pruned)
+                    } else {
+                        Ok(TeardownOutcome::Kept)
+                    }
+                } else {
+                    Ok(TeardownOutcome::Pruned)
+                }
+            }
+            TeardownAction::Keep => Ok(TeardownOutcome::Kept),
+            TeardownAction::Discard => {
+                if self.mode == WorktreeMode::IsolatedWorktree {
+                    let worktree_path_str = self
+                        .worktree_dir
+                        .to_str()
+                        .ok_or(WorkspaceError::InvalidPath)?;
+
+                    let _ = Command::new("git")
+                        .current_dir(self.repo.root())
+                        .args(["worktree", "remove", "--force", worktree_path_str])
+                        .output();
+
+                    let _ = Command::new("git")
+                        .current_dir(self.repo.root())
+                        .args(["branch", "-D", self.branch_name.as_str()])
+                        .output();
+
+                    if self.worktree_dir.exists() {
+                        let _ = fs::remove_dir_all(&self.worktree_dir);
+                    }
+                }
+                Ok(TeardownOutcome::Discarded)
+            }
+            TeardownAction::Merge => {
+                let _ = self.merge_to_primary()?;
+                Ok(TeardownOutcome::Merged)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WorkspaceError {
+    Io(std::io::Error),
+    GitError(String),
+    InvalidPath,
+}
+
+impl std::fmt::Display for WorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::GitError(msg) => write!(f, "Git error: {msg}"),
+            Self::InvalidPath => write!(f, "Invalid worktree path"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceError {}
+
+impl From<std::io::Error> for WorkspaceError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
     }
 }
