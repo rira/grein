@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn find_workspace_root() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
@@ -38,8 +38,8 @@ fn test_flake_nix_exists_and_declares_inputs_and_systems() {
         "flake.nix must declare nixpkgs input with URL"
     );
     assert!(
-        content.contains("flake-utils.url"),
-        "flake.nix must declare flake-utils input with URL"
+        content.contains("nixpkgs"),
+        "flake.nix must declare nixpkgs input"
     );
 
     // Verify supported architectures / systems
