@@ -1,16 +1,11 @@
 [package]
 name = "grein-acp"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "Agent Client Protocol (ACP) JSON-RPC stdio driver for grein"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-grein-core.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
