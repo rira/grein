@@ -1,82 +1,47 @@
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-pub const COMPOSER_HEIGHT: u16 = 3;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LayoutAreas {
-    pub navigator: Rect,
-    pub transcript: Rect,
-    pub blackboard: Option<Rect>,
-    pub composer: Rect,
+#[derive(Debug, Clone, Copy)]
+pub struct AppLayout {
+    pub tree_area: Rect,
+    pub transcript_area: Rect,
+    pub blackboard_area: Option<Rect>,
+    pub composer_area: Rect,
 }
 
-pub fn compute_layout(area: Rect, blackboard_collapsed: bool) -> LayoutAreas {
-    let composer_height = COMPOSER_HEIGHT.min(area.height);
-    let top_height = area.height.saturating_sub(composer_height);
-    let composer_y = area.y + top_height;
+pub fn compute_layout(area: Rect, blackboard_collapsed: bool) -> AppLayout {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
 
-    let composer = Rect {
-        x: area.x,
-        y: composer_y,
-        width: area.width,
-        height: composer_height,
-    };
-
-    let nav_width = ((area.width as u32 * 22) / 100) as u16;
+    let composer_area = vertical[1];
+    let top_area = vertical[0];
 
     if blackboard_collapsed {
-        let transcript_width = area.width.saturating_sub(nav_width);
-
-        let navigator = Rect {
-            x: area.x,
-            y: area.y,
-            width: nav_width,
-            height: top_height,
-        };
-
-        let transcript = Rect {
-            x: area.x + nav_width,
-            y: area.y,
-            width: transcript_width,
-            height: top_height,
-        };
-
-        LayoutAreas {
-            navigator,
-            transcript,
-            blackboard: None,
-            composer,
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(22), Constraint::Percentage(78)])
+            .split(top_area);
+        AppLayout {
+            tree_area: horizontal[0],
+            transcript_area: horizontal[1],
+            blackboard_area: None,
+            composer_area,
         }
     } else {
-        let blackboard_width = ((area.width as u32 * 22) / 100) as u16;
-        let transcript_width = area.width.saturating_sub(nav_width + blackboard_width);
-
-        let navigator = Rect {
-            x: area.x,
-            y: area.y,
-            width: nav_width,
-            height: top_height,
-        };
-
-        let transcript = Rect {
-            x: area.x + nav_width,
-            y: area.y,
-            width: transcript_width,
-            height: top_height,
-        };
-
-        let blackboard = Rect {
-            x: area.x + nav_width + transcript_width,
-            y: area.y,
-            width: blackboard_width,
-            height: top_height,
-        };
-
-        LayoutAreas {
-            navigator,
-            transcript,
-            blackboard: Some(blackboard),
-            composer,
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(22),
+                Constraint::Percentage(56),
+                Constraint::Percentage(22),
+            ])
+            .split(top_area);
+        AppLayout {
+            tree_area: horizontal[0],
+            transcript_area: horizontal[1],
+            blackboard_area: Some(horizontal[2]),
+            composer_area,
         }
     }
 }
