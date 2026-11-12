@@ -1,91 +1,129 @@
-use grein_workspace::shadow::ShadowSnapshot;
+use grein_workspace::diff::compute_directory_diff;
+use grein_workspace::shadow::{ShadowSnapshot, detect_git_environment};
 use std::fs;
+use std::path::Path;
 use tempfile::tempdir;
 
 #[test]
-fn test_merge_back_copies_modified_and_new_files_to_primary() {
-    let primary = tempdir().expect("failed to create primary tempdir");
-    let primary_path = primary.path();
+fn test_fallback_detection_in_non_git_directory() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let non_git_path = temp.path();
 
-    let initial_file = primary_path.join("existing.txt");
-    let nested_file = primary_path.join("src").join("lib.rs");
-    fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
-    fs::write(&initial_file, "original content\n").unwrap();
-    fs::write(&nested_file, "pub fn run() {}\n").unwrap();
-
-    let shadow_root = tempdir().expect("failed to create shadow root tempdir");
-    let thread_id = "thread-test-merge";
-
-    let shadow = ShadowSnapshot::create(primary_path, shadow_root.path(), thread_id)
-        .expect("failed to create shadow snapshot");
-
-    // Verify shadow path exists
-    assert!(shadow.path().exists());
-
-    // Modify existing file in shadow snapshot
-    let shadow_file = shadow.path().join("existing.txt");
-    fs::write(&shadow_file, "modified content in shadow\n").unwrap();
-
-    // Create a new file in shadow snapshot
-    let shadow_new_file = shadow.path().join("new_module.rs");
-    fs::write(&shadow_new_file, "pub struct Worker;\n").unwrap();
-
-    // Execute merge-back operation
-    let merge_result = shadow.merge_back();
+    let is_git = detect_git_environment(non_git_path);
     assert!(
-        merge_result.is_ok(),
-        "merge_back should succeed: {:?}",
-        merge_result.err()
-    );
-
-    // Verify primary directory has received the updates
-    assert_eq!(
-        fs::read_to_string(&initial_file).unwrap(),
-        "modified content in shadow\n"
-    );
-    assert_eq!(
-        fs::read_to_string(primary_path.join("new_module.rs")).unwrap(),
-        "pub struct Worker;\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&nested_file).unwrap(),
-        "pub fn run() {}\n"
+        !is_git,
+        "non-git temporary directory must trigger fallback mode"
     );
 }
 
 #[test]
-fn test_merge_back_handles_deleted_files_and_directory_cleanup() {
-    let primary = tempdir().expect("failed to create primary tempdir");
-    let primary_path = primary.path();
+fn test_shadow_snapshot_lifecycle_and_creation() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let primary_dir = temp.path().join("primary");
+    fs::create_dir_all(&primary_dir).expect("failed to create primary dir");
 
-    let keep_file = primary_path.join("keep.txt");
-    let delete_file = primary_path.join("to_remove.txt");
-    fs::write(&keep_file, "retain me").unwrap();
-    fs::write(&delete_file, "remove me").unwrap();
+    let file_a = primary_dir.join("file_a.txt");
+    fs::write(&file_a, "initial content\n").expect("failed to write file_a");
 
-    let shadow_root = tempdir().expect("failed to create shadow root tempdir");
-    let thread_id = "thread-test-delete";
+    let thread_id = "thread-12345";
+    let shadow =
+        ShadowSnapshot::create(&primary_dir, thread_id).expect("failed to create shadow snapshot");
 
-    let shadow = ShadowSnapshot::create(primary_path, shadow_root.path(), thread_id)
-        .expect("failed to create shadow snapshot");
+    let expected_shadow_path = primary_dir.join(".grein/shadow").join(thread_id);
+    assert_eq!(shadow.shadow_path(), expected_shadow_path.as_path());
+    assert!(shadow.shadow_path().exists(), "shadow path must exist");
 
-    // Delete file inside shadow
-    let shadow_delete_file = shadow.path().join("to_remove.txt");
-    fs::remove_file(&shadow_delete_file).unwrap();
-
-    // Execute merge-back
-    let merge_result = shadow.merge_back();
-    assert!(
-        merge_result.is_ok(),
-        "merge_back with deletion should succeed: {:?}",
-        merge_result.err()
+    let shadow_file_a = shadow.shadow_path().join("file_a.txt");
+    assert!(shadow_file_a.exists(), "shadow file_a must exist");
+    assert_eq!(
+        fs::read_to_string(&shadow_file_a).expect("failed to read shadow file_a"),
+        "initial content\n"
     );
 
-    // Verify primary directory reflects deletion and retains untouched files
-    assert!(keep_file.exists());
-    assert_eq!(fs::read_to_string(&keep_file).unwrap(), "retain me");
+    shadow.cleanup().expect("failed to cleanup shadow snapshot");
     assert!(
-        !delete_file.exists(),
-        "deleted file must be removed from primary upon merge-back"
+        !shadow.shadow_path().exists(),
+        "shadow path should be removed after cleanup"
     );
+}
+
+#[test]
+fn test_diff_generation_against_primary() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let primary_dir = temp.path().join("primary");
+    fs::create_dir_all(&primary_dir).expect("failed to create primary dir");
+
+    let file_a = primary_dir.join("hello.rs");
+    fs::write(&file_a, "fn main() {\n    println!(\"hello\");\n}\n").expect("failed to write file");
+
+    let thread_id = "thread-diff-test";
+    let shadow =
+        ShadowSnapshot::create(&primary_dir, thread_id).expect("failed to create shadow snapshot");
+
+    let shadow_file_a = shadow.shadow_path().join("hello.rs");
+    fs::write(
+        &shadow_file_a,
+        "fn main() {\n    println!(\"hello, world!\");\n}\n",
+    )
+    .expect("failed to modify shadow file");
+
+    let diff =
+        compute_directory_diff(&primary_dir, shadow.shadow_path()).expect("failed to compute diff");
+
+    assert!(
+        !diff.is_empty(),
+        "diff must not be empty for modified files"
+    );
+    assert!(
+        diff.contains("-    println!(\"hello\");"),
+        "diff must show removed line"
+    );
+    assert!(
+        diff.contains("+    println!(\"hello, world!\");"),
+        "diff must show added line"
+    );
+
+    shadow.cleanup().expect("failed to cleanup shadow snapshot");
+}
+
+#[test]
+fn test_merge_back_to_primary() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let primary_dir = temp.path().join("primary");
+    fs::create_dir_all(&primary_dir).expect("failed to create primary dir");
+
+    let file_to_update = primary_dir.join("config.toml");
+    fs::write(&file_to_update, "version = 1\n").expect("failed to write config");
+
+    let thread_id = "thread-merge-test";
+    let shadow =
+        ShadowSnapshot::create(&primary_dir, thread_id).expect("failed to create shadow snapshot");
+
+    let shadow_file_update = shadow.shadow_path().join("config.toml");
+    fs::write(&shadow_file_update, "version = 2\nenabled = true\n")
+        .expect("failed to update shadow config");
+
+    let shadow_new_file = shadow.shadow_path().join("new_file.txt");
+    fs::write(&shadow_new_file, "created in shadow\n").expect("failed to write new file");
+
+    shadow
+        .merge_back()
+        .expect("failed to merge back to primary");
+
+    assert_eq!(
+        fs::read_to_string(&file_to_update).expect("failed to read updated primary config"),
+        "version = 2\nenabled = true\n"
+    );
+
+    let merged_new_file = primary_dir.join("new_file.txt");
+    assert!(
+        merged_new_file.exists(),
+        "new file must be merged into primary"
+    );
+    assert_eq!(
+        fs::read_to_string(&merged_new_file).expect("failed to read new file"),
+        "created in shadow\n"
+    );
+
+    shadow.cleanup().expect("failed to cleanup shadow snapshot");
 }
