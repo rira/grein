@@ -1,15 +1,9 @@
 [package]
 name = "grein-workspace"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-description = "Git-aware lazy worktree manager with shadow snapshot fallback for grein"
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
-grein-core.workspace = true
-tokio.workspace = true
-similar.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
