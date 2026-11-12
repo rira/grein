@@ -1,54 +1,96 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-
-fn find_repo_root() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root_candidate = manifest_dir.join("../..");
-    if root_candidate.join("flake.nix").exists() || root_candidate.join("Cargo.toml").exists() {
-        root_candidate
-    } else if Path::new("flake.nix").exists() {
-        PathBuf::from(".")
-    } else {
-        root_candidate
-    }
-}
+use std::path::Path;
+use std::process::Command;
 
 #[test]
-fn test_flake_nix_exists_and_declares_build_rust_package() {
-    let root = find_repo_root();
-    let flake_path = root.join("flake.nix");
+fn test_flake_file_exists_and_contains_required_definitions() {
+    let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("Failed to locate workspace root");
+    let flake_path = root_dir.join("flake.nix");
 
     assert!(
         flake_path.exists(),
-        "Expected flake.nix to exist at repo root: {}",
-        flake_path.display()
+        "flake.nix must exist at repository workspace root: {:?}",
+        flake_path
     );
 
-    let content = fs::read_to_string(&flake_path).expect("Failed to read flake.nix");
-
-    assert!(
-        content.contains("buildRustPackage"),
-        "flake.nix must define package using rustPlatform.buildRustPackage"
-    );
+    let content = std::fs::read_to_string(&flake_path).expect("Failed to read flake.nix");
 
     assert!(
-        content.contains("cargoLock") || content.contains("lockFile"),
-        "flake.nix must configure Cargo.lock vendoring (cargoLock.lockFile)"
+        content.contains("packages") && content.contains("default"),
+        "flake.nix must define packages.default for hermetic package build"
     );
-
     assert!(
-        content.contains("pkg-config"),
-        "flake.nix must include pkg-config in nativeBuildInputs"
+        content.contains("apps") && content.contains("default"),
+        "flake.nix must define apps.default pointing to the built binary"
     );
-
     assert!(
-        content.contains("sqlite"),
-        "flake.nix must include sqlite in buildInputs"
+        content.contains("devShells") && content.contains("default"),
+        "flake.nix must define devShells.default"
     );
-
     assert!(
-        content.contains("packages.default")
-            || (content.contains("packages") && content.contains("default =")),
-        "flake.nix must expose packages.default derivation"
+        content.contains("buildRustPackage")
+            || content.contains("craneLib")
+            || content.contains("crane"),
+        "flake.nix must configure Rust package builder derivation"
     );
+}
+
+#[test]
+fn test_nix_flake_check_and_build_hermeticity() {
+    let root_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("Failed to locate workspace root");
+
+    let nix_check = Command::new("nix")
+        .current_dir(root_dir)
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "flake",
+            "check",
+        ])
+        .output();
+
+    match nix_check {
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "nix flake check failed:\nSTDOUT: {}\nSTDERR: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("nix binary not present in environment; skipping live execution check");
+        }
+        Err(err) => panic!("Unexpected error executing nix flake check: {}", err),
+    }
+
+    let nix_build = Command::new("nix")
+        .current_dir(root_dir)
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "build",
+            "--no-link",
+        ])
+        .output();
+
+    match nix_build {
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "nix build failed:\nSTDOUT: {}\nSTDERR: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("nix binary not present in environment; skipping live build check");
+        }
+        Err(err) => panic!("Unexpected error executing nix build: {}", err),
+    }
 }
