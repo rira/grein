@@ -1,1 +1,2 @@
-pub mod discovery;
+pub mod client;
+pub mod daemon;
