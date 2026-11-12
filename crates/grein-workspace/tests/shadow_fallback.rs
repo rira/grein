@@ -1,86 +1,91 @@
+use grein_workspace::shadow::ShadowSnapshot;
 use std::fs;
-use std::path::Path;
 use tempfile::tempdir;
 
-// Step 0: Test environment detection for git repository presence and git executable in PATH
-use grein_workspace::environment::{
-    EnvironmentDetector, GitEnvironmentStatus, WorkspaceEnvironment, detect_environment,
-};
-
 #[test]
-fn test_detect_environment_in_non_git_directory() {
-    let temp = tempdir().expect("failed to create temp dir");
-    let non_git_path = temp.path();
+fn test_merge_back_copies_modified_and_new_files_to_primary() {
+    let primary = tempdir().expect("failed to create primary tempdir");
+    let primary_path = primary.path();
 
-    let status = detect_environment(non_git_path);
+    let initial_file = primary_path.join("existing.txt");
+    let nested_file = primary_path.join("src").join("lib.rs");
+    fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+    fs::write(&initial_file, "original content\n").unwrap();
+    fs::write(&nested_file, "pub fn run() {}\n").unwrap();
+
+    let shadow_root = tempdir().expect("failed to create shadow root tempdir");
+    let thread_id = "thread-test-merge";
+
+    let shadow = ShadowSnapshot::create(primary_path, shadow_root.path(), thread_id)
+        .expect("failed to create shadow snapshot");
+
+    // Verify shadow path exists
+    assert!(shadow.path().exists());
+
+    // Modify existing file in shadow snapshot
+    let shadow_file = shadow.path().join("existing.txt");
+    fs::write(&shadow_file, "modified content in shadow\n").unwrap();
+
+    // Create a new file in shadow snapshot
+    let shadow_new_file = shadow.path().join("new_module.rs");
+    fs::write(&shadow_new_file, "pub struct Worker;\n").unwrap();
+
+    // Execute merge-back operation
+    let merge_result = shadow.merge_back();
+    assert!(
+        merge_result.is_ok(),
+        "merge_back should succeed: {:?}",
+        merge_result.err()
+    );
+
+    // Verify primary directory has received the updates
     assert_eq!(
-        status.git_repo_detected, false,
-        "Expected non-git directory to report git_repo_detected = false"
+        fs::read_to_string(&initial_file).unwrap(),
+        "modified content in shadow\n"
     );
     assert_eq!(
-        status.environment,
-        WorkspaceEnvironment::NonGitDirectory,
-        "Expected environment to be NonGitDirectory"
+        fs::read_to_string(primary_path.join("new_module.rs")).unwrap(),
+        "pub struct Worker;\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&nested_file).unwrap(),
+        "pub fn run() {}\n"
     );
 }
 
 #[test]
-fn test_detect_environment_in_simulated_git_directory() {
-    let temp = tempdir().expect("failed to create temp dir");
-    let git_dir = temp.path().join(".git");
-    fs::create_dir_all(&git_dir).expect("failed to create mock .git directory");
+fn test_merge_back_handles_deleted_files_and_directory_cleanup() {
+    let primary = tempdir().expect("failed to create primary tempdir");
+    let primary_path = primary.path();
 
-    let status = detect_environment(temp.path());
-    assert_eq!(
-        status.git_repo_detected, true,
-        "Expected git_repo_detected = true when .git directory exists"
+    let keep_file = primary_path.join("keep.txt");
+    let delete_file = primary_path.join("to_remove.txt");
+    fs::write(&keep_file, "retain me").unwrap();
+    fs::write(&delete_file, "remove me").unwrap();
+
+    let shadow_root = tempdir().expect("failed to create shadow root tempdir");
+    let thread_id = "thread-test-delete";
+
+    let shadow = ShadowSnapshot::create(primary_path, shadow_root.path(), thread_id)
+        .expect("failed to create shadow snapshot");
+
+    // Delete file inside shadow
+    let shadow_delete_file = shadow.path().join("to_remove.txt");
+    fs::remove_file(&shadow_delete_file).unwrap();
+
+    // Execute merge-back
+    let merge_result = shadow.merge_back();
+    assert!(
+        merge_result.is_ok(),
+        "merge_back with deletion should succeed: {:?}",
+        merge_result.err()
     );
-    assert_eq!(
-        status.environment,
-        WorkspaceEnvironment::GitRepository,
-        "Expected environment to be GitRepository"
-    );
-}
 
-#[test]
-fn test_git_binary_availability_check() {
-    let detector = EnvironmentDetector::default();
-    let is_available = detector.is_git_binary_available();
-
-    // In test runner environment, verify that is_git_binary_available returns a deterministic boolean
-    // and aligns with querying PATH for `git` or `git.exe`
-    let path_env = std::env::var_os("PATH");
-    let expected_available = if let Some(paths) = path_env {
-        std::env::split_paths(&paths).any(|dir| {
-            dir.join("git").is_file()
-                || dir.join("git.exe").is_file()
-                || dir.join("git.cmd").is_file()
-        })
-    } else {
-        false
-    };
-
-    assert_eq!(
-        is_available, expected_available,
-        "EnvironmentDetector git binary availability should match PATH search"
-    );
-}
-
-#[test]
-fn test_detect_environment_with_custom_detector_without_git_binary() {
-    let temp = tempdir().expect("failed to create temp dir");
-    let git_dir = temp.path().join(".git");
-    fs::create_dir_all(&git_dir).expect("failed to create mock .git directory");
-
-    // Even if .git folder exists, if git executable is missing, environment should degrade to NonGitFallback
-    let custom_detector = EnvironmentDetector::new(false);
-    let status = custom_detector.detect(temp.path());
-
-    assert_eq!(status.git_repo_detected, true);
-    assert_eq!(status.git_binary_present, false);
-    assert_eq!(
-        status.environment,
-        WorkspaceEnvironment::NonGitDirectory,
-        "Missing git binary must fallback to NonGitDirectory environment mode"
+    // Verify primary directory reflects deletion and retains untouched files
+    assert!(keep_file.exists());
+    assert_eq!(fs::read_to_string(&keep_file).unwrap(), "retain me");
+    assert!(
+        !delete_file.exists(),
+        "deleted file must be removed from primary upon merge-back"
     );
 }
