@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PermissionScope {
+pub enum PermissionDecision {
     AllowOnce,
     Deny,
     AlwaysThread,
@@ -9,118 +9,39 @@ pub enum PermissionScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionRequest {
-    pub session_id: String,
-    pub thread_id: String,
-    pub tool_name: String,
-    pub argument: String,
+pub struct ToolInvocationRequest {
+    tool_name: String,
+    parameters: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EvaluationResult {
-    Allowed,
-    Denied,
-    PromptRequired(PermissionRequest),
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct PermissionGate {
-    always_session: HashSet<(String, String, String)>,
-    always_thread: HashSet<(String, String, String, String)>,
-    denied: HashSet<(String, String, String, String)>,
-}
-
-impl PermissionGate {
-    pub fn new() -> Self {
+impl ToolInvocationRequest {
+    pub fn new(tool_name: impl Into<String>, parameters: Value) -> Self {
         Self {
-            always_session: HashSet::new(),
-            always_thread: HashSet::new(),
-            denied: HashSet::new(),
+            tool_name: tool_name.into(),
+            parameters,
         }
     }
 
-    pub fn evaluate(
-        &self,
-        session_id: &str,
-        thread_id: &str,
-        tool_name: &str,
-        argument: &str,
-    ) -> EvaluationResult {
-        let is_intercepted = matches!(tool_name, "run_command" | "write_file" | "edit_file");
-        if !is_intercepted {
-            return EvaluationResult::Allowed;
-        }
-
-        if self.denied.contains(&(
-            session_id.to_string(),
-            thread_id.to_string(),
-            tool_name.to_string(),
-            argument.to_string(),
-        )) {
-            return EvaluationResult::Denied;
-        }
-
-        if self.always_session.contains(&(
-            session_id.to_string(),
-            tool_name.to_string(),
-            argument.to_string(),
-        )) {
-            return EvaluationResult::Allowed;
-        }
-
-        if self.always_thread.contains(&(
-            session_id.to_string(),
-            thread_id.to_string(),
-            tool_name.to_string(),
-            argument.to_string(),
-        )) {
-            return EvaluationResult::Allowed;
-        }
-
-        EvaluationResult::PromptRequired(PermissionRequest {
-            session_id: session_id.to_string(),
-            thread_id: thread_id.to_string(),
-            tool_name: tool_name.to_string(),
-            argument: argument.to_string(),
-        })
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
     }
 
-    pub fn resolve_prompt(
-        &mut self,
-        session_id: &str,
-        thread_id: &str,
-        tool_name: &str,
-        argument: &str,
-        scope: PermissionScope,
-    ) -> bool {
-        match scope {
-            PermissionScope::AllowOnce => true,
-            PermissionScope::AlwaysThread => {
-                self.always_thread.insert((
-                    session_id.to_string(),
-                    thread_id.to_string(),
-                    tool_name.to_string(),
-                    argument.to_string(),
-                ));
-                true
-            }
-            PermissionScope::AlwaysSession => {
-                self.always_session.insert((
-                    session_id.to_string(),
-                    tool_name.to_string(),
-                    argument.to_string(),
-                ));
-                true
-            }
-            PermissionScope::Deny => {
-                self.denied.insert((
-                    session_id.to_string(),
-                    thread_id.to_string(),
-                    tool_name.to_string(),
-                    argument.to_string(),
-                ));
-                false
-            }
-        }
+    pub fn parameters(&self) -> &Value {
+        &self.parameters
+    }
+
+    pub fn command_line(&self) -> Option<&str> {
+        self.parameters
+            .get("CommandLine")
+            .or_else(|| self.parameters.get("command"))
+            .or_else(|| self.parameters.get("cmd"))
+            .and_then(Value::as_str)
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.parameters
+            .get("Path")
+            .or_else(|| self.parameters.get("path"))
+            .and_then(Value::as_str)
     }
 }

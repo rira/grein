@@ -1,13 +1,9 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 
-/// Identifies a thread or execution branch in the DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BranchThreadId(String);
+pub struct SessionId(String);
 
-impl BranchThreadId {
+impl SessionId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -17,122 +13,116 @@ impl BranchThreadId {
     }
 }
 
-/// Level of isolation applied to an ACP session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionIsolation {
-    ProcessPerSession,
-    SharedProcess,
+impl<T: Into<String>> From<T> for SessionId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
 }
 
-/// Errors related to session management and multiplexing.
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ThreadId(String);
+
+impl ThreadId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<T: Into<String>> From<T> for ThreadId {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+impl std::fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    id: SessionId,
+    thread_id: ThreadId,
+}
+
+impl Session {
+    pub fn new(id: SessionId, thread_id: ThreadId) -> Self {
+        Self { id, thread_id }
+    }
+
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    pub fn thread_id(&self) -> &ThreadId {
+        &self.thread_id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
-    InvalidBranchIdentifier(String),
     SessionNotFound(String),
-    Internal(String),
 }
 
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidBranchIdentifier(msg) => write!(f, "Invalid branch identifier: {}", msg),
-            Self::SessionNotFound(msg) => write!(f, "Session not found: {}", msg),
-            Self::Internal(msg) => write!(f, "Internal session error: {}", msg),
+            Self::SessionNotFound(msg) => write!(f, "Session not found: {msg}"),
         }
     }
 }
 
 impl std::error::Error for SessionError {}
 
-/// Handle representing an active ACP session.
-#[derive(Debug, Clone)]
-pub struct SessionHandle {
-    session_id: String,
-    isolation: SessionIsolation,
+#[derive(Debug)]
+pub struct SessionManager {
+    process_per_session: bool,
+    sessions: HashMap<ThreadId, Session>,
+    next_session_index: usize,
 }
 
-impl SessionHandle {
-    pub fn new(session_id: impl Into<String>, isolation: SessionIsolation) -> Self {
+impl SessionManager {
+    pub fn new(process_per_session: bool) -> Self {
         Self {
-            session_id: session_id.into(),
-            isolation,
+            process_per_session,
+            sessions: HashMap::new(),
+            next_session_index: 1,
         }
     }
 
-    pub fn session_id(&self) -> &String {
-        &self.session_id
+    pub fn process_per_session(&self) -> bool {
+        self.process_per_session
     }
 
-    pub fn isolation(&self) -> SessionIsolation {
-        self.isolation
-    }
-}
-
-/// Multiplexes parallel DAG branch threads to distinct ACP sessions.
-pub struct SessionMultiplexer {
-    isolation: SessionIsolation,
-    sessions: RwLock<HashMap<BranchThreadId, SessionHandle>>,
-    counter: AtomicU64,
-}
-
-impl SessionMultiplexer {
-    pub fn new(isolation: SessionIsolation) -> Self {
-        Self {
-            isolation,
-            sessions: RwLock::new(HashMap::new()),
-            counter: AtomicU64::new(1),
-        }
-    }
-
-    /// Retrieves an existing session for the given branch or creates a new one.
-    pub fn get_or_create_session(
-        &self,
-        branch: &BranchThreadId,
-    ) -> Result<SessionHandle, SessionError> {
-        if branch.as_str().is_empty() {
-            return Err(SessionError::InvalidBranchIdentifier(
-                "branch identifier cannot be empty".to_string(),
-            ));
-        }
-
-        // Fast path: read lock
-        {
-            let guard = self
-                .sessions
-                .read()
-                .map_err(|e| SessionError::Internal(e.to_string()))?;
-            if let Some(session) = guard.get(branch) {
-                return Ok(session.clone());
-            }
-        }
-
-        // Slow path: write lock
-        let mut guard = self
-            .sessions
-            .write()
-            .map_err(|e| SessionError::Internal(e.to_string()))?;
-        if let Some(session) = guard.get(branch) {
+    pub fn get_or_create_session(&mut self, thread_id: &ThreadId) -> Result<Session, SessionError> {
+        if let Some(session) = self.sessions.get(thread_id) {
             return Ok(session.clone());
         }
 
-        let next_id = self.counter.fetch_add(1, Ordering::SeqCst);
-        let session = SessionHandle::new(format!("acp-session-{}", next_id), self.isolation);
-        guard.insert(branch.clone(), session.clone());
+        let session_id = SessionId::from(format!("session-{}", self.next_session_index));
+        self.next_session_index += 1;
+
+        let session = Session::new(session_id, thread_id.clone());
+        self.sessions.insert(thread_id.clone(), session.clone());
         Ok(session)
     }
 
-    /// Terminates an active session associated with the branch thread.
-    pub fn terminate_session(&self, branch: &BranchThreadId) -> Result<(), SessionError> {
-        let mut guard = self
-            .sessions
-            .write()
-            .map_err(|e| SessionError::Internal(e.to_string()))?;
-        guard.remove(branch);
-        Ok(())
+    pub fn get_session(&self, thread_id: &ThreadId) -> Option<&Session> {
+        self.sessions.get(thread_id)
     }
 
-    /// Returns the number of currently active sessions.
     pub fn active_session_count(&self) -> usize {
-        self.sessions.read().map(|guard| guard.len()).unwrap_or(0)
+        self.sessions.len()
     }
 }
