@@ -1,7 +1,7 @@
 class Grein < Formula
-  desc "Autonomous development harness and workspace CLI for intelligent coding pipelines"
-  homepage "https://github.com/rira/grein"
-  url "https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz"
+  desc "AI-native engineering platform CLI"
+  homepage "https://github.com/example/grein"
+  url "https://github.com/example/grein/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Apache-2.0"
 

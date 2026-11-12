@@ -2,44 +2,44 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
-fn test_homebrew_formula_grein_metadata_and_dependencies() {
-    let formula_path = if PathBuf::from("Formula/grein.rb").exists() {
-        PathBuf::from("Formula/grein.rb")
-    } else {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("Formula/grein.rb"))
-            .unwrap_or_else(|| PathBuf::from("Formula/grein.rb"))
-    };
+fn test_formula_contains_install_and_test_blocks() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest_dir.join("Formula/grein.rb"),
+        manifest_dir.join("../../Formula/grein.rb"),
+        PathBuf::from("Formula/grein.rb"),
+    ];
+
+    let formula_path = candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("Formula/grein.rb"));
 
     assert!(
         formula_path.exists(),
-        "Formula/grein.rb must exist at {}",
-        formula_path.display()
+        "Expected Formula/grein.rb to exist at {:?}",
+        formula_path
     );
 
     let content = fs::read_to_string(&formula_path).expect("Failed to read Formula/grein.rb");
 
     assert!(
-        content.contains("class Grein < Formula"),
-        "Formula must declare 'class Grein < Formula'"
+        content.contains("def install"),
+        "Formula must define an install method"
     );
+
     assert!(
-        content.contains("desc "),
-        "Formula must define a description (desc)"
+        content.contains("*std_cargo_args(path: \"crates/grein-cli\")"),
+        "Formula install block must invoke cargo install with *std_cargo_args(path: \"crates/grein-cli\")"
     );
+
     assert!(
-        content.contains("homepage "),
-        "Formula must define a homepage"
+        content.contains("test do"),
+        "Formula must define a test do block"
     );
+
     assert!(
-        content.contains("license "),
-        "Formula must define a license"
-    );
-    assert!(
-        content.contains("depends_on \"rust\" => :build")
-            || content.contains("depends_on 'rust' => :build"),
-        "Formula must specify rust build dependency: depends_on 'rust' => :build"
+        content.contains("assert_match version.to_s, shell_output(\"#{bin}/grein --version\")"),
+        "Formula test block must verify #{{bin}}/grein --version matches formula version"
     );
 }
