@@ -1,52 +1,72 @@
-mod daemon;
-
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+pub mod daemon {
+    use std::path::Path;
+
+    pub fn run_daemon_with_socket(
+        socket_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = std::os::unix::net::UnixListener::bind(socket_path)?;
+        for stream in listener.incoming() {
+            match stream {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "grein",
     version,
-    about = "Grein CLI - Multi-Agent Terminal Development Environment"
+    about = "Grein autonomous software engineering CLI"
 )]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    pub command: Option<Command>,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Run standalone interactive TUI session with embedded engine
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Standalone mode (interactive TUI)
     Standalone,
-    /// Run headless Unix socket server
+    /// Daemon mode (headless server)
     Daemon {
-        /// Socket path for the daemon IPC
-        #[arg(long, default_value_os_t = daemon::default_socket_path())]
-        socket: PathBuf,
+        /// Unix domain socket path
+        #[arg(short, long)]
+        socket: Option<PathBuf>,
     },
-    /// Attach interactive TUI to a running daemon
+    /// Attach mode (connect to running daemon)
     Attach {
-        /// Socket path for the daemon IPC
-        #[arg(long, default_value_os_t = daemon::default_socket_path())]
-        socket: PathBuf,
+        /// Unix domain socket path
+        #[arg(short, long)]
+        socket: Option<PathBuf>,
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        None | Some(Commands::Standalone) => {
-            grein_tui::run().await?;
+        None | Some(Command::Standalone) => {
+            println!("Grein Standalone mode");
+            Ok(())
         }
-        Some(Commands::Daemon { socket }) => {
-            daemon::run_daemon_with_socket(socket).await?;
+        Some(Command::Daemon { socket }) => {
+            let socket_path = socket.unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("grein-daemon-{}.sock", std::process::id()))
+            });
+            daemon::run_daemon_with_socket(&socket_path)
         }
-        Some(Commands::Attach { socket: _ }) => {
-            grein_tui::run().await?;
+        Some(Command::Attach { socket: _ }) => {
+            println!("Grein Attach mode");
+            Ok(())
         }
     }
-
-    Ok(())
 }
