@@ -1,6 +1,5 @@
 use grein_acp::{
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, StdioProcessConfig, StdioProcessRunner,
-    StdioRunnerError,
+    JsonRpcMessage, JsonRpcRequest, StdioProcessConfig, StdioProcessRunner,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -31,7 +30,7 @@ async fn test_message_multiplexing_bidirectional() {
         .await
         .expect("Subprocess should start successfully");
 
-    let (mut client, mut incoming) = runner.into_channels();
+    let (client, mut incoming) = runner.into_channels();
 
     let request = JsonRpcMessage::Request(JsonRpcRequest {
         jsonrpc: "2.0".into(),
@@ -63,7 +62,7 @@ async fn test_error_propagation_on_non_zero_exit() {
         .await
         .expect("Spawn should succeed initially before immediate exit");
 
-    let (mut client, mut incoming) = runner.into_channels();
+    let (client, mut incoming) = runner.into_channels();
 
     let request = JsonRpcMessage::Request(JsonRpcRequest {
         jsonrpc: "2.0".into(),
@@ -88,7 +87,7 @@ async fn test_error_propagation_on_non_zero_exit() {
 #[tokio::test]
 async fn test_graceful_process_termination() {
     let config = StdioProcessConfig::new("cat", Vec::<String>::new());
-    let mut runner = StdioProcessRunner::spawn(config)
+    let runner = StdioProcessRunner::spawn(config)
         .await
         .expect("Subprocess should start successfully");
 
