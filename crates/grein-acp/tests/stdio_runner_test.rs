@@ -1,6 +1,4 @@
-use grein_acp::{
-    JsonRpcMessage, JsonRpcRequest, StdioProcessConfig, StdioProcessRunner,
-};
+use grein_acp::{JsonRpcMessage, JsonRpcRequest, StdioProcessConfig, StdioProcessRunner};
 use std::time::Duration;
 use tokio::time::timeout;
 
