@@ -1,126 +1,93 @@
-use std::sync::{Arc, Mutex};
+//! Black-box tests for thread status indicators and focus non-stealing invariant.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TaskPriority {
-    Background = 0,
-    Focused = 1,
-}
+use grein_tui::focus::{FocusManager, FocusTarget};
+use grein_tui::status::{BackgroundEvent, ThreadId, ThreadStatus, ThreadStatusRegistry};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduledTask {
-    pub id: u64,
-    pub thread_id: String,
-    pub priority: TaskPriority,
-}
+#[test]
+fn test_focus_non_stealing_on_background_stream_completion() {
+    let mut focus_manager = FocusManager::new();
+    let mut registry = ThreadStatusRegistry::new();
 
-#[derive(Default)]
-pub struct PriorityScheduler {
-    focused_thread_id: Option<String>,
-    tasks: Vec<ScheduledTask>,
-}
+    let active_thread = ThreadId::new("thread-active");
+    let background_thread = ThreadId::new("thread-bg");
 
-impl PriorityScheduler {
-    pub fn new() -> Self {
-        Self {
-            focused_thread_id: None,
-            tasks: Vec::new(),
-        }
-    }
+    // Simulate user actively typing in the input composer of the active thread
+    focus_manager.set_focus(FocusTarget::Composer(active_thread.clone()));
+    assert_eq!(
+        focus_manager.current_focus(),
+        FocusTarget::Composer(active_thread.clone()),
+        "Composer must initially hold focus"
+    );
 
-    pub fn set_focused_thread(&mut self, thread_id: impl Into<String>) {
-        self.focused_thread_id = Some(thread_id.into());
-    }
+    // Dispatch a background stream completion event
+    let completion_event = BackgroundEvent::StreamCompleted {
+        thread_id: background_thread.clone(),
+    };
+    registry.handle_event(&completion_event, &mut focus_manager);
 
-    pub fn enqueue(&mut self, id: u64, thread_id: impl Into<String>) {
-        let thread_id = thread_id.into();
-        let priority = match &self.focused_thread_id {
-            Some(focused) if focused == &thread_id => TaskPriority::Focused,
-            _ => TaskPriority::Background,
-        };
-        self.tasks.push(ScheduledTask {
-            id,
-            thread_id,
-            priority,
-        });
-    }
-
-    pub fn pop_next(&mut self) -> Option<ScheduledTask> {
-        if self.tasks.is_empty() {
-            return None;
-        }
-
-        // Find highest priority task index (FIFO within same priority)
-        let max_priority = self.tasks.iter().map(|t| t.priority).max()?;
-        let index = self.tasks.iter().position(|t| t.priority == max_priority)?;
-        Some(self.tasks.remove(index))
-    }
+    // Focus must NOT be stolen from the active composer
+    assert_eq!(
+        focus_manager.current_focus(),
+        FocusTarget::Composer(active_thread.clone()),
+        "Invariant violated: background stream completion stole focus from active composer"
+    );
+    assert_eq!(
+        registry.status_for(&background_thread),
+        Some(ThreadStatus::Idle),
+        "Background thread status should transition to Idle"
+    );
 }
 
 #[test]
-fn test_focused_thread_receives_scheduling_priority_over_background_tasks() {
-    let mut scheduler = PriorityScheduler::new();
-    scheduler.set_focused_thread("thread-focused");
+fn test_focus_non_stealing_on_background_tool_run_finished() {
+    let mut focus_manager = FocusManager::new();
+    let mut registry = ThreadStatusRegistry::new();
 
-    // Enqueue background tasks first
-    scheduler.enqueue(1, "thread-bg-1");
-    scheduler.enqueue(2, "thread-bg-2");
+    let active_thread = ThreadId::new("thread-active");
+    let background_thread = ThreadId::new("thread-bg");
 
-    // Enqueue focused task later
-    scheduler.enqueue(3, "thread-focused");
-    scheduler.enqueue(4, "thread-bg-3");
-    scheduler.enqueue(5, "thread-focused");
+    focus_manager.set_focus(FocusTarget::Composer(active_thread.clone()));
 
-    // Verify focused thread tasks are scheduled ahead of background tasks
-    let first = scheduler.pop_next().expect("Task expected");
-    assert_eq!(first.id, 3);
-    assert_eq!(first.priority, TaskPriority::Focused);
-    assert_eq!(first.thread_id, "thread-focused");
+    // Dispatch background tool execution finish event
+    let tool_event = BackgroundEvent::ToolExecutionFinished {
+        thread_id: background_thread.clone(),
+        tool_name: "bash".to_string(),
+    };
+    registry.handle_event(&tool_event, &mut focus_manager);
 
-    let second = scheduler.pop_next().expect("Task expected");
-    assert_eq!(second.id, 5);
-    assert_eq!(second.priority, TaskPriority::Focused);
-    assert_eq!(second.thread_id, "thread-focused");
-
-    // Remaining background tasks are popped in FIFO order
-    let third = scheduler.pop_next().expect("Task expected");
-    assert_eq!(third.id, 1);
-    assert_eq!(third.priority, TaskPriority::Background);
-
-    let fourth = scheduler.pop_next().expect("Task expected");
-    assert_eq!(fourth.id, 2);
-    assert_eq!(fourth.priority, TaskPriority::Background);
-
-    let fifth = scheduler.pop_next().expect("Task expected");
-    assert_eq!(fifth.id, 4);
-    assert_eq!(fifth.priority, TaskPriority::Background);
-
-    assert!(scheduler.pop_next().is_none());
+    assert_eq!(
+        focus_manager.current_focus(),
+        FocusTarget::Composer(active_thread.clone()),
+        "Invariant violated: finished background tool run stole focus from active composer"
+    );
 }
 
 #[test]
-fn test_switching_focus_dynamically_prioritizes_new_focused_tasks() {
-    let mut scheduler = PriorityScheduler::new();
-    scheduler.set_focused_thread("thread-A");
+fn test_focus_non_stealing_on_permission_alert() {
+    let mut focus_manager = FocusManager::new();
+    let mut registry = ThreadStatusRegistry::new();
 
-    scheduler.enqueue(10, "thread-B");
-    scheduler.enqueue(11, "thread-A");
+    let active_thread = ThreadId::new("thread-active");
+    let background_thread = ThreadId::new("thread-bg");
 
-    // Switch focus to thread B
-    scheduler.set_focused_thread("thread-B");
-    scheduler.enqueue(12, "thread-B");
+    focus_manager.set_focus(FocusTarget::Composer(active_thread.clone()));
 
-    // Thread A task had already been enqueued with Focused priority
-    // Thread B task 12 is enqueued with Focused priority
-    // Thread B task 10 remains Background
-    let first = scheduler.pop_next().expect("First task");
-    assert_eq!(first.id, 11);
-    assert_eq!(first.priority, TaskPriority::Focused);
+    // Dispatch permission required alert for background task
+    let permission_event = BackgroundEvent::PermissionRequired {
+        thread_id: background_thread.clone(),
+        request_id: "perm-123".to_string(),
+    };
+    registry.handle_event(&permission_event, &mut focus_manager);
 
-    let second = scheduler.pop_next().expect("Second task");
-    assert_eq!(second.id, 12);
-    assert_eq!(second.priority, TaskPriority::Focused);
-
-    let third = scheduler.pop_next().expect("Third task");
-    assert_eq!(third.id, 10);
-    assert_eq!(third.priority, TaskPriority::Background);
+    // Active input composer focus must be preserved while background thread marks permission needed
+    assert_eq!(
+        focus_manager.current_focus(),
+        FocusTarget::Composer(active_thread.clone()),
+        "Invariant violated: permission alert stole focus from active input composer"
+    );
+    assert_eq!(
+        registry.status_for(&background_thread),
+        Some(ThreadStatus::PermissionRequired),
+        "Background thread status should indicate PermissionRequired without stealing focus"
+    );
 }
