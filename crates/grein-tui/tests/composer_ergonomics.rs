@@ -1,105 +1,168 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use grein_tui::composer::{ComposerAction, InputComposer};
+use std::cell::RefCell;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-#[test]
-fn test_single_enter_dispatches_input() {
-    let mut composer = InputComposer::new();
-    let thread_id = "thread-alpha";
-    composer.set_active_thread(thread_id);
+// We assert the contract for Composer and ExternalEditorRunner in grein_tui
+use grein_tui::composer::{Composer, ComposerAction, ComposerEvent, KeyCode, KeyModifiers};
+use grein_tui::editor::{EditorError, ExternalEditorRunner};
 
-    // Input text "Deploy to staging"
-    for ch in "Deploy to staging".chars() {
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+#[derive(Clone, Default)]
+struct MockTerminalSuspender {
+    suspended: Rc<RefCell<bool>>,
+    resumed: Rc<RefCell<bool>>,
+}
+
+impl MockTerminalSuspender {
+    fn new() -> Self {
+        Self::default()
     }
+}
 
-    assert_eq!(composer.get_text(), "Deploy to staging");
+#[derive(Clone)]
+struct MockEditorRunner {
+    suspender: MockTerminalSuspender,
+    file_transform: Rc<dyn Fn(&Path) -> Result<(), EditorError>>,
+    executed_path: Rc<RefCell<Option<PathBuf>>>,
+}
 
-    // Press Enter to dispatch
-    let action = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+impl MockEditorRunner {
+    fn new(
+        suspender: MockTerminalSuspender,
+        transform: impl Fn(&Path) -> Result<(), EditorError> + 'static,
+    ) -> Self {
+        Self {
+            suspender,
+            file_transform: Rc::new(transform),
+            executed_path: Rc::new(RefCell::new(None)),
+        }
+    }
+}
 
-    assert_eq!(
-        action,
-        ComposerAction::Submit("Deploy to staging".to_string())
-    );
-    assert_eq!(composer.get_text(), "");
+impl ExternalEditorRunner for MockEditorRunner {
+    fn run_editor(&self, file_path: &Path) -> Result<(), EditorError> {
+        // Assert terminal was suspended before running editor
+        assert!(
+            *self.suspender.suspended.borrow(),
+            "Terminal must be suspended before external editor is invoked"
+        );
+        assert!(
+            !*self.suspender.resumed.borrow(),
+            "Terminal must not be resumed while external editor is running"
+        );
+
+        *self.executed_path.borrow_mut() = Some(file_path.to_path_buf());
+        (self.file_transform)(file_path)
+    }
 }
 
 #[test]
-fn test_ctrl_and_shift_enter_insert_newline() {
-    let mut composer = InputComposer::new();
-    composer.set_active_thread("thread-1");
+fn test_ctrl_e_spawns_external_editor_and_repopulates_composer() {
+    let suspender = MockTerminalSuspender::new();
+    let suspender_clone = suspender.clone();
 
-    for ch in "First line".chars() {
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    let editor_runner = MockEditorRunner::new(suspender.clone(), |scratch_file: &Path| {
+        // Verify initial draft was written to the scratch file
+        let current_content =
+            fs::read_to_string(scratch_file).map_err(|e| EditorError::Io(e.to_string()))?;
+        assert_eq!(current_content, "Draft before editing");
 
-    // Shift+Enter should insert a newline without dispatching
-    let shift_enter_action =
-        composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-    assert_eq!(shift_enter_action, ComposerAction::None);
+        // Simulate user editing and saving in $EDITOR
+        fs::write(scratch_file, "Draft updated from external editor")
+            .map_err(|e| EditorError::Io(e.to_string()))?;
+        Ok(())
+    });
 
-    for ch in "Second line".chars() {
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
-
-    // Ctrl+Enter should also insert a newline without dispatching
-    let ctrl_enter_action =
-        composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
-    assert_eq!(ctrl_enter_action, ComposerAction::None);
-
-    for ch in "Third line".chars() {
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
-
-    assert_eq!(composer.get_text(), "First line\nSecond line\nThird line");
-
-    // Regular Enter dispatches the full multiline text
-    let submit_action =
-        composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(
-        submit_action,
-        ComposerAction::Submit("First line\nSecond line\nThird line".to_string())
+    let mut composer = Composer::with_editor_runner(editor_runner.clone()).with_terminal_hooks(
+        {
+            let s = suspender_clone.clone();
+            move || *s.suspended.borrow_mut() = true
+        },
+        {
+            let s = suspender_clone.clone();
+            move || *s.resumed.borrow_mut() = true
+        },
     );
-    assert_eq!(composer.get_text(), "");
+
+    composer.set_buffer("Draft before editing");
+    assert_eq!(composer.buffer(), "Draft before editing");
+
+    // Dispatch Ctrl+E
+    let event = ComposerEvent::Key {
+        code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::CONTROL,
+    };
+
+    let action = composer
+        .handle_event(event)
+        .expect("Handling Ctrl+E must succeed");
+
+    assert_eq!(action, ComposerAction::EditorExited);
+    assert_eq!(
+        composer.buffer(),
+        "Draft updated from external editor",
+        "Composer buffer must be re-populated with edited file contents"
+    );
+
+    // Assert terminal lifecycle was respected
+    assert!(
+        *suspender.suspended.borrow(),
+        "Terminal must have been suspended"
+    );
+    assert!(
+        *suspender.resumed.borrow(),
+        "Terminal must have been resumed on editor exit"
+    );
+
+    // Assert temporary scratch file has been cleaned up
+    let executed_path = editor_runner
+        .executed_path
+        .borrow()
+        .clone()
+        .expect("Editor runner must have captured scratch file path");
+    assert!(
+        !executed_path.exists(),
+        "Scratch file must be cleaned up after composer re-population"
+    );
 }
 
 #[test]
-fn test_thread_isolated_unsubmitted_draft_persistence() {
-    let mut composer = InputComposer::new();
+fn test_ctrl_e_retains_draft_if_editor_returns_error() {
+    let suspender = MockTerminalSuspender::new();
+    let editor_runner = MockEditorRunner::new(suspender.clone(), |_scratch_file: &Path| {
+        Err(EditorError::ExecutionFailed("editor crashed".to_string()))
+    });
 
-    let thread_a = "thread-alpha";
-    let thread_b = "thread-beta";
-
-    // Draft text in Thread A
-    composer.set_active_thread(thread_a);
-    for ch in "Unfinished draft for Thread A".chars() {
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
-    assert_eq!(composer.get_text(), "Unfinished draft for Thread A");
-
-    // Switch to Thread B (should be empty initially)
-    composer.set_active_thread(thread_b);
-    assert_eq!(composer.get_text(), "");
-
-    // Draft text in Thread B
-    for ch in "Draft for Thread B".chars() {
-        composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
-    assert_eq!(composer.get_text(), "Draft for Thread B");
-
-    // Switch back to Thread A (restores Thread A draft)
-    composer.set_active_thread(thread_a);
-    assert_eq!(composer.get_text(), "Unfinished draft for Thread A");
-
-    // Submit Thread A's draft
-    let action_a = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(
-        action_a,
-        ComposerAction::Submit("Unfinished draft for Thread A".to_string())
+    let mut composer = Composer::with_editor_runner(editor_runner).with_terminal_hooks(
+        {
+            let s = suspender.clone();
+            move || *s.suspended.borrow_mut() = true
+        },
+        {
+            let s = suspender.clone();
+            move || *s.resumed.borrow_mut() = true
+        },
     );
-    assert_eq!(composer.get_text(), "");
 
-    // Switch back to Thread B (Thread B's draft is still preserved)
-    composer.set_active_thread(thread_b);
-    assert_eq!(composer.get_text(), "Draft for Thread B");
+    composer.set_buffer("Preserved draft content");
+
+    let event = ComposerEvent::Key {
+        code: KeyCode::Char('e'),
+        modifiers: KeyModifiers::CONTROL,
+    };
+
+    let result = composer.handle_event(event);
+    assert!(
+        result.is_err(),
+        "Expected failure when external editor fails"
+    );
+    assert_eq!(
+        composer.buffer(),
+        "Preserved draft content",
+        "Original buffer must be retained if editor execution fails"
+    );
+    assert!(
+        *suspender.resumed.borrow(),
+        "Terminal must be resumed even upon editor failure"
+    );
 }

@@ -1,68 +1,126 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::HashMap;
+use std::fmt;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::editor::{EditorError, ExternalEditorRunner, SystemEditorRunner};
+pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerAction {
     None,
-    Submit(String),
+    EditorExited,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct InputComposer {
-    active_thread: Option<String>,
-    drafts: HashMap<String, String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerEvent {
+    Key {
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    },
 }
 
-impl InputComposer {
+impl From<KeyEvent> for ComposerEvent {
+    fn from(key: KeyEvent) -> Self {
+        Self::Key {
+            code: key.code,
+            modifiers: key.modifiers,
+        }
+    }
+}
+
+pub struct Composer<R = SystemEditorRunner> {
+    buffer: String,
+    editor_runner: R,
+    suspend_terminal: Box<dyn FnMut()>,
+    resume_terminal: Box<dyn FnMut()>,
+}
+
+impl<R: fmt::Debug> fmt::Debug for Composer<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Composer")
+            .field("buffer", &self.buffer)
+            .field("editor_runner", &self.editor_runner)
+            .finish()
+    }
+}
+
+impl Composer<SystemEditorRunner> {
     pub fn new() -> Self {
+        Self::with_editor_runner(SystemEditorRunner)
+    }
+}
+
+impl Default for Composer<SystemEditorRunner> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<R: ExternalEditorRunner> Composer<R> {
+    pub fn with_editor_runner(runner: R) -> Self {
         Self {
-            active_thread: None,
-            drafts: HashMap::new(),
+            buffer: String::new(),
+            editor_runner: runner,
+            suspend_terminal: Box::new(|| {}),
+            resume_terminal: Box::new(|| {}),
         }
     }
 
-    pub fn set_active_thread(&mut self, thread_id: impl Into<String>) {
-        self.active_thread = Some(thread_id.into());
+    pub fn with_terminal_hooks<S, T>(mut self, suspend: S, resume: T) -> Self
+    where
+        S: FnMut() + 'static,
+        T: FnMut() + 'static,
+    {
+        self.suspend_terminal = Box::new(suspend);
+        self.resume_terminal = Box::new(resume);
+        self
     }
 
-    pub fn get_text(&self) -> &str {
-        match &self.active_thread {
-            Some(thread_id) => self.drafts.get(thread_id).map(|s| s.as_str()).unwrap_or(""),
-            None => "",
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn set_buffer(&mut self, buffer: impl Into<String>) {
+        self.buffer = buffer.into();
+    }
+
+    pub fn handle_event(&mut self, event: ComposerEvent) -> Result<ComposerAction, EditorError> {
+        match event {
+            ComposerEvent::Key {
+                code: KeyCode::Char('e'),
+                modifiers,
+            } if modifiers.contains(KeyModifiers::CONTROL) => self.spawn_external_editor(),
+            _ => Ok(ComposerAction::None),
         }
     }
 
-    pub fn handle_key_event(&mut self, event: KeyEvent) -> ComposerAction {
-        let thread_id = match &self.active_thread {
-            Some(id) => id.clone(),
-            None => return ComposerAction::None,
-        };
+    fn spawn_external_editor(&mut self) -> Result<ComposerAction, EditorError> {
+        let temp_dir = std::env::temp_dir();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let scratch_path = temp_dir.join(format!("grein_composer_{pid}_{timestamp}.txt"));
 
-        match event.code {
-            KeyCode::Enter => {
-                if event.modifiers.contains(KeyModifiers::SHIFT)
-                    || event.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    let draft = self.drafts.entry(thread_id).or_default();
-                    draft.push('\n');
-                    ComposerAction::None
-                } else {
-                    let text = self.drafts.remove(&thread_id).unwrap_or_default();
-                    ComposerAction::Submit(text)
-                }
+        fs::write(&scratch_path, &self.buffer).map_err(|e| EditorError::Io(e.to_string()))?;
+
+        (self.suspend_terminal)();
+        let editor_res = self.editor_runner.run_editor(&scratch_path);
+        (self.resume_terminal)();
+
+        match editor_res {
+            Ok(()) => {
+                let updated = fs::read_to_string(&scratch_path)
+                    .map_err(|e| EditorError::Io(e.to_string()))?;
+                let _ = fs::remove_file(&scratch_path);
+                self.buffer = updated;
+                Ok(ComposerAction::EditorExited)
             }
-            KeyCode::Char(ch) => {
-                let draft = self.drafts.entry(thread_id).or_default();
-                draft.push(ch);
-                ComposerAction::None
+            Err(err) => {
+                let _ = fs::remove_file(&scratch_path);
+                Err(err)
             }
-            KeyCode::Backspace => {
-                if let Some(draft) = self.drafts.get_mut(&thread_id) {
-                    draft.pop();
-                }
-                ComposerAction::None
-            }
-            _ => ComposerAction::None,
         }
     }
 }
