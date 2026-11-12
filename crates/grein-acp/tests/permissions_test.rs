@@ -1,153 +1,112 @@
-use grein_acp::permissions::{PermissionDecision, PermissionGate, ToolInvocation};
+use grein_acp::permissions::{
+    EvaluationResult, PermissionGate, PermissionRequest, PermissionScope,
+};
 
 #[test]
-fn test_safe_read_tools_bypass_interception() {
+fn test_read_tools_are_automatically_allowed() {
     let mut gate = PermissionGate::new();
-    let invocation = ToolInvocation::new(
-        "read_file",
-        "session-1",
-        "thread-1",
-        serde_json::json!({"Path": "/src/main.rs"}),
-    );
+    let result = gate.evaluate("session-1", "thread-1", "read_file", "crates/test.rs");
 
-    assert!(!gate.is_intercepted(&invocation));
-    let result = gate.evaluate(&invocation);
-    assert_eq!(result, Ok(true));
+    assert_eq!(result, EvaluationResult::Allowed);
 }
 
 #[test]
-fn test_intercepted_tools_require_permission() {
-    let gate = PermissionGate::new();
-    let intercepted_tools = ["run_command", "write_file", "edit_file"];
+fn test_intercepted_tools_require_permission_by_default() {
+    let mut gate = PermissionGate::new();
 
-    for tool_name in intercepted_tools {
-        let invocation =
-            ToolInvocation::new(tool_name, "session-1", "thread-1", serde_json::json!({}));
-        assert!(
-            gate.is_intercepted(&invocation),
-            "Expected {tool_name} to be intercepted"
-        );
+    let intercepted_tools = ["run_command", "write_file", "edit_file"];
+    for tool in intercepted_tools {
+        let result = gate.evaluate("session-1", "thread-1", tool, "cargo test");
+        match result {
+            EvaluationResult::PromptRequired(req) => {
+                assert_eq!(req.session_id, "session-1");
+                assert_eq!(req.thread_id, "thread-1");
+                assert_eq!(req.tool_name, tool);
+                assert_eq!(req.argument, "cargo test");
+            }
+            _ => panic!("Expected PromptRequired for intercepted tool {tool}"),
+        }
     }
 }
 
 #[test]
-fn test_deny_decision_rejects_invocation() {
+fn test_allow_once_scope_permits_single_invocation_only() {
     let mut gate = PermissionGate::new();
-    let invocation = ToolInvocation::new(
-        "run_command",
+
+    let prompt = gate.evaluate("session-1", "thread-1", "run_command", "cargo test");
+    assert!(matches!(prompt, EvaluationResult::PromptRequired(_)));
+
+    let allowed = gate.resolve_prompt(
         "session-1",
         "thread-1",
-        serde_json::json!({"CommandLine": "rm -rf /tmp/data"}),
+        "run_command",
+        "cargo test",
+        PermissionScope::AllowOnce,
     );
+    assert!(allowed);
 
-    assert!(gate.is_intercepted(&invocation));
-    gate.record_decision(&invocation, PermissionDecision::Deny);
-
-    let result = gate.evaluate(&invocation);
-    assert_eq!(result, Ok(false));
+    // Second call must prompt again because scope was AllowOnce
+    let next = gate.evaluate("session-1", "thread-1", "run_command", "cargo test");
+    assert!(matches!(next, EvaluationResult::PromptRequired(_)));
 }
 
 #[test]
-fn test_allow_once_scope_authorizes_single_invocation_only() {
+fn test_deny_scope_rejects_invocation() {
     let mut gate = PermissionGate::new();
-    let invocation = ToolInvocation::new(
+
+    let allowed = gate.resolve_prompt(
+        "session-1",
+        "thread-1",
         "write_file",
-        "session-1",
-        "thread-1",
-        serde_json::json!({"Path": "/tmp/test.txt", "Content": "hello"}),
+        "secrets.env",
+        PermissionScope::Deny,
     );
+    assert!(!allowed);
 
-    gate.record_decision(&invocation, PermissionDecision::AllowOnce);
-
-    // First evaluation succeeds
-    assert_eq!(gate.evaluate(&invocation), Ok(true));
-
-    // Subsequent invocation with same parameters is no longer cached
-    assert!(gate.needs_prompt(&invocation));
+    let next = gate.evaluate("session-1", "thread-1", "write_file", "secrets.env");
+    assert_eq!(next, EvaluationResult::Denied);
 }
 
 #[test]
-fn test_always_thread_scope_remembers_permission_for_thread_only() {
+fn test_always_thread_scope_persists_within_thread_only() {
     let mut gate = PermissionGate::new();
-    let invocation_t1 = ToolInvocation::new(
+
+    let allowed = gate.resolve_prompt(
+        "session-1",
+        "thread-1",
         "edit_file",
-        "session-1",
-        "thread-1",
-        serde_json::json!({"Path": "/tmp/file.rs"}),
+        "src/main.rs",
+        PermissionScope::AlwaysThread,
     );
-    let invocation_t2 = ToolInvocation::new(
-        "edit_file",
-        "session-1",
-        "thread-2",
-        serde_json::json!({"Path": "/tmp/file.rs"}),
-    );
+    assert!(allowed);
 
-    gate.record_decision(&invocation_t1, PermissionDecision::AlwaysThread);
+    // Same thread: automatically allowed
+    let same_thread = gate.evaluate("session-1", "thread-1", "edit_file", "src/main.rs");
+    assert_eq!(same_thread, EvaluationResult::Allowed);
 
-    // Thread 1 is approved automatically without prompt
-    assert!(!gate.needs_prompt(&invocation_t1));
-    assert_eq!(gate.evaluate(&invocation_t1), Ok(true));
-
-    // Thread 2 still requires prompt
-    assert!(gate.needs_prompt(&invocation_t2));
+    // Different thread in same session: must prompt
+    let other_thread = gate.evaluate("session-1", "thread-2", "edit_file", "src/main.rs");
+    assert!(matches!(other_thread, EvaluationResult::PromptRequired(_)));
 }
 
 #[test]
-fn test_always_session_scope_remembers_permission_across_all_threads() {
+fn test_always_session_scope_persists_across_threads_in_session() {
     let mut gate = PermissionGate::new();
-    let invocation_s1_t1 = ToolInvocation::new(
-        "run_command",
+
+    let allowed = gate.resolve_prompt(
         "session-1",
         "thread-1",
-        serde_json::json!({"CommandLine": "cargo test"}),
-    );
-    let invocation_s1_t2 = ToolInvocation::new(
         "run_command",
-        "session-1",
-        "thread-2",
-        serde_json::json!({"CommandLine": "cargo check"}),
+        "git status",
+        PermissionScope::AlwaysSession,
     );
-    let invocation_s2_t1 = ToolInvocation::new(
-        "run_command",
-        "session-2",
-        "thread-1",
-        serde_json::json!({"CommandLine": "cargo test"}),
-    );
+    assert!(allowed);
 
-    gate.record_decision(&invocation_s1_t1, PermissionDecision::AlwaysSession);
+    // Different thread in same session: automatically allowed
+    let other_thread = gate.evaluate("session-1", "thread-2", "run_command", "git status");
+    assert_eq!(other_thread, EvaluationResult::Allowed);
 
-    // Both threads within session-1 are authorized
-    assert!(!gate.needs_prompt(&invocation_s1_t1));
-    assert_eq!(gate.evaluate(&invocation_s1_t1), Ok(true));
-
-    assert!(!gate.needs_prompt(&invocation_s1_t2));
-    assert_eq!(gate.evaluate(&invocation_s1_t2), Ok(true));
-
-    // Invocations belonging to a different session still require prompt
-    assert!(gate.needs_prompt(&invocation_s2_t1));
-}
-
-#[test]
-fn test_permission_scopes_are_isolated_by_tool_name() {
-    let mut gate = PermissionGate::new();
-    let run_cmd = ToolInvocation::new(
-        "run_command",
-        "session-1",
-        "thread-1",
-        serde_json::json!({"CommandLine": "ls"}),
-    );
-    let write_file = ToolInvocation::new(
-        "write_file",
-        "session-1",
-        "thread-1",
-        serde_json::json!({"Path": "/tmp/out.txt"}),
-    );
-
-    gate.record_decision(&run_cmd, PermissionDecision::AlwaysSession);
-
-    assert!(!gate.needs_prompt(&run_cmd));
-    assert_eq!(gate.evaluate(&run_cmd), Ok(true));
-
-    // write_file must not inherit run_command's session grant
-    assert!(gate.needs_prompt(&write_file));
+    // Different session: must prompt
+    let other_session = gate.evaluate("session-2", "thread-1", "run_command", "git status");
+    assert!(matches!(other_session, EvaluationResult::PromptRequired(_)));
 }

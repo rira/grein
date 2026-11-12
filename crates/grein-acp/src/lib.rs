@@ -1,2 +1,1 @@
-pub mod policy;
-pub mod session;
+pub mod permissions;
