@@ -1,9 +1,9 @@
-//! Terminal user interface module for Grein.
+pub mod app;
+pub mod layout;
+pub mod panes;
 
-pub mod composer;
-pub mod focus;
+pub use app::{App, AppConfig, AppEvent, AppState};
 
-/// Entry point for running the interactive TUI application.
 pub async fn run() -> std::io::Result<()> {
     Ok(())
 }

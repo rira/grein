@@ -1,85 +1,139 @@
-use crate::focus::PaneFocus;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use std::time::Duration;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
-/// Root TUI application state coordinating focus and input routing.
-#[derive(Debug, Default)]
+use crate::layout::PaneFocus;
+use crate::panes::blackboard::{BlackboardAction, BlackboardPane};
+
+#[derive(Debug, Clone, Default)]
+pub struct AppConfig {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppEvent {
+    Key(KeyEvent),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AppState {}
+
+#[derive(Debug)]
 pub struct App {
-    focus: PaneFocus,
-    composer_content: String,
-    last_submitted_prompt: Option<String>,
+    config: AppConfig,
+    state: AppState,
+    focused: PaneFocus,
+    blackboard: BlackboardPane,
 }
 
 impl App {
-    /// Creates a new TUI application instance.
-    pub fn new() -> Self {
+    pub fn new(config: AppConfig) -> Self {
         Self {
-            focus: PaneFocus::default(),
-            composer_content: String::new(),
-            last_submitted_prompt: None,
+            config,
+            state: AppState::default(),
+            focused: PaneFocus::Workspace,
+            blackboard: BlackboardPane::new(),
         }
     }
 
-    /// Returns current pane focus.
-    pub fn focus(&self) -> PaneFocus {
-        self.focus
+    pub fn config(&self) -> &AppConfig {
+        &self.config
     }
 
-    /// Explicitly updates pane focus.
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    pub fn focused_pane(&self) -> PaneFocus {
+        self.focused
+    }
+
     pub fn set_focus(&mut self, focus: PaneFocus) {
-        self.focus = focus;
+        self.focused = focus;
     }
 
-    /// Returns the current text buffer of the composer pane.
-    pub fn composer_content(&self) -> &str {
-        &self.composer_content
+    pub fn blackboard_pane(&self) -> &BlackboardPane {
+        &self.blackboard
     }
 
-    /// Returns the last submitted prompt, if any.
-    pub fn last_submitted_prompt(&self) -> Option<String> {
-        self.last_submitted_prompt.clone()
+    pub fn blackboard_pane_mut(&mut self) -> &mut BlackboardPane {
+        &mut self.blackboard
     }
 
-    /// Routes keyboard events based on active focus and key modifier.
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press {
-            return;
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if self.focused == PaneFocus::Blackboard {
+            self.blackboard.handle_key(key)
+        } else {
+            false
         }
+    }
 
-        match key.code {
-            KeyCode::Tab => {
-                self.focus = self.focus.next();
-            }
-            KeyCode::BackTab => {
-                self.focus = self.focus.prev();
-            }
-            _ => {
-                if self.focus == PaneFocus::Composer {
-                    match key.code {
-                        KeyCode::Char(c) => {
-                            self.composer_content.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            self.composer_content.pop();
-                        }
-                        KeyCode::Enter => {
-                            let prompt = std::mem::take(&mut self.composer_content);
-                            self.last_submitted_prompt = Some(prompt);
-                        }
-                        _ => {}
+    pub fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Key(key) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+                    self.blackboard
+                        .handle_action(BlackboardAction::ToggleCollapse);
+                    if self.blackboard.is_collapsed() && self.focused == PaneFocus::Blackboard {
+                        self.focused = PaneFocus::Composer;
                     }
+                    return;
                 }
+
+                if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.cycle_focus_forward();
+                    return;
+                }
+
+                if key.code == KeyCode::BackTab
+                    || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+                {
+                    self.cycle_focus_backward();
+                    return;
+                }
+
+                self.handle_key_event(key);
             }
         }
     }
 
-    /// Performs non-blocking event polling and event dispatching.
-    pub fn poll_events(&mut self, timeout: Duration) -> std::io::Result<()> {
-        if event::poll(timeout).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                self.handle_key(key);
-            }
+    fn active_panes(&self) -> Vec<PaneFocus> {
+        if self.blackboard.is_collapsed() {
+            vec![PaneFocus::Workspace, PaneFocus::Composer]
+        } else {
+            vec![
+                PaneFocus::Workspace,
+                PaneFocus::Composer,
+                PaneFocus::Blackboard,
+            ]
         }
-        Ok(())
+    }
+
+    fn cycle_focus_forward(&mut self) {
+        let panes = self.active_panes();
+        let idx = panes.iter().position(|&p| p == self.focused).unwrap_or(0);
+        let next_idx = (idx + 1) % panes.len();
+        self.focused = panes[next_idx];
+    }
+
+    fn cycle_focus_backward(&mut self) {
+        let panes = self.active_panes();
+        let idx = panes.iter().position(|&p| p == self.focused).unwrap_or(0);
+        let prev_idx = if idx == 0 { panes.len() - 1 } else { idx - 1 };
+        self.focused = panes[prev_idx];
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        if self.blackboard.is_collapsed() {
+            self.blackboard.set_rendered_rect(Rect::new(
+                area.x + area.width,
+                area.y,
+                0,
+                area.height,
+            ));
+        } else {
+            let width = if area.width > 30 { 30 } else { area.width / 2 };
+            let x = area.x + area.width.saturating_sub(width);
+            let blackboard_area = Rect::new(x, area.y, width, area.height);
+            self.blackboard.render(frame, blackboard_area);
+        }
     }
 }
