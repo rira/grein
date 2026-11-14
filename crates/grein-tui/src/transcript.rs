@@ -93,6 +93,7 @@ impl TranscriptPane {
                 }
                 matches!(key.code, KeyCode::Up | KeyCode::Down)
             }
+            _ => false,
         }
     }
 

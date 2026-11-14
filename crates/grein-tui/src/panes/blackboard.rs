@@ -16,7 +16,7 @@ pub enum BlackboardAction {
     Expand,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlackboardPane {
     state: BlackboardState,
     rendered_rect: Rect,
