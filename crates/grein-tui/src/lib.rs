@@ -1,8 +1,9 @@
 pub mod app;
+pub mod layout;
+pub mod panes;
 
-pub use app::{App, PaneFocus};
+pub use app::{App, AppConfig, AppEvent, AppState};
 
-/// Entry point for running the Grein TUI interface.
 pub async fn run() -> std::io::Result<()> {
     Ok(())
 }

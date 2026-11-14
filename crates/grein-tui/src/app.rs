@@ -1,109 +1,139 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
-/// Focus state across the primary TUI panes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PaneFocus {
-    #[default]
-    Composer,
-    Timeline,
-    Workspace,
-    Blackboard,
-}
+use crate::layout::PaneFocus;
+use crate::panes::blackboard::{BlackboardAction, BlackboardPane};
 
-/// Central application state for the Grein TUI.
+#[derive(Debug, Clone, Default)]
+pub struct AppConfig {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct App {
-    focused_pane: PaneFocus,
-    blackboard_collapsed: bool,
-    should_quit: bool,
+pub enum AppEvent {
+    Key(KeyEvent),
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            focused_pane: PaneFocus::Composer,
-            blackboard_collapsed: false,
-            should_quit: false,
-        }
-    }
+#[derive(Debug, Clone, Default)]
+pub struct AppState {}
+
+#[derive(Debug)]
+pub struct App {
+    config: AppConfig,
+    state: AppState,
+    focused: PaneFocus,
+    blackboard: BlackboardPane,
 }
 
 impl App {
-    /// Creates a new application state instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(config: AppConfig) -> Self {
+        Self {
+            config,
+            state: AppState::default(),
+            focused: PaneFocus::Workspace,
+            blackboard: BlackboardPane::new(),
+        }
     }
 
-    /// Returns the currently focused pane.
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
     pub fn focused_pane(&self) -> PaneFocus {
-        self.focused_pane
+        self.focused
     }
 
-    /// Sets the focused pane.
-    pub fn set_focused_pane(&mut self, pane: PaneFocus) {
-        self.focused_pane = pane;
+    pub fn set_focus(&mut self, focus: PaneFocus) {
+        self.focused = focus;
     }
 
-    /// Returns whether the blackboard pane is collapsed.
-    pub fn is_blackboard_collapsed(&self) -> bool {
-        self.blackboard_collapsed
+    pub fn blackboard_pane(&self) -> &BlackboardPane {
+        &self.blackboard
     }
 
-    /// Sets the collapsed state of the blackboard pane.
-    pub fn set_blackboard_collapsed(&mut self, collapsed: bool) {
-        self.blackboard_collapsed = collapsed;
+    pub fn blackboard_pane_mut(&mut self) -> &mut BlackboardPane {
+        &mut self.blackboard
     }
 
-    /// Returns whether the application should exit.
-    pub fn should_quit(&self) -> bool {
-        self.should_quit
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if self.focused == PaneFocus::Blackboard {
+            self.blackboard.handle_key(key)
+        } else {
+            false
+        }
     }
 
-    /// Transitions focus to the next pane in the focus cycle.
-    pub fn focus_next(&mut self) {
-        self.focused_pane = match self.focused_pane {
-            PaneFocus::Composer => PaneFocus::Timeline,
-            PaneFocus::Timeline => PaneFocus::Workspace,
-            PaneFocus::Workspace => PaneFocus::Blackboard,
-            PaneFocus::Blackboard => PaneFocus::Composer,
-        };
-    }
-
-    /// Transitions focus to the previous pane in reverse cycle.
-    pub fn focus_previous(&mut self) {
-        self.focused_pane = match self.focused_pane {
-            PaneFocus::Composer => PaneFocus::Blackboard,
-            PaneFocus::Blackboard => PaneFocus::Workspace,
-            PaneFocus::Workspace => PaneFocus::Timeline,
-            PaneFocus::Timeline => PaneFocus::Composer,
-        };
-    }
-
-    /// Handles keyboard events for navigation and pane control.
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::BackTab => {
-                self.focus_previous();
-            }
-            KeyCode::Tab => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.focus_previous();
-                } else {
-                    self.focus_next();
+    pub fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Key(key) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+                    self.blackboard
+                        .handle_action(BlackboardAction::ToggleCollapse);
+                    if self.blackboard.is_collapsed() && self.focused == PaneFocus::Blackboard {
+                        self.focused = PaneFocus::Composer;
+                    }
+                    return;
                 }
+
+                if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.cycle_focus_forward();
+                    return;
+                }
+
+                if key.code == KeyCode::BackTab
+                    || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+                {
+                    self.cycle_focus_backward();
+                    return;
+                }
+
+                self.handle_key_event(key);
             }
-            KeyCode::Char('b') | KeyCode::Char('B')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.blackboard_collapsed = !self.blackboard_collapsed;
-            }
-            KeyCode::Char('[') => {
-                self.blackboard_collapsed = true;
-            }
-            KeyCode::Char(']') => {
-                self.blackboard_collapsed = false;
-            }
-            _ => {}
+        }
+    }
+
+    fn active_panes(&self) -> Vec<PaneFocus> {
+        if self.blackboard.is_collapsed() {
+            vec![PaneFocus::Workspace, PaneFocus::Composer]
+        } else {
+            vec![
+                PaneFocus::Workspace,
+                PaneFocus::Composer,
+                PaneFocus::Blackboard,
+            ]
+        }
+    }
+
+    fn cycle_focus_forward(&mut self) {
+        let panes = self.active_panes();
+        let idx = panes.iter().position(|&p| p == self.focused).unwrap_or(0);
+        let next_idx = (idx + 1) % panes.len();
+        self.focused = panes[next_idx];
+    }
+
+    fn cycle_focus_backward(&mut self) {
+        let panes = self.active_panes();
+        let idx = panes.iter().position(|&p| p == self.focused).unwrap_or(0);
+        let prev_idx = if idx == 0 { panes.len() - 1 } else { idx - 1 };
+        self.focused = panes[prev_idx];
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        if self.blackboard.is_collapsed() {
+            self.blackboard.set_rendered_rect(Rect::new(
+                area.x + area.width,
+                area.y,
+                0,
+                area.height,
+            ));
+        } else {
+            let width = if area.width > 30 { 30 } else { area.width / 2 };
+            let x = area.x + area.width.saturating_sub(width);
+            let blackboard_area = Rect::new(x, area.y, width, area.height);
+            self.blackboard.render(frame, blackboard_area);
         }
     }
 }
