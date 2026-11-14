@@ -1,5 +1,3 @@
-//! UI components and focus navigation modules.
+pub mod navigator;
 
-pub mod focus;
-
-pub use focus::{FocusNavigation, PaneFocus};
+pub use navigator::{TreeNavigator, TreeNavigatorState, TreeNode};
