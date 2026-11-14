@@ -2,7 +2,10 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -176,6 +179,10 @@ impl TerminalGuard {
         if io::stdout().is_terminal() {
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen)?;
+            let _ = execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
             Ok(Self { active: true })
         } else {
             Ok(Self { active: false })
@@ -186,6 +193,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.active {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
             let _ = disable_raw_mode();
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
         }
@@ -204,7 +212,10 @@ pub fn handle_key_event(
     let was_composer = app.focused_pane == FocusedPane::Composer
         || app.focus == FocusedPane::Composer
         || app.active_focus == FocusedPane::Composer;
-    let is_enter = key.code == KeyCode::Enter;
+    let is_enter = key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT);
     let action = app.handle_key_tree(key);
     app.handle_key_event(key);
     if was_composer && is_enter {

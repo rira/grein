@@ -293,12 +293,18 @@ impl Composer {
 
     /// Handles key events directly for ergonomics testing.
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
+        {
             return ComposerAction::SpawnExternalEditor(EditorHook(self.text.clone()));
         }
 
-        if (key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter)
-            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Enter)
+        if (key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && key.code == KeyCode::Enter)
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J')))
         {
             self.insert_char('\n');
             return ComposerAction::None;
@@ -317,6 +323,15 @@ impl Composer {
         if let ComposerMode::DiffPreviewActive { ref diff_id } = self.mode {
             if key.code == KeyCode::Char('o') {
                 return ComposerAction::SpawnDiffPager(DiffPagerHook(diff_id.clone()));
+            }
+        }
+
+        if let KeyCode::Char(c) = key.code {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                self.insert_char(c);
             }
         }
 
@@ -407,13 +422,34 @@ impl Composer {
                 }
             }
             KeyCode::Enter => {
-                let submitted = self.text.clone();
-                self.clear();
-                ComposerEventResult::Action(ComposerAction::Submit(submitted))
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.insert_char('\n');
+                    ComposerEventResult::Consumed
+                } else {
+                    let submitted = self.text.clone();
+                    self.clear();
+                    ComposerEventResult::Action(ComposerAction::Submit(submitted))
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Char('J')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.insert_char('\n');
+                ComposerEventResult::Consumed
             }
             KeyCode::Char(c) => {
-                self.insert_char(c);
-                ComposerEventResult::Consumed
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    ComposerEventResult::Ignored
+                } else {
+                    self.insert_char(c);
+                    ComposerEventResult::Consumed
+                }
             }
             KeyCode::Backspace => {
                 self.delete_char_before_cursor();
