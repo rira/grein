@@ -1,10 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use grein_tui::app::FocusedPane;
+use grein_tui::runner::handle_key_event;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 #[test]
 fn test_terminal_guard_raii_lifecycle() {
-    // Verify that TerminalGuard can be instantiated and dropped cleanly without panicking.
     let guard = grein_tui::runner::TerminalGuard::new();
     assert!(guard.is_ok());
     drop(guard);
@@ -53,4 +54,109 @@ async fn test_runner_render_cycle_with_test_backend() {
     let buffer = terminal.backend().buffer();
     assert!(buffer.area.width == 100);
     assert!(buffer.area.height == 30);
+}
+
+#[test]
+fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
+    let backend = TestBackend::new(120, 36);
+    let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
+    let mut app = grein_tui::state::AppState::new();
+
+    // 1. Focus Composer and type prompt including brackets '[' and ']', then submit with Enter
+    app.set_focus(FocusedPane::Composer);
+    for ch in "Verify [4-pane] slice".chars() {
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .expect("char input should succeed");
+    }
+    assert!(
+        !app.is_blackboard_collapsed(),
+        "Typing '[' or ']' in Composer must not collapse Blackboard"
+    );
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .expect("Enter submit should succeed");
+
+    // 2. Stream multi-line agent response and verify SQLite persistence updates multi-line turn
+    let db_path = std::env::temp_dir().join(format!(
+        "grein-golden-e2e-{}.sqlite3",
+        grein_core::model::ThreadId::now_v7()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+
+    app.apply_agent_response("### Step 1: Tree & Transcript");
+    app.persist_state_to_sqlite(&db_path);
+    app.apply_agent_response("- Rendered all 4 panes cleanly");
+    app.persist_state_to_sqlite(&db_path);
+
+    let mut reloaded = grein_tui::state::AppState::new();
+    reloaded.load_state_from_sqlite(&db_path);
+    assert!(
+        reloaded
+            .active_transcript_md
+            .contains("Rendered all 4 panes cleanly"),
+        "Multi-line streamed agent output must persist across SQLite saves without truncating after line 1"
+    );
+    let _ = std::fs::remove_file(&db_path);
+
+    // 3. Populate multi-line draft in Composer via Shift+Enter
+    for ch in "Draft line 1".chars() {
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    )
+    .unwrap();
+    for ch in "Draft line 2".chars() {
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .unwrap();
+    }
+
+    // 4. Render all 4 panes via draw_frame and verify non-empty expected text in all 4 panes
+    grein_tui::runner::draw_frame(&mut terminal, &app).expect("draw_frame must succeed");
+
+    let buf = terminal.backend().buffer();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+
+    // Tree pane assertions
+    assert!(
+        screen.contains("Tree") && screen.contains("Verify [4-pane] slice"),
+        "Tree pane must render thread title and anchors"
+    );
+    // Transcript pane assertions
+    assert!(
+        screen.contains("Transcript") && screen.contains("Rendered all 4 panes cleanly"),
+        "Transcript pane must render markdown turns"
+    );
+    // Blackboard pane assertions
+    assert!(
+        screen.contains("Blackboard") && screen.contains("Active Thread:"),
+        "Blackboard pane must render active thread notes"
+    );
+    // Composer pane & status bar assertions
+    assert!(
+        screen.contains("Composer")
+            && screen.contains("Draft line 1")
+            && screen.contains("Draft line 2")
+            && screen.contains("Enter: Submit"),
+        "Composer pane must auto-grow for multi-line draft and display keybinding status bar"
+    );
 }

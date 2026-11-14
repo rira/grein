@@ -14,9 +14,9 @@ use grein_core::model::{
 };
 use grein_core::storage::sqlite::SqliteStorage;
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::{Frame, Terminal};
+use ratatui::Terminal;
 
-use crate::app::{AnchorItem, App, FocusedPane, ThreadItem};
+use crate::app::{AnchorItem, App, FocusedPane, ThreadItem, TreeAction, TuiError};
 
 pub struct TerminalGuard {
     active: bool,
@@ -43,13 +43,14 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn draw_frame(frame: &mut Frame<'_>, app: &App) {
-    crate::render::render(frame, app);
+pub fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> io::Result<()> {
+    terminal.draw(|frame| crate::render::render(frame, app))?;
+    Ok(())
 }
 
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
     if let Event::Key(key) = event {
-        handle_key_event(app, key);
+        let _ = handle_key_event(app, key);
     }
     Ok(app.should_quit())
 }
@@ -215,7 +216,7 @@ impl App {
             let title = turns
                 .iter()
                 .find(|(role, _)| *role == AuthorRole::User)
-                .map(|(_, content)| content.clone())
+                .map(|(_, content)| content.lines().next().unwrap_or("Active Session").to_string())
                 .unwrap_or_else(|| "Active Session".to_string());
             self.threads.push(ThreadItem {
                 id: ThreadId::now_v7().to_string(),
@@ -223,22 +224,80 @@ impl App {
                 anchors: Vec::new(),
             });
         }
-        if let Some(thread) = self.threads.first_mut() {
-            if thread.id == "thread-1" {
-                thread.id = ThreadId::now_v7().to_string();
-            }
-            let mut anchors = Vec::new();
+
+        let parsed = grein_core::anchor::parse_anchors(&self.active_transcript_md);
+        let mut anchor_items: Vec<AnchorItem> = parsed
+            .into_iter()
+            .map(|a| AnchorItem {
+                id: a.slug,
+                label: a.title,
+            })
+            .collect();
+
+        if anchor_items.is_empty() {
             for (idx, (role, content)) in turns.iter().enumerate() {
                 if *role == AuthorRole::User {
                     let label = content.lines().next().unwrap_or("Turn").to_string();
-                    anchors.push(AnchorItem {
+                    anchor_items.push(AnchorItem {
                         id: format!("anchor-{}", idx + 1),
                         label,
                     });
                 }
             }
-            thread.anchors = anchors;
         }
+
+        if let Some(thread) = self.threads.first_mut() {
+            if thread.id == "thread-1" {
+                thread.id = ThreadId::now_v7().to_string();
+            }
+            thread.anchors = anchor_items.clone();
+        }
+
+        let mut nodes = Vec::new();
+        for thread in &self.threads {
+            nodes.push(crate::ui::tree::TreeNode::Thread(
+                crate::ui::tree::ThreadNode {
+                    id: thread.id.clone(),
+                    title: thread.title.clone(),
+                },
+            ));
+            for anchor in &thread.anchors {
+                nodes.push(crate::ui::tree::TreeNode::Anchor(
+                    crate::ui::tree::AnchorNode {
+                        id: anchor.id.clone(),
+                        thread_id: thread.id.clone(),
+                        label: anchor.label.clone(),
+                    },
+                ));
+            }
+        }
+        let prev_selected = self.tree.selected_index();
+        let prev_active = self.tree.active_anchor_id().map(str::to_string);
+        self.tree = crate::ui::tree::TreeState::new(nodes);
+        if let Some(idx) = prev_selected {
+            self.tree.select_index(idx);
+        }
+        if let Some(active_id) = prev_active {
+            self.tree.set_active_anchor_id(Some(active_id));
+        }
+
+        let thread_title = self
+            .threads
+            .first()
+            .map(|t| t.title.as_str())
+            .unwrap_or("active-session");
+        let mut notes = format!(
+            "Active Thread: {}\nAnchors: {}\n",
+            thread_title,
+            anchor_items.len()
+        );
+        if let Some(last_prompt) = &self.last_submitted_prompt {
+            notes.push_str(&format!("Last Prompt: {}\n", last_prompt));
+        }
+        for a in &anchor_items {
+            notes.push_str(&format!("- [{}] {}\n", a.id, a.label));
+        }
+        self.blackboard_notes = notes;
     }
 
     pub fn persist_state_to_sqlite(&self, db_path: &Path) {
@@ -272,11 +331,25 @@ impl App {
             .and_then(|t| storage.get_trunk_path(t.active_leaf_id).ok())
             .unwrap_or_default();
 
-        let mut parent_id = existing_trunk.last().map(|n| n.id);
-        let mut root_id = existing_trunk.first().map(|n| n.id);
+        let common_len = existing_trunk
+            .iter()
+            .zip(turns.iter())
+            .take_while(|(node, (role, content))| node.role == *role && node.content == *content)
+            .count();
+
+        let mut parent_id = if common_len > 0 {
+            existing_trunk.get(common_len - 1).map(|n| n.id)
+        } else {
+            None
+        };
+        let mut root_id = if common_len > 0 {
+            existing_trunk.first().map(|n| n.id)
+        } else {
+            None
+        };
         let mut last_node_id = parent_id;
 
-        for (role, content) in turns.into_iter().skip(existing_trunk.len()) {
+        for (role, content) in turns.into_iter().skip(common_len) {
             let node_id = NodeId::now_v7();
             let node = ConversationNode::new(node_id, parent_id, role, content);
             if storage.insert_node(&node).is_ok() {
@@ -322,6 +395,7 @@ impl App {
         ];
 
         for (key, value) in entries {
+            let _ = storage.delete_blackboard_entry(&key);
             let _ = storage.insert_blackboard_entry(&BlackboardEntry {
                 id: BlackboardEntryId::now_v7(),
                 key,
@@ -393,13 +467,17 @@ impl App {
             .ok()
             .flatten()
         {
-            self.blackboard_notes = notes_entry.value;
+            if !notes_entry.value.is_empty() {
+                self.blackboard_notes = notes_entry.value;
+            }
         }
     }
 }
 
-pub fn handle_key_event(app: &mut App, key: KeyEvent) {
-    let was_composer = app.focused_pane() == FocusedPane::Composer;
+pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<TreeAction>, TuiError> {
+    let was_composer = app.focused_pane() == FocusedPane::Composer
+        || app.focus() == FocusedPane::Composer
+        || app.active_focus() == FocusedPane::Composer;
     let is_enter = key.code == KeyCode::Enter
         && !key
             .modifiers
@@ -408,6 +486,14 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) {
         app.last_submitted_prompt = None;
     }
     app.handle_key_event(key);
+    if key.code == KeyCode::Enter && app.focused_pane() == FocusedPane::Tree {
+        if let Some(idx) = app.tree.selected_index() {
+            if let Some(crate::ui::tree::TreeNode::Anchor(anchor)) = app.tree.nodes.get(idx) {
+                return Ok(Some(TreeAction::ActivateAnchor(anchor.id.clone())));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
@@ -433,7 +519,7 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             }
         }
 
-        terminal.draw(|frame| draw_frame(frame, &app))?;
+        draw_frame(terminal, &app)?;
 
         if app.should_quit() {
             if let Some((mut child, _)) = active_child.take() {
@@ -446,7 +532,7 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 
         if event::poll(Duration::from_millis(25))? {
             if let Event::Key(key) = event::read()? {
-                handle_key_event(&mut app, key);
+                let _ = handle_key_event(&mut app, key);
 
                 if let Some(prompt) = app.last_submitted_prompt.take() {
                     let cmd = prompt.trim();
