@@ -1,41 +1,53 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use thiserror::Error;
 
+/// Identifiers for the four primary workspace panes in the TUI layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FocusPane {
     #[default]
-    Sidebar,
-    Transcript,
+    WorkspaceTree,
+    AgentStream,
     Composer,
-    Inspector,
+    DiffPreview,
 }
 
 impl FocusPane {
+    /// Advance focus to the next pane in clockwise order.
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Sidebar => Self::Transcript,
-            Self::Transcript => Self::Composer,
-            Self::Composer => Self::Inspector,
-            Self::Inspector => Self::Sidebar,
+            Self::WorkspaceTree => Self::AgentStream,
+            Self::AgentStream => Self::Composer,
+            Self::Composer => Self::DiffPreview,
+            Self::DiffPreview => Self::WorkspaceTree,
         }
     }
 
+    /// Move focus to the previous pane in counter-clockwise order.
     #[must_use]
     pub const fn prev(self) -> Self {
         match self {
-            Self::Sidebar => Self::Inspector,
-            Self::Transcript => Self::Sidebar,
-            Self::Composer => Self::Transcript,
-            Self::Inspector => Self::Composer,
+            Self::WorkspaceTree => Self::DiffPreview,
+            Self::AgentStream => Self::WorkspaceTree,
+            Self::Composer => Self::AgentStream,
+            Self::DiffPreview => Self::Composer,
         }
     }
 }
 
+/// Sealed domain error hierarchy for TUI operations.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TuiError {
+    #[error("Terminal I/O error: {0}")]
+    Io(String),
+}
+
+/// Core TUI application state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
-    focused_pane: FocusPane,
-    composer_input: String,
-    running: bool,
+    pub focus: FocusPane,
+    pub input_buffer: String,
+    pub should_quit: bool,
 }
 
 impl Default for App {
@@ -45,60 +57,92 @@ impl Default for App {
 }
 
 impl App {
+    /// Construct a new `App` instance in its initial state.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            focused_pane: FocusPane::Sidebar,
-            composer_input: String::new(),
-            running: true,
+            focus: FocusPane::default(),
+            input_buffer: String::new(),
+            should_quit: false,
         }
     }
 
+    /// Return the currently focused pane.
     #[must_use]
-    pub const fn focused_pane(&self) -> FocusPane {
-        self.focused_pane
+    pub const fn focus(&self) -> FocusPane {
+        self.focus
     }
 
-    pub fn set_focused_pane(&mut self, pane: FocusPane) {
-        self.focused_pane = pane;
-    }
-
+    /// Return the current contents of the composer input buffer.
     #[must_use]
-    pub fn composer_input(&self) -> &str {
-        &self.composer_input
+    pub fn input_buffer(&self) -> &str {
+        &self.input_buffer
     }
 
+    /// Return whether the application has been flagged to exit.
     #[must_use]
-    pub const fn is_running(&self) -> bool {
-        self.running
+    pub const fn should_quit(&self) -> bool {
+        self.should_quit
     }
 
-    pub fn quit(&mut self) {
-        self.running = false;
-    }
-
-    pub fn focus_next(&mut self) {
-        self.focused_pane = self.focused_pane.next();
-    }
-
-    pub fn focus_prev(&mut self) {
-        self.focused_pane = self.focused_pane.prev();
-    }
-
-    pub fn handle_key_event(&mut self, event: KeyEvent) {
-        match event.code {
-            KeyCode::Tab => self.focus_next(),
-            KeyCode::BackTab => self.focus_prev(),
-            KeyCode::Char(ch) if self.focused_pane == FocusPane::Composer => {
-                self.composer_input.push(ch);
-            }
-            KeyCode::Backspace if self.focused_pane == FocusPane::Composer => {
-                self.composer_input.pop();
-            }
-            KeyCode::Char('q') => {
-                self.quit();
-            }
-            _ => {}
+    /// Process a single terminal key event.
+    ///
+    /// Returns `Ok(true)` if the application should exit, or `Ok(false)` to continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TuiError` if event handling encounters an unrecoverable state error.
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool, TuiError> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return Ok(true);
         }
+
+        match key.code {
+            KeyCode::Tab => {
+                self.focus = self.focus.next();
+                Ok(false)
+            }
+            KeyCode::BackTab => {
+                self.focus = self.focus.prev();
+                Ok(false)
+            }
+            KeyCode::Char('q') if self.focus != FocusPane::Composer => {
+                self.should_quit = true;
+                Ok(true)
+            }
+            KeyCode::Char(c) if self.focus == FocusPane::Composer => {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.input_buffer.push(c);
+                }
+                Ok(false)
+            }
+            KeyCode::Backspace if self.focus == FocusPane::Composer => {
+                self.input_buffer.pop();
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn test_composer_typing_immunity_for_q_key() {
+        let mut app = App::new();
+        app.focus = FocusPane::Composer;
+
+        let key_event = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let result = app.handle_key_event(key_event);
+
+        assert_eq!(result, Ok(false));
+        assert_eq!(app.input_buffer(), "q");
     }
 }

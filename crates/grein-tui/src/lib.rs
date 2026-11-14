@@ -1,13 +1,13 @@
 pub mod app;
 
-pub use app::{App, FocusPane};
+pub use app::{App, FocusPane, TuiError};
 
-/// Launches the Grein TUI application.
+/// Run the interactive terminal user interface.
 ///
 /// # Errors
 ///
-/// Returns an I/O error if terminal initialization or event loop execution fails.
-pub async fn run() -> std::io::Result<()> {
+/// Returns `TuiError` if terminal initialization or event loop execution fails.
+pub async fn run() -> Result<(), TuiError> {
     let _app = App::new();
     Ok(())
 }
