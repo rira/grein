@@ -1,10 +1,22 @@
-//! Grein TUI crate.
+//! Terminal User Interface for Grein.
 
-pub mod focus;
+pub mod composer;
 
-pub use focus::PaneFocus;
+pub use composer::Composer;
 
-/// Runs the Grein TUI application.
-pub async fn run() -> std::io::Result<()> {
+/// Error type for TUI runtime operations.
+#[derive(Debug)]
+pub struct TuiError(pub String);
+
+impl std::fmt::Display for TuiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for TuiError {}
+
+/// Starts the terminal user interface event loop.
+pub async fn run() -> Result<(), TuiError> {
     Ok(())
 }
