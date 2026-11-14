@@ -1,93 +1,86 @@
-use grein_tui::pane::blackboard::{BlackboardState, InspectionTarget};
-use grein_tui::pane::focus::PaneFocus;
+use grein_tui::ui::focus::PaneFocus;
+use grein_tui::views::blackboard::{BlackboardState, BlackboardView, DecisionItem};
+use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
 #[test]
-fn test_pane_focus_blackboard_variant_exists() {
-    let focus = PaneFocus::Blackboard;
-    assert_eq!(focus, PaneFocus::Blackboard);
-    assert_eq!(focus.name(), "Blackboard");
-}
+fn test_blackboard_view_renders_inspector_and_decision_registry() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("failed to initialize test terminal");
 
-#[test]
-fn test_blackboard_state_default_initialization() {
-    let state = BlackboardState::default();
+    let mut state = BlackboardState::default();
+    state.set_inspector_title("Global Inspector");
+    state.set_inspector_detail("Active agent: autonomous-coder");
+    state.add_decision(DecisionItem::new(
+        "DEC-001",
+        "Adopt Universal Two-Tier Architecture",
+    ));
+    state.add_decision(DecisionItem::new("DEC-002", "Enforce Zero-Null Policy"));
+
+    let view = BlackboardView::new(&state).with_focus(PaneFocus::Blackboard);
+
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, 80, 24);
+            frame.render_widget(view, area);
+        })
+        .expect("failed to render blackboard view");
+
+    let buffer = terminal.backend().buffer();
+    let content = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
 
     assert!(
-        state.is_visible(),
-        "Blackboard pane should be visible by default"
+        content.contains("Global Inspector"),
+        "Expected buffer to render inspector title"
     );
-    assert_eq!(state.inspection_target(), &InspectionTarget::None);
-    assert_eq!(state.decision_registry_selection(), None);
-    assert_eq!(state.decision_registry_scroll_offset(), 0);
-}
-
-#[test]
-fn test_blackboard_state_collapsible_visibility_toggle() {
-    let mut state = BlackboardState::new();
-    assert!(state.is_visible());
-
-    state.toggle_visibility();
     assert!(
-        !state.is_visible(),
-        "Blackboard pane should be collapsed/hidden after toggle"
+        content.contains("Active agent: autonomous-coder"),
+        "Expected buffer to render inspector details"
     );
-
-    state.set_visible(true);
-    assert!(state.is_visible());
-
-    state.set_visible(false);
-    assert!(!state.is_visible());
+    assert!(
+        content.contains("DEC-001"),
+        "Expected buffer to render decision ID"
+    );
+    assert!(
+        content.contains("Adopt Universal Two-Tier Architecture"),
+        "Expected buffer to render decision description"
+    );
+    assert!(
+        content.contains("DEC-002"),
+        "Expected buffer to render second decision ID"
+    );
 }
 
 #[test]
-fn test_blackboard_state_inspection_target_tracking() {
-    let mut state = BlackboardState::new();
-    assert_eq!(state.inspection_target(), &InspectionTarget::None);
+fn test_blackboard_view_collapsed_state_renders_indicator() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("failed to initialize test terminal");
 
-    let ticket_target =
-        InspectionTarget::Ticket("01a1d8a2-9617-7003-8945-0076ae34055e".to_string());
-    state.set_inspection_target(ticket_target.clone());
-    assert_eq!(state.inspection_target(), &ticket_target);
+    let mut state = BlackboardState::default();
+    state.set_collapsed(true);
+    state.set_inspector_title("Global Inspector");
 
-    let node_target = InspectionTarget::Node("worker-node-1".to_string());
-    state.set_inspection_target(node_target.clone());
-    assert_eq!(state.inspection_target(), &node_target);
+    let view = BlackboardView::new(&state).with_focus(PaneFocus::Blackboard);
 
-    state.clear_inspection_target();
-    assert_eq!(state.inspection_target(), &InspectionTarget::None);
-}
+    terminal
+        .draw(|frame| {
+            let area = Rect::new(0, 0, 80, 24);
+            frame.render_widget(view, area);
+        })
+        .expect("failed to render collapsed blackboard view");
 
-#[test]
-fn test_blackboard_decision_registry_scroll_and_selection() {
-    let mut state = BlackboardState::new();
+    let buffer = terminal.backend().buffer();
+    let content = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
 
-    // Populate decision item count
-    state.set_decision_item_count(5);
-    assert_eq!(state.decision_item_count(), 5);
-
-    // Test initial selection
-    state.select_decision(Some(0));
-    assert_eq!(state.decision_registry_selection(), Some(0));
-
-    // Test moving selection down
-    state.select_next_decision();
-    assert_eq!(state.decision_registry_selection(), Some(1));
-
-    // Test moving selection up
-    state.select_previous_decision();
-    assert_eq!(state.decision_registry_selection(), Some(0));
-
-    // Test bounds on previous
-    state.select_previous_decision();
-    assert_eq!(state.decision_registry_selection(), Some(0));
-
-    // Test scroll offsets
-    state.set_decision_registry_scroll_offset(3);
-    assert_eq!(state.decision_registry_scroll_offset(), 3);
-
-    state.scroll_decision_down(2);
-    assert_eq!(state.decision_registry_scroll_offset(), 5);
-
-    state.scroll_decision_up(4);
-    assert_eq!(state.decision_registry_scroll_offset(), 1);
+    assert!(
+        content.contains("Blackboard [Collapsed]") || content.contains("Blackboard (Collapsed)"),
+        "Expected collapsed indicator when blackboard is collapsed"
+    );
 }

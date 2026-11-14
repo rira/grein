@@ -1,6 +1,9 @@
-pub mod pane;
+pub mod ui;
+pub mod views;
 
-/// Entry point for grein_tui execution.
+pub use ui::focus::PaneFocus;
+pub use views::blackboard::{BlackboardState, BlackboardView, DecisionItem};
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
