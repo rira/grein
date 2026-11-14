@@ -32,7 +32,7 @@ fn test_blackboard_collapse_expand_transitions() {
 #[test]
 fn test_focus_delegation_when_focused_blackboard_collapses() {
     let config = AppConfig::default();
-    let mut app = App::new(config);
+    let mut app = App::new();
 
     // Focus blackboard pane
     app.set_focus(PaneFocus::Blackboard);
@@ -59,7 +59,7 @@ fn test_focus_delegation_when_focused_blackboard_collapses() {
 #[test]
 fn test_tab_navigation_skips_collapsed_blackboard_pane() {
     let config = AppConfig::default();
-    let mut app = App::new(config);
+    let mut app = App::new();
 
     // Collapse the blackboard pane
     app.blackboard_pane_mut().collapse();
@@ -95,7 +95,7 @@ fn test_tab_navigation_skips_collapsed_blackboard_pane() {
 #[test]
 fn test_event_routing_invariants_focused_vs_collapsed() {
     let config = AppConfig::default();
-    let mut app = App::new(config);
+    let mut app = App::new();
 
     // When expanded and focused, blackboard consumes inspector navigation events
     app.blackboard_pane_mut().expand();
@@ -122,7 +122,7 @@ fn test_blackboard_pane_render_snapshot_layout() {
     let backend = TestBackend::new(120, 40);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
     let config = AppConfig::default();
-    let mut app = App::new(config);
+    let mut app = App::new();
 
     // Render expanded
     app.blackboard_pane_mut().expand();

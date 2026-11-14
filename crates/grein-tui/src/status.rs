@@ -171,6 +171,8 @@ impl UiFocusController {
     }
 }
 
+pub type StatusBar = ThreadStatus;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +333,3 @@ mod tests {
         );
     }
 }
-
-pub type StatusBar = ThreadStatus;

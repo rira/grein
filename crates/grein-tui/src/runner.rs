@@ -17,8 +17,10 @@ pub fn draw_frame<B: Backend>(_terminal: &mut Terminal<B>, _app: &App) -> io::Re
     Ok(())
 }
 
-pub fn handle_key_event(app: &mut App, key: KeyEvent) {
+pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<crate::app::TreeAction>, crate::app::TuiError> {
+    let action = app.handle_key_tree(key);
     app.handle_key_event(key);
+    Ok(action)
 }
 
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
@@ -83,7 +85,6 @@ mod tests {
         let mut app = App::new();
         app.set_focus(FocusPane::Composer);
         app.input_buffer.clear();
-        app.composer_input.clear();
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         let result = handle_event(&mut app, event);
@@ -98,7 +99,6 @@ mod tests {
         let mut app = App::new();
         app.set_focus(FocusPane::Composer);
         app.input_buffer.clear();
-        app.composer_input.clear();
 
         for ch in "hello world".chars() {
             let event = Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
