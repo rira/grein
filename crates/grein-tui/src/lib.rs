@@ -1,8 +1,7 @@
 pub mod app;
 
-pub use app::{App, FocusedPane, TuiError};
+pub use app::{App, FocusPane};
 
-pub async fn run() -> Result<(), TuiError> {
-    let mut app = App::new();
-    app.run().await
+pub async fn run() -> std::io::Result<()> {
+    Ok(())
 }
