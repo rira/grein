@@ -1,9 +1,6 @@
-//! Terminal user interface module for Grein.
+pub mod pane;
 
-pub mod composer;
-pub mod focus;
-
-/// Entry point for running the interactive TUI application.
-pub async fn run() -> std::io::Result<()> {
+/// Entry point for grein_tui execution.
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
