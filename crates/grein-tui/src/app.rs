@@ -252,6 +252,21 @@ impl App {
         &self.input_buffer
     }
 
+    pub fn composer_line_count(&self) -> u16 {
+        self.input_buffer.split('\n').count().max(1) as u16
+    }
+
+    pub fn composer_cursor_2d(&self) -> (u16, u16) {
+        let clamped_pos = self.cursor_position.min(self.input_buffer.len());
+        let prefix = &self.input_buffer[..clamped_pos];
+        let row = prefix.bytes().filter(|&b| b == b'\n').count() as u16;
+        let col = match prefix.rfind('\n') {
+            Some(idx) => prefix[idx + 1..].chars().count() as u16,
+            None => prefix.chars().count() as u16,
+        };
+        (col, row)
+    }
+
     pub fn last_submitted_prompt(&self) -> Option<String> {
         self.last_submitted_prompt.clone()
     }
@@ -454,9 +469,27 @@ impl App {
                 }
             }
             KeyCode::Enter if self.focused_pane == FocusedPane::Composer => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.input_buffer.insert(self.cursor_position, '\n');
+                    self.cursor_position += 1;
+                    self.sync_focus_out();
+                    return true;
+                }
                 let prompt = std::mem::take(&mut self.input_buffer);
                 self.cursor_position = 0;
                 self.last_submitted_prompt = Some(prompt);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::Char('j') | KeyCode::Char('J')
+                if self.focused_pane == FocusedPane::Composer
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.input_buffer.insert(self.cursor_position, '\n');
+                self.cursor_position += 1;
                 self.sync_focus_out();
                 return true;
             }
@@ -466,7 +499,10 @@ impl App {
                 return true;
             }
             KeyCode::Char(c) if self.focused_pane == FocusedPane::Composer => {
-                if !key.modifiers.contains(KeyModifiers::ALT) {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     self.input_buffer.insert(self.cursor_position, c);
                     self.cursor_position += c.len_utf8();
                     self.sync_focus_out();
@@ -538,7 +574,11 @@ impl App {
             self.blackboard_pane
                 .set_rendered_rect(ratatui::layout::Rect::default());
         } else {
-            let layout = crate::layout::compute_layout(area, false);
+            let layout = crate::layout::compute_layout_with_composer_lines(
+                area,
+                false,
+                self.composer_line_count(),
+            );
             if let Some(r) = layout.blackboard_area {
                 self.blackboard_pane.set_rendered_rect(r);
             } else {

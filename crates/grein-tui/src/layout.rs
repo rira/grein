@@ -13,11 +13,21 @@ pub struct AppLayout {
 }
 
 pub type WorkspaceLayout = AppLayout;
+pub type LayoutRegions = AppLayout;
 
 pub fn compute_layout(area: Rect, blackboard_collapsed: bool) -> AppLayout {
+    compute_layout_with_composer_lines(area, blackboard_collapsed, 1)
+}
+
+pub fn compute_layout_with_composer_lines(
+    area: Rect,
+    blackboard_collapsed: bool,
+    composer_lines: u16,
+) -> AppLayout {
+    let composer_height = (composer_lines.max(1) + 2).clamp(3, 10);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(composer_height)])
         .split(area);
 
     let top_area = vertical[0];
