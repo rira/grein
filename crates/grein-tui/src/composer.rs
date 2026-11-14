@@ -42,7 +42,9 @@ impl ThreadDraftStore {
 pub enum ComposerMode {
     #[default]
     Normal,
-    DiffPreviewActive { diff_id: String },
+    DiffPreviewActive {
+        diff_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

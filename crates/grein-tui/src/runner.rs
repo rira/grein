@@ -1,7 +1,7 @@
-use std::io;
-use std::time::Duration;
 use crossterm::event::{self, Event, KeyEvent};
 use ratatui::{backend::Backend, Terminal};
+use std::io;
+use std::time::Duration;
 
 use crate::app::App;
 
@@ -17,7 +17,10 @@ pub fn draw_frame<B: Backend>(_terminal: &mut Terminal<B>, _app: &App) -> io::Re
     Ok(())
 }
 
-pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<crate::app::TreeAction>, crate::app::TuiError> {
+pub fn handle_key_event(
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Option<crate::app::TreeAction>, crate::app::TuiError> {
     let action = app.handle_key_tree(key);
     app.handle_key_event(key);
     Ok(action)
@@ -53,8 +56,8 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use crate::app::{App, FocusPane};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn test_handle_event_ctrl_c_always_quits() {

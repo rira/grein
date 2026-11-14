@@ -393,7 +393,9 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(idx) = self.tree.selected_index() {
-                    if let Some(crate::ui::tree::TreeNode::Anchor(anchor)) = self.tree.nodes.get(idx) {
+                    if let Some(crate::ui::tree::TreeNode::Anchor(anchor)) =
+                        self.tree.nodes.get(idx)
+                    {
                         let id = anchor.id.clone();
                         self.tree.set_active_anchor_id(Some(id.clone()));
                         return Some(TreeAction::ActivateAnchor(id));
@@ -533,7 +535,8 @@ impl App {
 
     pub fn render(&mut self, _frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         if self.is_blackboard_collapsed() {
-            self.blackboard_pane.set_rendered_rect(ratatui::layout::Rect::default());
+            self.blackboard_pane
+                .set_rendered_rect(ratatui::layout::Rect::default());
         } else {
             let layout = crate::layout::compute_layout(area, false);
             if let Some(r) = layout.blackboard_area {
