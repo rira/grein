@@ -1,107 +1,76 @@
-use grein_tui::app::{AppState, Pane};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use grein_tui::app::{App, FocusPane};
 
 #[test]
-fn test_focusable_panes_when_blackboard_not_collapsed() {
-    let mut state = AppState::default();
-    state.blackboard_collapsed = false;
+fn focus_pane_cycles_forward_through_all_four_panes() {
+    let mut app = App::new();
+    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
 
-    let panes = state.focusable_panes();
-    assert_eq!(
-        panes,
-        vec![
-            Pane::Workspace,
-            Pane::Blackboard,
-            Pane::Chat,
-            Pane::Composer,
-        ]
-    );
+    app.focus_next();
+    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
+
+    app.focus_next();
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
+
+    app.focus_next();
+    assert_eq!(app.focused_pane(), FocusPane::ContextInspector);
+
+    app.focus_next();
+    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
 }
 
 #[test]
-fn test_focusable_panes_when_blackboard_collapsed() {
-    let mut state = AppState::default();
-    state.blackboard_collapsed = true;
+fn focus_pane_cycles_backward_through_all_four_panes() {
+    let mut app = App::new();
+    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
 
-    let panes = state.focusable_panes();
-    assert_eq!(panes, vec![Pane::Workspace, Pane::Chat, Pane::Composer,]);
+    app.focus_prev();
+    assert_eq!(app.focused_pane(), FocusPane::ContextInspector);
+
+    app.focus_prev();
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
+
+    app.focus_prev();
+    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
+
+    app.focus_prev();
+    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
 }
 
 #[test]
-fn test_focus_next_cycles_forward_with_blackboard() {
-    let mut state = AppState::default();
-    state.blackboard_collapsed = false;
-    state.focus = Pane::Workspace;
+fn handle_key_event_tab_and_backtab_navigate_focus() {
+    let mut app = App::new();
+    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
 
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Blackboard);
+    let tab_event = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    app.handle_key_event(tab_event);
+    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
 
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Chat);
+    app.handle_key_event(tab_event);
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Composer);
+    let backtab_event = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+    app.handle_key_event(backtab_event);
+    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
 
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Workspace);
+    app.handle_key_event(backtab_event);
+    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
+
+    app.handle_key_event(backtab_event);
+    assert_eq!(app.focused_pane(), FocusPane::ContextInspector);
 }
 
 #[test]
-fn test_focus_prev_cycles_backward_with_blackboard() {
-    let mut state = AppState::default();
-    state.blackboard_collapsed = false;
-    state.focus = Pane::Workspace;
+fn focus_pane_enum_next_and_prev_methods_are_symmetric() {
+    let panes = [
+        FocusPane::WorkspaceTree,
+        FocusPane::ChatStream,
+        FocusPane::Composer,
+        FocusPane::ContextInspector,
+    ];
 
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Composer);
-
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Chat);
-
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Blackboard);
-
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Workspace);
-}
-
-#[test]
-fn test_focus_next_skips_collapsed_blackboard() {
-    let mut state = AppState::default();
-    state.blackboard_collapsed = true;
-    state.focus = Pane::Workspace;
-
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Chat);
-
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Composer);
-
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Workspace);
-}
-
-#[test]
-fn test_focus_prev_skips_collapsed_blackboard() {
-    let mut state = AppState::default();
-    state.blackboard_collapsed = true;
-    state.focus = Pane::Chat;
-
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Workspace);
-
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Composer);
-
-    state.focus_prev();
-    assert_eq!(state.focus, Pane::Chat);
-}
-
-#[test]
-fn test_focus_next_when_starting_on_collapsed_pane() {
-    let mut state = AppState::default();
-    state.focus = Pane::Blackboard;
-    state.blackboard_collapsed = true;
-
-    state.focus_next();
-    assert_eq!(state.focus, Pane::Chat);
+    for pane in panes {
+        assert_eq!(pane.next().prev(), pane);
+        assert_eq!(pane.prev().next(), pane);
+    }
 }
