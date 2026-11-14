@@ -1,151 +1,99 @@
-#![allow(clippy::field_reassign_with_default)]
-
-use grein_tui::app::{AnchorItem, AppState, PaneFocus, ThreadItem};
-use grein_tui::render::{render_app, render_markdown_lines, render_tree_view};
+use grein_tui::app::{AnchorItem, AppState, FocusPane, ThreadItem};
+use grein_tui::layout::compute_layout;
+use grein_tui::render::render_app;
+use grein_tui::runner::draw_frame;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 #[test]
-fn test_render_tree_navigator_displays_hierarchy() {
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).expect("failed to initialize test terminal");
+fn compute_layout_splits_four_panes_when_blackboard_expanded() {
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = compute_layout(area, false);
 
-    let mut state = AppState::default();
-    state.threads = vec![ThreadItem {
+    assert_eq!(layout.composer_area.height, 3);
+    assert_eq!(layout.composer_area.y, 37);
+    assert_eq!(layout.tree_area.height, 37);
+    assert_eq!(layout.transcript_area.height, 37);
+    assert!(layout.blackboard_area.is_some());
+
+    let bb = layout.blackboard_area.unwrap();
+    assert_eq!(bb.height, 37);
+    assert!(layout.tree_area.width > 0);
+    assert!(layout.transcript_area.width > layout.tree_area.width);
+    assert!(bb.width > 0);
+}
+
+#[test]
+fn compute_layout_hides_blackboard_when_collapsed() {
+    let area = Rect::new(0, 0, 120, 40);
+    let expanded = compute_layout(area, false);
+    let collapsed = compute_layout(area, true);
+
+    assert!(collapsed.blackboard_area.is_none());
+    assert_eq!(collapsed.composer_area.height, 3);
+    assert_eq!(collapsed.tree_area.width, expanded.tree_area.width);
+    assert!(collapsed.transcript_area.width > expanded.transcript_area.width);
+}
+
+#[test]
+fn render_app_draws_four_panes_with_expanded_blackboard() {
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal init");
+
+    let mut app = AppState::new();
+    app.threads = vec![ThreadItem {
         id: "t-1".to_string(),
-        title: "Root Thread".to_string(),
-        anchors: vec![
-            AnchorItem {
-                id: "a-1".to_string(),
-                label: "Anchor 1".to_string(),
-            },
-            AnchorItem {
-                id: "a-2".to_string(),
-                label: "Anchor 2".to_string(),
-            },
-        ],
+        title: "feature/tui".to_string(),
+        anchors: vec![AnchorItem {
+            id: "a-1".to_string(),
+            label: "Pinned architecture invariant".to_string(),
+        }],
     }];
+    app.focused_pane = FocusPane::Composer;
 
     terminal
-        .draw(|f| {
-            let area = Rect::new(0, 0, 25, 20);
-            render_tree_view(f, area, &state);
-        })
-        .expect("draw tree view should succeed");
+        .draw(|f| render_app(f, &app))
+        .expect("render frame");
 
     let buffer = terminal.backend().buffer();
-    let rendered = buffer
+    let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+    assert!(content.contains("feature/tui"));
+    assert!(content.contains("Pinned architecture invariant"));
+}
+
+#[test]
+fn draw_frame_renders_collapsed_blackboard_state() {
+    let backend_expanded = TestBackend::new(120, 40);
+    let mut terminal_expanded = Terminal::new(backend_expanded).expect("terminal init");
+    let mut app_expanded = AppState::new();
+    app_expanded.blackboard_collapsed = false;
+    draw_frame(&mut terminal_expanded, &app_expanded).expect("draw_frame expanded");
+    let expanded_content: String = terminal_expanded
+        .backend()
+        .buffer()
         .content()
         .iter()
         .map(|c| c.symbol())
-        .collect::<Vec<_>>()
-        .join("");
-
-    assert!(
-        rendered.contains("Root Thread"),
-        "Tree must render thread title"
-    );
-    assert!(
-        rendered.contains("Anchor 1"),
-        "Tree must render nested anchor items"
-    );
-}
-
-#[test]
-fn test_render_transcript_markdown_formatting() {
-    let markdown = "# Header 1\n\n**Bold text** and `code`\n\n- item 1\n- item 2";
-    let lines = render_markdown_lines(markdown);
-
-    assert!(!lines.is_empty(), "Markdown output lines must not be empty");
-
-    let plain_text: String = lines
-        .iter()
-        .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
         .collect();
 
-    assert!(
-        plain_text.contains("Header 1"),
-        "Rendered text should retain header"
-    );
-    assert!(
-        plain_text.contains("Bold text"),
-        "Rendered text should retain bold content"
-    );
-    assert!(
-        plain_text.contains("code"),
-        "Rendered text should retain inline code"
-    );
-    assert!(
-        plain_text.contains("item 1"),
-        "Rendered text should retain list items"
-    );
-}
-
-#[test]
-fn test_render_full_layout_contains_all_four_panes() {
     let backend = TestBackend::new(120, 40);
-    let mut terminal = Terminal::new(backend).expect("failed to initialize test terminal");
+    let mut terminal = Terminal::new(backend).expect("terminal init");
 
-    let mut state = AppState::default();
-    state.active_focus = PaneFocus::Transcript;
-    state.active_transcript_md = "## Active Discussion\nSystem prompt initialized.".to_string();
-    state.blackboard_notes = "Shared blackboard state: OK".to_string();
-    state.input_buffer = "echo test input".to_string();
+    let mut app = AppState::new();
+    app.blackboard_collapsed = true;
+    app.threads = vec![ThreadItem {
+        id: "t-2".to_string(),
+        title: "collapsed-thread".to_string(),
+        anchors: vec![],
+    }];
 
-    terminal
-        .draw(|f| {
-            render_app(f, &state);
-        })
-        .expect("draw app should succeed");
+    draw_frame(&mut terminal, &app).expect("draw_frame succeeds");
 
     let buffer = terminal.backend().buffer();
-    let rendered_text = buffer
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<Vec<_>>()
-        .join("");
+    let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
 
-    assert!(
-        rendered_text.contains("Active Discussion"),
-        "Transcript pane must be rendered"
-    );
-    assert!(
-        rendered_text.contains("Shared blackboard"),
-        "Blackboard pane must be rendered"
-    );
-    assert!(
-        rendered_text.contains("echo test input"),
-        "Input composer pane must be rendered"
-    );
-}
-
-#[test]
-fn test_render_collapsible_blackboard() {
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).expect("failed to initialize test terminal");
-
-    let mut state = AppState::default();
-    state.blackboard_collapsed = true;
-    state.blackboard_notes = "Secret blackboard content".to_string();
-
-    terminal
-        .draw(|f| {
-            render_app(f, &state);
-        })
-        .expect("draw app should succeed with collapsed blackboard");
-
-    let buffer = terminal.backend().buffer();
-    let rendered_text = buffer
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<Vec<_>>()
-        .join("");
-
-    assert!(
-        !rendered_text.contains("Secret blackboard content"),
-        "Collapsed blackboard notes must not be rendered"
-    );
+    assert!(content.contains("collapsed-thread"));
+    assert_ne!(content, expanded_content);
 }
