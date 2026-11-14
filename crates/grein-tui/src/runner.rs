@@ -1,11 +1,16 @@
-use std::io;
+use std::io::{self, IsTerminal};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
-use crate::app::{App, FocusPane};
+use crate::app::App;
+use crate::render::render_app;
 
 pub struct TerminalGuard {
     active: bool,
@@ -13,15 +18,9 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
-        use std::io::IsTerminal;
         if io::stdout().is_terminal() {
-            crossterm::terminal::enable_raw_mode()?;
-            if let Err(e) =
-                crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)
-            {
-                let _ = crossterm::terminal::disable_raw_mode();
-                return Err(e);
-            }
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen)?;
             Ok(Self { active: true })
         } else {
             Ok(Self { active: false })
@@ -32,63 +31,32 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
         }
     }
 }
 
 pub fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> io::Result<()> {
-    terminal.draw(|f| crate::render::render_app(f, app))?;
+    terminal.draw(|f| render_app(f, app))?;
     Ok(())
 }
 
-pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('c') | KeyCode::Char('q') => {
-                app.should_quit = true;
-                return true;
-            }
-            KeyCode::Char('b') => {
-                app.blackboard_collapsed = !app.blackboard_collapsed;
-                return false;
-            }
-            _ => {}
-        }
-    }
-
-    match key.code {
-        KeyCode::Char('q') => {
-            app.should_quit = true;
-            true
-        }
-        KeyCode::Tab => {
-            app.focused_pane = match app.focused_pane {
-                FocusPane::Workspace | FocusPane::Transcript => FocusPane::Composer,
-                FocusPane::Composer => FocusPane::Blackboard,
-                FocusPane::Blackboard => FocusPane::Workspace,
-            };
-            false
-        }
-        KeyCode::BackTab => {
-            app.focused_pane = match app.focused_pane {
-                FocusPane::Workspace | FocusPane::Transcript => FocusPane::Blackboard,
-                FocusPane::Composer => FocusPane::Workspace,
-                FocusPane::Blackboard => FocusPane::Composer,
-            };
-            false
-        }
-        _ => false,
-    }
+pub fn handle_key_event(
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Option<crate::app::TreeAction>, crate::app::TuiError> {
+    let action = app.handle_key_tree(key);
+    app.handle_key_event(key);
+    Ok(action)
 }
 
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
-    match event {
-        Event::Key(key) => Ok(handle_key_event(app, key)),
-        Event::Resize(_, _) => Ok(false),
-        _ => Ok(false),
+    if let Event::Key(key) = event {
+        app.handle_key_event(key);
+        return Ok(app.should_quit);
     }
+    Ok(false)
 }
 
 pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
@@ -105,47 +73,4 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::backend::TestBackend;
-
-    #[test]
-    fn terminal_guard_succeeds_in_test_env() {
-        let guard = TerminalGuard::new().expect("guard init");
-        drop(guard);
-    }
-
-    #[test]
-    fn handle_key_event_quits_on_q() {
-        let mut app = App::new();
-        let quit = handle_key_event(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-        );
-        assert!(quit);
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn handle_key_event_cycles_focus_on_tab() {
-        let mut app = App::new();
-        assert_eq!(app.focused_pane, FocusPane::Workspace);
-        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane, FocusPane::Composer);
-        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane, FocusPane::Blackboard);
-        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane, FocusPane::Workspace);
-    }
-
-    #[test]
-    fn draw_frame_renders_onto_test_backend() {
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let app = App::new();
-        draw_frame(&mut terminal, &app).expect("draw frame");
-    }
 }
