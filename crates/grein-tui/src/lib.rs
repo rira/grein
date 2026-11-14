@@ -1,9 +1,8 @@
-pub mod ui;
-pub mod views;
+pub mod app;
 
-pub use ui::focus::PaneFocus;
-pub use views::blackboard::{BlackboardState, BlackboardView, DecisionItem};
+pub use app::{App, PaneFocus};
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Entry point for running the Grein TUI interface.
+pub async fn run() -> std::io::Result<()> {
     Ok(())
 }
