@@ -12,7 +12,19 @@ impl DaemonClient {
     }
 
     pub async fn ping(&mut self) -> Result<String, std::io::Error> {
-        self.stream.write_all(b"ping\n").await?;
+        self.send_command("ping").await
+    }
+
+    pub async fn send_turn(&mut self, prompt: &str) -> Result<String, std::io::Error> {
+        self.send_command(&format!("send_turn:{prompt}")).await
+    }
+
+    pub async fn list_entries(&mut self) -> Result<String, std::io::Error> {
+        self.send_command("list_entries").await
+    }
+
+    async fn send_command(&mut self, cmd: &str) -> Result<String, std::io::Error> {
+        self.stream.write_all(format!("{cmd}\n").as_bytes()).await?;
         self.stream.flush().await?;
 
         let mut buf = [0u8; 1024];
