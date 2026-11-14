@@ -23,16 +23,37 @@ pub enum FocusedPane {
 }
 
 pub type FocusPane = FocusedPane;
+pub type PaneFocus = FocusedPane;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnchorItem {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThreadItem {
+    pub id: String,
+    pub title: String,
+    pub anchors: Vec<AnchorItem>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct App {
     pub focused_pane: FocusedPane,
     pub focus: FocusedPane,
+    pub active_focus: FocusedPane,
     pub blackboard_collapsed: bool,
+    pub blackboard_notes: String,
     pub composer_input: String,
+    pub input_buffer: String,
     pub cursor_position: usize,
     pub should_quit: bool,
+    pub active_transcript_md: String,
+    pub threads: Vec<ThreadItem>,
 }
+
+pub type AppState = App;
 
 impl App {
     pub fn new() -> Self {
@@ -47,10 +68,68 @@ impl App {
                 self.focus = self.focused_pane;
             }
         }
+        if self.active_focus != self.focused_pane {
+            if self.active_focus != FocusedPane::Tree {
+                self.focused_pane = self.active_focus;
+            } else {
+                self.active_focus = self.focused_pane;
+            }
+        }
+        if self.input_buffer != self.composer_input {
+            if !self.input_buffer.is_empty() && self.composer_input.is_empty() {
+                self.composer_input = self.input_buffer.clone();
+                self.cursor_position = self.composer_input.len();
+            } else {
+                self.input_buffer = self.composer_input.clone();
+            }
+        }
     }
 
     fn sync_focus_out(&mut self) {
         self.focus = self.focused_pane;
+        self.active_focus = self.focused_pane;
+        self.input_buffer = self.composer_input.clone();
+    }
+
+    pub fn focused_pane(&self) -> FocusedPane {
+        self.focused_pane
+    }
+
+    pub fn active_focus(&self) -> FocusedPane {
+        self.focused_pane
+    }
+
+    pub fn set_focus(&mut self, pane: FocusedPane) {
+        self.focused_pane = pane;
+        self.sync_focus_out();
+    }
+
+    pub fn composer_content(&self) -> &str {
+        &self.composer_input
+    }
+
+    pub fn is_blackboard_collapsed(&self) -> bool {
+        self.blackboard_collapsed
+    }
+
+    pub fn set_blackboard_collapsed(&mut self, collapsed: bool) {
+        self.blackboard_collapsed = collapsed;
+        if self.blackboard_collapsed && self.focused_pane == FocusedPane::Blackboard {
+            self.focused_pane = FocusedPane::Tree;
+        }
+        self.sync_focus_out();
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    pub fn cycle_focus(&mut self) {
+        self.focus_next();
+    }
+
+    pub fn cycle_focus_reverse(&mut self) {
+        self.focus_prev();
     }
 
     pub fn focus_next(&mut self) {

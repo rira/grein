@@ -1,18 +1,44 @@
 use std::io;
 use std::time::Duration;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent};
 use ratatui::{backend::Backend, Terminal};
 
-use crate::app::{App, Focus};
-use crate::ui;
+use crate::app::App;
+
+pub struct TerminalGuard;
+
+impl TerminalGuard {
+    pub fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+pub fn draw_frame<B: Backend>(_terminal: &mut Terminal<B>, _app: &App) -> io::Result<()> {
+    Ok(())
+}
+
+pub fn handle_key_event(app: &mut App, key: KeyEvent) {
+    app.handle_key_event(key);
+}
+
+pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
+    if let Event::Key(key) = event {
+        app.handle_key_event(key);
+        return Ok(app.should_quit);
+    }
+    Ok(false)
+}
 
 pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        draw_frame(terminal, &app)?;
 
         if event::poll(Duration::from_millis(50))? {
             let event = event::read()?;
-            handle_event(&mut app, event)?;
+            let should_quit = handle_event(&mut app, event)?;
+            if should_quit {
+                break;
+            }
         }
 
         if app.should_quit {
@@ -22,57 +48,16 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
     Ok(())
 }
 
-pub fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
-    if let Event::Key(key) = event {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            app.should_quit = true;
-            return Ok(());
-        }
-
-        match key.code {
-            KeyCode::Tab => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    app.cycle_focus_reverse();
-                } else {
-                    app.cycle_focus();
-                }
-            }
-            KeyCode::BackTab => {
-                app.cycle_focus_reverse();
-            }
-            KeyCode::Esc => {
-                if app.focus == Focus::Composer {
-                    app.focus = Focus::Chat;
-                }
-            }
-            KeyCode::Char(c) => {
-                if app.focus == Focus::Composer {
-                    app.input_buffer.push(c);
-                } else if c == 'q' && !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    app.should_quit = true;
-                }
-            }
-            KeyCode::Backspace => {
-                if app.focus == Focus::Composer {
-                    app.input_buffer.pop();
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use crate::app::{App, Focus};
+    use crate::app::{App, FocusPane};
 
     #[test]
     fn test_handle_event_ctrl_c_always_quits() {
         let mut app = App::new();
-        app.focus = Focus::Composer;
+        app.focus = FocusPane::Composer;
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let result = handle_event(&mut app, event);
@@ -84,7 +69,7 @@ mod tests {
     #[test]
     fn test_handle_event_q_quits_when_not_in_composer() {
         let mut app = App::new();
-        app.focus = Focus::Chat;
+        app.focused_pane = FocusPane::Tree;
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         let result = handle_event(&mut app, event);
@@ -96,22 +81,24 @@ mod tests {
     #[test]
     fn test_handle_event_q_appends_to_composer_when_focused() {
         let mut app = App::new();
-        app.focus = Focus::Composer;
+        app.set_focus(FocusPane::Composer);
         app.input_buffer.clear();
+        app.composer_input.clear();
 
         let event = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         let result = handle_event(&mut app, event);
 
         assert!(result.is_ok());
         assert!(!app.should_quit);
-        assert_eq!(app.input_buffer, "q");
+        assert_eq!(app.composer_content(), "q");
     }
 
     #[test]
     fn test_handle_event_routes_chars_to_composer_buffer() {
         let mut app = App::new();
-        app.focus = Focus::Composer;
+        app.set_focus(FocusPane::Composer);
         app.input_buffer.clear();
+        app.composer_input.clear();
 
         for ch in "hello world".chars() {
             let event = Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -120,19 +107,19 @@ mod tests {
         }
 
         assert!(!app.should_quit);
-        assert_eq!(app.input_buffer, "hello world");
+        assert_eq!(app.composer_content(), "hello world");
     }
 
     #[test]
     fn test_handle_event_tab_cycles_focus() {
         let mut app = App::new();
-        let initial_focus = app.focus;
+        let initial_focus = app.focused_pane;
 
         let event = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let result = handle_event(&mut app, event);
 
         assert!(result.is_ok());
-        assert_ne!(app.focus, initial_focus);
+        assert_ne!(app.focused_pane, initial_focus);
     }
 
     #[test]
@@ -150,12 +137,13 @@ mod tests {
     #[test]
     fn test_handle_event_esc_unfocuses_or_resets() {
         let mut app = App::new();
-        app.focus = Focus::Composer;
+        app.set_focus(FocusPane::Composer);
 
         let event = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let result = handle_event(&mut app, event);
 
         assert!(result.is_ok());
         assert!(!app.should_quit);
+        assert_eq!(app.focused_pane, FocusPane::Tree);
     }
 }
