@@ -71,6 +71,12 @@ pub struct PriorityScheduler {
     queue: Arc<Mutex<Vec<Task>>>,
 }
 
+impl Default for PriorityScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PriorityScheduler {
     pub fn new() -> Self {
         Self {
@@ -126,6 +132,12 @@ pub struct UiFocusController {
     pub current_focus: FocusTarget,
     pub is_user_typing: bool,
     pub pending_permissions: Vec<(u64, String)>,
+}
+
+impl Default for UiFocusController {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UiFocusController {

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn find_flake_path() -> PathBuf {
     let mut current = std::env::current_dir().expect("Failed to get current directory");

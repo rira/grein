@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use grein_tui::transcript::{TranscriptMessage, TranscriptPane};
-use grein_tui::{AppAction, AppEvent, FocusDirection, PaneFocus, TuiComponent};
+use grein_tui::{AppAction, AppEvent, FocusDirection, PaneFocus};
 
 #[test]
 fn test_transcript_pane_exports_and_initial_state() {

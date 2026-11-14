@@ -2,7 +2,6 @@ use grein_tui::ui::navigator::{TreeNavigator, TreeNavigatorState, TreeNode};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::Widget;
 use ratatui::Terminal;
 
 #[test]
@@ -122,7 +121,7 @@ fn buffer_to_string(buffer: &Buffer) -> String {
     let mut result = String::new();
     for y in 0..buffer.area.height {
         for x in 0..buffer.area.width {
-            result.push(buffer.get(x, y).symbol().chars().next().unwrap_or(' '));
+            result.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
         }
         result.push('\n');
     }
