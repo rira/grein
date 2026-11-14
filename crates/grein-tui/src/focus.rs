@@ -1,86 +1,71 @@
-//! TUI focus navigation and state management.
+//! Focus management across TUI panes.
 
-/// Identifies which pane in the TUI currently has user focus.
+/// Identifies the active focus pane in the 4-pane TUI navigation cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PaneFocus {
-    /// Sidebar pane (navigation / thread selection).
+    /// Workspaces navigation pane.
     #[default]
-    Sidebar,
-    /// Active thread transcript pane (center pane).
-    Transcript,
-    /// Composer input pane (prompt / message editor).
+    Workspaces,
+    /// Tasks list pane.
+    Tasks,
+    /// Messages and event log pane.
+    Messages,
+    /// Non-blocking prompt input composer pane.
     Composer,
-    /// Inspector details pane.
-    Inspector,
 }
 
 impl PaneFocus {
-    /// Returns the next pane in forward cyclic navigation order.
+    #[allow(non_upper_case_globals)]
+    pub const Workspace: Self = Self::Workspaces;
+    #[allow(non_upper_case_globals)]
+    pub const Task: Self = Self::Tasks;
+    #[allow(non_upper_case_globals)]
+    pub const Message: Self = Self::Messages;
+
+    /// All available pane focus variants in cycle order.
+    pub const ALL: [Self; 4] = [
+        Self::Workspaces,
+        Self::Tasks,
+        Self::Messages,
+        Self::Composer,
+    ];
+
+    /// Advances focus to the next pane in the 4-pane Tab cycle.
     #[must_use]
-    pub const fn next(self) -> Self {
+    pub fn next(self) -> Self {
         match self {
-            Self::Sidebar => Self::Transcript,
-            Self::Transcript => Self::Composer,
-            Self::Composer => Self::Inspector,
-            Self::Inspector => Self::Sidebar,
+            Self::Workspaces => Self::Tasks,
+            Self::Tasks => Self::Messages,
+            Self::Messages => Self::Composer,
+            Self::Composer => Self::Workspaces,
         }
     }
 
-    /// Returns the previous pane in backward cyclic navigation order.
+    /// Retreats focus to the previous pane in the 4-pane BackTab cycle.
     #[must_use]
-    pub const fn previous(self) -> Self {
+    pub fn prev(self) -> Self {
         match self {
-            Self::Sidebar => Self::Inspector,
-            Self::Transcript => Self::Sidebar,
-            Self::Composer => Self::Transcript,
-            Self::Inspector => Self::Composer,
+            Self::Workspaces => Self::Composer,
+            Self::Tasks => Self::Workspaces,
+            Self::Messages => Self::Tasks,
+            Self::Composer => Self::Messages,
         }
     }
-}
 
-/// Navigation action triggered by keyboard shortcuts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FocusNavigationAction {
-    /// Forward navigation to next pane.
-    Tab,
-    /// Backward navigation to previous pane.
-    BackTab,
-}
-
-/// State machine managing the current active pane focus.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FocusManager {
-    current: PaneFocus,
-}
-
-impl Default for FocusManager {
-    fn default() -> Self {
-        Self::new(PaneFocus::Sidebar)
-    }
-}
-
-impl FocusManager {
-    /// Creates a new `FocusManager` initialized to the specified pane.
+    /// Returns all available pane focus variants in cycle order.
     #[must_use]
-    pub const fn new(initial: PaneFocus) -> Self {
-        Self { current: initial }
+    pub fn all() -> &'static [Self] {
+        &Self::ALL
     }
+}
 
-    /// Returns the currently focused pane.
-    #[must_use]
-    pub const fn current(&self) -> PaneFocus {
-        self.current
-    }
-
-    /// Updates focus according to the provided navigation action.
-    pub fn handle_action(&mut self, action: FocusNavigationAction) {
-        match action {
-            FocusNavigationAction::Tab => {
-                self.current = self.current.next();
-            }
-            FocusNavigationAction::BackTab => {
-                self.current = self.current.previous();
-            }
+impl std::fmt::Display for PaneFocus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Workspaces => write!(f, "Workspaces"),
+            Self::Tasks => write!(f, "Tasks"),
+            Self::Messages => write!(f, "Messages"),
+            Self::Composer => write!(f, "Composer"),
         }
     }
 }
