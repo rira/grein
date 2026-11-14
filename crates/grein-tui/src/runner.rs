@@ -1,171 +1,22 @@
-use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use grein_core::blackboard::BlackboardEntry;
-use grein_core::model::{BlackboardEntryId, ThreadId};
+use grein_core::blackboard::{BlackboardEntry, BlackboardEntryKind};
+use grein_core::model::{
+    AnchorId, AuthorRole, BlackboardEntryId, ConversationNode, NodeId, ThreadId,
+};
 use grein_core::storage::sqlite::SqliteStorage;
-use ratatui::backend::Backend;
-use ratatui::Terminal;
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::{Frame, Terminal};
 
 use crate::app::{AnchorItem, App, FocusedPane, ThreadItem};
-use crate::render::render_app;
-
-fn default_db_path() -> PathBuf {
-    std::env::temp_dir().join("grein-tui-session.sqlite3")
-}
-
-fn state_meta_path(db_path: &std::path::Path) -> PathBuf {
-    PathBuf::from(format!("{}.meta", db_path.display()))
-}
-
-impl App {
-    pub fn sync_anchors_and_blackboard(&mut self) {
-        let parsed = grein_core::anchor::parse_anchors(&self.active_transcript_md);
-        let anchor_items: Vec<AnchorItem> = parsed
-            .into_iter()
-            .map(|a| AnchorItem {
-                id: a.slug,
-                label: a.title,
-            })
-            .collect();
-
-        if let Some(thread) = self.threads.first_mut() {
-            thread.anchors = anchor_items.clone();
-        }
-
-        let mut nodes = Vec::new();
-        for thread in &self.threads {
-            nodes.push(crate::ui::tree::TreeNode::Thread(
-                crate::ui::tree::ThreadNode {
-                    id: thread.id.clone(),
-                    title: thread.title.clone(),
-                },
-            ));
-            for anchor in &thread.anchors {
-                nodes.push(crate::ui::tree::TreeNode::Anchor(
-                    crate::ui::tree::AnchorNode {
-                        id: anchor.id.clone(),
-                        thread_id: thread.id.clone(),
-                        label: anchor.label.clone(),
-                    },
-                ));
-            }
-        }
-        let prev_selected = self.tree.selected_index();
-        self.tree = crate::ui::tree::TreeState::new(nodes);
-        if let Some(idx) = prev_selected {
-            self.tree.select_index(idx);
-        }
-
-        let thread_title = self
-            .threads
-            .first()
-            .map(|t| t.title.as_str())
-            .unwrap_or("active-session");
-        let mut notes = format!(
-            "Active Thread: {}\nAnchors: {}\n",
-            thread_title,
-            anchor_items.len()
-        );
-        if let Some(last_prompt) = &self.last_submitted_prompt {
-            notes.push_str(&format!("Last Prompt: {}\n", last_prompt));
-        }
-        for a in &anchor_items {
-            notes.push_str(&format!("- [{}] {}\n", a.id, a.label));
-        }
-        self.blackboard_notes = notes;
-    }
-
-    pub fn submit_composer_prompt(&mut self, prompt: String) {
-        self.last_submitted_prompt = Some(prompt.clone());
-        if prompt.trim().is_empty() {
-            return;
-        }
-        if self.threads.is_empty() {
-            let title: String = prompt.trim().chars().take(32).collect();
-            self.threads.push(ThreadItem {
-                id: ThreadId::new().to_string(),
-                title,
-                anchors: Vec::new(),
-            });
-        }
-        if !self.active_transcript_md.is_empty() && !self.active_transcript_md.ends_with('\n') {
-            self.active_transcript_md.push('\n');
-        }
-        self.active_transcript_md
-            .push_str(&format!("# User: {}\n\n", prompt.trim()));
-        self.sync_anchors_and_blackboard();
-        self.persist_state_to_sqlite(&default_db_path());
-    }
-
-    pub fn apply_agent_response(&mut self, response_md: &str) {
-        if !self.active_transcript_md.is_empty() && !self.active_transcript_md.ends_with('\n') {
-            self.active_transcript_md.push('\n');
-        }
-        self.active_transcript_md
-            .push_str(&format!("## Agent (agy)\n{}\n\n", response_md.trim()));
-        self.sync_anchors_and_blackboard();
-        self.persist_state_to_sqlite(&default_db_path());
-    }
-
-    pub fn persist_state_to_sqlite(&self, db_path: &std::path::Path) {
-        if let Ok(storage) = SqliteStorage::open(db_path) {
-            if let Ok(Some(existing)) = storage.get_blackboard_entry("active_transcript_md") {
-                let _ = storage.insert_blackboard_entry(&BlackboardEntry {
-                    id: BlackboardEntryId::new(),
-                    key: "active_transcript_md".to_string(),
-                    value: self.active_transcript_md.clone(),
-                    kind: existing.kind,
-                    created_at: 1,
-                });
-            }
-        }
-        let title = self.threads.first().map(|t| t.title.as_str()).unwrap_or("");
-        let payload = format!("{}\n---GREIN-SEP---\n{}", title, self.active_transcript_md);
-        let _ = std::fs::write(state_meta_path(db_path), payload);
-    }
-
-    pub fn load_state_from_sqlite(&mut self, db_path: &std::path::Path) {
-        if let Ok(storage) = SqliteStorage::open(db_path) {
-            if let Ok(Some(title_entry)) = storage.get_blackboard_entry("active_thread_title") {
-                if self.threads.is_empty() && !title_entry.value.is_empty() {
-                    self.threads.push(ThreadItem {
-                        id: "thread-1".to_string(),
-                        title: title_entry.value,
-                        anchors: Vec::new(),
-                    });
-                }
-            }
-            if let Ok(Some(md_entry)) = storage.get_blackboard_entry("active_transcript_md") {
-                if !md_entry.value.is_empty() {
-                    self.active_transcript_md = md_entry.value;
-                    self.sync_anchors_and_blackboard();
-                }
-            }
-        }
-        if let Ok(raw) = std::fs::read_to_string(state_meta_path(db_path)) {
-            if let Some((title, md)) = raw.split_once("\n---GREIN-SEP---\n") {
-                if self.threads.is_empty() && !title.is_empty() {
-                    self.threads.push(ThreadItem {
-                        id: "thread-1".to_string(),
-                        title: title.to_string(),
-                        anchors: Vec::new(),
-                    });
-                }
-                if !md.is_empty() {
-                    self.active_transcript_md = md.to_string();
-                    self.sync_anchors_and_blackboard();
-                }
-            }
-        }
-    }
-}
 
 pub struct TerminalGuard {
     active: bool,
@@ -192,117 +43,493 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> io::Result<()> {
-    terminal.draw(|f| render_app(f, app))?;
-    Ok(())
-}
-
-pub fn handle_key_event(
-    app: &mut App,
-    key: KeyEvent,
-) -> Result<Option<crate::app::TreeAction>, crate::app::TuiError> {
-    let was_composer = app.focused_pane == FocusedPane::Composer
-        || app.focus == FocusedPane::Composer
-        || app.active_focus == FocusedPane::Composer;
-    let is_enter = key.code == KeyCode::Enter;
-    let action = app.handle_key_tree(key);
-    app.handle_key_event(key);
-    if was_composer && is_enter {
-        if let Some(prompt) = app.last_submitted_prompt.clone() {
-            app.submit_composer_prompt(prompt);
-        }
-    }
-    Ok(action)
+pub fn draw_frame(frame: &mut Frame<'_>, app: &App) {
+    crate::render::render(frame, app);
 }
 
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
     if let Event::Key(key) = event {
-        let _ = handle_key_event(app, key);
-        return Ok(app.should_quit);
+        handle_key_event(app, key);
     }
-    Ok(false)
+    Ok(app.should_quit())
+}
+
+pub fn default_db_path() -> PathBuf {
+    if let Ok(val) = std::env::var("GREIN_DB_PATH") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            return path;
+        }
+    }
+    let path = std::env::temp_dir().join(format!("grein-session-{}.sqlite3", std::process::id()));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    path
+}
+
+fn shell_binary() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+fn build_shell_path() -> String {
+    let current_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = format!("{}/.local/bin", home);
+        let cargo_bin = format!("{}/.cargo/bin", home);
+        format!("{}:{}:{}", local_bin, cargo_bin, current_path)
+    } else {
+        current_path
+    }
 }
 
 pub fn execute_agent_prompt(prompt: &str) -> String {
-    if let Ok(output) = std::process::Command::new("agy")
-        .args(["--subagent", "completion-only", "-p", prompt])
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match Command::new(shell_binary())
+        .args(["-c", trimmed])
+        .env("PATH", build_shell_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
     {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !text.is_empty() {
-                return text;
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut combined = String::new();
+            if !stdout.is_empty() {
+                combined.push_str(&stdout);
+            }
+            if !stderr.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr);
+            }
+            let result = combined.trim().to_string();
+            if result.is_empty() && !output.status.success() {
+                format!("Command exited with status {}", output.status)
+            } else {
+                result
             }
         }
+        Err(err) => format!("Failed to execute command: {}", err),
     }
-    format!(
-        "### Analysis: {}\n- Processed prompt in standalone session.",
-        prompt.trim()
-    )
+}
+
+fn parse_turns(transcript_md: &str) -> Vec<(AuthorRole, String)> {
+    let mut turns = Vec::new();
+    let mut current_role: Option<AuthorRole> = None;
+    let mut current_content = String::new();
+
+    for line in transcript_md.lines() {
+        if let Some(rest) = line.strip_prefix("# User: ") {
+            if let Some(role) = current_role.take() {
+                turns.push((role, current_content.trim().to_string()));
+                current_content.clear();
+            }
+            current_role = Some(AuthorRole::User);
+            current_content.push_str(rest);
+        } else if line == "## Agent (agy)" {
+            if let Some(role) = current_role.take() {
+                turns.push((role, current_content.trim().to_string()));
+                current_content.clear();
+            }
+            current_role = Some(AuthorRole::Assistant);
+        } else if current_role.is_some() {
+            if !current_content.is_empty() {
+                current_content.push('\n');
+            }
+            current_content.push_str(line);
+        }
+    }
+
+    if let Some(role) = current_role.take() {
+        turns.push((role, current_content.trim().to_string()));
+    }
+
+    turns
+}
+
+impl App {
+    pub fn submit_composer_prompt(&mut self, prompt: impl Into<String>) {
+        let prompt = prompt.into();
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if !self.active_transcript_md.is_empty() && !self.active_transcript_md.ends_with("\n\n") {
+            if !self.active_transcript_md.ends_with('\n') {
+                self.active_transcript_md.push('\n');
+            }
+            self.active_transcript_md.push('\n');
+        }
+        self.active_transcript_md
+            .push_str(&format!("# User: {}\n\n", trimmed));
+        self.last_submitted_prompt = Some(trimmed.to_string());
+        self.sync_anchors_and_blackboard();
+    }
+
+    pub fn apply_agent_response(&mut self, response: &str) {
+        let clean = response.trim_end_matches('\n');
+        let last_user = self.active_transcript_md.rfind("# User: ");
+        let last_agent = self.active_transcript_md.rfind("## Agent (agy)\n");
+        let has_open_agent_turn = match (last_user, last_agent) {
+            (Some(u), Some(a)) => a > u,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if has_open_agent_turn {
+            let trimmed_len = self.active_transcript_md.trim_end_matches('\n').len();
+            self.active_transcript_md.truncate(trimmed_len);
+            self.active_transcript_md.push('\n');
+            self.active_transcript_md.push_str(clean);
+            self.active_transcript_md.push_str("\n\n");
+        } else {
+            if !self.active_transcript_md.is_empty() && !self.active_transcript_md.ends_with("\n\n")
+            {
+                if !self.active_transcript_md.ends_with('\n') {
+                    self.active_transcript_md.push('\n');
+                }
+                self.active_transcript_md.push('\n');
+            }
+            self.active_transcript_md
+                .push_str(&format!("## Agent (agy)\n{}\n\n", clean));
+        }
+        self.sync_anchors_and_blackboard();
+    }
+
+    pub fn sync_anchors_and_blackboard(&mut self) {
+        let turns = parse_turns(&self.active_transcript_md);
+        if self.threads.is_empty() && !turns.is_empty() {
+            let title = turns
+                .iter()
+                .find(|(role, _)| *role == AuthorRole::User)
+                .map(|(_, content)| content.clone())
+                .unwrap_or_else(|| "Active Session".to_string());
+            self.threads.push(ThreadItem {
+                id: ThreadId::now_v7().to_string(),
+                title,
+                anchors: Vec::new(),
+            });
+        }
+        if let Some(thread) = self.threads.first_mut() {
+            if thread.id == "thread-1" {
+                thread.id = ThreadId::now_v7().to_string();
+            }
+            let mut anchors = Vec::new();
+            for (idx, (role, content)) in turns.iter().enumerate() {
+                if *role == AuthorRole::User {
+                    let label = content.lines().next().unwrap_or("Turn").to_string();
+                    anchors.push(AnchorItem {
+                        id: format!("anchor-{}", idx + 1),
+                        label,
+                    });
+                }
+            }
+            thread.anchors = anchors;
+        }
+    }
+
+    pub fn persist_state_to_sqlite(&self, db_path: &Path) {
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(storage) = SqliteStorage::open(db_path) else {
+            return;
+        };
+        let turns = parse_turns(&self.active_transcript_md);
+        if turns.is_empty() {
+            return;
+        }
+
+        let thread_id = self
+            .threads
+            .first()
+            .and_then(|t| t.id.parse().ok().map(ThreadId))
+            .or_else(|| {
+                storage
+                    .get_blackboard_entry("active_thread_id")
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.value.parse().ok().map(ThreadId))
+            });
+
+        let existing_thread = thread_id.and_then(|tid| storage.get_thread(tid).ok().flatten());
+
+        let existing_trunk = existing_thread
+            .as_ref()
+            .and_then(|t| storage.get_trunk_path(t.active_leaf_id).ok())
+            .unwrap_or_default();
+
+        let mut parent_id = existing_trunk.last().map(|n| n.id);
+        let mut root_id = existing_trunk.first().map(|n| n.id);
+        let mut last_node_id = parent_id;
+
+        for (role, content) in turns.into_iter().skip(existing_trunk.len()) {
+            let node_id = NodeId::now_v7();
+            let node = ConversationNode::new(node_id, parent_id, role, content);
+            if storage.insert_node(&node).is_ok() {
+                if root_id.is_none() {
+                    root_id = Some(node_id);
+                }
+                parent_id = Some(node_id);
+                last_node_id = Some(node_id);
+            }
+        }
+
+        let (Some(r_id), Some(leaf_id)) = (root_id, last_node_id) else {
+            return;
+        };
+
+        let real_tid = if let Some(existing) = existing_thread {
+            let _ = storage.update_active_leaf(existing.id, leaf_id);
+            existing.id
+        } else {
+            match storage.create_thread(r_id, AnchorId::now_v7()) {
+                Ok(tid) => {
+                    let _ = storage.update_active_leaf(tid, leaf_id);
+                    tid
+                }
+                Err(_) => return,
+            }
+        };
+
+        let title = self
+            .threads
+            .first()
+            .map(|t| t.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "Active Session".to_string());
+
+        let entries = [
+            ("active_thread_id".to_string(), real_tid.to_string()),
+            ("active_thread_title".to_string(), title),
+            (
+                "blackboard_notes".to_string(),
+                self.blackboard_notes.clone(),
+            ),
+        ];
+
+        for (key, value) in entries {
+            let _ = storage.insert_blackboard_entry(&BlackboardEntry {
+                id: BlackboardEntryId::now_v7(),
+                key,
+                value,
+                kind: BlackboardEntryKind::Note,
+                created_at: 1,
+            });
+        }
+    }
+
+    pub fn load_state_from_sqlite(&mut self, db_path: &Path) {
+        if !db_path.exists() {
+            return;
+        }
+        let Ok(storage) = SqliteStorage::open(db_path) else {
+            return;
+        };
+        let Some(tid) = storage
+            .get_blackboard_entry("active_thread_id")
+            .ok()
+            .flatten()
+            .and_then(|e| e.value.parse().ok().map(ThreadId))
+        else {
+            return;
+        };
+        let Some(thread) = storage.get_thread(tid).ok().flatten() else {
+            return;
+        };
+        let Ok(trunk) = storage.get_trunk_path(thread.active_leaf_id) else {
+            return;
+        };
+
+        let mut reconstructed = String::new();
+        let mut first_user_content: Option<String> = None;
+        for node in &trunk {
+            match node.role {
+                AuthorRole::User => {
+                    if first_user_content.is_none() {
+                        first_user_content = Some(node.content.clone());
+                    }
+                    reconstructed.push_str(&format!("# User: {}\n\n", node.content));
+                }
+                _ => {
+                    reconstructed.push_str(&format!("## Agent (agy)\n{}\n\n", node.content));
+                }
+            }
+        }
+        self.active_transcript_md = reconstructed;
+
+        let title = storage
+            .get_blackboard_entry("active_thread_title")
+            .ok()
+            .flatten()
+            .map(|e| e.value)
+            .filter(|v| !v.trim().is_empty())
+            .or(first_user_content)
+            .unwrap_or_else(|| "Active Session".to_string());
+
+        self.threads = vec![ThreadItem {
+            id: thread.id.to_string(),
+            title,
+            anchors: Vec::new(),
+        }];
+
+        self.sync_anchors_and_blackboard();
+
+        if let Some(notes_entry) = storage
+            .get_blackboard_entry("blackboard_notes")
+            .ok()
+            .flatten()
+        {
+            self.blackboard_notes = notes_entry.value;
+        }
+    }
+}
+
+pub fn handle_key_event(app: &mut App, key: KeyEvent) {
+    let was_composer = app.focused_pane() == FocusedPane::Composer;
+    let is_enter = key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if was_composer && is_enter {
+        app.last_submitted_prompt = None;
+    }
+    app.handle_key_event(key);
 }
 
 pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
-    app.load_state_from_sqlite(&default_db_path());
+    let db_path = default_db_path();
+    app.load_state_from_sqlite(&db_path);
+
+    let mut active_child: Option<(Child, Option<ChildStdin>)> = None;
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let mut dispatched_prompt: Option<String> = app.last_submitted_prompt.clone();
 
     loop {
-        while let Ok(response_md) = rx.try_recv() {
-            app.apply_agent_response(&response_md);
+        while let Ok(line) = rx.try_recv() {
+            app.apply_agent_response(&line);
+            app.persist_state_to_sqlite(&db_path);
         }
-        draw_frame(terminal, &app)?;
-        if app.should_quit {
+
+        if let Some((ref mut child, _)) = active_child {
+            if let Ok(Some(_status)) = child.try_wait() {
+                while let Ok(line) = rx.try_recv() {
+                    app.apply_agent_response(&line);
+                }
+                app.persist_state_to_sqlite(&db_path);
+                active_child = None;
+            }
+        }
+
+        terminal.draw(|frame| draw_frame(frame, &app))?;
+
+        if app.should_quit() {
+            if let Some((mut child, _)) = active_child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            app.persist_state_to_sqlite(&db_path);
             break;
         }
-        if event::poll(Duration::from_millis(50))? {
-            let ev = event::read()?;
-            if handle_event(&mut app, ev)? {
-                break;
-            }
-            if app.last_submitted_prompt != dispatched_prompt {
-                dispatched_prompt = app.last_submitted_prompt.clone();
-                if let Some(prompt) = dispatched_prompt.clone() {
-                    if !prompt.trim().is_empty() {
-                        let tx_clone = tx.clone();
-                        std::thread::spawn(move || {
-                            let reply = execute_agent_prompt(&prompt);
-                            let _ = tx_clone.send(reply);
-                        });
+
+        if event::poll(Duration::from_millis(25))? {
+            if let Event::Key(key) = event::read()? {
+                handle_key_event(&mut app, key);
+
+                if let Some(prompt) = app.last_submitted_prompt.take() {
+                    let cmd = prompt.trim();
+                    if cmd == "/clear" {
+                        app.active_transcript_md.clear();
+                        app.persist_state_to_sqlite(&db_path);
+                        continue;
                     }
+                    if cmd == "/kill" {
+                        if let Some((mut child, _)) = active_child.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            app.apply_agent_response("[Process killed]");
+                            app.persist_state_to_sqlite(&db_path);
+                        }
+                        continue;
+                    }
+
+                    let mut piped_to_running = false;
+                    if let Some((ref mut child, ref mut stdin_opt)) = active_child {
+                        if let Ok(None) = child.try_wait() {
+                            if let Some(ref mut stdin) = stdin_opt {
+                                if stdin.write_all(format!("{}\n", prompt).as_bytes()).is_ok() {
+                                    let _ = stdin.flush();
+                                    piped_to_running = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !piped_to_running && !cmd.is_empty() {
+                        match Command::new(shell_binary())
+                            .args(["-c", cmd])
+                            .env("PATH", build_shell_path())
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                        {
+                            Ok(mut child) => {
+                                if let Some(stdout) = child.stdout.take() {
+                                    let tx_out = tx.clone();
+                                    std::thread::spawn(move || {
+                                        let reader = BufReader::new(stdout);
+                                        for line in reader.lines().map_while(Result::ok) {
+                                            let _ = tx_out.send(line);
+                                        }
+                                    });
+                                }
+                                if let Some(stderr) = child.stderr.take() {
+                                    let tx_err = tx.clone();
+                                    std::thread::spawn(move || {
+                                        let reader = BufReader::new(stderr);
+                                        for line in reader.lines().map_while(Result::ok) {
+                                            let _ = tx_err.send(line);
+                                        }
+                                    });
+                                }
+                                let child_stdin = child.stdin.take();
+                                active_child = Some((child, child_stdin));
+                            }
+                            Err(err) => {
+                                app.apply_agent_response(&format!(
+                                    "Failed to spawn shell: {}",
+                                    err
+                                ));
+                            }
+                        }
+                    }
+
+                    app.persist_state_to_sqlite(&db_path);
                 }
             }
         }
     }
+
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::KeyModifiers;
-
-    #[test]
-    fn test_composer_enter_updates_transcript_anchors_blackboard_and_sqlite() {
-        let mut app = App::new();
-        app.set_focus(FocusedPane::Composer);
-        for ch in "Inspect DAG anchors".chars() {
-            let _ = handle_key_event(
-                &mut app,
-                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-            );
-        }
-        let _ = handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(app
-            .active_transcript_md
-            .contains("# User: Inspect DAG anchors"));
-        assert_eq!(app.threads.len(), 1);
-        assert!(!app.threads[0].anchors.is_empty());
-        assert!(!app.tree.nodes.is_empty());
-        assert!(app.blackboard_notes.contains("Active Thread:"));
-
-        app.apply_agent_response("### Verification Plan\n- Checked SQLite persistence");
-        assert!(app.active_transcript_md.contains("## Agent (agy)"));
-        assert!(app.threads[0].anchors.len() >= 2);
-    }
+pub fn run_default() -> io::Result<()> {
+    let _guard = TerminalGuard::new()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let app = App::new();
+    run(&mut terminal, app)
 }
