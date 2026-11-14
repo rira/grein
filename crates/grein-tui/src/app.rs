@@ -1,98 +1,78 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use thiserror::Error;
 
-/// Identifiers for the four primary workspace panes in the TUI layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FocusPane {
-    #[default]
-    WorkspaceTree,
-    AgentStream,
-    Composer,
-    DiffPreview,
-}
-
-impl FocusPane {
-    /// Advance focus to the next pane in clockwise order.
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::WorkspaceTree => Self::AgentStream,
-            Self::AgentStream => Self::Composer,
-            Self::Composer => Self::DiffPreview,
-            Self::DiffPreview => Self::WorkspaceTree,
-        }
-    }
-
-    /// Move focus to the previous pane in counter-clockwise order.
-    #[must_use]
-    pub const fn prev(self) -> Self {
-        match self {
-            Self::WorkspaceTree => Self::DiffPreview,
-            Self::AgentStream => Self::WorkspaceTree,
-            Self::Composer => Self::AgentStream,
-            Self::DiffPreview => Self::Composer,
-        }
-    }
-}
-
-/// Sealed domain error hierarchy for TUI operations.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum TuiError {
     #[error("Terminal I/O error: {0}")]
     Io(String),
 }
 
-/// Core TUI application state machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct App {
-    pub focus: FocusPane,
-    pub input_buffer: String,
-    pub should_quit: bool,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
+impl From<std::io::Error> for TuiError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err.to_string())
     }
 }
 
-impl App {
-    /// Construct a new `App` instance in its initial state.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            focus: FocusPane::default(),
-            input_buffer: String::new(),
-            should_quit: false,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusedPane {
+    #[default]
+    WorkspaceTree,
+    AgentStream,
+    ContextInspector,
+    PromptComposer,
+}
+
+impl FocusedPane {
+    pub fn next(self) -> Self {
+        match self {
+            Self::WorkspaceTree => Self::AgentStream,
+            Self::AgentStream => Self::ContextInspector,
+            Self::ContextInspector => Self::PromptComposer,
+            Self::PromptComposer => Self::WorkspaceTree,
         }
     }
 
-    /// Return the currently focused pane.
-    #[must_use]
-    pub const fn focus(&self) -> FocusPane {
-        self.focus
+    pub fn prev(self) -> Self {
+        match self {
+            Self::WorkspaceTree => Self::PromptComposer,
+            Self::AgentStream => Self::WorkspaceTree,
+            Self::ContextInspector => Self::AgentStream,
+            Self::PromptComposer => Self::ContextInspector,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct App {
+    pub focused_pane: FocusedPane,
+    pub input_buffer: String,
+    pub cursor_position: usize,
+    pub submitted_prompts: Vec<String>,
+    pub should_quit: bool,
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Return the current contents of the composer input buffer.
-    #[must_use]
-    pub fn input_buffer(&self) -> &str {
-        &self.input_buffer
+    pub async fn run(&mut self) -> Result<(), TuiError> {
+        Ok(())
     }
 
-    /// Return whether the application has been flagged to exit.
-    #[must_use]
-    pub const fn should_quit(&self) -> bool {
-        self.should_quit
+    pub fn focus_next(&mut self) {
+        self.focused_pane = self.focused_pane.next();
     }
 
-    /// Process a single terminal key event.
-    ///
-    /// Returns `Ok(true)` if the application should exit, or `Ok(false)` to continue.
-    ///
-    /// # Errors
-    ///
-    /// Returns `TuiError` if event handling encounters an unrecoverable state error.
+    pub fn focus_prev(&mut self) {
+        self.focused_pane = self.focused_pane.prev();
+    }
+
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool, TuiError> {
+        if key.kind == KeyEventKind::Release {
+            return Ok(false);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return Ok(true);
@@ -100,32 +80,100 @@ impl App {
 
         match key.code {
             KeyCode::Tab => {
-                self.focus = self.focus.next();
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.focus_prev();
+                } else {
+                    self.focus_next();
+                }
                 Ok(false)
             }
             KeyCode::BackTab => {
-                self.focus = self.focus.prev();
+                self.focus_prev();
                 Ok(false)
             }
-            KeyCode::Char('q') if self.focus != FocusPane::Composer => {
-                self.should_quit = true;
-                Ok(true)
-            }
-            KeyCode::Char(c) if self.focus == FocusPane::Composer => {
+            _ => match self.focused_pane {
+                FocusedPane::PromptComposer => self.handle_composer_key(key),
+                _ => self.handle_navigation_key(key),
+            },
+        }
+    }
+
+    fn handle_navigation_key(&mut self, key: KeyEvent) -> Result<bool, TuiError> {
+        if key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::NONE {
+            self.should_quit = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn handle_composer_key(&mut self, key: KeyEvent) -> Result<bool, TuiError> {
+        match key.code {
+            KeyCode::Char(c) => {
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 {
-                    self.input_buffer.push(c);
+                    let byte_idx = self.byte_index_at_cursor();
+                    self.input_buffer.insert(byte_idx, c);
+                    self.cursor_position += 1;
                 }
                 Ok(false)
             }
-            KeyCode::Backspace if self.focus == FocusPane::Composer => {
-                self.input_buffer.pop();
+            KeyCode::Backspace => {
+                if self.cursor_position > 0 {
+                    self.cursor_position -= 1;
+                    let byte_idx = self.byte_index_at_cursor();
+                    self.input_buffer.remove(byte_idx);
+                }
+                Ok(false)
+            }
+            KeyCode::Delete => {
+                let char_count = self.input_buffer.chars().count();
+                if self.cursor_position < char_count {
+                    let byte_idx = self.byte_index_at_cursor();
+                    self.input_buffer.remove(byte_idx);
+                }
+                Ok(false)
+            }
+            KeyCode::Left => {
+                self.cursor_position = self.cursor_position.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Right => {
+                let char_count = self.input_buffer.chars().count();
+                if self.cursor_position < char_count {
+                    self.cursor_position += 1;
+                }
+                Ok(false)
+            }
+            KeyCode::Home => {
+                self.cursor_position = 0;
+                Ok(false)
+            }
+            KeyCode::End => {
+                self.cursor_position = self.input_buffer.chars().count();
+                Ok(false)
+            }
+            KeyCode::Enter => {
+                if !self.input_buffer.trim().is_empty() {
+                    let submitted = std::mem::take(&mut self.input_buffer);
+                    self.submitted_prompts.push(submitted);
+                } else {
+                    self.input_buffer.clear();
+                }
+                self.cursor_position = 0;
                 Ok(false)
             }
             _ => Ok(false),
         }
+    }
+
+    fn byte_index_at_cursor(&self) -> usize {
+        self.input_buffer
+            .char_indices()
+            .nth(self.cursor_position)
+            .map(|(idx, _)| idx)
+            .unwrap_or(self.input_buffer.len())
     }
 }
 
@@ -135,14 +183,74 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
+    fn test_default_focus_is_workspace_tree() {
+        let app = App::new();
+        assert_eq!(app.focused_pane, FocusedPane::WorkspaceTree);
+    }
+
+    #[test]
+    fn test_tab_cycles_forward_through_four_panes() {
+        let mut app = App::new();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        app.handle_key_event(tab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::AgentStream);
+
+        app.handle_key_event(tab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::ContextInspector);
+
+        app.handle_key_event(tab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::PromptComposer);
+
+        app.handle_key_event(tab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::WorkspaceTree);
+    }
+
+    #[test]
+    fn test_backtab_cycles_backward_through_four_panes() {
+        let mut app = App::new();
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+
+        app.handle_key_event(backtab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::PromptComposer);
+
+        app.handle_key_event(backtab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::ContextInspector);
+
+        app.handle_key_event(backtab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::AgentStream);
+
+        app.handle_key_event(backtab).unwrap();
+        assert_eq!(app.focused_pane, FocusedPane::WorkspaceTree);
+    }
+
+    #[test]
+    fn test_q_quits_in_non_composer_panes() {
+        for pane in [
+            FocusedPane::WorkspaceTree,
+            FocusedPane::AgentStream,
+            FocusedPane::ContextInspector,
+        ] {
+            let mut app = App::new();
+            app.focused_pane = pane;
+            let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+            let result = app.handle_key_event(key);
+            assert_eq!(result, Ok(true));
+            assert!(app.should_quit);
+        }
+    }
+
+    #[test]
     fn test_composer_typing_immunity_for_q_key() {
         let mut app = App::new();
-        app.focus = FocusPane::Composer;
+        app.focused_pane = FocusedPane::PromptComposer;
 
-        let key_event = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
-        let result = app.handle_key_event(key_event);
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let result = app.handle_key_event(key);
 
         assert_eq!(result, Ok(false));
-        assert_eq!(app.input_buffer(), "q");
+        assert_eq!(app.input_buffer, "q");
+        assert_eq!(app.cursor_position, 1);
+        assert!(!app.should_quit);
     }
 }
