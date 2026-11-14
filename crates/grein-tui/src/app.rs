@@ -1,115 +1,158 @@
-//! Application state and navigation state machine.
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Identifies focusable panes in the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Pane {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusPane {
     #[default]
-    Workspace,
-    Blackboard,
-    Chat,
+    Tree,
+    Transcript,
     Composer,
+    Blackboard,
 }
 
-/// Application runtime state.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AppState {
-    pub focus: Pane,
-    pub blackboard_collapsed: bool,
-}
-
-impl AppState {
-    /// Returns the currently focusable panes in logical tab order.
-    pub fn focusable_panes(&self) -> Vec<Pane> {
-        if self.blackboard_collapsed {
-            vec![Pane::Workspace, Pane::Chat, Pane::Composer]
-        } else {
-            vec![
-                Pane::Workspace,
-                Pane::Blackboard,
-                Pane::Chat,
-                Pane::Composer,
-            ]
+impl FocusPane {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Tree => Self::Transcript,
+            Self::Transcript => Self::Composer,
+            Self::Composer => Self::Blackboard,
+            Self::Blackboard => Self::Tree,
         }
     }
 
-    /// Cycles focus to the next available pane, skipping collapsed panes.
-    pub fn focus_next(&mut self) {
-        let focusable = self.focusable_panes();
-        if focusable.is_empty() {
-            return;
-        }
-
-        const ALL_PANES: [Pane; 4] = [
-            Pane::Workspace,
-            Pane::Blackboard,
-            Pane::Chat,
-            Pane::Composer,
-        ];
-
-        let current_idx = ALL_PANES.iter().position(|&p| p == self.focus).unwrap_or(0);
-
-        let total = ALL_PANES.len();
-        for step in 1..=total {
-            let candidate = ALL_PANES[(current_idx + step) % total];
-            if focusable.contains(&candidate) {
-                self.focus = candidate;
-                return;
-            }
-        }
-    }
-
-    /// Cycles focus to the previous available pane, skipping collapsed panes.
-    pub fn focus_prev(&mut self) {
-        let focusable = self.focusable_panes();
-        if focusable.is_empty() {
-            return;
-        }
-
-        const ALL_PANES: [Pane; 4] = [
-            Pane::Workspace,
-            Pane::Blackboard,
-            Pane::Chat,
-            Pane::Composer,
-        ];
-
-        let current_idx = ALL_PANES.iter().position(|&p| p == self.focus).unwrap_or(0);
-
-        let total = ALL_PANES.len();
-        for step in 1..=total {
-            let candidate = ALL_PANES[(current_idx + total - (step % total)) % total];
-            if focusable.contains(&candidate) {
-                self.focus = candidate;
-                return;
-            }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Tree => Self::Blackboard,
+            Self::Transcript => Self::Tree,
+            Self::Composer => Self::Transcript,
+            Self::Blackboard => Self::Composer,
         }
     }
 }
 
-/// Configuration for the TUI application.
-#[derive(Debug, Clone, Default)]
-pub struct AppConfig {}
-
-/// Events processed by the TUI application.
-#[derive(Debug, Clone)]
-pub enum AppEvent {}
-
-/// Top-level application container.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
-    pub state: AppState,
-    pub config: AppConfig,
-}
-
-impl App {
-    pub fn new(config: AppConfig) -> Self {
-        Self {
-            state: AppState::default(),
-            config,
-        }
-    }
+    focus: FocusPane,
+    composer_input: String,
+    should_quit: bool,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self::new(AppConfig::default())
+        Self::new()
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self {
+            focus: FocusPane::Tree,
+            composer_input: String::new(),
+            should_quit: false,
+        }
+    }
+
+    pub fn focus(&self) -> FocusPane {
+        self.focus
+    }
+
+    pub fn set_focus(&mut self, focus: FocusPane) {
+        self.focus = focus;
+    }
+
+    pub fn focus_next(&mut self) {
+        self.focus = self.focus.next();
+    }
+
+    pub fn focus_prev(&mut self) {
+        self.focus = self.focus.prev();
+    }
+
+    pub fn composer_input(&self) -> &str {
+        &self.composer_input
+    }
+
+    pub fn take_composer_input(&mut self) -> String {
+        std::mem::take(&mut self.composer_input)
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    pub fn quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    pub fn handle_key_event(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Tab => {
+                self.focus_next();
+            }
+            KeyCode::BackTab => {
+                self.focus_prev();
+            }
+            KeyCode::Char(c) => {
+                if self.focus == FocusPane::Composer {
+                    self.composer_input.push(c);
+                } else if c == 'q' {
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Backspace => {
+                if self.focus == FocusPane::Composer {
+                    self.composer_input.pop();
+                }
+            }
+            KeyCode::Esc => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tab_cycles_focus_forward() {
+        let mut app = App::default();
+        assert_eq!(app.focus(), FocusPane::Tree);
+
+        app.focus_next();
+        assert_eq!(app.focus(), FocusPane::Transcript);
+
+        app.focus_next();
+        assert_eq!(app.focus(), FocusPane::Composer);
+
+        app.focus_next();
+        assert_eq!(app.focus(), FocusPane::Blackboard);
+
+        app.focus_next();
+        assert_eq!(app.focus(), FocusPane::Tree);
+    }
+
+    #[test]
+    fn test_backtab_cycles_focus_backward() {
+        let mut app = App::default();
+        assert_eq!(app.focus(), FocusPane::Tree);
+
+        app.focus_prev();
+        assert_eq!(app.focus(), FocusPane::Blackboard);
+
+        app.focus_prev();
+        assert_eq!(app.focus(), FocusPane::Composer);
+
+        app.focus_prev();
+        assert_eq!(app.focus(), FocusPane::Transcript);
+
+        app.focus_prev();
+        assert_eq!(app.focus(), FocusPane::Tree);
     }
 }
