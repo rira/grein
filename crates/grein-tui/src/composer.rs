@@ -1,192 +1,180 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::collections::HashMap;
+//! Non-blocking prompt input composer pane.
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ThreadId(String);
+use crate::focus::PaneFocus;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-impl ThreadId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ThreadId {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
-impl From<String> for ThreadId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ThreadDraftStore {
-    drafts: HashMap<ThreadId, String>,
-}
-
-impl ThreadDraftStore {
-    pub fn new() -> Self {
-        Self {
-            drafts: HashMap::new(),
-        }
-    }
-
-    pub fn save_draft(&mut self, thread_id: &ThreadId, draft: impl Into<String>) {
-        self.drafts.insert(thread_id.clone(), draft.into());
-    }
-
-    pub fn get_draft(&self, thread_id: &ThreadId) -> Option<&str> {
-        self.drafts.get(thread_id).map(|s| s.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalEditorHook {
-    initial_content: String,
-}
-
-impl ExternalEditorHook {
-    pub fn new(initial_content: impl Into<String>) -> Self {
-        Self {
-            initial_content: initial_content.into(),
-        }
-    }
-
-    pub fn initial_content(&self) -> &str {
-        &self.initial_content
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalPagerHook {
-    target_diff_id: String,
-}
-
-impl ExternalPagerHook {
-    pub fn new(target_diff_id: impl Into<String>) -> Self {
-        Self {
-            target_diff_id: target_diff_id.into(),
-        }
-    }
-
-    pub fn target_diff_id(&self) -> &str {
-        &self.target_diff_id
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ComposerMode {
-    #[default]
-    Normal,
-    DiffPreviewActive {
-        diff_id: String,
-    },
-}
-
+/// Actions resulting from composer event handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerAction {
-    None,
-    DispatchTurn(String),
-    SpawnExternalEditor(ExternalEditorHook),
-    SpawnDiffPager(ExternalPagerHook),
-    ClearReplyAnchor,
+    /// Submitted message payload.
+    Submit(String),
+    /// Request focus cycle to the next pane.
+    NextPane,
+    /// Request focus cycle to the previous pane.
+    PrevPane,
 }
 
+/// Outcome of evaluating a key event in the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerEventResult {
+    /// Key was consumed internally by the composer.
+    Consumed,
+    /// Key was ignored (e.g. composer pane is not focused).
+    Ignored,
+    /// Key triggered an external lifecycle or navigation action.
+    Action(ComposerAction),
+}
+
+/// Input buffer managing user prompt text and cursor manipulation.
 #[derive(Debug, Clone, Default)]
 pub struct Composer {
-    draft: String,
-    reply_anchor: Option<String>,
-    mode: ComposerMode,
+    chars: Vec<char>,
+    cursor: usize,
+    text: String,
 }
 
 impl Composer {
+    /// Creates a new, empty composer.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert_text(&mut self, text: &str) {
-        self.draft.push_str(text);
+    /// Returns a borrowed slice of the current text buffer.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
     }
 
-    pub fn draft_text(&self) -> &str {
-        &self.draft
+    /// Returns current cursor position as a character index.
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
     }
 
-    pub fn set_draft_text(&mut self, text: impl Into<String>) {
-        self.draft = text.into();
+    /// Returns the total character count in the buffer.
+    #[must_use]
+    pub fn char_count(&self) -> usize {
+        self.chars.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.draft.is_empty()
-    }
-
+    /// Clears the composer buffer and resets cursor position to zero.
     pub fn clear(&mut self) {
-        self.draft.clear();
+        self.chars.clear();
+        self.cursor = 0;
+        self.text.clear();
     }
 
-    pub fn set_reply_anchor(&mut self, anchor: Option<String>) {
-        self.reply_anchor = anchor;
+    /// Inserts a single Unicode character at the current cursor position.
+    pub fn insert_char(&mut self, c: char) {
+        self.chars.insert(self.cursor, c);
+        self.cursor += 1;
+        self.sync_text();
     }
 
-    pub fn clear_reply_anchor(&mut self) {
-        self.reply_anchor = None;
+    /// Inserts a string slice at the current cursor position.
+    pub fn insert_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.chars.insert(self.cursor, c);
+            self.cursor += 1;
+        }
+        self.sync_text();
     }
 
-    pub fn reply_badge_text(&self) -> Option<String> {
-        self.reply_anchor
-            .as_ref()
-            .map(|anchor| format!("[Replying to: {anchor}]"))
+    /// Moves cursor one character to the left, bounded at zero.
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
     }
 
-    pub fn set_mode(&mut self, mode: ComposerMode) {
-        self.mode = mode;
+    /// Moves cursor one character to the right, bounded at buffer length.
+    pub fn move_cursor_right(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.cursor += 1;
+        }
     }
 
-    pub fn mode(&self) -> &ComposerMode {
-        &self.mode
+    /// Moves cursor to the beginning of the buffer.
+    pub fn move_cursor_home(&mut self) {
+        self.cursor = 0;
     }
 
-    pub fn apply_editor_result(&mut self, text: impl Into<String>) {
-        self.draft = text.into();
+    /// Moves cursor to the end of the buffer.
+    pub fn move_cursor_end(&mut self) {
+        self.cursor = self.chars.len();
     }
 
-    pub fn handle_key(&mut self, event: KeyEvent) -> ComposerAction {
-        if event.kind != KeyEventKind::Press {
-            return ComposerAction::None;
+    /// Deletes the character directly preceding the cursor.
+    pub fn delete_char_before_cursor(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+            self.sync_text();
+        }
+    }
+
+    /// Deletes the character at the current cursor position.
+    pub fn delete_char_after_cursor(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.chars.remove(self.cursor);
+            self.sync_text();
+        }
+    }
+
+    /// Dispatches a key event according to the current focus state.
+    pub fn handle_key_event(&mut self, key: KeyEvent, focus: PaneFocus) -> ComposerEventResult {
+        if focus != PaneFocus::Composer {
+            return ComposerEventResult::Ignored;
         }
 
-        if let ComposerMode::DiffPreviewActive { ref diff_id } = self.mode {
-            if event.code == KeyCode::Char('o') && event.modifiers.is_empty() {
-                return ComposerAction::SpawnDiffPager(ExternalPagerHook::new(diff_id.clone()));
-            }
-        }
-
-        match event.code {
-            KeyCode::Enter => {
-                if event.modifiers.contains(KeyModifiers::SHIFT)
-                    || event.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.draft.push('\n');
-                    ComposerAction::None
-                } else if event.modifiers.is_empty() {
-                    let dispatched = std::mem::take(&mut self.draft);
-                    ComposerAction::DispatchTurn(dispatched)
+        match key.code {
+            KeyCode::BackTab => ComposerEventResult::Action(ComposerAction::PrevPane),
+            KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    ComposerEventResult::Action(ComposerAction::PrevPane)
                 } else {
-                    ComposerAction::None
+                    ComposerEventResult::Action(ComposerAction::NextPane)
                 }
             }
-            KeyCode::Char('e') if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                ComposerAction::SpawnExternalEditor(ExternalEditorHook::new(self.draft.clone()))
+            KeyCode::Enter => {
+                let submitted = self.text.clone();
+                self.clear();
+                ComposerEventResult::Action(ComposerAction::Submit(submitted))
             }
-            KeyCode::Esc => ComposerAction::ClearReplyAnchor,
-            _ => ComposerAction::None,
+            KeyCode::Char(c) => {
+                self.insert_char(c);
+                ComposerEventResult::Consumed
+            }
+            KeyCode::Backspace => {
+                self.delete_char_before_cursor();
+                ComposerEventResult::Consumed
+            }
+            KeyCode::Delete => {
+                self.delete_char_after_cursor();
+                ComposerEventResult::Consumed
+            }
+            KeyCode::Left => {
+                self.move_cursor_left();
+                ComposerEventResult::Consumed
+            }
+            KeyCode::Right => {
+                self.move_cursor_right();
+                ComposerEventResult::Consumed
+            }
+            KeyCode::Home => {
+                self.move_cursor_home();
+                ComposerEventResult::Consumed
+            }
+            KeyCode::End => {
+                self.move_cursor_end();
+                ComposerEventResult::Consumed
+            }
+            _ => ComposerEventResult::Ignored,
         }
+    }
+
+    fn sync_text(&mut self) {
+        self.text = self.chars.iter().collect();
     }
 }

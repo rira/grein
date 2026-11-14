@@ -1,86 +1,41 @@
-//! TUI focus navigation and state management.
+//! Pane focus definitions and cyclic navigation.
 
-/// Identifies which pane in the TUI currently has user focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Represents the currently active pane in the TUI layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneFocus {
-    /// Sidebar pane (navigation / thread selection).
+    /// Bottom pane prompt composer (default active pane).
     #[default]
-    Sidebar,
-    /// Active thread transcript pane (center pane).
-    Transcript,
-    /// Composer input pane (prompt / message editor).
     Composer,
-    /// Inspector details pane.
-    Inspector,
+    /// Left pane active sessions overview.
+    Sessions,
+    /// Central chat conversation view.
+    Chat,
+    /// Right pane diff review and inspector view.
+    Diff,
 }
 
 impl PaneFocus {
-    /// Returns the next pane in forward cyclic navigation order.
+    /// Cycles forward to the next pane in sequence:
+    /// Composer -> Sessions -> Chat -> Diff -> Composer.
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
-            Self::Sidebar => Self::Transcript,
-            Self::Transcript => Self::Composer,
-            Self::Composer => Self::Inspector,
-            Self::Inspector => Self::Sidebar,
+            Self::Composer => Self::Sessions,
+            Self::Sessions => Self::Chat,
+            Self::Chat => Self::Diff,
+            Self::Diff => Self::Composer,
         }
     }
 
-    /// Returns the previous pane in backward cyclic navigation order.
+    /// Cycles backward to the previous pane in sequence:
+    /// Composer -> Diff -> Chat -> Sessions -> Composer.
     #[must_use]
-    pub const fn previous(self) -> Self {
+    pub const fn prev(self) -> Self {
         match self {
-            Self::Sidebar => Self::Inspector,
-            Self::Transcript => Self::Sidebar,
-            Self::Composer => Self::Transcript,
-            Self::Inspector => Self::Composer,
-        }
-    }
-}
-
-/// Navigation action triggered by keyboard shortcuts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FocusNavigationAction {
-    /// Forward navigation to next pane.
-    Tab,
-    /// Backward navigation to previous pane.
-    BackTab,
-}
-
-/// State machine managing the current active pane focus.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FocusManager {
-    current: PaneFocus,
-}
-
-impl Default for FocusManager {
-    fn default() -> Self {
-        Self::new(PaneFocus::Sidebar)
-    }
-}
-
-impl FocusManager {
-    /// Creates a new `FocusManager` initialized to the specified pane.
-    #[must_use]
-    pub const fn new(initial: PaneFocus) -> Self {
-        Self { current: initial }
-    }
-
-    /// Returns the currently focused pane.
-    #[must_use]
-    pub const fn current(&self) -> PaneFocus {
-        self.current
-    }
-
-    /// Updates focus according to the provided navigation action.
-    pub fn handle_action(&mut self, action: FocusNavigationAction) {
-        match action {
-            FocusNavigationAction::Tab => {
-                self.current = self.current.next();
-            }
-            FocusNavigationAction::BackTab => {
-                self.current = self.current.previous();
-            }
+            Self::Composer => Self::Diff,
+            Self::Sessions => Self::Composer,
+            Self::Chat => Self::Sessions,
+            Self::Diff => Self::Chat,
         }
     }
 }
