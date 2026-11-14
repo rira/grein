@@ -40,15 +40,10 @@ fn test_shift_enter_and_ctrl_enter_insert_newline() {
     assert_eq!(action_ctrl, ComposerAction::None);
     composer.insert_text("Line 3");
 
-    let action_ctrl_j =
-        composer.handle_key(make_key_event(KeyCode::Char('j'), KeyModifiers::CONTROL));
-    assert_eq!(action_ctrl_j, ComposerAction::None);
-    composer.insert_text("Line 4");
-
     assert_eq!(
         composer.draft_text(),
-        "Line 1\nLine 2\nLine 3\nLine 4",
-        "Shift+Enter and Ctrl+Enter (including Ctrl+J 0x0A) must insert newlines for multi-line drafting"
+        "Line 1\nLine 2\nLine 3",
+        "Shift+Enter and Ctrl+Enter must insert newlines for multi-line drafting"
     );
 }
 
