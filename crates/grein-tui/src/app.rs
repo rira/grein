@@ -1,114 +1,111 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Represents the four primary focusable panes in the TUI layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FocusPane {
+pub enum FocusedPane {
     #[default]
-    Tree,
-    Transcript,
+    Sessions,
+    Stream,
+    Inspector,
     Composer,
-    Blackboard,
 }
 
-impl FocusPane {
-    pub fn next(self) -> Self {
+impl FocusedPane {
+    /// Advances focus to the next pane in forward order:
+    /// Sessions -> Stream -> Inspector -> Composer -> Sessions.
+    #[must_use]
+    pub const fn next(self) -> Self {
         match self {
-            Self::Tree => Self::Transcript,
-            Self::Transcript => Self::Composer,
-            Self::Composer => Self::Blackboard,
-            Self::Blackboard => Self::Tree,
+            Self::Sessions => Self::Stream,
+            Self::Stream => Self::Inspector,
+            Self::Inspector => Self::Composer,
+            Self::Composer => Self::Sessions,
         }
     }
 
-    pub fn prev(self) -> Self {
+    /// Moves focus to the previous pane in reverse order:
+    /// Sessions -> Composer -> Inspector -> Stream -> Sessions.
+    #[must_use]
+    pub const fn prev(self) -> Self {
         match self {
-            Self::Tree => Self::Blackboard,
-            Self::Transcript => Self::Tree,
-            Self::Composer => Self::Transcript,
-            Self::Blackboard => Self::Composer,
+            Self::Sessions => Self::Composer,
+            Self::Composer => Self::Inspector,
+            Self::Inspector => Self::Stream,
+            Self::Stream => Self::Sessions,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Top-level application state for the Grein TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct App {
-    focus: FocusPane,
+    focused_pane: FocusedPane,
     composer_input: String,
     should_quit: bool,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl App {
+    /// Creates a new `App` instance with default initial state.
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            focus: FocusPane::Tree,
-            composer_input: String::new(),
-            should_quit: false,
-        }
+        Self::default()
     }
 
-    pub fn focus(&self) -> FocusPane {
-        self.focus
+    /// Returns the currently focused pane.
+    #[must_use]
+    pub const fn focused_pane(&self) -> FocusedPane {
+        self.focused_pane
     }
 
-    pub fn set_focus(&mut self, focus: FocusPane) {
-        self.focus = focus;
-    }
-
-    pub fn focus_next(&mut self) {
-        self.focus = self.focus.next();
-    }
-
-    pub fn focus_prev(&mut self) {
-        self.focus = self.focus.prev();
-    }
-
+    /// Returns the current text buffer in the composer pane.
+    #[must_use]
     pub fn composer_input(&self) -> &str {
         &self.composer_input
     }
 
-    pub fn take_composer_input(&mut self) -> String {
-        std::mem::take(&mut self.composer_input)
-    }
-
-    pub fn should_quit(&self) -> bool {
+    /// Returns `true` if the application has been requested to quit.
+    #[must_use]
+    pub const fn should_quit(&self) -> bool {
         self.should_quit
     }
 
-    pub fn quit(&mut self) {
-        self.should_quit = true;
+    /// Cycles focus forward to the next pane.
+    pub fn focus_next(&mut self) {
+        self.focused_pane = self.focused_pane.next();
     }
 
-    pub fn handle_key_event(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
-        }
+    /// Cycles focus backward to the previous pane.
+    pub fn focus_prev(&mut self) {
+        self.focused_pane = self.focused_pane.prev();
+    }
 
+    /// Handles an incoming terminal key event.
+    pub fn handle_key_event(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Tab => {
-                self.focus_next();
-            }
             KeyCode::BackTab => {
                 self.focus_prev();
             }
-            KeyCode::Char(c) => {
-                if self.focus == FocusPane::Composer {
-                    self.composer_input.push(c);
-                } else if c == 'q' {
-                    self.should_quit = true;
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.focus_prev();
+            }
+            KeyCode::Tab => {
+                self.focus_next();
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            KeyCode::Char(ch) if self.focused_pane == FocusedPane::Composer => {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.composer_input.push(ch);
                 }
             }
-            KeyCode::Backspace => {
-                if self.focus == FocusPane::Composer {
-                    self.composer_input.pop();
-                }
+            KeyCode::Backspace if self.focused_pane == FocusedPane::Composer => {
+                self.composer_input.pop();
             }
-            KeyCode::Esc => {
+            KeyCode::Char('q') | KeyCode::Esc if self.focused_pane != FocusedPane::Composer => {
                 self.should_quit = true;
             }
             _ => {}
@@ -119,40 +116,95 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
-    fn test_tab_cycles_focus_forward() {
-        let mut app = App::default();
-        assert_eq!(app.focus(), FocusPane::Tree);
-
-        app.focus_next();
-        assert_eq!(app.focus(), FocusPane::Transcript);
-
-        app.focus_next();
-        assert_eq!(app.focus(), FocusPane::Composer);
-
-        app.focus_next();
-        assert_eq!(app.focus(), FocusPane::Blackboard);
-
-        app.focus_next();
-        assert_eq!(app.focus(), FocusPane::Tree);
+    fn test_initial_focus_is_sessions() {
+        let app = App::new();
+        assert_eq!(app.focused_pane(), FocusedPane::Sessions);
+        assert_eq!(app.composer_input(), "");
+        assert!(!app.should_quit());
     }
 
     #[test]
-    fn test_backtab_cycles_focus_backward() {
-        let mut app = App::default();
-        assert_eq!(app.focus(), FocusPane::Tree);
+    fn test_tab_cycles_focus_forward() {
+        let mut app = App::new();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
 
-        app.focus_prev();
-        assert_eq!(app.focus(), FocusPane::Blackboard);
+        app.handle_key_event(tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Stream);
 
-        app.focus_prev();
-        assert_eq!(app.focus(), FocusPane::Composer);
+        app.handle_key_event(tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Inspector);
 
-        app.focus_prev();
-        assert_eq!(app.focus(), FocusPane::Transcript);
+        app.handle_key_event(tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-        app.focus_prev();
-        assert_eq!(app.focus(), FocusPane::Tree);
+        app.handle_key_event(tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Sessions);
+    }
+
+    #[test]
+    fn test_backtab_and_shift_tab_cycles_focus_backward() {
+        let mut app = App::new();
+        assert_eq!(app.focused_pane(), FocusedPane::Sessions);
+
+        // Reverse cycle via KeyCode::BackTab
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+
+        app.handle_key_event(backtab);
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+        app.handle_key_event(backtab);
+        assert_eq!(app.focused_pane(), FocusedPane::Inspector);
+
+        app.handle_key_event(backtab);
+        assert_eq!(app.focused_pane(), FocusedPane::Stream);
+
+        app.handle_key_event(backtab);
+        assert_eq!(app.focused_pane(), FocusedPane::Sessions);
+
+        // Reverse cycle via KeyCode::Tab + KeyModifiers::SHIFT
+        let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+
+        app.handle_key_event(shift_tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+        app.handle_key_event(shift_tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Inspector);
+
+        app.handle_key_event(shift_tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Stream);
+
+        app.handle_key_event(shift_tab);
+        assert_eq!(app.focused_pane(), FocusedPane::Sessions);
+    }
+
+    #[test]
+    fn test_composer_captures_character_input_and_backspace() {
+        let mut app = App::new();
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        app.handle_key_event(backtab);
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(app.composer_input(), "hi");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.composer_input(), "h");
+    }
+
+    #[test]
+    fn test_non_composer_panes_ignore_typing_and_allow_quit() {
+        let mut app = App::new();
+        assert_eq!(app.focused_pane(), FocusedPane::Sessions);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.composer_input(), "");
+        assert!(!app.should_quit());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.should_quit());
     }
 }
