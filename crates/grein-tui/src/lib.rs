@@ -1,7 +1,7 @@
-pub mod app;
-pub mod layout;
-pub mod render;
-pub mod runner;
-pub mod state;
+//! Terminal User Interface for Grein.
 
-pub use runner::run;
+pub mod ui;
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
