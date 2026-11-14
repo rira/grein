@@ -77,3 +77,5 @@ where
         (self.handler)(payload)
     }
 }
+
+pub type Pager = DefaultPagerRunner;

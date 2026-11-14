@@ -178,3 +178,5 @@ impl Composer {
         self.text = self.chars.iter().collect();
     }
 }
+
+pub type ComposerPane = Composer;
