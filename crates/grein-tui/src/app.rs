@@ -102,3 +102,48 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn test_composer_text_input_and_backspace() {
+        let mut app = App::new();
+        app.set_focused_pane(FocusPane::Composer);
+
+        // Edge case: backspace on an empty buffer should be a no-op without panicking
+        app.handle_key_event(key_event(KeyCode::Backspace));
+        assert_eq!(app.composer_input(), "");
+
+        // Append characters when Composer pane is focused
+        app.handle_key_event(key_event(KeyCode::Char('h')));
+        app.handle_key_event(key_event(KeyCode::Char('i')));
+        app.handle_key_event(key_event(KeyCode::Char('!')));
+        assert_eq!(app.composer_input(), "hi!");
+
+        // Backspace pops the last character while preserving buffer integrity
+        app.handle_key_event(key_event(KeyCode::Backspace));
+        assert_eq!(app.composer_input(), "hi");
+
+        // Append additional character after backspace
+        app.handle_key_event(key_event(KeyCode::Char('?')));
+        assert_eq!(app.composer_input(), "hi?");
+
+        // Pop remaining characters down to empty buffer
+        app.handle_key_event(key_event(KeyCode::Backspace));
+        app.handle_key_event(key_event(KeyCode::Backspace));
+        app.handle_key_event(key_event(KeyCode::Backspace));
+        assert_eq!(app.composer_input(), "");
+
+        // Verify subsequent backspace on emptied buffer maintains integrity
+        app.handle_key_event(key_event(KeyCode::Backspace));
+        assert_eq!(app.composer_input(), "");
+    }
+}
+
