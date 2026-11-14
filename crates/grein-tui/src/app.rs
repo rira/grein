@@ -252,6 +252,21 @@ impl App {
         &self.input_buffer
     }
 
+    pub fn composer_line_count(&self) -> u16 {
+        self.input_buffer.split('\n').count().max(1) as u16
+    }
+
+    pub fn composer_cursor_2d(&self) -> (u16, u16) {
+        let clamped_pos = self.cursor_position.min(self.input_buffer.len());
+        let prefix = &self.input_buffer[..clamped_pos];
+        let row = prefix.bytes().filter(|&b| b == b'\n').count() as u16;
+        let col = match prefix.rfind('\n') {
+            Some(idx) => prefix[idx + 1..].chars().count() as u16,
+            None => prefix.chars().count() as u16,
+        };
+        (col, row)
+    }
+
     pub fn last_submitted_prompt(&self) -> Option<String> {
         self.last_submitted_prompt.clone()
     }
@@ -438,11 +453,11 @@ impl App {
                 self.focus_prev();
                 return true;
             }
-            KeyCode::Char('[') => {
+            KeyCode::Char('[') if self.focused_pane != FocusedPane::Composer => {
                 self.set_blackboard_collapsed(true);
                 return true;
             }
-            KeyCode::Char(']') => {
+            KeyCode::Char(']') if self.focused_pane != FocusedPane::Composer => {
                 self.set_blackboard_collapsed(false);
                 return true;
             }
@@ -454,9 +469,28 @@ impl App {
                 }
             }
             KeyCode::Enter if self.focused_pane == FocusedPane::Composer => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.input_buffer.insert(self.cursor_position, '\n');
+                    self.cursor_position += 1;
+                    self.sync_focus_out();
+                    return true;
+                }
                 let prompt = std::mem::take(&mut self.input_buffer);
                 self.cursor_position = 0;
-                self.last_submitted_prompt = Some(prompt);
+                self.last_submitted_prompt = Some(prompt.clone());
+                self.submit_composer_prompt(prompt);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::Char('j') | KeyCode::Char('J')
+                if self.focused_pane == FocusedPane::Composer
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.input_buffer.insert(self.cursor_position, '\n');
+                self.cursor_position += 1;
                 self.sync_focus_out();
                 return true;
             }
@@ -466,7 +500,10 @@ impl App {
                 return true;
             }
             KeyCode::Char(c) if self.focused_pane == FocusedPane::Composer => {
-                if !key.modifiers.contains(KeyModifiers::ALT) {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     self.input_buffer.insert(self.cursor_position, c);
                     self.cursor_position += c.len_utf8();
                     self.sync_focus_out();
@@ -523,6 +560,11 @@ impl App {
                 return true;
             }
             _ => {
+                if self.focused_pane == FocusedPane::Tree {
+                    let _ = self.handle_key_tree(key);
+                    self.sync_focus_out();
+                    return true;
+                }
                 if self.focused_pane == FocusedPane::Blackboard {
                     return self.blackboard_pane.handle_key(key);
                 }
@@ -643,6 +685,18 @@ mod tests {
 
         assert!(!app.should_quit());
         assert_eq!(app.composer_content(), "q");
+    }
+
+    #[test]
+    fn test_composer_typing_immunity_for_bracket_keys() {
+        let mut app = App::new();
+        app.set_focus(FocusPane::Composer);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+
+        assert!(!app.is_blackboard_collapsed());
+        assert_eq!(app.composer_content(), "[]");
     }
 
     #[test]
