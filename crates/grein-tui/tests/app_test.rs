@@ -1,76 +1,77 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use grein_tui::app::{App, FocusPane};
 
-#[test]
-fn focus_pane_cycles_forward_through_all_four_panes() {
-    let mut app = App::new();
-    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
-
-    app.focus_next();
-    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
-
-    app.focus_next();
-    assert_eq!(app.focused_pane(), FocusPane::Composer);
-
-    app.focus_next();
-    assert_eq!(app.focused_pane(), FocusPane::ContextInspector);
-
-    app.focus_next();
-    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 #[test]
-fn focus_pane_cycles_backward_through_all_four_panes() {
-    let mut app = App::new();
-    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
+fn default_focus_starts_on_sidebar_and_cycles_forward_through_four_panes() {
+    let mut app = App::default();
+    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 
-    app.focus_prev();
-    assert_eq!(app.focused_pane(), FocusPane::ContextInspector);
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Transcript);
 
-    app.focus_prev();
+    app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    app.focus_prev();
-    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Inspector);
 
-    app.focus_prev();
-    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 }
 
 #[test]
-fn handle_key_event_tab_and_backtab_navigate_focus() {
-    let mut app = App::new();
-    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
+fn backtab_cycles_focus_backward_through_four_panes() {
+    let mut app = App::default();
+    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 
-    let tab_event = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-    app.handle_key_event(tab_event);
-    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
+    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.focused_pane(), FocusPane::Inspector);
 
-    app.handle_key_event(tab_event);
+    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    let backtab_event = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
-    app.handle_key_event(backtab_event);
-    assert_eq!(app.focused_pane(), FocusPane::ChatStream);
+    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.focused_pane(), FocusPane::Transcript);
 
-    app.handle_key_event(backtab_event);
-    assert_eq!(app.focused_pane(), FocusPane::WorkspaceTree);
-
-    app.handle_key_event(backtab_event);
-    assert_eq!(app.focused_pane(), FocusPane::ContextInspector);
+    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 }
 
 #[test]
-fn focus_pane_enum_next_and_prev_methods_are_symmetric() {
-    let panes = [
-        FocusPane::WorkspaceTree,
-        FocusPane::ChatStream,
-        FocusPane::Composer,
-        FocusPane::ContextInspector,
-    ];
+fn character_input_routes_to_composer_only_when_composer_focused() {
+    let mut app = App::default();
 
-    for pane in panes {
-        assert_eq!(pane.next().prev(), pane);
-        assert_eq!(pane.prev().next(), pane);
-    }
+    // Typing while Sidebar is focused does not mutate composer buffer
+    app.handle_key_event(key(KeyCode::Char('x')));
+    assert_eq!(app.composer_input(), "");
+
+    // Focus Composer (Sidebar -> Transcript -> Composer)
+    app.handle_key_event(key(KeyCode::Tab));
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
+
+    app.handle_key_event(key(KeyCode::Char('h')));
+    app.handle_key_event(key(KeyCode::Char('i')));
+    assert_eq!(app.composer_input(), "hi");
+
+    app.handle_key_event(key(KeyCode::Backspace));
+    assert_eq!(app.composer_input(), "h");
+}
+
+#[test]
+fn quit_key_stops_app_only_outside_composer_focus() {
+    let mut app = App::default();
+    app.set_focused_pane(FocusPane::Composer);
+
+    app.handle_key_event(key(KeyCode::Char('q')));
+    assert!(app.is_running());
+    assert_eq!(app.composer_input(), "q");
+
+    app.set_focused_pane(FocusPane::Sidebar);
+    app.handle_key_event(key(KeyCode::Char('q')));
+    assert!(!app.is_running());
 }
