@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use grein_tui::app::{AnchorItem, AppState, PaneFocus, ThreadItem};
 use grein_tui::render::{render_app, render_markdown_lines, render_tree_view};
 use ratatui::backend::TestBackend;

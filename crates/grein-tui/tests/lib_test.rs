@@ -2,6 +2,7 @@ use std::future::Future;
 use std::io::Result as IoResult;
 
 // Assert all required public modules and re-exports are publicly accessible
+#[allow(unused_imports)]
 use grein_tui::{
     app, composer, diff_card, editor, events, focus, layout, pager, panes, state, status,
 };
