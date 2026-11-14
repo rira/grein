@@ -54,3 +54,5 @@ impl ExternalEditorRunner for SystemEditorRunner {
         }
     }
 }
+
+pub type EditorPane = SystemEditorRunner;

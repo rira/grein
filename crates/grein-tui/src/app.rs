@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::layout::PaneFocus;
+pub use crate::layout::PaneFocus;
 use crate::panes::blackboard::{BlackboardAction, BlackboardPane};
 
 #[derive(Debug, Clone, Default)]
@@ -135,5 +135,11 @@ impl App {
             let blackboard_area = Rect::new(x, area.y, width, area.height);
             self.blackboard.render(frame, blackboard_area);
         }
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new(AppConfig::default())
     }
 }

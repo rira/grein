@@ -39,3 +39,5 @@ impl PaneFocus {
         }
     }
 }
+
+pub struct FocusManager;

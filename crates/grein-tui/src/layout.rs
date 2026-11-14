@@ -5,3 +5,5 @@ pub enum PaneFocus {
     Composer,
     Blackboard,
 }
+
+pub struct LayoutManager;
