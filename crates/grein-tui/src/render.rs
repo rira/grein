@@ -1,6 +1,6 @@
 use crate::app::{AppState, PaneFocus};
-use crate::layout::compute_layout_with_composer_lines;
-use ratatui::layout::{Position, Rect};
+use crate::layout::compute_layout;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -173,11 +173,7 @@ pub fn render_tree_view(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 pub fn render_app(f: &mut Frame, state: &AppState) {
-    let layout = compute_layout_with_composer_lines(
-        f.area(),
-        state.blackboard_collapsed,
-        state.composer_line_count(),
-    );
+    let layout = compute_layout(f.area(), state.blackboard_collapsed);
 
     render_tree_view(f, layout.tree_area, state);
 
@@ -223,23 +219,6 @@ pub fn render_app(f: &mut Frame, state: &AppState) {
         .borders(Borders::ALL)
         .border_style(composer_border_style)
         .title("Composer");
-    let composer_lines: Vec<Line<'static>> = state
-        .input_buffer
-        .split('\n')
-        .map(|l| Line::raw(l.to_string()))
-        .collect();
-    let composer_widget = Paragraph::new(composer_lines).block(composer_block);
+    let composer_widget = Paragraph::new(state.input_buffer.as_str()).block(composer_block);
     f.render_widget(composer_widget, layout.composer_area);
-
-    if state.active_focus == PaneFocus::Composer
-        || state.focused_pane == PaneFocus::Composer
-        || state.focus == PaneFocus::Composer
-    {
-        let (col, row) = state.composer_cursor_2d();
-        let inner_width = layout.composer_area.width.saturating_sub(2);
-        let inner_height = layout.composer_area.height.saturating_sub(2);
-        let cursor_x = layout.composer_area.x + 1 + col.min(inner_width.saturating_sub(1));
-        let cursor_y = layout.composer_area.y + 1 + row.min(inner_height.saturating_sub(1));
-        f.set_cursor_position(Position::new(cursor_x, cursor_y));
-    }
 }
