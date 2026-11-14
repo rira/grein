@@ -127,16 +127,34 @@ pub fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
 
 pub fn render_tree_view(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines = Vec::new();
+    let selected = state.tree.selected_index();
+    let mut row_idx = 0usize;
     for thread in &state.threads {
+        let style = if selected == Some(row_idx) {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
         lines.push(Line::from(vec![Span::styled(
             format!("📁 {}", thread.title),
-            Style::default().add_modifier(Modifier::BOLD),
+            style,
         )]));
+        row_idx += 1;
         for anchor in &thread.anchors {
-            lines.push(Line::from(vec![Span::raw(format!(
-                "  ⚓ {}",
-                anchor.label
-            ))]));
+            let anchor_style = if selected == Some(row_idx) {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("  ⚓ {}", anchor.label),
+                anchor_style,
+            )]));
+            row_idx += 1;
         }
     }
     let border_style = if state.active_focus == PaneFocus::Tree {
