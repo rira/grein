@@ -4,32 +4,36 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum FocusPane {
     #[default]
     Tree,
-    Chat,
+    Transcript,
+    Diff,
     Composer,
-    Terminal,
 }
 
 impl FocusPane {
     pub fn next(self) -> Self {
         match self {
-            Self::Tree => Self::Chat,
-            Self::Chat => Self::Composer,
-            Self::Composer => Self::Terminal,
-            Self::Terminal => Self::Tree,
+            Self::Tree => Self::Transcript,
+            Self::Transcript => Self::Diff,
+            Self::Diff => Self::Composer,
+            Self::Composer => Self::Tree,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Tree => Self::Terminal,
-            Self::Chat => Self::Tree,
-            Self::Composer => Self::Chat,
-            Self::Terminal => Self::Composer,
+            Self::Tree => Self::Composer,
+            Self::Transcript => Self::Tree,
+            Self::Diff => Self::Transcript,
+            Self::Composer => Self::Diff,
         }
+    }
+
+    pub fn previous(self) -> Self {
+        self.prev()
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct App {
     pub focus: FocusPane,
     pub composer_input: String,
@@ -38,44 +42,55 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            focus: FocusPane::Tree,
+            composer_input: String::new(),
+            should_quit: false,
+        }
+    }
+
+    pub fn focus_next(&mut self) {
+        self.focus = self.focus.next();
+    }
+
+    pub fn focus_prev(&mut self) {
+        self.focus = self.focus.prev();
+    }
+
+    pub fn focus_previous(&mut self) {
+        self.focus = self.focus.prev();
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab => {
-                self.focus = self.focus.next();
-                return;
+                self.focus_next();
             }
             KeyCode::BackTab => {
-                self.focus = self.focus.prev();
-                return;
+                self.focus_prev();
             }
-            _ => {}
-        }
-
-        match self.focus {
-            FocusPane::Composer => match key.code {
-                KeyCode::Esc => {
+            KeyCode::Esc => {
+                if self.focus == FocusPane::Composer {
                     self.focus = FocusPane::Tree;
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.composer_input.push(c);
-                }
-                KeyCode::Backspace => {
+            }
+            KeyCode::Backspace => {
+                if self.focus == FocusPane::Composer {
                     self.composer_input.pop();
                 }
-                _ => {}
-            },
-            _ => match key.code {
-                KeyCode::Char('q') => {
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                    self.should_quit = true;
+                    return;
+                }
+                if self.focus == FocusPane::Composer {
+                    self.composer_input.push(c);
+                } else if c == 'q' {
                     self.should_quit = true;
                 }
-                KeyCode::Char('i') => {
-                    self.focus = FocusPane::Composer;
-                }
-                _ => {}
-            },
+            }
+            _ => {}
         }
     }
 }
@@ -83,6 +98,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn test_composer_esc_returns_to_tree_focus() {
