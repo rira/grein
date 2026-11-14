@@ -26,7 +26,7 @@ pub fn compute_layout(area: Rect, blackboard_collapsed: bool) -> AppLayout {
     if blackboard_collapsed {
         let horizontal = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(22), Constraint::Percentage(78)])
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
             .split(top_area);
         AppLayout {
             tree_area: horizontal[0],
@@ -38,9 +38,9 @@ pub fn compute_layout(area: Rect, blackboard_collapsed: bool) -> AppLayout {
         let horizontal = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(22),
-                Constraint::Percentage(56),
-                Constraint::Percentage(22),
+                Constraint::Percentage(34),
+                Constraint::Percentage(46),
+                Constraint::Percentage(20),
             ])
             .split(top_area);
         AppLayout {
