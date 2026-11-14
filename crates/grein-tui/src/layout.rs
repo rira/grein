@@ -1,6 +1,16 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PaneFocus {
+    #[default]
+    Workspace,
+    Composer,
+    Blackboard,
+}
+
+pub struct LayoutManager;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppLayout {
     pub tree_area: Rect,
     pub transcript_area: Rect,
@@ -8,44 +18,42 @@ pub struct AppLayout {
     pub composer_area: Rect,
 }
 
+pub type WorkspaceLayout = AppLayout;
+
 pub fn compute_layout(area: Rect, blackboard_collapsed: bool) -> AppLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(area);
 
-    let composer_area = vertical[1];
     let top_area = vertical[0];
+    let composer_area = vertical[1];
+
+    let main_horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(top_area);
+
+    let tree_area = main_horizontal[0];
+    let right_area = main_horizontal[1];
 
     if blackboard_collapsed {
-        let horizontal = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(22), Constraint::Percentage(78)])
-            .split(top_area);
         AppLayout {
-            tree_area: horizontal[0],
-            transcript_area: horizontal[1],
+            tree_area,
+            transcript_area: right_area,
             blackboard_area: None,
             composer_area,
         }
     } else {
-        let horizontal = Layout::default()
+        let right_split = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(22),
-                Constraint::Percentage(56),
-                Constraint::Percentage(22),
-            ])
-            .split(top_area);
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(right_area);
         AppLayout {
-            tree_area: horizontal[0],
-            transcript_area: horizontal[1],
-            blackboard_area: Some(horizontal[2]),
+            tree_area,
+            transcript_area: right_split[0],
+            blackboard_area: Some(right_split[1]),
             composer_area,
         }
     }
 }
-
-pub use crate::app::FocusedPane as PaneFocus;
-
-pub struct LayoutManager;
