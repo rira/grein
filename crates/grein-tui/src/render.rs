@@ -245,8 +245,13 @@ pub fn render_app(f: &mut Frame, state: &AppState) {
 
     let transcript_lines = render_markdown_lines(&state.active_transcript_md);
     let transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
-    let transcript_scroll_y =
-        (transcript_lines.len() as u16).saturating_sub(transcript_inner_height);
+    let max_scroll_u16 = (transcript_lines.len() as u16).saturating_sub(transcript_inner_height);
+    let vp = state.transcript_viewport(state.active_thread_id());
+    let transcript_scroll_y = if vp.auto_scroll() {
+        max_scroll_u16
+    } else {
+        (vp.scroll_offset() as u16).min(max_scroll_u16)
+    };
     let transcript_block = Block::default()
         .title(" Transcript ")
         .borders(Borders::ALL)
