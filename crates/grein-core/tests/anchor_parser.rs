@@ -190,6 +190,43 @@ fn test_empty_and_no_anchor_markdown() {
 }
 
 #[test]
+fn test_numbered_list_multibyte_whitespace_does_not_panic() {
+    let nbsp = "1.\u{00A0}**Database Schema**: Setup tables and indexes.\n";
+    let anchors = parse_anchors(nbsp);
+    assert!(anchors
+        .iter()
+        .all(|a| a.kind == AnchorKind::NumberedList || a.kind == AnchorKind::Heading));
+
+    let ideographic = "2.\u{3000}Architecture Boundary: Enforce component boundaries.\n";
+    let anchors = parse_anchors(ideographic);
+    for anchor in &anchors {
+        assert!(!anchor.title.is_empty());
+    }
+
+    let mixed = "3.\u{00A0}\u{3000} Component Interfaces: All components expose contracts.\n";
+    let _ = parse_anchors(mixed);
+}
+
+#[test]
+fn test_numbered_list_multibyte_whitespace_byte_ranges_are_valid() {
+    let markdown = "# Plan\n\n1.\u{3000}**Zero-Null Policy**: Null values are eradicated.\n2.\u{00A0}Universal Architecture: Tier one and tier two boundaries.\n";
+    let anchors = parse_anchors(markdown);
+    assert!(!anchors.is_empty());
+    for anchor in &anchors {
+        assert!(markdown.is_char_boundary(anchor.byte_range.start));
+        assert!(markdown.is_char_boundary(anchor.byte_range.end));
+        assert!(anchor.byte_range.start <= anchor.byte_range.end);
+    }
+}
+
+#[test]
+fn test_slugify_lowercases_unicode_alphanumerics() {
+    let anchors = parse_anchors("## Ünïcode Ärchitecture Überblick\n");
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].slug, "ünïcode-ärchitecture-überblick");
+}
+
+#[test]
 fn test_coding_agent_markdown_turn_comprehensive() {
     let markdown = r#"# Architectural Analysis & Implementation Plan
 

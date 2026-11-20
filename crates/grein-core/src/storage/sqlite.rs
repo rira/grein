@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 pub struct SqliteStorage {
@@ -16,8 +16,85 @@ pub struct SqliteStorage {
     initialized: bool,
 }
 
+fn conversion_error<E: std::error::Error + Send + Sync + 'static>(idx: usize, e: E) -> CoreError {
+    CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
+        idx,
+        rusqlite::types::Type::Text,
+        Box::new(e),
+    ))
+}
+
+fn parse_uuid(idx: usize, s: &str) -> Result<Uuid, CoreError> {
+    Uuid::parse_str(s).map_err(|e| conversion_error(idx, e))
+}
+
+fn node_from_row(row: &rusqlite::Row<'_>) -> Result<ConversationNode, CoreError> {
+    let id_str: String = row.get(0)?;
+    let parent_id_str: Option<String> = row.get(1)?;
+    let role_str: String = row.get(2)?;
+    let content: String = row.get(3)?;
+
+    let node_id = parse_uuid(0, &id_str)?;
+    let parent_id = match parent_id_str {
+        Some(s) => Some(NodeId(parse_uuid(1, &s)?)),
+        None => None,
+    };
+    let role: AuthorRole = serde_json::from_str(&format!("\"{}\"", role_str))?;
+
+    Ok(ConversationNode {
+        id: NodeId(node_id),
+        parent_id,
+        role,
+        content,
+    })
+}
+
+fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread, CoreError> {
+    let id_str: String = row.get(0)?;
+    let parent_node_id_str: String = row.get(1)?;
+    let anchor_id_str: String = row.get(2)?;
+    let active_leaf_id_str: String = row.get(3)?;
+    let status_str: String = row.get(4)?;
+
+    let id = parse_uuid(0, &id_str)?;
+    let parent_node_id = parse_uuid(1, &parent_node_id_str)?;
+    let anchor_id = parse_uuid(2, &anchor_id_str)?;
+    let active_leaf_id = parse_uuid(3, &active_leaf_id_str)?;
+    let status: ThreadStatus = serde_json::from_str(&format!("\"{}\"", status_str))?;
+
+    Ok(Thread {
+        id: ThreadId(id),
+        parent_node_id: NodeId(parent_node_id),
+        head_node_id: NodeId(parent_node_id),
+        anchor_id: AnchorId(anchor_id),
+        active_leaf_id: NodeId(active_leaf_id),
+        leaf_node_id: NodeId(active_leaf_id),
+        status,
+        state: status,
+    })
+}
+
+fn anchor_from_row(row: &rusqlite::Row<'_>) -> Result<Anchor, rusqlite::Error> {
+    let level: u8 = row.get(0)?;
+    let title: String = row.get(1)?;
+    let slug: String = row.get(2)?;
+    let line_number: i64 = row.get(3)?;
+    Ok(Anchor {
+        level,
+        title,
+        slug,
+        line_number: usize::try_from(line_number).unwrap_or(0),
+    })
+}
+
 impl SqliteStorage {
     pub fn new(mut conn: Connection) -> Result<Self, CoreError> {
+        // Pragmas must be applied outside of a transaction and before migrations.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;",
+        )?;
         Self::apply_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -43,8 +120,14 @@ impl SqliteStorage {
         self.initialized
     }
 
+    fn lock(&self) -> Result<MutexGuard<'_, Connection>, CoreError> {
+        self.conn
+            .lock()
+            .map_err(|_| CoreError::SyncError("sqlite connection mutex poisoned".to_string()))
+    }
+
     pub fn run_migrations(&self) -> Result<(), CoreError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock()?;
         Self::apply_migrations(&mut conn)
     }
 
@@ -67,7 +150,9 @@ impl SqliteStorage {
                 anchor_id TEXT NOT NULL,
                 active_leaf_id TEXT NOT NULL,
                 status TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+                FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
             );
             CREATE INDEX IF NOT EXISTS idx_threads_parent_node ON threads(parent_node_id);
 
@@ -95,7 +180,7 @@ impl SqliteStorage {
                 kind TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_blackboard_entries_key ON blackboard_entries(key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_blackboard_entries_key_unique ON blackboard_entries(key);
             CREATE INDEX IF NOT EXISTS idx_blackboard_entries_kind ON blackboard_entries(kind);",
         )?;
         tx.commit()?;
@@ -103,7 +188,7 @@ impl SqliteStorage {
     }
 
     pub fn table_exists(&self, table_name: &str) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let count: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
             params![table_name],
@@ -113,7 +198,7 @@ impl SqliteStorage {
     }
 
     pub fn list_tables(&self) -> Result<Vec<String>, CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         let mut tables = Vec::new();
@@ -124,7 +209,7 @@ impl SqliteStorage {
     }
 
     pub fn insert_anchor(&self, anchor_id: &Uuid, anchor: &Anchor) -> Result<(), CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         conn.execute(
             "INSERT INTO anchors (id, level, title, slug, line_number, created_at)
@@ -141,8 +226,52 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn get_anchor<B: Borrow<Uuid>>(&self, anchor_id: B) -> Result<Option<Anchor>, CoreError> {
+        let conn = self.lock()?;
+        let mut stmt =
+            conn.prepare("SELECT level, title, slug, line_number FROM anchors WHERE id = ?1")?;
+        let mut rows = stmt.query(params![anchor_id.borrow().to_string()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(anchor_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn link_node_anchor<B1: Borrow<Uuid>, B2: Borrow<Uuid>>(
+        &self,
+        node_id: B1,
+        anchor_id: B2,
+    ) -> Result<(), CoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO node_anchors (node_id, anchor_id) VALUES (?1, ?2)",
+            params![node_id.borrow().to_string(), anchor_id.borrow().to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_anchors_for_node<B: Borrow<Uuid>>(
+        &self,
+        node_id: B,
+    ) -> Result<Vec<Anchor>, CoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.level, a.title, a.slug, a.line_number
+             FROM anchors a
+             JOIN node_anchors na ON na.anchor_id = a.id
+             WHERE na.node_id = ?1
+             ORDER BY a.line_number ASC, a.rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![node_id.borrow().to_string()], anchor_from_row)?;
+        let mut anchors = Vec::new();
+        for r in rows {
+            anchors.push(r?);
+        }
+        Ok(anchors)
+    }
+
     pub fn insert_node(&self, node: &ConversationNode) -> Result<(), CoreError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock()?;
 
         if let Some(parent_id) = node.parent_id {
             if *parent_id == *node.id {
@@ -185,44 +314,14 @@ impl SqliteStorage {
 
     pub fn get_node<B: Borrow<Uuid>>(&self, id: B) -> Result<Option<ConversationNode>, CoreError> {
         let id_ref = id.borrow();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt =
             conn.prepare("SELECT id, parent_id, role, content FROM nodes WHERE id = ?1")?;
         let mut rows = stmt.query(params![id_ref.to_string()])?;
 
-        if let Some(row) = rows.next()? {
-            let id_str: String = row.get(0)?;
-            let parent_id_str: Option<String> = row.get(1)?;
-            let role_str: String = row.get(2)?;
-            let content: String = row.get(3)?;
-
-            let node_id = Uuid::parse_str(&id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?;
-            let parent_id = match parent_id_str {
-                Some(s) => Some(NodeId(Uuid::parse_str(&s).map_err(|e| {
-                    CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    ))
-                })?)),
-                None => None,
-            };
-            let role: AuthorRole = serde_json::from_str(&format!("\"{}\"", role_str))?;
-
-            Ok(Some(ConversationNode {
-                id: NodeId(node_id),
-                parent_id,
-                role,
-                content,
-            }))
-        } else {
-            Ok(None)
+        match rows.next()? {
+            Some(row) => Ok(Some(node_from_row(row)?)),
+            None => Ok(None),
         }
     }
 
@@ -231,46 +330,43 @@ impl SqliteStorage {
         parent_id: B,
     ) -> Result<Vec<ConversationNode>, CoreError> {
         let pid_ref = parent_id.borrow();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, role, content FROM nodes WHERE parent_id = ?1 ORDER BY created_at ASC",
+            "SELECT id, parent_id, role, content FROM nodes WHERE parent_id = ?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query(params![pid_ref.to_string()])?;
 
         let mut children = Vec::new();
         while let Some(row) = rows.next()? {
-            let id_str: String = row.get(0)?;
-            let parent_id_str: Option<String> = row.get(1)?;
-            let role_str: String = row.get(2)?;
-            let content: String = row.get(3)?;
-
-            let node_id = Uuid::parse_str(&id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?;
-            let parent_id = match parent_id_str {
-                Some(s) => Some(NodeId(Uuid::parse_str(&s).map_err(|e| {
-                    CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    ))
-                })?)),
-                None => None,
-            };
-            let role: AuthorRole = serde_json::from_str(&format!("\"{}\"", role_str))?;
-
-            children.push(ConversationNode {
-                id: NodeId(node_id),
-                parent_id,
-                role,
-                content,
-            });
+            children.push(node_from_row(row)?);
         }
         Ok(children)
+    }
+
+    pub fn list_nodes(&self) -> Result<Vec<ConversationNode>, CoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, role, content FROM nodes ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(node_from_row(row)?);
+        }
+        Ok(nodes)
+    }
+
+    pub fn list_root_nodes(&self) -> Result<Vec<ConversationNode>, CoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, role, content FROM nodes WHERE parent_id IS NULL ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut nodes = Vec::new();
+        while let Some(row) = rows.next()? {
+            nodes.push(node_from_row(row)?);
+        }
+        Ok(nodes)
     }
 
     pub fn get_trunk_path<B: Borrow<Uuid>>(
@@ -311,7 +407,7 @@ impl SqliteStorage {
     ) -> Result<ThreadId, CoreError> {
         let p_ref = parent_node_id.borrow();
         let a_ref = anchor_id.borrow();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
 
         let parent_exists: i64 = conn.query_row(
             "SELECT count(*) FROM nodes WHERE id = ?1",
@@ -325,7 +421,7 @@ impl SqliteStorage {
         let thread_id = Uuid::now_v7();
         let status_str = serde_json::to_string(&ThreadStatus::Idle)?;
         let status_trimmed = status_str.trim_matches('"');
-        let now = 0i64;
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         conn.execute(
             "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at)
@@ -345,62 +441,38 @@ impl SqliteStorage {
 
     pub fn get_thread<B: Borrow<Uuid>>(&self, thread_id: B) -> Result<Option<Thread>, CoreError> {
         let t_ref = thread_id.borrow();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, parent_node_id, anchor_id, active_leaf_id, status FROM threads WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![t_ref.to_string()])?;
 
-        if let Some(row) = rows.next()? {
-            let id_str: String = row.get(0)?;
-            let parent_node_id_str: String = row.get(1)?;
-            let anchor_id_str: String = row.get(2)?;
-            let active_leaf_id_str: String = row.get(3)?;
-            let status_str: String = row.get(4)?;
-
-            let id = Uuid::parse_str(&id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?;
-            let parent_node_id = Uuid::parse_str(&parent_node_id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?;
-            let anchor_id = Uuid::parse_str(&anchor_id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?;
-            let active_leaf_id = Uuid::parse_str(&active_leaf_id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?;
-            let status: ThreadStatus = serde_json::from_str(&format!("\"{}\"", status_str))?;
-
-            Ok(Some(Thread {
-                id: ThreadId(id),
-                parent_node_id: NodeId(parent_node_id),
-                head_node_id: NodeId(parent_node_id),
-                anchor_id: AnchorId(anchor_id),
-                active_leaf_id: NodeId(active_leaf_id),
-                leaf_node_id: NodeId(active_leaf_id),
-                status,
-                state: status,
-            }))
-        } else {
-            Ok(None)
+        match rows.next()? {
+            Some(row) => Ok(Some(thread_from_row(row)?)),
+            None => Ok(None),
         }
+    }
+
+    pub fn list_threads(&self) -> Result<Vec<Thread>, CoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status FROM threads ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut threads = Vec::new();
+        while let Some(row) = rows.next()? {
+            threads.push(thread_from_row(row)?);
+        }
+        Ok(threads)
+    }
+
+    pub fn delete_thread<B: Borrow<Uuid>>(&self, thread_id: B) -> Result<bool, CoreError> {
+        let conn = self.lock()?;
+        let affected = conn.execute(
+            "DELETE FROM threads WHERE id = ?1",
+            params![thread_id.borrow().to_string()],
+        )?;
+        Ok(affected > 0)
     }
 
     pub fn get_thread_leaf<B: Borrow<Uuid>>(&self, thread_id: B) -> Result<NodeId, CoreError> {
@@ -422,7 +494,7 @@ impl SqliteStorage {
     ) -> Result<(), CoreError> {
         let t_ref = thread_id.borrow();
         let l_ref = leaf_id.borrow();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let leaf_exists: i64 = conn.query_row(
             "SELECT count(*) FROM nodes WHERE id = ?1",
             params![l_ref.to_string()],
@@ -456,7 +528,7 @@ impl SqliteStorage {
         status: ThreadStatus,
     ) -> Result<(), CoreError> {
         let t_ref = thread_id.borrow();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock()?;
         let status_str = serde_json::to_string(&status)?;
         let status_trimmed = status_str.trim_matches('"');
 
@@ -491,12 +563,12 @@ impl SqliteStorage {
     }
 
     pub fn insert_blackboard_entry(&self, entry: &BlackboardEntry) -> Result<(), CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         conn.execute(
             "INSERT INTO blackboard_entries (id, key, value, kind, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET
-                key = excluded.key,
+             ON CONFLICT(key) DO UPDATE SET
+                id = excluded.id,
                 value = excluded.value,
                 kind = excluded.kind,
                 created_at = excluded.created_at",
@@ -512,7 +584,7 @@ impl SqliteStorage {
     }
 
     pub fn get_blackboard_entry(&self, key: &str) -> Result<Option<BlackboardEntry>, CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, key, value, kind, created_at FROM blackboard_entries WHERE key = ?1",
         )?;
@@ -525,13 +597,7 @@ impl SqliteStorage {
             let kind_str: String = row.get(3)?;
             let created_at: i64 = row.get(4)?;
 
-            let id = BlackboardEntryId(Uuid::parse_str(&id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?);
+            let id = BlackboardEntryId(parse_uuid(0, &id_str)?);
             let kind = kind_str.parse::<BlackboardEntryKind>()?;
 
             Ok(Some(BlackboardEntry {
@@ -547,7 +613,7 @@ impl SqliteStorage {
     }
 
     pub fn list_blackboard_entries(&self) -> Result<Vec<BlackboardEntry>, CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, key, value, kind, created_at FROM blackboard_entries ORDER BY created_at ASC",
         )?;
@@ -563,13 +629,7 @@ impl SqliteStorage {
         let mut entries = Vec::new();
         for r in rows {
             let (id_str, key_str, value_str, kind_str, created_at) = r?;
-            let id = BlackboardEntryId(Uuid::parse_str(&id_str).map_err(|e| {
-                CoreError::Database(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                ))
-            })?);
+            let id = BlackboardEntryId(parse_uuid(0, &id_str)?);
             let kind = kind_str.parse::<BlackboardEntryKind>()?;
             entries.push(BlackboardEntry {
                 id,
@@ -583,7 +643,7 @@ impl SqliteStorage {
     }
 
     pub fn delete_blackboard_entry(&self, key: &str) -> Result<bool, CoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock()?;
         let affected = conn.execute(
             "DELETE FROM blackboard_entries WHERE key = ?1",
             params![key],
