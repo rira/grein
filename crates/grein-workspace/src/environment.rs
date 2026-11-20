@@ -39,7 +39,7 @@ impl EnvironmentDetector {
 
     pub fn detect<P: AsRef<Path>>(&self, path: P) -> GitEnvironmentStatus {
         let path = path.as_ref();
-        let git_repo_detected = path.join(".git").exists();
+        let git_repo_detected = path.ancestors().any(|p| p.join(".git").exists());
         let git_binary_present = self.git_binary_available;
 
         let environment = if git_repo_detected && git_binary_present {
