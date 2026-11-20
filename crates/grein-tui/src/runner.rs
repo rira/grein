@@ -216,7 +216,13 @@ impl App {
             let title = turns
                 .iter()
                 .find(|(role, _)| *role == AuthorRole::User)
-                .map(|(_, content)| content.lines().next().unwrap_or("Active Session").to_string())
+                .map(|(_, content)| {
+                    content
+                        .lines()
+                        .next()
+                        .unwrap_or("Active Session")
+                        .to_string()
+                })
                 .unwrap_or_else(|| "Active Session".to_string());
             self.threads.push(ThreadItem {
                 id: ThreadId::now_v7().to_string(),
