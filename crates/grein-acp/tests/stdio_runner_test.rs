@@ -1,4 +1,7 @@
-use grein_acp::{JsonRpcMessage, JsonRpcRequest, StdioProcessConfig, StdioProcessRunner};
+use grein_acp::{
+    AcpStdioDriver, AgentDriver, JsonRpcMessage, JsonRpcRequest, StdioProcessConfig,
+    StdioProcessRunner,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -104,4 +107,78 @@ async fn test_graceful_process_termination() {
         exit_status.success(),
         "Gracefully terminated process should yield success status"
     );
+}
+
+#[tokio::test]
+async fn test_notification_streaming() {
+    let script = r#"printf '{"jsonrpc":"2.0","method":"stream/chunk","params":{"text":"one"}}\n{"jsonrpc":"2.0","method":"stream/chunk","params":{"text":"two"}}\n'; sleep 2"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()]);
+    let mut runner = StdioProcessRunner::spawn(config)
+        .await
+        .expect("Subprocess should start successfully");
+
+    let mut notifications = runner
+        .take_notification_rx()
+        .expect("Notification receiver must be available once");
+
+    for expected in ["one", "two"] {
+        let notification = timeout(Duration::from_secs(2), notifications.recv())
+            .await
+            .expect("Timed out waiting for notification")
+            .expect("Notification channel should yield a frame");
+        assert_eq!(notification.jsonrpc, "2.0");
+        assert_eq!(notification.method, "stream/chunk");
+        let text = notification
+            .params
+            .as_ref()
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str());
+        assert_eq!(text, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn test_large_stderr_output_is_drained_without_deadlock() {
+    // ~320KB of stderr output, well beyond the 64KB OS pipe buffer and 128KB threshold.
+    let script = r#"i=0; while [ $i -lt 4000 ]; do echo "0123456789012345678901234567890123456789012345678901234567890123456789012345678" >&2; i=$((i+1)); done; printf '{"jsonrpc":"2.0","method":"done"}\n'; sleep 2"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()]);
+    let mut runner = StdioProcessRunner::spawn(config)
+        .await
+        .expect("Subprocess should start successfully");
+
+    let mut notifications = runner
+        .take_notification_rx()
+        .expect("Notification receiver must be available once");
+
+    let notification = timeout(Duration::from_secs(10), notifications.recv())
+        .await
+        .expect("Child blocked on stderr pipe: drain deadlock")
+        .expect("Notification channel should yield the completion frame");
+    assert_eq!(notification.method, "done");
+}
+
+#[tokio::test]
+async fn test_acp_stdio_driver_streams_events() {
+    let script = r#"read line; printf '{"jsonrpc":"2.0","method":"stream/chunk","params":{"text":"hello"}}\n'; sleep 1"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()]);
+    let runner = StdioProcessRunner::spawn(config)
+        .await
+        .expect("Subprocess should start successfully");
+
+    let driver = AcpStdioDriver::new(runner);
+
+    let mut events = driver
+        .send_turn("thread-1", "say hello")
+        .await
+        .expect("send_turn should return an event stream");
+
+    let first = timeout(Duration::from_secs(3), events.recv())
+        .await
+        .expect("Timed out waiting for driver event");
+    assert!(first.is_some(), "Driver must emit at least one event");
+
+    driver
+        .shutdown()
+        .await
+        .expect("Driver shutdown should succeed");
 }
