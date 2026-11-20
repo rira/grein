@@ -3,7 +3,7 @@ class Grein < Formula
   homepage "https://github.com/example/grein"
   url "https://github.com/example/grein/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  license "Apache-2.0"
+  license "MIT"
 
   depends_on "rust" => :build
 
