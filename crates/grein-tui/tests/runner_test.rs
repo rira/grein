@@ -57,6 +57,67 @@ async fn test_runner_render_cycle_with_test_backend() {
 }
 
 #[test]
+fn test_pane_focus_round_trip_conversions_across_focus_modules() {
+    use grein_tui::focus::PaneFocus as CorePaneFocus;
+    use grein_tui::pane::focus::PaneFocus as PanePaneFocus;
+    use grein_tui::ui::focus::PaneFocus as UiPaneFocus;
+
+    // ui::focus::PaneFocus <-> app::FocusedPane
+    let ui_pairs = [
+        (UiPaneFocus::Tree, FocusedPane::Tree),
+        (UiPaneFocus::Chat, FocusedPane::Transcript),
+        (UiPaneFocus::Composer, FocusedPane::Composer),
+        (UiPaneFocus::Blackboard, FocusedPane::Blackboard),
+    ];
+    for (ui, app_pane) in ui_pairs {
+        assert_eq!(FocusedPane::from(ui), app_pane);
+        assert_eq!(UiPaneFocus::from(app_pane), ui);
+        assert_eq!(UiPaneFocus::from(FocusedPane::from(ui)), ui);
+    }
+
+    // pane::focus::PaneFocus <-> app::FocusedPane
+    let pane_pairs = [
+        (PanePaneFocus::Workspace, FocusedPane::Tree),
+        (PanePaneFocus::Logs, FocusedPane::Transcript),
+        (PanePaneFocus::Composer, FocusedPane::Composer),
+        (PanePaneFocus::Blackboard, FocusedPane::Blackboard),
+    ];
+    for (pane, app_pane) in pane_pairs {
+        assert_eq!(FocusedPane::from(pane), app_pane);
+        assert_eq!(PanePaneFocus::from(app_pane), pane);
+        assert_eq!(PanePaneFocus::from(FocusedPane::from(pane)), pane);
+    }
+
+    // app::FocusedPane -> focus::PaneFocus -> app::FocusedPane
+    let core_pairs = [
+        (FocusedPane::Tree, CorePaneFocus::Sidebar),
+        (FocusedPane::Transcript, CorePaneFocus::Transcript),
+        (FocusedPane::Composer, CorePaneFocus::Composer),
+        (FocusedPane::Blackboard, CorePaneFocus::Inspector),
+    ];
+    for (app_pane, core) in core_pairs {
+        assert_eq!(CorePaneFocus::from(app_pane), core);
+        assert_eq!(FocusedPane::from(core), app_pane);
+    }
+
+    // Cross-module round trips through app::FocusedPane
+    for ui in [
+        UiPaneFocus::Tree,
+        UiPaneFocus::Chat,
+        UiPaneFocus::Composer,
+        UiPaneFocus::Blackboard,
+    ] {
+        let via_app: FocusedPane = ui.into();
+        let pane: PanePaneFocus = via_app.into();
+        let back: FocusedPane = pane.into();
+        let core: CorePaneFocus = back.into();
+        let final_app: FocusedPane = core.into();
+        assert_eq!(final_app, via_app);
+        assert_eq!(UiPaneFocus::from(final_app), ui);
+    }
+}
+
+#[test]
 fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
     let backend = TestBackend::new(120, 36);
     let mut terminal = Terminal::new(backend).expect("failed to create test terminal");

@@ -57,6 +57,17 @@ impl PaneFocus {
     }
 }
 
+impl From<crate::app::FocusedPane> for PaneFocus {
+    fn from(pane: crate::app::FocusedPane) -> Self {
+        match pane {
+            crate::app::FocusedPane::Tree => Self::Sidebar,
+            crate::app::FocusedPane::Transcript => Self::Transcript,
+            crate::app::FocusedPane::Composer => Self::Composer,
+            crate::app::FocusedPane::Blackboard => Self::Inspector,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusNavigationAction {
     Tab,
