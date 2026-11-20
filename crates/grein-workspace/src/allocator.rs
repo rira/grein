@@ -1,11 +1,14 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::git::{GitRepository, MergeResult};
 use crate::teardown::{TeardownAction, TeardownOutcome};
+
+const GREIN_EXCLUDE_LINE: &str = ".grein/";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThreadId(String);
@@ -91,10 +94,106 @@ impl WorktreeSession {
         }
     }
 
+    /// Resolves the git info exclude file, preferring `git rev-parse --git-path`.
+    fn exclude_file_path(&self) -> PathBuf {
+        let root = self.repo.root();
+        let resolved = Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "--git-path", "info/exclude"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        match resolved {
+            Some(p) => {
+                let path = PathBuf::from(p);
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            }
+            None => root.join(".git").join("info").join("exclude"),
+        }
+    }
+
+    /// Ensures a `.grein/` line exists in the git info exclude file (idempotent).
+    fn ensure_grein_excluded(&self) -> Result<(), WorkspaceError> {
+        let exclude_path = self.exclude_file_path();
+        let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+
+        if existing.lines().any(|l| l.trim() == GREIN_EXCLUDE_LINE) {
+            return Ok(());
+        }
+
+        if let Some(parent) = exclude_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(GREIN_EXCLUDE_LINE.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn stage_all(&self, dir: &Path) -> Result<(), WorkspaceError> {
+        self.ensure_grein_excluded()?;
+
+        let add_output = Command::new("git")
+            .current_dir(dir)
+            .args(["add", "-A"])
+            .output()?;
+
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
+            return Err(WorkspaceError::GitError(stderr));
+        }
+
+        // Best-effort: unstage anything under .grein; non-zero exit is ignored.
+        let _ = Command::new("git")
+            .current_dir(dir)
+            .args(["reset", "-q", "--", ".grein"])
+            .output();
+
+        Ok(())
+    }
+
+    fn remove_worktree_and_branch(&self) -> Result<(), WorkspaceError> {
+        let worktree_path_str = self
+            .worktree_dir
+            .to_str()
+            .ok_or(WorkspaceError::InvalidPath)?;
+
+        let _ = Command::new("git")
+            .current_dir(self.repo.root())
+            .args(["worktree", "remove", "--force", worktree_path_str])
+            .output();
+
+        let _ = Command::new("git")
+            .current_dir(self.repo.root())
+            .args(["branch", "-D", self.branch_name.as_str()])
+            .output();
+
+        if self.worktree_dir.exists() {
+            let _ = fs::remove_dir_all(&self.worktree_dir);
+        }
+        Ok(())
+    }
+
     pub fn transition_to_isolated_worktree(&mut self) -> Result<(), WorkspaceError> {
         if self.mode == WorktreeMode::IsolatedWorktree {
             return Ok(());
         }
+
+        self.ensure_grein_excluded()?;
 
         if let Some(parent) = self.worktree_dir.parent() {
             fs::create_dir_all(parent)?;
@@ -129,15 +228,7 @@ impl WorktreeSession {
     pub fn commit(&self, message: &str) -> Result<(), WorkspaceError> {
         let dir = self.working_directory();
 
-        let add_output = Command::new("git")
-            .current_dir(dir)
-            .args(["add", "-A"])
-            .output()?;
-
-        if !add_output.status.success() {
-            let stderr = String::from_utf8_lossy(&add_output.stderr).to_string();
-            return Err(WorkspaceError::GitError(stderr));
-        }
+        self.stage_all(dir)?;
 
         let commit_output = Command::new("git")
             .current_dir(dir)
@@ -193,25 +284,7 @@ impl WorktreeSession {
 
                     let stdout = String::from_utf8_lossy(&status_output.stdout);
                     if stdout.trim().is_empty() {
-                        let worktree_path_str = self
-                            .worktree_dir
-                            .to_str()
-                            .ok_or(WorkspaceError::InvalidPath)?;
-
-                        let _ = Command::new("git")
-                            .current_dir(self.repo.root())
-                            .args(["worktree", "remove", "--force", worktree_path_str])
-                            .output();
-
-                        let _ = Command::new("git")
-                            .current_dir(self.repo.root())
-                            .args(["branch", "-D", self.branch_name.as_str()])
-                            .output();
-
-                        if self.worktree_dir.exists() {
-                            let _ = fs::remove_dir_all(&self.worktree_dir);
-                        }
-
+                        self.remove_worktree_and_branch()?;
                         self.mode = WorktreeMode::SharedRead;
                         Ok(TeardownOutcome::Pruned)
                     } else {
@@ -224,31 +297,22 @@ impl WorktreeSession {
             TeardownAction::Keep => Ok(TeardownOutcome::Kept),
             TeardownAction::Discard => {
                 if self.mode == WorktreeMode::IsolatedWorktree {
-                    let worktree_path_str = self
-                        .worktree_dir
-                        .to_str()
-                        .ok_or(WorkspaceError::InvalidPath)?;
-
-                    let _ = Command::new("git")
-                        .current_dir(self.repo.root())
-                        .args(["worktree", "remove", "--force", worktree_path_str])
-                        .output();
-
-                    let _ = Command::new("git")
-                        .current_dir(self.repo.root())
-                        .args(["branch", "-D", self.branch_name.as_str()])
-                        .output();
-
-                    if self.worktree_dir.exists() {
-                        let _ = fs::remove_dir_all(&self.worktree_dir);
-                    }
+                    self.remove_worktree_and_branch()?;
                 }
                 Ok(TeardownOutcome::Discarded)
             }
-            TeardownAction::Merge => {
-                let _ = self.merge_to_primary()?;
-                Ok(TeardownOutcome::Merged)
-            }
+            TeardownAction::Merge => match self.merge_to_primary()? {
+                MergeResult::Success => {
+                    if self.mode == WorktreeMode::IsolatedWorktree {
+                        self.remove_worktree_and_branch()?;
+                        self.mode = WorktreeMode::SharedRead;
+                    }
+                    Ok(TeardownOutcome::Merged)
+                }
+                MergeResult::Conflict { conflicting_files } => {
+                    Err(WorkspaceError::MergeConflict(conflicting_files))
+                }
+            },
         }
     }
 }
@@ -258,6 +322,7 @@ pub enum WorkspaceError {
     Io(std::io::Error),
     GitError(String),
     InvalidPath,
+    MergeConflict(Vec<String>),
 }
 
 impl std::fmt::Display for WorkspaceError {
@@ -266,6 +331,9 @@ impl std::fmt::Display for WorkspaceError {
             Self::Io(err) => write!(f, "I/O error: {err}"),
             Self::GitError(msg) => write!(f, "Git error: {msg}"),
             Self::InvalidPath => write!(f, "Invalid worktree path"),
+            Self::MergeConflict(files) => {
+                write!(f, "Merge conflict in files: {}", files.join(", "))
+            }
         }
     }
 }
