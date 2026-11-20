@@ -1,19 +1,70 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use grein_core::model::{AuthorRole, ConversationNode, NodeId};
-use grein_core::storage::sqlite::SqliteStorage;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-#[allow(dead_code)]
+use crate::engine::{dispatch_json_rpc, DaemonEngine, InProcessEngine};
+
+const STATE_DIR_NAME: &str = ".grein";
+
+/// Resolves `<git_root>/.grein` inside a Git repository, `<cwd>/.grein` otherwise.
+pub fn resolve_state_dir(cwd: &Path) -> PathBuf {
+    let root = cwd
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(cwd);
+    root.join(STATE_DIR_NAME)
+}
+
+fn current_state_dir() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_state_dir(&cwd)
+}
+
+pub fn default_db_path() -> PathBuf {
+    current_state_dir().join("session.db")
+}
+
 pub fn default_socket_path() -> PathBuf {
-    std::env::temp_dir().join("grein.sock")
+    current_state_dir().join("daemon.sock")
 }
 
 pub async fn run_daemon_with_socket(
     socket_path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let db_path = socket_path
+        .parent()
+        .map(|p| p.join("session.db"))
+        .unwrap_or_else(|| PathBuf::from("session.db"));
+    run_daemon_with_socket_and_db(socket_path, db_path).await
+}
+
+async fn handle_legacy(engine: &InProcessEngine, line: &str) -> String {
+    if line == "ping" {
+        return "pong\n".to_string();
+    }
+    if let Some(prompt) = line.strip_prefix("send_turn:") {
+        return match engine.send_turn(prompt).await {
+            Ok(result) => format!("ok:{}\n", result.node_id),
+            Err(e) => format!("error:{e}\n"),
+        };
+    }
+    if line == "list_entries" {
+        return match engine.snapshot().await {
+            Ok(snapshot) => format!(
+                "entries:{}\n",
+                snapshot.blackboard_entries + snapshot.node_count
+            ),
+            Err(e) => format!("error:{e}\n"),
+        };
+    }
+    "ok\n".to_string()
+}
+
+pub async fn run_daemon_with_socket_and_db(
+    socket_path: PathBuf,
+    db_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -22,8 +73,7 @@ pub async fn run_daemon_with_socket(
         std::fs::create_dir_all(parent)?;
     }
 
-    let storage = Arc::new(SqliteStorage::in_memory()?);
-    let entry_count = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(InProcessEngine::open(&db_path)?);
     let listener = UnixListener::bind(&socket_path)?;
 
     loop {
@@ -31,42 +81,25 @@ pub async fn run_daemon_with_socket(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _addr)) => {
-                        let store = Arc::clone(&storage);
-                        let entries = Arc::clone(&entry_count);
+                        let engine = Arc::clone(&engine);
                         tokio::spawn(async move {
                             let (reader, mut writer) = stream.into_split();
                             let mut lines = BufReader::new(reader).lines();
                             while let Ok(Some(line)) = lines.next_line().await {
                                 let trimmed = line.trim();
-                                if trimmed == "ping" {
-                                    let _ = writer.write_all(b"pong\n").await;
-                                    let _ = writer.flush().await;
-                                } else if let Some(prompt) = trimmed.strip_prefix("send_turn:") {
-                                    let node_id = NodeId::new();
-                                    let node = ConversationNode::new(
-                                        node_id,
-                                        None::<NodeId>,
-                                        AuthorRole::User,
-                                        prompt.to_string(),
-                                    );
-                                    if store.insert_node(&node).is_ok() {
-                                        entries.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    let resp = format!("ok:{}\n", node_id);
-                                    let _ = writer.write_all(resp.as_bytes()).await;
-                                    let _ = writer.flush().await;
-                                } else if trimmed == "list_entries" {
-                                    let db_count = store
-                                        .list_blackboard_entries()
-                                        .map(|v| v.len())
-                                        .unwrap_or(0);
-                                    let count = db_count + entries.load(Ordering::Relaxed);
-                                    let resp = format!("entries:{}\n", count);
-                                    let _ = writer.write_all(resp.as_bytes()).await;
-                                    let _ = writer.flush().await;
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                let response = if trimmed.starts_with('{') {
+                                    format!("{}\n", dispatch_json_rpc(engine.as_ref(), trimmed).await)
                                 } else {
-                                    let _ = writer.write_all(b"ok\n").await;
-                                    let _ = writer.flush().await;
+                                    handle_legacy(engine.as_ref(), trimmed).await
+                                };
+                                if writer.write_all(response.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
                                 }
                             }
                         });

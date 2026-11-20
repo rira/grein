@@ -439,13 +439,17 @@ name = "grein-cli"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "grein-acp",
  "grein-core",
  "grein-tui",
  "grein-workspace",
  "predicates",
+ "serde",
+ "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

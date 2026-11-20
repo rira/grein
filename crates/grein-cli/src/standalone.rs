@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use grein_core::model::{AnchorId, AuthorRole, ConversationNode, NodeId, ThreadId};
 use grein_core::storage::sqlite::SqliteStorage;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::engine::{dispatch_json_rpc, InProcessEngine};
 
 #[derive(Debug)]
 pub enum StandaloneError {
@@ -41,6 +44,10 @@ pub enum InProcessRequest {
     ListThreads {
         responder: oneshot::Sender<Result<Vec<ThreadId>, StandaloneError>>,
     },
+    JsonRpc {
+        request: String,
+        responder: oneshot::Sender<String>,
+    },
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -56,18 +63,29 @@ impl Drop for DaemonGuard {
     }
 }
 
+fn last_sender() -> Option<mpsc::Sender<InProcessRequest>> {
+    ACTIVE_DAEMONS
+        .lock()
+        .ok()
+        .and_then(|lock| lock.last().map(|(_, tx)| tx.clone()))
+}
+
 pub async fn run_standalone(mut shutdown_rx: oneshot::Receiver<()>) -> Result<(), StandaloneError> {
     let (tx, mut rx) = mpsc::channel(32);
     let daemon_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     {
-        let mut lock = ACTIVE_DAEMONS.lock().unwrap();
+        let mut lock = ACTIVE_DAEMONS
+            .lock()
+            .map_err(|e| StandaloneError::Storage(e.to_string()))?;
         lock.push((daemon_id, tx));
     }
     let _guard = DaemonGuard(daemon_id);
 
     let storage =
         SqliteStorage::in_memory().map_err(|e| StandaloneError::Storage(e.to_string()))?;
+    let rpc_engine =
+        InProcessEngine::in_memory().map_err(|e| StandaloneError::Storage(e.to_string()))?;
     let mut thread_ids: Vec<ThreadId> = Vec::new();
     let mut last_node_id: Option<NodeId> = None;
 
@@ -114,6 +132,10 @@ pub async fn run_standalone(mut shutdown_rx: oneshot::Receiver<()>) -> Result<()
                     Some(InProcessRequest::ListThreads { responder }) => {
                         let _ = responder.send(Ok(thread_ids.clone()));
                     }
+                    Some(InProcessRequest::JsonRpc { request, responder }) => {
+                        let response = dispatch_json_rpc(&rpc_engine, &request).await;
+                        let _ = responder.send(response);
+                    }
                     None => {
                         break;
                     }
@@ -134,11 +156,7 @@ impl InProcessClient {
     pub async fn ping(&mut self) -> Result<(), StandaloneError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send(InProcessRequest::Ping(resp_tx)).await.is_err() {
-            let fallback_tx = {
-                let lock = ACTIVE_DAEMONS.lock().unwrap();
-                lock.last().map(|(_, tx)| tx.clone())
-            };
-            if let Some(tx) = fallback_tx {
+            if let Some(tx) = last_sender() {
                 self.tx = tx;
                 let (resp_tx2, resp_rx2) = oneshot::channel();
                 self.tx
@@ -204,15 +222,32 @@ impl InProcessClient {
             .await
             .map_err(|_| StandaloneError::DaemonTerminated)?
     }
+
+    /// Performs a JSON-RPC 2.0 round-trip against the embedded standalone engine.
+    pub async fn json_rpc(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, StandaloneError> {
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx
+            .send(InProcessRequest::JsonRpc {
+                request: request.to_string(),
+                responder: resp_tx,
+            })
+            .await
+            .map_err(|_| StandaloneError::DaemonTerminated)?;
+        let raw = resp_rx
+            .await
+            .map_err(|_| StandaloneError::DaemonTerminated)?;
+        serde_json::from_str(&raw).map_err(|e| StandaloneError::Storage(e.to_string()))
+    }
 }
 
 pub async fn create_in_process_client() -> Result<InProcessClient, StandaloneError> {
     for _ in 0..50 {
-        let sender = {
-            let lock = ACTIVE_DAEMONS.lock().unwrap();
-            lock.last().map(|(_, tx)| tx.clone())
-        };
-        if let Some(tx) = sender {
+        if let Some(tx) = last_sender() {
             return Ok(InProcessClient { tx });
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -245,6 +280,25 @@ mod tests {
             .expect("fork_thread succeeds");
         let threads = client.list_threads().await.expect("list_threads succeeds");
         assert!(threads.contains(&thread_id));
+
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_standalone_json_rpc_ping() {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move { run_standalone(shutdown_rx).await });
+
+        let mut client = create_in_process_client()
+            .await
+            .expect("connect standalone");
+        let response = client
+            .json_rpc("session.ping", json!({}))
+            .await
+            .expect("json-rpc ping");
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert!(response.get("result").is_some());
 
         let _ = shutdown_tx.send(());
         let _ = handle.await;
