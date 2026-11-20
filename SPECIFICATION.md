@@ -57,7 +57,7 @@ Each message node represents an immutable conversational event:
 #### Anchor Extraction & Filtering Algorithm
 To provide rapid branching without cluttering the interface with trivial step-by-step checklists, the parser applies structural heuristics:
 1. **Markdown Headings:** All `#`, `##`, `###`, `####` elements are automatically registered as Primary Anchors.
-2. **Titled Numbered Lists:** Numbered items matching `^([0-9]+)\.\s+(\*\*[^*]+\*\*|[^:\n]+:|[^\n]{20,})` are registered as Secondary Anchors (e.g. `1. **Database Schema**:` or `1. API Gateway Routing:`). Trivial short items (e.g. `1. Run tests`, `2. Commit code`) are filtered out to prevent anchor spam.
+2. **Titled Numbered Lists:** Numbered items matching `^([0-9]+)\.\s+(\*\*[^*]+\*\*|[^:\n]+:|^[\n]{20,})` are registered as Secondary Anchors (e.g. `1. **Database Schema**:` or `1. API Gateway Routing:`). Trivial short items (e.g. `1. Run tests`, `2. Commit code`) are filtered out to prevent anchor spam.
 3. **Manual Selection Forking (`Ctrl+N`):** Users can highlight any block of text or select any turn in the transcript and press `Ctrl+N` to manually fork a thread from that exact anchor.
 
 #### Branch Context Resolution
@@ -110,12 +110,12 @@ When file mutations occur (`write_file`, `edit_file`, build commands), the daemo
 
 | Workspace Mode | Detection Condition | Read Operations | Mutating Operations | Teardown / Merge Mechanism |
 | :--- | :--- | :--- | :--- | :--- |
-| **Mode 1: Git-Backed Worktree** | `.git` root detected in current or parent directory | Primary repository checkout | Dynamic `git worktree` (`.agent-tui/worktrees/thread-<id>`) | Clean: auto-prune. Dirty: prompt `[Keep/Discard/Merge]`. Merges via Git cherry-pick. |
-| **Mode 2: Standalone / Non-Git** | No `.git` found, or `git` binary absent from `$PATH` | Primary working directory | **Snapshot Shadowing:** Hardlink/reflink copy into `.agent-tui/shadow/thread-<id>/` | Interactive diff review via pure-Rust `similar` crate; copy back to root on merge. |
+| **Mode 1: Git-Backed Worktree** | `.git` root detected in current or parent directory | Primary repository checkout | Dynamic `git worktree` (`.grein/worktrees/thread-<id>`) | Clean: auto-prune. Dirty: prompt `[Keep/Discard/Merge]`. Merges via Git cherry-pick. |
+| **Mode 2: Standalone / Non-Git** | No `.git` found, or `git` binary absent from `$PATH` | Primary working directory | **Snapshot Shadowing:** Hardlink/reflink copy into `.grein/shadow/thread-<id>/` | Interactive diff review via pure-Rust `similar` crate; copy back to root on merge. |
 
 #### Mode 1: Git Worktree Workflow (When in a Git Repo)
 1. Thread starts in shared inspection mode against the primary checkout.
-2. On first write tool call, daemon runs `git worktree add -b tui-thread-<id> .agent-tui/worktrees/thread-<id> HEAD`.
+2. On first write tool call, daemon runs `git worktree add -b tui-thread-<id> .grein/worktrees/thread-<id> HEAD`.
 3. Tool executes inside the isolated worktree directory.
 4. On thread close:
    * **Clean Worktrees:** Pruned automatically (`git worktree remove`) with zero friction.
@@ -218,7 +218,7 @@ When an agent invokes a tool (e.g., executing a bash command or writing a file) 
 ┌────────────────────────────────────────────────────────────────────────┐
 │ ⚠️  Tool Execution Request: run_command                                │
 │ Command: cargo test --lib                                              │
-│ Working Directory: .tui-manager/worktrees/thread-8f2a/ (Isolated)      │
+│ Working Directory: .grein/worktrees/thread-8f2a/ (Isolated)            │
 ├────────────────────────────────────────────────────────────────────────┤
 │ [a] Allow Once   [d] Deny   [t] Always for Thread   [s] Always Session │
 └────────────────────────────────────────────────────────────────────────┘
@@ -226,11 +226,11 @@ When an agent invokes a tool (e.g., executing a bash command or writing a file) 
 
 #### 2. Declarative Allowlist Policy Files
 The policy engine evaluates security rules hierarchically from two files:
-1. **Global User Policy:** `~/.config/agent-tui/policy.toml`
-2. **Project-Local Policy:** `.tui-policy.toml` (committed in repo or git-ignored)
+1. **Global User Policy:** `~/.config/grein/policy.toml`
+2. **Project-Local Policy:** `.grein/policy.toml` (committed in repo or git-ignored)
 
 ```toml
-# Example .tui-policy.toml
+# Example .grein/policy.toml
 [policy]
 # Automatically allow read-only inspection tools without interactive prompts
 auto_allow_read_tools = true  # read_file, grep, find, git status, git log
@@ -276,11 +276,11 @@ A notorious flaw in terminal multiplexers and IDEs is popups stealing focus whil
 
 #### 1. Storage Location
 All conversation DAG trees, branch points, blackboard entries, and worktree leases are stored transactionally in a local embedded SQLite database:
-* **Project-Local Mode (Default):** `.agent-tui/session.db` in the repository root (added to `.gitignore`).
-* **Global Mode (Fallback for non-git directories):** `~/.local/share/agent-tui/projects/<repo-hash>/session.db`.
+* **Project-Local Mode (Default):** `.grein/session.db` in the repository root (added to `.gitignore`).
+* **Global Mode (Fallback for non-git directories):** `~/.local/share/grein/projects/<repo-hash>/session.db`.
 
 #### 2. State Hydration on Launch
-* Launching `agent-tui` in a repository immediately resumes the active session, restoring all branches, unmerged worktrees, and input drafts.
+* Launching `grein` in a repository immediately resumes the active session, restoring all branches, unmerged worktrees, and input drafts.
 * If a previous run was abruptly killed (e.g. terminal crash), the database journal recovers state cleanly and cleans up orphaned PIDs.
 
 ---
@@ -387,7 +387,7 @@ To give the developer instant situational awareness across all active branches w
 
 ## 4. Technical Stack & Implementation Boundary
 
-* **Language:** Rust (2024 edition)
+* **Language:** Rust (2021 edition)
 * **TUI Layer:** `ratatui` + `crossterm`
 * **Concurrency Runtime:** `tokio` (multi-threaded async runtime)
 * **Local Persistence:** `rusqlite` or `redb` (embedded, zero external daemon dependency)
@@ -396,8 +396,9 @@ To give the developer instant situational awareness across all active branches w
 * **Process Execution Model:** Native OS subprocess runner (`tokio::process::Command`) with `cwd` scoped to the dedicated worktree directory. Environment sanitization with explicit PATH pass-through. Zero container requirement (no Docker, no Podman).
 * **Distribution Target:** Single static or self-contained binary packaged for Homebrew (`brew install`), Nix (`nix profile install` / Flake), and Cargo (`cargo install`).
 * **Deployment Topology (Single Binary, Dual Mode):**
-  * **Default (Standalone):** `agent-tui` launches TUI and embeds the daemon engine internally within Tokio tasks. Zero socket setup required.
-  * **Headless / Multi-Client:** `agent-tui daemon` runs headless in the background; `agent-tui attach` connects over a local Unix domain socket.
+  * **Default (Standalone):** `grein` launches TUI and embeds the daemon engine internally within Tokio tasks. Zero socket setup required.
+  * **Headless / Multi-Client:** `grein daemon` runs headless in the background; `grein attach` connects over a local Unix domain socket (`.grein/daemon.sock`).
+  * **Headless Inspection Subcommands:** `grein threads`, `grein status`, and `grein agents --json` for scriptable and CLI introspection.
 
 ---
 

@@ -24,7 +24,7 @@
             };
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ pkgs.sqlite ];
-            doCheck = false;
+            doCheck = true;
           };
         in
         {
@@ -46,14 +46,15 @@
         in
         {
           default = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
-              rustc
-              cargo
-              rustfmt
-              clippy
-              pkg-config
-              sqlite
-            ];
+            nativeBuildInputs = with pkgs;
+              [
+                rustc
+                cargo
+                rustfmt
+                clippy
+                pkg-config
+                sqlite
+              ];
           };
         }
       );
