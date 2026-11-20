@@ -126,3 +126,101 @@ fn test_merge_back_to_primary() {
 
     shadow.cleanup().expect("failed to cleanup shadow snapshot");
 }
+
+#[test]
+fn test_merge_back_removes_deleted_files_and_preserves_grein() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let primary_dir = temp.path().join("primary");
+    fs::create_dir_all(primary_dir.join("nested/deep")).expect("failed to create nested dirs");
+
+    let keep_file = primary_dir.join("keep.txt");
+    let doomed_file = primary_dir.join("doomed.txt");
+    let nested_file = primary_dir.join("nested/deep/gone.txt");
+    fs::write(&keep_file, "keep\n").expect("failed to write keep");
+    fs::write(&doomed_file, "doomed\n").expect("failed to write doomed");
+    fs::write(&nested_file, "nested\n").expect("failed to write nested");
+
+    let shadow = ShadowSnapshot::create(&primary_dir, "thread-delete-test")
+        .expect("failed to create shadow snapshot");
+
+    fs::remove_file(shadow.shadow_path().join("doomed.txt")).expect("failed to delete shadow file");
+    fs::remove_file(shadow.shadow_path().join("nested/deep/gone.txt"))
+        .expect("failed to delete nested shadow file");
+
+    shadow
+        .merge_back()
+        .expect("failed to merge back to primary");
+
+    assert!(!doomed_file.exists(), "deleted file must be removed");
+    assert!(!nested_file.exists(), "nested deleted file must be removed");
+    assert!(
+        !primary_dir.join("nested").exists(),
+        "empty directories must be pruned"
+    );
+    assert!(keep_file.exists(), "untouched file must remain");
+    assert!(
+        primary_dir.join(".grein").exists(),
+        ".grein must be preserved"
+    );
+
+    shadow.cleanup().expect("failed to cleanup shadow snapshot");
+}
+
+#[test]
+fn test_shadow_edit_does_not_mutate_primary_before_merge_back() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let primary_dir = temp.path().join("primary");
+    fs::create_dir_all(&primary_dir).expect("failed to create primary dir");
+
+    let primary_file = primary_dir.join("data.txt");
+    fs::write(&primary_file, "original\n").expect("failed to write primary file");
+
+    let shadow = ShadowSnapshot::create(&primary_dir, "thread-isolation-test")
+        .expect("failed to create shadow snapshot");
+
+    fs::write(shadow.shadow_path().join("data.txt"), "edited\n")
+        .expect("failed to edit shadow file");
+
+    assert_eq!(
+        fs::read_to_string(&primary_file).expect("failed to read primary file"),
+        "original\n",
+        "primary must not change before merge_back"
+    );
+
+    shadow.cleanup().expect("failed to cleanup shadow snapshot");
+}
+
+#[test]
+fn test_compute_directory_diff_handles_binary_files() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let primary_dir = temp.path().join("primary");
+    fs::create_dir_all(&primary_dir).expect("failed to create primary dir");
+
+    fs::write(primary_dir.join("blob.bin"), [0xff_u8, 0xfe, 0x00, 0x01])
+        .expect("failed to write primary binary");
+    fs::write(primary_dir.join("same.bin"), [0xc3_u8, 0x28, 0x00])
+        .expect("failed to write primary same binary");
+
+    let shadow = ShadowSnapshot::create(&primary_dir, "thread-binary-test")
+        .expect("failed to create shadow snapshot");
+
+    fs::write(
+        shadow.shadow_path().join("blob.bin"),
+        [0xff_u8, 0xfe, 0x02, 0x03],
+    )
+    .expect("failed to modify shadow binary");
+
+    let diff = compute_directory_diff(&primary_dir, shadow.shadow_path())
+        .expect("binary files must not cause diff errors");
+
+    assert!(
+        diff.contains("Binary files a/blob.bin and b/blob.bin differ\n"),
+        "diff must report differing binary file"
+    );
+    assert!(
+        !diff.contains("same.bin"),
+        "identical binary files must be skipped"
+    );
+
+    shadow.cleanup().expect("failed to cleanup shadow snapshot");
+}
