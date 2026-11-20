@@ -121,12 +121,12 @@ impl AnchorParser {
             if digits_len > 0 {
                 let after_digits = &trimmed[digits_len..];
                 if let Some(after_dot) = after_digits.strip_prefix('.') {
-                    let ws_len = after_dot
-                        .chars()
-                        .take_while(|c| c.is_whitespace() && *c != '\n')
-                        .count();
+                    // Byte-safe whitespace skipping: slicing happens on the remainder
+                    // returned by `trim_start_matches`, never on a char count.
+                    let rest =
+                        after_dot.trim_start_matches(|c: char| c.is_whitespace() && c != '\n');
+                    let ws_len = after_dot.len() - rest.len();
                     if ws_len > 0 {
-                        let rest = &after_dot[ws_len..];
                         if let Some(title) = extract_numbered_list_title(rest) {
                             let slug = slugify(&title);
                             anchors.push(Anchor {
@@ -183,14 +183,14 @@ fn extract_numbered_list_title(rest: &str) -> Option<String> {
     None
 }
 
-/// Generates an anchor slug by lowercasing, normalizing non-alphanumeric runs to `-`, and trimming dashes.
+/// Generates an anchor slug by lowercasing (Unicode-aware), normalizing non-alphanumeric runs to `-`, and trimming dashes.
 fn slugify(text: &str) -> String {
     let mut slug = String::with_capacity(text.len());
     let mut prev_dash = false;
 
     for c in text.chars() {
         if c.is_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
+            slug.extend(c.to_lowercase());
             prev_dash = false;
         } else if !prev_dash && !slug.is_empty() {
             slug.push('-');

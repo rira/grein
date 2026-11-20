@@ -1,5 +1,5 @@
 use crate::error::CoreError;
-use crate::model::{ConversationNode, Thread, ThreadStatus};
+use crate::model::{Anchor, ConversationNode, Thread, ThreadStatus};
 pub use crate::storage::sqlite::{SqliteStorage, SqliteStorage as SqliteDagStorage};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -11,6 +11,9 @@ pub trait DagStorage {
     fn get_trunk_path(&self, leaf_id: &Uuid) -> Result<Vec<ConversationNode>, CoreError>;
     fn create_thread(&self, parent_node_id: &Uuid, anchor_id: &Uuid) -> Result<Uuid, CoreError>;
     fn get_thread(&self, thread_id: &Uuid) -> Result<Option<Thread>, CoreError>;
+    fn list_threads(&self) -> Result<Vec<Thread>, CoreError>;
+    fn list_nodes(&self) -> Result<Vec<ConversationNode>, CoreError>;
+    fn get_anchor(&self, anchor_id: &Uuid) -> Result<Option<Anchor>, CoreError>;
     fn update_thread_leaf(&self, thread_id: &Uuid, leaf_id: &Uuid) -> Result<(), CoreError>;
     fn update_thread_status(&self, thread_id: &Uuid, status: ThreadStatus)
         -> Result<(), CoreError>;
@@ -39,6 +42,18 @@ impl DagStorage for SqliteStorage {
 
     fn get_thread(&self, thread_id: &Uuid) -> Result<Option<Thread>, CoreError> {
         SqliteStorage::get_thread(self, thread_id)
+    }
+
+    fn list_threads(&self) -> Result<Vec<Thread>, CoreError> {
+        SqliteStorage::list_threads(self)
+    }
+
+    fn list_nodes(&self) -> Result<Vec<ConversationNode>, CoreError> {
+        SqliteStorage::list_nodes(self)
+    }
+
+    fn get_anchor(&self, anchor_id: &Uuid) -> Result<Option<Anchor>, CoreError> {
+        SqliteStorage::get_anchor(self, anchor_id)
     }
 
     fn update_thread_leaf(&self, thread_id: &Uuid, leaf_id: &Uuid) -> Result<(), CoreError> {
