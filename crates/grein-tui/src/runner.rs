@@ -1,6 +1,7 @@
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{self, IsTerminal};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -13,10 +14,15 @@ use grein_core::model::{
     AnchorId, AuthorRole, BlackboardEntryId, ConversationNode, NodeId, ThreadId,
 };
 use grein_core::storage::sqlite::SqliteStorage;
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::Backend;
 use ratatui::Terminal;
+use tokio::sync::mpsc;
 
 use crate::app::{AnchorItem, App, FocusedPane, ThreadItem, TreeAction, TuiError};
+use crate::engine_port::{HydratedSession, TuiEngineEvent, TuiEnginePort};
+
+const USER_PREFIX: &str = "# User: ";
+const AGENT_HEADER: &str = "## Agent (agy)";
 
 pub struct TerminalGuard {
     active: bool,
@@ -55,111 +61,40 @@ pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
     Ok(app.should_quit())
 }
 
-pub fn default_db_path() -> PathBuf {
-    if let Ok(val) = std::env::var("GREIN_DB_PATH") {
-        let trimmed = val.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+/// Structured view of the transcript: ordered (role, content) turns.
+fn collect_turns(transcript: &str) -> Vec<(AuthorRole, String)> {
+    let mut turns: Vec<(AuthorRole, String)> = Vec::new();
+    let mut current: Option<(AuthorRole, String)> = None;
+
+    for line in transcript.lines() {
+        if let Some(rest) = line.strip_prefix(USER_PREFIX) {
+            if let Some((role, content)) = current.take() {
+                turns.push((role, content.trim().to_string()));
             }
-            return path;
+            current = Some((AuthorRole::User, rest.to_string()));
+        } else if line == AGENT_HEADER {
+            if let Some((role, content)) = current.take() {
+                turns.push((role, content.trim().to_string()));
+            }
+            current = Some((AuthorRole::Assistant, String::new()));
+        } else if let Some((_, content)) = current.as_mut() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(line);
         }
     }
-    let path = std::env::temp_dir().join(format!("grein-session-{}.sqlite3", std::process::id()));
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some((role, content)) = current.take() {
+        turns.push((role, content.trim().to_string()));
     }
-    path
-}
-
-fn shell_binary() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_string())
-}
-
-fn build_shell_path() -> String {
-    let current_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
-    if let Ok(home) = std::env::var("HOME") {
-        let local_bin = format!("{}/.local/bin", home);
-        let cargo_bin = format!("{}/.cargo/bin", home);
-        format!("{}:{}:{}", local_bin, cargo_bin, current_path)
-    } else {
-        current_path
-    }
-}
-
-pub fn execute_agent_prompt(prompt: &str) -> String {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    match Command::new(shell_binary())
-        .args(["-c", trimmed])
-        .env("PATH", build_shell_path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-    {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let mut combined = String::new();
-            if !stdout.is_empty() {
-                combined.push_str(&stdout);
-            }
-            if !stderr.is_empty() {
-                if !combined.is_empty() && !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr);
-            }
-            let result = combined.trim().to_string();
-            if result.is_empty() && !output.status.success() {
-                format!("Command exited with status {}", output.status)
-            } else {
-                result
-            }
-        }
-        Err(err) => format!("Failed to execute command: {}", err),
-    }
-}
-
-fn parse_turns(transcript_md: &str) -> Vec<(AuthorRole, String)> {
-    let mut turns = Vec::new();
-    let mut current_role: Option<AuthorRole> = None;
-    let mut current_content = String::new();
-
-    for line in transcript_md.lines() {
-        if let Some(rest) = line.strip_prefix("# User: ") {
-            if let Some(role) = current_role.take() {
-                turns.push((role, current_content.trim().to_string()));
-                current_content.clear();
-            }
-            current_role = Some(AuthorRole::User);
-            current_content.push_str(rest);
-        } else if line == "## Agent (agy)" {
-            if let Some(role) = current_role.take() {
-                turns.push((role, current_content.trim().to_string()));
-                current_content.clear();
-            }
-            current_role = Some(AuthorRole::Assistant);
-        } else if current_role.is_some() {
-            if !current_content.is_empty() {
-                current_content.push('\n');
-            }
-            current_content.push_str(line);
-        }
-    }
-
-    if let Some(role) = current_role.take() {
-        turns.push((role, current_content.trim().to_string()));
-    }
-
     turns
+}
+
+fn render_node(role: &AuthorRole, content: &str) -> String {
+    match role {
+        AuthorRole::User => format!("{USER_PREFIX}{content}\n\n"),
+        _ => format!("{AGENT_HEADER}\n{content}\n\n"),
+    }
 }
 
 impl App {
@@ -176,15 +111,16 @@ impl App {
             self.active_transcript_md.push('\n');
         }
         self.active_transcript_md
-            .push_str(&format!("# User: {}\n\n", trimmed));
+            .push_str(&render_node(&AuthorRole::User, trimmed));
         self.last_submitted_prompt = Some(trimmed.to_string());
         self.sync_anchors_and_blackboard();
     }
 
     pub fn apply_agent_response(&mut self, response: &str) {
         let clean = response.trim_end_matches('\n');
-        let last_user = self.active_transcript_md.rfind("# User: ");
-        let last_agent = self.active_transcript_md.rfind("## Agent (agy)\n");
+        let last_user = self.active_transcript_md.rfind(USER_PREFIX);
+        let agent_marker = format!("{AGENT_HEADER}\n");
+        let last_agent = self.active_transcript_md.rfind(agent_marker.as_str());
         let has_open_agent_turn = match (last_user, last_agent) {
             (Some(u), Some(a)) => a > u,
             (None, Some(_)) => true,
@@ -205,13 +141,13 @@ impl App {
                 self.active_transcript_md.push('\n');
             }
             self.active_transcript_md
-                .push_str(&format!("## Agent (agy)\n{}\n\n", clean));
+                .push_str(&render_node(&AuthorRole::Assistant, clean));
         }
         self.sync_anchors_and_blackboard();
     }
 
     pub fn sync_anchors_and_blackboard(&mut self) {
-        let turns = parse_turns(&self.active_transcript_md);
+        let turns = collect_turns(&self.active_transcript_md);
         if self.threads.is_empty() && !turns.is_empty() {
             let title = turns
                 .iter()
@@ -313,7 +249,7 @@ impl App {
         let Ok(storage) = SqliteStorage::open(db_path) else {
             return;
         };
-        let turns = parse_turns(&self.active_transcript_md);
+        let turns = collect_turns(&self.active_transcript_md);
         if turns.is_empty() {
             return;
         }
@@ -437,17 +373,10 @@ impl App {
         let mut reconstructed = String::new();
         let mut first_user_content: Option<String> = None;
         for node in &trunk {
-            match node.role {
-                AuthorRole::User => {
-                    if first_user_content.is_none() {
-                        first_user_content = Some(node.content.clone());
-                    }
-                    reconstructed.push_str(&format!("# User: {}\n\n", node.content));
-                }
-                _ => {
-                    reconstructed.push_str(&format!("## Agent (agy)\n{}\n\n", node.content));
-                }
+            if node.role == AuthorRole::User && first_user_content.is_none() {
+                first_user_content = Some(node.content.clone());
             }
+            reconstructed.push_str(&render_node(&node.role, &node.content));
         }
         self.active_transcript_md = reconstructed;
 
@@ -502,126 +431,153 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<TreeActio
     Ok(None)
 }
 
-pub fn run<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
-    let db_path = default_db_path();
-    app.load_state_from_sqlite(&db_path);
+/// Seeds the app (threads, transcript nodes, blackboard) from a hydrated session.
+pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
+    app.threads = session
+        .threads
+        .iter()
+        .map(|t| ThreadItem {
+            id: t.id.clone(),
+            title: t.title.clone(),
+            anchors: Vec::new(),
+        })
+        .collect();
 
-    let mut active_child: Option<(Child, Option<ChildStdin>)> = None;
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let active = session
+        .threads
+        .iter()
+        .find(|t| t.id == session.active_thread_id)
+        .or_else(|| session.threads.first());
+    if let Some(thread) = active {
+        if let Some(pos) = app.threads.iter().position(|t| t.id == thread.id) {
+            let item = app.threads.remove(pos);
+            app.threads.insert(0, item);
+        }
+        let mut transcript = String::new();
+        for turn in &thread.turns {
+            let role = if turn.role.eq_ignore_ascii_case("user") {
+                AuthorRole::User
+            } else {
+                AuthorRole::Assistant
+            };
+            transcript.push_str(&render_node(&role, &turn.content));
+        }
+        app.active_transcript_md = transcript;
+    }
+
+    app.sync_anchors_and_blackboard();
+    for entry in &session.blackboard {
+        app.blackboard_notes
+            .push_str(&format!("{}: {}\n", entry.key, entry.value));
+    }
+}
+
+/// Folds a streamed engine event into the app state.
+pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
+    match event {
+        TuiEngineEvent::StreamChunk { content, .. } => app.apply_agent_response(&content),
+        TuiEngineEvent::TurnCompleted { .. } => app.sync_anchors_and_blackboard(),
+        TuiEngineEvent::ToolInvoked { tool_name, .. } => {
+            app.apply_agent_response(&format!("[tool invoked: {tool_name}]"));
+        }
+        TuiEngineEvent::ToolResult {
+            tool_name, output, ..
+        } => {
+            app.apply_agent_response(&format!("[tool result: {tool_name}] {output}"));
+        }
+        TuiEngineEvent::PermissionRequested {
+            request_id,
+            description,
+        } => {
+            app.blackboard_notes.push_str(&format!(
+                "Permission requested [{request_id}]: {description}\n"
+            ));
+        }
+        TuiEngineEvent::ThreadStatusChanged { thread_id, status } => {
+            app.blackboard_notes
+                .push_str(&format!("Thread {thread_id}: {status}\n"));
+        }
+        TuiEngineEvent::BlackboardUpdated { key, value } => {
+            app.blackboard_notes.push_str(&format!("{key}: {value}\n"));
+        }
+        TuiEngineEvent::Error { message } => {
+            app.apply_agent_response(&format!("Error: {message}"));
+        }
+    }
+}
+
+fn spawn_key_reader(
+    stop: Arc<AtomicBool>,
+    tx: mpsc::UnboundedSender<Event>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(25)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+pub async fn run_with_engine<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    engine: Arc<dyn TuiEnginePort>,
+) -> io::Result<()> {
+    let session = engine.hydrate_session().await?;
+    apply_hydrated_session(&mut app, &session);
+    let mut engine_events = engine.subscribe_events().await?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
+    let reader = spawn_key_reader(Arc::clone(&stop), key_tx);
+
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let mut result = Ok(());
 
     loop {
-        while let Ok(line) = rx.try_recv() {
-            app.apply_agent_response(&line);
-            app.persist_state_to_sqlite(&db_path);
+        if let Err(err) = draw_frame(terminal, &app) {
+            result = Err(err);
+            break;
         }
-
-        if let Some((ref mut child, _)) = active_child {
-            if let Ok(Some(_status)) = child.try_wait() {
-                while let Ok(line) = rx.try_recv() {
-                    app.apply_agent_response(&line);
-                }
-                app.persist_state_to_sqlite(&db_path);
-                active_child = None;
-            }
-        }
-
-        draw_frame(terminal, &app)?;
-
         if app.should_quit() {
-            if let Some((mut child, _)) = active_child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            app.persist_state_to_sqlite(&db_path);
             break;
         }
 
-        if event::poll(Duration::from_millis(25))? {
-            if let Event::Key(key) = event::read()? {
-                let _ = handle_key_event(&mut app, key);
-
+        tokio::select! {
+            Some(ev) = key_rx.recv() => {
+                if let Err(err) = handle_event(&mut app, ev) {
+                    result = Err(err);
+                    break;
+                }
                 if let Some(prompt) = app.last_submitted_prompt.take() {
-                    let cmd = prompt.trim();
-                    if cmd == "/clear" {
-                        app.active_transcript_md.clear();
-                        app.persist_state_to_sqlite(&db_path);
-                        continue;
+                    let thread_id = app
+                        .threads
+                        .first()
+                        .map(|t| t.id.clone())
+                        .unwrap_or_else(|| session.active_thread_id.clone());
+                    if let Err(err) = engine.send_turn(&thread_id, prompt.trim()).await {
+                        app.apply_agent_response(&format!("Error: {err}"));
                     }
-                    if cmd == "/kill" {
-                        if let Some((mut child, _)) = active_child.take() {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            app.apply_agent_response("[Process killed]");
-                            app.persist_state_to_sqlite(&db_path);
-                        }
-                        continue;
-                    }
-
-                    let mut piped_to_running = false;
-                    if let Some((ref mut child, ref mut stdin_opt)) = active_child {
-                        if let Ok(None) = child.try_wait() {
-                            if let Some(ref mut stdin) = stdin_opt {
-                                if stdin.write_all(format!("{}\n", prompt).as_bytes()).is_ok() {
-                                    let _ = stdin.flush();
-                                    piped_to_running = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if !piped_to_running && !cmd.is_empty() {
-                        match Command::new(shell_binary())
-                            .args(["-c", cmd])
-                            .env("PATH", build_shell_path())
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
-                        {
-                            Ok(mut child) => {
-                                if let Some(stdout) = child.stdout.take() {
-                                    let tx_out = tx.clone();
-                                    std::thread::spawn(move || {
-                                        let reader = BufReader::new(stdout);
-                                        for line in reader.lines().map_while(Result::ok) {
-                                            let _ = tx_out.send(line);
-                                        }
-                                    });
-                                }
-                                if let Some(stderr) = child.stderr.take() {
-                                    let tx_err = tx.clone();
-                                    std::thread::spawn(move || {
-                                        let reader = BufReader::new(stderr);
-                                        for line in reader.lines().map_while(Result::ok) {
-                                            let _ = tx_err.send(line);
-                                        }
-                                    });
-                                }
-                                let child_stdin = child.stdin.take();
-                                active_child = Some((child, child_stdin));
-                            }
-                            Err(err) => {
-                                app.apply_agent_response(&format!(
-                                    "Failed to spawn shell: {}",
-                                    err
-                                ));
-                            }
-                        }
-                    }
-
-                    app.persist_state_to_sqlite(&db_path);
                 }
             }
+            Some(event) = engine_events.recv() => {
+                apply_engine_event(&mut app, event);
+            }
+            _ = tick.tick() => {}
         }
     }
 
-    Ok(())
-}
-
-pub fn run_default() -> io::Result<()> {
-    let _guard = TerminalGuard::new()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    let app = App::new();
-    run(&mut terminal, app)
+    stop.store(true, Ordering::Relaxed);
+    let _ = reader.join();
+    result
 }
