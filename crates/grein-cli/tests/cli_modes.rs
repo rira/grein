@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use assert_cmd::prelude::*;
+use predicates::prelude::*;
+
 fn grein_cmd() -> Command {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_grein") {
         Command::new(bin)
@@ -263,4 +266,86 @@ fn test_daemon_mode_binds_socket_cleanly() {
 
     // Clean up socket file
     let _ = std::fs::remove_file(&socket_path);
+}
+
+#[test]
+fn test_headless_threads_json_subcommand() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = temp_dir.path().join("session.db");
+
+    let mut cmd = grein_cmd();
+    let assert = cmd
+        .arg("threads")
+        .arg("--json")
+        .arg("--db")
+        .arg(&db_path)
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid utf8");
+    let json_val: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    assert!(
+        json_val.is_array() || json_val.is_object(),
+        "threads output must be JSON array or object: {stdout}"
+    );
+}
+
+#[test]
+fn test_headless_status_json_subcommand() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = temp_dir.path().join("session.db");
+    let socket_path = temp_dir.path().join("daemon.sock");
+
+    let mut cmd = grein_cmd();
+    let assert = cmd
+        .arg("status")
+        .arg("--json")
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--socket")
+        .arg(&socket_path)
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid utf8");
+    let json_val: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    assert!(
+        json_val.is_object(),
+        "status output must be a JSON object: {stdout}"
+    );
+}
+
+#[test]
+fn test_headless_agents_json_subcommand() {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let config_path = temp_dir.path().join("grein.toml");
+    std::fs::write(&config_path, "").expect("failed to write empty config");
+
+    let mut cmd = grein_cmd();
+    let assert = cmd
+        .arg("agents")
+        .arg("--json")
+        .arg("--config")
+        .arg(&config_path)
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid utf8");
+    let json_val: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    assert!(
+        json_val.is_array() || json_val.is_object(),
+        "agents output must be JSON array or object: {stdout}"
+    );
 }

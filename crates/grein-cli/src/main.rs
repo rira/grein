@@ -1,4 +1,5 @@
 use std::io;
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -9,7 +10,6 @@ use grein_tui::engine_port::{
     TuiEnginePort,
 };
 use serde_json::Value;
-use std::io::IsTerminal;
 use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug, Parser, Clone, PartialEq, Eq)]
@@ -222,6 +222,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let transport = UnixSocketEngineClient::connect(&socket_path).await?;
                 grein_tui::run_with_engine(Arc::new(EngineClientPort::new(transport))).await?;
             }
+        }
+        Some(Command::Threads(args)) => {
+            grein_cli::headless::handle_threads(&args).await?;
+        }
+        Some(Command::Status(args)) => {
+            grein_cli::headless::handle_status(&args).await?;
+        }
+        Some(Command::Agents(args)) => {
+            grein_cli::headless::handle_agents(&args).await?;
         }
     }
 
