@@ -75,11 +75,8 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
         !app.is_blackboard_collapsed(),
         "Typing '[' or ']' in Composer must not collapse Blackboard"
     );
-    handle_key_event(
-        &mut app,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .expect("Enter submit should succeed");
+    handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter submit should succeed");
 
     // 2. Stream multi-line agent response and verify SQLite persistence updates multi-line turn
     let db_path = std::env::temp_dir().join(format!(
@@ -111,11 +108,7 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
         )
         .unwrap();
     }
-    handle_key_event(
-        &mut app,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-    )
-    .unwrap();
+    handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).unwrap();
     for ch in "Draft line 2".chars() {
         handle_key_event(
             &mut app,

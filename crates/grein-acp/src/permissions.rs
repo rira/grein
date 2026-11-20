@@ -12,6 +12,7 @@ pub enum PermissionDecision {
 pub struct ToolInvocationRequest {
     tool_name: String,
     parameters: Value,
+    in_isolated_worktree: bool,
 }
 
 impl ToolInvocationRequest {
@@ -19,7 +20,24 @@ impl ToolInvocationRequest {
         Self {
             tool_name: tool_name.into(),
             parameters,
+            in_isolated_worktree: false,
         }
+    }
+
+    pub fn with_isolated_worktree(mut self, isolated: bool) -> Self {
+        self.in_isolated_worktree = isolated;
+        self
+    }
+
+    pub fn is_in_isolated_worktree(&self) -> bool {
+        self.in_isolated_worktree
+    }
+
+    pub fn is_write_tool(&self) -> bool {
+        matches!(
+            self.tool_name.as_str(),
+            "write_file" | "edit_file" | "delete_file" | "create_file" | "write"
+        )
     }
 
     pub fn tool_name(&self) -> &str {
