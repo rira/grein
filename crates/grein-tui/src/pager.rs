@@ -53,6 +53,7 @@ impl PagerRunner for DefaultPagerRunner {
     }
 }
 
+#[cfg(test)]
 pub struct MockPagerRunner<F>
 where
     F: Fn(&str) -> io::Result<()> + Send + Sync,
@@ -60,6 +61,7 @@ where
     handler: F,
 }
 
+#[cfg(test)]
 impl<F> MockPagerRunner<F>
 where
     F: Fn(&str) -> io::Result<()> + Send + Sync,
@@ -69,6 +71,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl<F> PagerRunner for MockPagerRunner<F>
 where
     F: Fn(&str) -> io::Result<()> + Send + Sync,
@@ -79,3 +82,50 @@ where
 }
 
 pub type Pager = DefaultPagerRunner;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff_card::DiffCard;
+    use std::sync::Mutex;
+
+    #[test]
+    fn test_mock_pager_runner_works_with_diff_card() {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-old\n+new\n";
+
+        let card = DiffCard::builder()
+            .diff_content(diff)
+            .pager_runner(MockPagerRunner::new(move |payload: &str| {
+                if let Ok(mut guard) = sink.lock() {
+                    guard.push(payload.to_string());
+                }
+                Ok(())
+            }))
+            .build();
+
+        assert_eq!(card.diff_content(), diff);
+
+        let runner = MockPagerRunner::new(|payload: &str| {
+            if payload.is_empty() {
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "empty payload"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(runner.run_pager(card.diff_content()).is_ok());
+        assert!(runner.run_pager("").is_err());
+
+        let recording_sink = Arc::clone(&captured);
+        let recording = MockPagerRunner::new(move |payload: &str| {
+            if let Ok(mut guard) = recording_sink.lock() {
+                guard.push(payload.to_string());
+            }
+            Ok(())
+        });
+        assert!(recording.run_pager(card.diff_content()).is_ok());
+        let recorded = captured.lock().map(|g| g.clone()).unwrap_or_default();
+        assert_eq!(recorded, vec![diff.to_string()]);
+    }
+}
