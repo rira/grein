@@ -78,6 +78,22 @@ fn collect_all_relative_files(dir: &Path) -> io::Result<BTreeSet<PathBuf>> {
     Ok(set)
 }
 
+/// Returns the text of `bytes` when it is valid UTF-8 without NUL bytes.
+fn as_text(bytes: &[u8]) -> Option<&str> {
+    if bytes.contains(&0u8) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()
+}
+
+fn read_or_empty(path: &Path) -> io::Result<Vec<u8>> {
+    if path.is_file() {
+        fs::read(path)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 pub fn compute_directory_diff(primary: &Path, shadow: &Path) -> io::Result<String> {
     let primary_files = collect_all_relative_files(primary)?;
     let shadow_files = collect_all_relative_files(shadow)?;
@@ -85,24 +101,23 @@ pub fn compute_directory_diff(primary: &Path, shadow: &Path) -> io::Result<Strin
 
     let mut diff_output = String::new();
     for rel_path in all_files {
-        let p_path = primary.join(&rel_path);
-        let s_path = shadow.join(&rel_path);
+        let p_bytes = read_or_empty(&primary.join(&rel_path))?;
+        let s_bytes = read_or_empty(&shadow.join(&rel_path))?;
 
-        let p_content = if p_path.exists() {
-            fs::read_to_string(&p_path)?
-        } else {
-            String::new()
-        };
-        let s_content = if s_path.exists() {
-            fs::read_to_string(&s_path)?
-        } else {
-            String::new()
-        };
+        if p_bytes == s_bytes {
+            continue;
+        }
 
-        if p_content != s_content {
-            let rel_str = rel_path.to_string_lossy();
-            let file_diff = compute_file_diff(&rel_str, &p_content, &s_content);
-            diff_output.push_str(&file_diff);
+        let rel_str = rel_path.to_string_lossy();
+        match (as_text(&p_bytes), as_text(&s_bytes)) {
+            (Some(p_text), Some(s_text)) => {
+                diff_output.push_str(&compute_file_diff(&rel_str, p_text, s_text));
+            }
+            _ => {
+                diff_output.push_str(&format!(
+                    "Binary files a/{rel_str} and b/{rel_str} differ\n"
+                ));
+            }
         }
     }
     Ok(diff_output)
