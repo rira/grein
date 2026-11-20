@@ -30,6 +30,28 @@ impl PaneFocus {
     }
 }
 
+impl From<PaneFocus> for crate::app::FocusedPane {
+    fn from(focus: PaneFocus) -> Self {
+        match focus {
+            PaneFocus::Tree => Self::Tree,
+            PaneFocus::Chat => Self::Transcript,
+            PaneFocus::Composer => Self::Composer,
+            PaneFocus::Blackboard => Self::Blackboard,
+        }
+    }
+}
+
+impl From<crate::app::FocusedPane> for PaneFocus {
+    fn from(pane: crate::app::FocusedPane) -> Self {
+        match pane {
+            crate::app::FocusedPane::Tree => Self::Tree,
+            crate::app::FocusedPane::Transcript => Self::Chat,
+            crate::app::FocusedPane::Composer => Self::Composer,
+            crate::app::FocusedPane::Blackboard => Self::Blackboard,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FocusNavigation {
     current: PaneFocus,

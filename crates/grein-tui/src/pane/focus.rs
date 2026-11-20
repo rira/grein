@@ -39,3 +39,25 @@ impl PaneFocus {
         }
     }
 }
+
+impl From<PaneFocus> for crate::app::FocusedPane {
+    fn from(focus: PaneFocus) -> Self {
+        match focus {
+            PaneFocus::Workspace => Self::Tree,
+            PaneFocus::Logs => Self::Transcript,
+            PaneFocus::Composer => Self::Composer,
+            PaneFocus::Blackboard => Self::Blackboard,
+        }
+    }
+}
+
+impl From<crate::app::FocusedPane> for PaneFocus {
+    fn from(pane: crate::app::FocusedPane) -> Self {
+        match pane {
+            crate::app::FocusedPane::Tree => Self::Workspace,
+            crate::app::FocusedPane::Transcript => Self::Logs,
+            crate::app::FocusedPane::Composer => Self::Composer,
+            crate::app::FocusedPane::Blackboard => Self::Blackboard,
+        }
+    }
+}
