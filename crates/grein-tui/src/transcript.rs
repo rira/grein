@@ -1,6 +1,73 @@
 use crate::{AppAction, AppEvent, PaneFocus, TuiComponent};
 use crossterm::event::KeyCode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptViewport {
+    pub scroll_offset: usize,
+    pub max_scroll: usize,
+    pub auto_scroll: bool,
+}
+
+impl Default for TranscriptViewport {
+    fn default() -> Self {
+        Self {
+            scroll_offset: 0,
+            max_scroll: 0,
+            auto_scroll: true,
+        }
+    }
+}
+
+impl TranscriptViewport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub fn max_scroll(&self) -> usize {
+        self.max_scroll
+    }
+
+    pub fn auto_scroll(&self) -> bool {
+        self.auto_scroll
+    }
+
+    pub fn set_max_scroll(&mut self, max_scroll: usize) {
+        self.max_scroll = max_scroll;
+        if self.auto_scroll {
+            self.scroll_offset = max_scroll;
+        } else {
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+        }
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.auto_scroll = false;
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(lines)
+            .min(self.max_scroll);
+        self.auto_scroll = self.scroll_offset >= self.max_scroll;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+        self.auto_scroll = false;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = self.max_scroll;
+        self.auto_scroll = true;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageRole {
     User,

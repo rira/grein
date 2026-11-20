@@ -1,5 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::BTreeMap;
 use thiserror::Error;
+
+use crate::transcript::TranscriptViewport;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TuiError {
@@ -128,7 +131,7 @@ pub struct ThreadItem {
     pub anchors: Vec<AnchorItem>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppConfig {
     pub poll_interval: std::time::Duration,
 }
@@ -156,6 +159,10 @@ pub struct App {
     pub tree: crate::ui::tree::TreeState,
     pub blackboard_pane: crate::panes::blackboard::BlackboardPane,
     pub last_submitted_prompt: Option<String>,
+    pub active_thread_id: String,
+    pub thread_viewports: BTreeMap<String, TranscriptViewport>,
+    pub thread_drafts: BTreeMap<String, String>,
+    pub config: AppConfig,
 }
 
 pub type AppState = App;
@@ -176,6 +183,10 @@ impl Default for App {
             tree: crate::ui::tree::TreeState::default(),
             blackboard_pane: crate::panes::blackboard::BlackboardPane::new(),
             last_submitted_prompt: None,
+            active_thread_id: "trunk".to_string(),
+            thread_viewports: BTreeMap::new(),
+            thread_drafts: BTreeMap::new(),
+            config: AppConfig::default(),
         }
     }
 }
@@ -185,8 +196,47 @@ impl App {
         Self::default()
     }
 
-    pub fn with_config(_config: AppConfig) -> Self {
-        Self::default()
+    pub fn with_config(config: AppConfig) -> Self {
+        Self {
+            config,
+            ..Self::default()
+        }
+    }
+
+    pub fn active_thread_id(&self) -> &str {
+        &self.active_thread_id
+    }
+
+    pub fn switch_thread(&mut self, thread_id: impl Into<String>) {
+        let target_thread = thread_id.into();
+        self.thread_drafts
+            .insert(self.active_thread_id.clone(), self.input_buffer.clone());
+        self.active_thread_id = target_thread;
+        let restored = self
+            .thread_drafts
+            .get(&self.active_thread_id)
+            .cloned()
+            .unwrap_or_default();
+        self.input_buffer = restored;
+        self.cursor_position = self.input_buffer.len();
+    }
+
+    pub fn transcript_viewport(&self, thread_id: &str) -> TranscriptViewport {
+        self.thread_viewports
+            .get(thread_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn transcript_viewport_mut(&mut self, thread_id: &str) -> &mut TranscriptViewport {
+        self.thread_viewports
+            .entry(thread_id.to_string())
+            .or_default()
+    }
+
+    pub fn active_transcript_scroll_offset(&self) -> usize {
+        self.transcript_viewport(&self.active_thread_id)
+            .scroll_offset()
     }
 
     fn sync_focus_in(&mut self) {
@@ -271,7 +321,12 @@ impl App {
         self.last_submitted_prompt.clone()
     }
 
-    pub fn poll_events(&mut self, _d: std::time::Duration) -> Result<(), TuiError> {
+    pub fn poll_events(&mut self, timeout: std::time::Duration) -> Result<(), TuiError> {
+        if crossterm::event::poll(timeout)? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                self.handle_key_event(key);
+            }
+        }
         Ok(())
     }
 
@@ -499,6 +554,42 @@ impl App {
                 self.sync_focus_out();
                 return true;
             }
+            KeyCode::Up if self.focused_pane == FocusedPane::Transcript => {
+                let active = self.active_thread_id.clone();
+                self.transcript_viewport_mut(&active).scroll_up(1);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::Down if self.focused_pane == FocusedPane::Transcript => {
+                let active = self.active_thread_id.clone();
+                self.transcript_viewport_mut(&active).scroll_down(1);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::PageUp if self.focused_pane == FocusedPane::Transcript => {
+                let active = self.active_thread_id.clone();
+                self.transcript_viewport_mut(&active).scroll_up(10);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::PageDown if self.focused_pane == FocusedPane::Transcript => {
+                let active = self.active_thread_id.clone();
+                self.transcript_viewport_mut(&active).scroll_down(10);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::Home if self.focused_pane == FocusedPane::Transcript => {
+                let active = self.active_thread_id.clone();
+                self.transcript_viewport_mut(&active).scroll_to_top();
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::End if self.focused_pane == FocusedPane::Transcript => {
+                let active = self.active_thread_id.clone();
+                self.transcript_viewport_mut(&active).scroll_to_bottom();
+                self.sync_focus_out();
+                return true;
+            }
             KeyCode::Char(c) if self.focused_pane == FocusedPane::Composer => {
                 if !key
                     .modifiers
@@ -593,6 +684,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn test_initial_focus_is_tree() {
