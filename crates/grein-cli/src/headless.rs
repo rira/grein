@@ -12,8 +12,11 @@ use crate::engine::{DaemonEngine, InProcessEngine};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadOutput {
     pub thread_id: String,
+    pub title: String,
     pub parent_node_id: String,
+    pub active_leaf_id: String,
     pub merged: bool,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,28 +36,39 @@ pub struct AgentOutput {
     pub executable_path: PathBuf,
 }
 
+pub async fn collect_threads_output(
+    args: &ThreadsArgs,
+) -> Result<Vec<ThreadOutput>, Box<dyn std::error::Error + Send + Sync>> {
+    let db_path = args.db.clone().unwrap_or_else(default_db_path);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let engine = InProcessEngine::open_with_config(&db_path, cwd, None)
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+    let summaries = engine
+        .list_threads()
+        .await
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+    Ok(summaries
+        .into_iter()
+        .map(|s| ThreadOutput {
+            thread_id: s.thread_id,
+            title: s.title,
+            parent_node_id: s.parent_node_id,
+            active_leaf_id: s.active_leaf_id,
+            merged: s.merged,
+            status: serde_json::to_string(&s.status)
+                .map(|raw| raw.trim_matches('"').to_string())
+                .unwrap_or_else(|_| "idle".to_string()),
+        })
+        .collect())
+}
+
 pub async fn handle_threads(
     args: &ThreadsArgs,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let db_path = args.db.clone().unwrap_or_else(default_db_path);
-    let threads: Vec<ThreadOutput> = if db_path.exists() {
-        let engine =
-            InProcessEngine::open(&db_path).map_err(|e| io::Error::other(format!("{e:?}")))?;
-        let summaries = engine
-            .list_threads()
-            .await
-            .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        summaries
-            .into_iter()
-            .map(|s| ThreadOutput {
-                thread_id: s.thread_id,
-                parent_node_id: s.parent_node_id,
-                merged: s.merged,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let threads = collect_threads_output(args).await?;
 
     if args.json {
         let json = serde_json::to_string_pretty(&threads)?;
@@ -63,13 +77,13 @@ pub async fn handle_threads(
         println!("No threads found.");
     } else {
         println!(
-            "{:<36} {:<36} {:<6}",
-            "THREAD ID", "PARENT NODE ID", "MERGED"
+            "{:<36} {:<20} {:<36} {:<10} {:<6}",
+            "THREAD ID", "TITLE", "PARENT NODE ID", "STATUS", "MERGED"
         );
         for t in threads {
             println!(
-                "{:<36} {:<36} {:<6}",
-                t.thread_id, t.parent_node_id, t.merged
+                "{:<36} {:<20} {:<36} {:<10} {:<6}",
+                t.thread_id, t.title, t.parent_node_id, t.status, t.merged
             );
         }
     }
@@ -77,9 +91,7 @@ pub async fn handle_threads(
     Ok(())
 }
 
-pub async fn handle_status(
-    args: &StatusArgs,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let state_dir = resolve_state_dir(&cwd);
     let db_path = args.db.clone().unwrap_or_else(default_db_path);
@@ -97,7 +109,7 @@ pub async fn handle_status(
     };
 
     let (thread_count, blackboard_count) = if db_path.exists() {
-        if let Ok(engine) = InProcessEngine::open(&db_path) {
+        if let Ok(engine) = InProcessEngine::open_with_config(&db_path, cwd, None) {
             let tc = engine.list_threads().await.map(|t| t.len()).unwrap_or(0);
             let bc = engine.blackboard_list().await.map(|b| b.len()).unwrap_or(0);
             (tc, bc)
@@ -108,7 +120,7 @@ pub async fn handle_status(
         (0, 0)
     };
 
-    let status = StatusOutput {
+    StatusOutput {
         workspace_mode,
         state_dir,
         db_path,
@@ -116,7 +128,13 @@ pub async fn handle_status(
         socket_reachable,
         thread_count,
         blackboard_count,
-    };
+    }
+}
+
+pub async fn handle_status(
+    args: &StatusArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let status = collect_status_output(args).await;
 
     if args.json {
         let json = serde_json::to_string_pretty(&status)?;
@@ -165,4 +183,67 @@ pub async fn handle_agents(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_headless_threads_and_status_reflect_hydrated_sqlite_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("session.db");
+        let socket_path = temp.path().join("daemon.sock");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("topic-a"))
+            .await
+            .expect("fork");
+        engine
+            .blackboard_upsert("goal", "ship")
+            .await
+            .expect("upsert");
+        drop(engine);
+
+        let threads_out = collect_threads_output(&ThreadsArgs {
+            json: true,
+            db: Some(db_path.clone()),
+        })
+        .await
+        .expect("collect_threads_output");
+        assert_eq!(threads_out.len(), 2);
+        assert_eq!(threads_out[0].thread_id, main.thread_id);
+        assert_eq!(threads_out[0].title, "Main");
+        assert_eq!(threads_out[0].status, "idle");
+        assert!(!threads_out[0].merged);
+        assert_eq!(threads_out[1].title, "topic-a");
+
+        let status_out = collect_status_output(&StatusArgs {
+            json: true,
+            socket: Some(socket_path.clone()),
+            db: Some(db_path.clone()),
+        })
+        .await;
+        assert_eq!(status_out.thread_count, 2);
+        assert_eq!(status_out.blackboard_count, 1);
+
+        handle_threads(&ThreadsArgs {
+            json: true,
+            db: Some(db_path.clone()),
+        })
+        .await
+        .expect("handle_threads");
+
+        handle_status(&StatusArgs {
+            json: true,
+            socket: Some(socket_path.clone()),
+            db: Some(db_path.clone()),
+        })
+        .await
+        .expect("handle_status");
+    }
 }

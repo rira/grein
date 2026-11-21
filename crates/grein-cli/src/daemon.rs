@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -62,6 +63,16 @@ async fn handle_legacy(engine: &InProcessEngine, line: &str) -> String {
     "ok\n".to_string()
 }
 
+fn parse_subscribe_events_id(line: &str) -> Option<Value> {
+    let req: Value = serde_json::from_str(line).ok()?;
+    let method = req.get("method").and_then(Value::as_str)?;
+    if method == "session.subscribe_events" {
+        Some(req.get("id").cloned().unwrap_or(Value::Null))
+    } else {
+        None
+    }
+}
+
 pub async fn run_daemon_with_socket_and_db(
     socket_path: PathBuf,
     db_path: PathBuf,
@@ -70,7 +81,9 @@ pub async fn run_daemon_with_socket_and_db(
         let _ = std::fs::remove_file(&socket_path);
     }
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
 
     let engine = Arc::new(InProcessEngine::open(&db_path)?);
@@ -90,16 +103,44 @@ pub async fn run_daemon_with_socket_and_db(
                                 if trimmed.is_empty() {
                                     continue;
                                 }
-                                let response = if trimmed.starts_with('{') {
-                                    format!("{}\n", dispatch_json_rpc(engine.as_ref(), trimmed).await)
+                                if trimmed.starts_with('{') {
+                                    if let Some(id) = parse_subscribe_events_id(trimmed) {
+                                        let ack = json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": {"subscribed": true}
+                                        });
+                                        if writer.write_all(format!("{ack}\n").as_bytes()).await.is_err()
+                                            || writer.flush().await.is_err()
+                                        {
+                                            break;
+                                        }
+                                        let mut rx = engine.subscribe_tui_events();
+                                        while let Some(ev) = rx.recv().await {
+                                            let Ok(encoded) = serde_json::to_string(&ev) else {
+                                                continue;
+                                            };
+                                            if writer.write_all(format!("{encoded}\n").as_bytes()).await.is_err()
+                                                || writer.flush().await.is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    let response = format!("{}\n", dispatch_json_rpc(engine.as_ref(), trimmed).await);
+                                    if writer.write_all(response.as_bytes()).await.is_err()
+                                        || writer.flush().await.is_err()
+                                    {
+                                        break;
+                                    }
                                 } else {
-                                    handle_legacy(engine.as_ref(), trimmed).await
-                                };
-                                if writer.write_all(response.as_bytes()).await.is_err() {
-                                    break;
-                                }
-                                if writer.flush().await.is_err() {
-                                    break;
+                                    let response = handle_legacy(engine.as_ref(), trimmed).await;
+                                    if writer.write_all(response.as_bytes()).await.is_err()
+                                        || writer.flush().await.is_err()
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -121,4 +162,104 @@ pub async fn run_daemon_with_socket_and_db(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::connect_to_daemon;
+    use crate::engine::UnixSocketEngineClient;
+    use grein_tui::engine_port::TuiEngineEvent;
+    use std::time::Duration;
+    use tokio::net::UnixStream;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_daemon_socket_rpc_methods_and_live_event_subscription() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("daemon.sock");
+        let db_path = temp.path().join("session.db");
+
+        let sock_clone = socket_path.clone();
+        let db_clone = db_path.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_daemon_with_socket_and_db(sock_clone, db_clone).await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client = UnixSocketEngineClient::connect(&socket_path)
+            .await
+            .expect("connect UnixSocketEngineClient");
+        let mut rx = client
+            .subscribe_events()
+            .await
+            .expect("subscribe")
+            .expect("live socket event receiver");
+
+        let main = client.ensure_main_thread().await.expect("ensure main");
+        assert_eq!(main.title, "Main");
+
+        let forked = client
+            .fork_thread_with_title(Some(&main.thread_id), Some("socket-branch"))
+            .await
+            .expect("fork");
+        assert_eq!(forked.title, "socket-branch");
+
+        client
+            .blackboard_upsert("mode", "daemon")
+            .await
+            .expect("upsert");
+        assert!(client.blackboard_delete("mode").await.expect("delete"));
+
+        let shell_res = client
+            .run_shell_command(&main.thread_id, "printf 'via-socket'")
+            .await
+            .expect("shell");
+        assert_eq!(shell_res.stdout, "via-socket");
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            if let Ok(Some(ev)) = timeout(Duration::from_secs(2), rx.recv()).await {
+                seen.push(ev);
+            }
+        }
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCreated { thread } if thread.id == forked.thread_id
+        )));
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::BlackboardUpdated { key, value } if key == "mode" && value == "daemon"
+        )));
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::BlackboardDeleted { key } if key == "mode"
+        )));
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ShellOutput { stdout, .. } if stdout == "via-socket"
+        )));
+
+        let mut raw_client = connect_to_daemon(&socket_path)
+            .await
+            .expect("connect DaemonClient");
+        let threads_val = raw_client
+            .session_list_threads()
+            .await
+            .expect("session_list_threads");
+        assert_eq!(threads_val["result"].as_array().unwrap().len(), 2);
+        let merged_val = raw_client
+            .session_merge_thread(&forked.thread_id)
+            .await
+            .expect("session_merge_thread");
+        assert_eq!(merged_val["result"]["merged"], true);
+
+        server.abort();
+    }
 }
