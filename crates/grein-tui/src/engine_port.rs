@@ -65,6 +65,27 @@ pub enum TuiEngineEvent {
         key: String,
         value: String,
     },
+    BlackboardDeleted {
+        key: String,
+    },
+    ThoughtChunk {
+        thread_id: String,
+        content: String,
+    },
+    ThreadCreated {
+        thread: HydratedThread,
+    },
+    ThreadTitleUpdated {
+        thread_id: String,
+        title: String,
+    },
+    ShellOutput {
+        thread_id: String,
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
     Error {
         message: String,
     },
@@ -79,4 +100,38 @@ pub trait TuiEnginePort: Send + Sync {
     async fn merge_thread(&self, source_id: &str, target_id: &str) -> io::Result<()>;
     async fn resolve_permission(&self, request_id: &str, approved: bool) -> io::Result<()>;
     async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>>;
+
+    async fn fork_branch(
+        &self,
+        source_thread_id: &str,
+        title: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        let id = self
+            .fork_thread(source_thread_id, title.unwrap_or(""))
+            .await?;
+        Ok(HydratedThread {
+            id,
+            title: title
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or("Branch")
+                .to_string(),
+            turns: Vec::new(),
+        })
+    }
+
+    async fn cancel_turn(&self, _thread_id: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn upsert_blackboard(&self, _key: &str, _value: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_blackboard(&self, _key: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn run_shell_command(&self, _thread_id: &str, _command: &str) -> io::Result<()> {
+        Ok(())
+    }
 }

@@ -299,3 +299,304 @@ async fn test_engine_port_hydrates_from_real_sqlite_storage() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+#[tokio::test]
+async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use grein_tui::app::FocusedPane;
+    use grein_tui::runner::run_with_engine_events;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tokio::sync::Notify;
+
+    struct SlowBlockingEngine {
+        session: HydratedSession,
+        unblock_send: Arc<Notify>,
+        tx: Mutex<Option<mpsc::UnboundedSender<TuiEngineEvent>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TuiEnginePort for SlowBlockingEngine {
+        async fn hydrate_session(&self) -> io::Result<HydratedSession> {
+            Ok(self.session.clone())
+        }
+        async fn send_turn(&self, thread_id: &str, prompt: &str) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("send:{thread_id}:{prompt}"));
+            self.unblock_send.notified().await;
+            Ok(())
+        }
+        async fn fork_thread(&self, thread_id: &str, title: &str) -> io::Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("fork:{thread_id}:{title}"));
+            Ok("t-branch".to_string())
+        }
+        async fn merge_thread(&self, _source_id: &str, _target_id: &str) -> io::Result<()> {
+            Ok(())
+        }
+        async fn resolve_permission(&self, request_id: &str, approved: bool) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("perm:{request_id}:{approved}"));
+            Ok(())
+        }
+        async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        }
+        async fn upsert_blackboard(&self, key: &str, value: &str) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("wb_set:{key}:{value}"));
+            Ok(())
+        }
+        async fn delete_blackboard(&self, key: &str) -> io::Result<()> {
+            self.calls.lock().unwrap().push(format!("wb_del:{key}"));
+            Ok(())
+        }
+        async fn run_shell_command(&self, thread_id: &str, command: &str) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("shell:{thread_id}:{command}"));
+            Err(io::Error::other("shell failed cleanly"))
+        }
+        async fn cancel_turn(&self, thread_id: &str) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cancel:{thread_id}"));
+            Ok(())
+        }
+    }
+
+    let unblock = Arc::new(Notify::new());
+    let engine = Arc::new(SlowBlockingEngine {
+        session: sample_session(),
+        unblock_send: Arc::clone(&unblock),
+        tx: Mutex::new(None),
+        calls: Mutex::new(Vec::new()),
+    });
+
+    let branched = engine.fork_branch("t-1", Some("side")).await.unwrap();
+    assert_eq!(branched.id, "t-branch");
+    assert_eq!(branched.title, "side");
+
+    let backend = TestBackend::new(120, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let app = App::new();
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+    let (key_tx, key_rx) = mpsc::unbounded_channel();
+    let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
+    let runner_handle = tokio::spawn(async move {
+        run_with_engine_events(&mut terminal, app, engine_dyn, key_rx).await?;
+        Ok::<_, io::Error>(terminal)
+    });
+
+    for ch in "hello async".chars() {
+        key_tx
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
+    key_tx
+        .send(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        .unwrap();
+
+    // Even while send_turn is blocked on Notify, UI keeps accepting commands and receives errors.
+    for ch in "/wb set env dev".chars() {
+        key_tx
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
+    key_tx
+        .send(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        .unwrap();
+    for ch in "!false".chars() {
+        key_tx
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
+    key_tx
+        .send(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    if let Some(ev_tx) = engine.tx.lock().unwrap().as_ref() {
+        let _ = ev_tx.send(TuiEngineEvent::PermissionRequested {
+            request_id: "perm-99".to_string(),
+            description: "Allow tool?".to_string(),
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    key_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    key_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), runner_handle)
+        .await
+        .expect("event loop must not block on slow send_turn")
+        .unwrap()
+        .unwrap();
+
+    unblock.notify_waiters();
+    let recorded = engine.calls.lock().unwrap().clone();
+    assert!(recorded.contains(&"send:t-1:hello async".to_string()));
+    assert!(recorded.contains(&"wb_set:env:dev".to_string()));
+    assert!(recorded.contains(&"shell:t-1:false".to_string()));
+    assert!(recorded.contains(&"perm:perm-99:true".to_string()));
+
+    let buf = terminal.backend().buffer();
+    let mut screen = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(screen.contains("shell failed cleanly"));
+    assert!(screen.contains("env: dev"));
+}
+
+#[test]
+fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_whiteboard() {
+    use grein_tui::app::FocusedPane;
+    use grein_tui::runner::{apply_engine_event, apply_hydrated_session};
+
+    let mut app = App::new();
+    apply_hydrated_session(&mut app, &sample_session());
+    assert_eq!(app.active_thread_id(), "t-1");
+    assert_eq!(app.blackboard_entries.len(), 1);
+    assert!(app.blackboard_notes.contains("goal: ship"));
+
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadCreated {
+            thread: HydratedThread {
+                id: "t-2".to_string(),
+                title: "Forked".to_string(),
+                turns: Vec::new(),
+            },
+        },
+    );
+    assert_eq!(app.active_thread_id(), "t-2");
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+    // Background stream arrives on t-1 while t-2 is active.
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::StreamChunk {
+            thread_id: "t-1".to_string(),
+            content: "Hel".to_string(),
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::StreamChunk {
+            thread_id: "t-1".to_string(),
+            content: "lo!".to_string(),
+        },
+    );
+    assert!(!app.active_transcript_md.contains("Hello!"));
+
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ToolInvoked {
+            thread_id: "t-1".to_string(),
+            tool_name: "read".to_string(),
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ToolResult {
+            thread_id: "t-1".to_string(),
+            tool_name: "read".to_string(),
+            output: "42 lines".to_string(),
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::TurnCompleted {
+            thread_id: "t-1".to_string(),
+        },
+    );
+    assert!(!app.streaming_assistant_threads.contains("t-1"));
+    assert_eq!(
+        app.thread_statuses.get("t-1").map(String::as_str),
+        Some("idle")
+    );
+
+    app.switch_thread("t-1");
+    assert!(app.active_transcript_md.contains("\n\n## Assistant\nHello!"));
+    assert_eq!(app.active_transcript_md.matches("## Assistant").count(), 1);
+    assert!(app.active_transcript_md.contains("read"));
+    assert!(app.active_transcript_md.contains("42 lines"));
+
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ShellOutput {
+            thread_id: "t-1".to_string(),
+            command: "echo hi".to_string(),
+            stdout: "hi\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        },
+    );
+    assert!(app
+        .active_transcript_md
+        .contains("$ echo hi (exit 0)\n```text\nhi\n```"));
+
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadTitleUpdated {
+            thread_id: "t-2".to_string(),
+            title: "Renamed Branch".to_string(),
+        },
+    );
+    assert_eq!(app.threads[1].title, "Renamed Branch");
+
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::BlackboardDeleted {
+            key: "goal".to_string(),
+        },
+    );
+    assert!(app.blackboard_entries.is_empty());
+
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThoughtChunk {
+            thread_id: "t-1".to_string(),
+            content: "thinking".to_string(),
+        },
+    );
+    assert!(!app.active_transcript_md.contains("thinking"));
+}

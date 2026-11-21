@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
+use crate::engine_port::HydratedBlackboardEntry;
 use crate::transcript::TranscriptViewport;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -18,9 +19,9 @@ impl From<std::io::Error> for TuiError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum FocusedPane {
-    #[default]
     Tree,
     Transcript,
+    #[default]
     Composer,
     Blackboard,
 }
@@ -32,9 +33,41 @@ pub enum FocusDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermission {
+    pub request_id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
     Scrolled { delta: i32 },
     None,
+    SendPrompt {
+        thread_id: String,
+        prompt: String,
+    },
+    RunShell {
+        thread_id: String,
+        command: String,
+    },
+    ForkBranch {
+        source_thread_id: String,
+        title: Option<String>,
+    },
+    UpsertBlackboard {
+        key: String,
+        value: String,
+    },
+    DeleteBlackboard {
+        key: String,
+    },
+    CancelTurn {
+        thread_id: String,
+    },
+    ResolvePermission {
+        request_id: String,
+        approved: bool,
+    },
 }
 
 pub trait TuiComponent {
@@ -151,6 +184,8 @@ pub struct App {
     pub active_focus: FocusedPane,
     pub blackboard_collapsed: bool,
     pub blackboard_notes: String,
+    pub blackboard_entries: Vec<HydratedBlackboardEntry>,
+    pub blackboard_selected: usize,
     pub input_buffer: String,
     pub cursor_position: usize,
     pub should_quit: bool,
@@ -160,8 +195,15 @@ pub struct App {
     pub blackboard_pane: crate::panes::blackboard::BlackboardPane,
     pub last_submitted_prompt: Option<String>,
     pub active_thread_id: String,
+    pub thread_transcripts: BTreeMap<String, String>,
+    pub thread_statuses: BTreeMap<String, String>,
+    pub streaming_assistant_threads: BTreeSet<String>,
+    pub thread_thoughts: BTreeMap<String, String>,
     pub thread_viewports: BTreeMap<String, TranscriptViewport>,
     pub thread_drafts: BTreeMap<String, String>,
+    pub pending_permission: Option<PendingPermission>,
+    pub pending_permissions: VecDeque<PendingPermission>,
+    pub pending_actions: VecDeque<AppAction>,
     pub config: AppConfig,
 }
 
@@ -170,11 +212,13 @@ pub type AppState = App;
 impl Default for App {
     fn default() -> Self {
         Self {
-            focused_pane: FocusedPane::Tree,
-            focus: FocusedPane::Tree,
-            active_focus: FocusedPane::Tree,
+            focused_pane: FocusedPane::Composer,
+            focus: FocusedPane::Composer,
+            active_focus: FocusedPane::Composer,
             blackboard_collapsed: false,
             blackboard_notes: String::new(),
+            blackboard_entries: Vec::new(),
+            blackboard_selected: 0,
             input_buffer: String::new(),
             cursor_position: 0,
             should_quit: false,
@@ -184,8 +228,15 @@ impl Default for App {
             blackboard_pane: crate::panes::blackboard::BlackboardPane::new(),
             last_submitted_prompt: None,
             active_thread_id: "trunk".to_string(),
+            thread_transcripts: BTreeMap::new(),
+            thread_statuses: BTreeMap::new(),
+            streaming_assistant_threads: BTreeSet::new(),
+            thread_thoughts: BTreeMap::new(),
             thread_viewports: BTreeMap::new(),
             thread_drafts: BTreeMap::new(),
+            pending_permission: None,
+            pending_permissions: VecDeque::new(),
+            pending_actions: VecDeque::new(),
             config: AppConfig::default(),
         }
     }
@@ -211,6 +262,10 @@ impl App {
         let target_thread = thread_id.into();
         self.thread_drafts
             .insert(self.active_thread_id.clone(), self.input_buffer.clone());
+        self.thread_transcripts.insert(
+            self.active_thread_id.clone(),
+            self.active_transcript_md.clone(),
+        );
         self.active_thread_id = target_thread;
         let restored = self
             .thread_drafts
@@ -219,6 +274,86 @@ impl App {
             .unwrap_or_default();
         self.input_buffer = restored;
         self.cursor_position = self.input_buffer.len();
+        self.active_transcript_md = self
+            .thread_transcripts
+            .get(&self.active_thread_id)
+            .cloned()
+            .unwrap_or_default();
+        self.thread_viewports
+            .entry(self.active_thread_id.clone())
+            .or_default();
+        self.sync_anchors_and_blackboard();
+        self.select_active_thread_in_tree();
+    }
+
+    pub fn select_active_thread_in_tree(&mut self) {
+        if let Some(idx) = self.tree.nodes.iter().position(|n| {
+            matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == self.active_thread_id)
+        }) {
+            self.tree.select_index(idx);
+        }
+    }
+
+    pub fn sync_blackboard_notes(&mut self) {
+        self.blackboard_notes = self
+            .blackboard_entries
+            .iter()
+            .map(|e| format!("• {}: {}", e.key, e.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.blackboard_entries.is_empty() {
+            self.blackboard_selected = 0;
+        } else if self.blackboard_selected >= self.blackboard_entries.len() {
+            self.blackboard_selected = self.blackboard_entries.len() - 1;
+        }
+    }
+
+    pub fn upsert_blackboard_entry(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        if let Some(existing) = self.blackboard_entries.iter_mut().find(|e| e.key == key) {
+            existing.value = value;
+        } else {
+            self.blackboard_entries
+                .push(HydratedBlackboardEntry { key, value });
+        }
+        self.sync_blackboard_notes();
+    }
+
+    pub fn remove_blackboard_entry(&mut self, key: &str) {
+        self.blackboard_entries.retain(|e| e.key != key);
+        self.sync_blackboard_notes();
+    }
+
+    pub fn push_permission(&mut self, perm: PendingPermission) {
+        if let Some(active) = &self.pending_permission {
+            if active.request_id == perm.request_id {
+                return;
+            }
+        }
+        if self
+            .pending_permissions
+            .iter()
+            .any(|p| p.request_id == perm.request_id)
+        {
+            return;
+        }
+        if self.pending_permission.is_none() {
+            self.pending_permission = Some(perm);
+        } else {
+            self.pending_permissions.push_back(perm);
+        }
+    }
+
+    pub fn resolve_active_permission(&mut self, approved: bool) {
+        if let Some(perm) = self.pending_permission.take() {
+            self.pending_actions
+                .push_back(AppAction::ResolvePermission {
+                    request_id: perm.request_id,
+                    approved,
+                });
+            self.pending_permission = self.pending_permissions.pop_front();
+        }
     }
 
     pub fn transcript_viewport(&self, thread_id: &str) -> TranscriptViewport {
@@ -241,14 +376,14 @@ impl App {
 
     fn sync_focus_in(&mut self) {
         if self.focus != self.focused_pane {
-            if self.focus != FocusedPane::Tree {
+            if self.focus != FocusedPane::Composer {
                 self.focused_pane = self.focus;
             } else {
                 self.focus = self.focused_pane;
             }
         }
         if self.active_focus != self.focused_pane {
-            if self.active_focus != FocusedPane::Tree {
+            if self.active_focus != FocusedPane::Composer {
                 self.focused_pane = self.active_focus;
             } else {
                 self.active_focus = self.focused_pane;
@@ -463,12 +598,25 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(idx) = self.tree.selected_index() {
-                    if let Some(crate::ui::tree::TreeNode::Anchor(anchor)) =
-                        self.tree.nodes.get(idx)
-                    {
-                        let id = anchor.id.clone();
-                        self.tree.set_active_anchor_id(Some(id.clone()));
-                        return Some(TreeAction::ActivateAnchor(id));
+                    match self.tree.nodes.get(idx).cloned() {
+                        Some(crate::ui::tree::TreeNode::Anchor(anchor)) => {
+                            let id = anchor.id;
+                            let thread_id = anchor.thread_id;
+                            if thread_id != self.active_thread_id
+                                && self.threads.iter().any(|t| t.id == thread_id)
+                            {
+                                self.switch_thread(&thread_id);
+                            }
+                            self.tree.set_active_anchor_id(Some(id.clone()));
+                            return Some(TreeAction::ActivateAnchor(id));
+                        }
+                        Some(crate::ui::tree::TreeNode::Thread(thread)) => {
+                            self.switch_thread(&thread.id);
+                            self.focused_pane = FocusedPane::Composer;
+                            self.sync_focus_out();
+                            return None;
+                        }
+                        None => {}
                     }
                 }
                 None
@@ -477,18 +625,102 @@ impl App {
         }
     }
 
+    fn handle_key_blackboard(&mut self, key: KeyEvent) -> bool {
+        if self.is_blackboard_collapsed() {
+            return false;
+        }
+        let no_ctrl_alt = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') if no_ctrl_alt => {
+                self.blackboard_selected = self.blackboard_selected.saturating_sub(1);
+                self.sync_focus_out();
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') if no_ctrl_alt => {
+                if self.blackboard_selected + 1 < self.blackboard_entries.len() {
+                    self.blackboard_selected += 1;
+                }
+                self.sync_focus_out();
+                true
+            }
+            KeyCode::Char('a') if no_ctrl_alt => {
+                self.input_buffer = "/wb set ".to_string();
+                self.cursor_position = self.input_buffer.len();
+                self.focused_pane = FocusedPane::Composer;
+                self.sync_focus_out();
+                true
+            }
+            KeyCode::Char('e') if no_ctrl_alt => {
+                if let Some(entry) = self.blackboard_entries.get(self.blackboard_selected) {
+                    self.input_buffer = format!("/wb set {} {}", entry.key, entry.value);
+                    self.cursor_position = self.input_buffer.len();
+                    self.focused_pane = FocusedPane::Composer;
+                    self.sync_focus_out();
+                    true
+                } else {
+                    false
+                }
+            }
+            KeyCode::Char('d') if no_ctrl_alt => {
+                if let Some(entry) = self.blackboard_entries.get(self.blackboard_selected) {
+                    let key = entry.key.clone();
+                    self.pending_actions
+                        .push_back(AppAction::DeleteBlackboard { key });
+                    self.sync_focus_out();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => self.blackboard_pane.handle_key(key),
+        }
+    }
+
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         self.sync_focus_in();
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(
+                key.code,
+                KeyCode::Char('c') | KeyCode::Char('q') | KeyCode::Char('Q')
+            ) {
+                self.should_quit = true;
+                self.sync_focus_out();
+                return true;
+            }
+        }
+
+        if self.pending_permission.is_some() {
+            let no_ctrl_alt = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
             match key.code {
-                KeyCode::Char('c') => {
-                    self.should_quit = true;
-                    self.sync_focus_out();
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if no_ctrl_alt => {
+                    self.resolve_active_permission(true);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc if no_ctrl_alt => {
+                    self.resolve_active_permission(false);
+                }
+                _ => {}
+            }
+            self.sync_focus_out();
+            return true;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    self.toggle_blackboard();
                     return true;
                 }
-                KeyCode::Char('b') => {
-                    self.toggle_blackboard();
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.pending_actions.push_back(AppAction::ForkBranch {
+                        source_thread_id: self.active_thread_id.clone(),
+                        title: None,
+                    });
+                    self.sync_focus_out();
                     return true;
                 }
                 _ => {}
@@ -517,6 +749,18 @@ impl App {
                 return true;
             }
             KeyCode::Esc => {
+                let status = self
+                    .thread_statuses
+                    .get(&self.active_thread_id)
+                    .map(String::as_str)
+                    .unwrap_or("idle");
+                if matches!(status, "streaming" | "executing") {
+                    self.pending_actions.push_back(AppAction::CancelTurn {
+                        thread_id: self.active_thread_id.clone(),
+                    });
+                    self.sync_focus_out();
+                    return true;
+                }
                 if self.focused_pane == FocusedPane::Composer {
                     self.focused_pane = FocusedPane::Tree;
                     self.sync_focus_out();
@@ -535,7 +779,6 @@ impl App {
                 }
                 let prompt = std::mem::take(&mut self.input_buffer);
                 self.cursor_position = 0;
-                self.last_submitted_prompt = Some(prompt.clone());
                 self.submit_composer_prompt(prompt);
                 self.sync_focus_out();
                 return true;
@@ -657,7 +900,7 @@ impl App {
                     return true;
                 }
                 if self.focused_pane == FocusedPane::Blackboard {
-                    return self.blackboard_pane.handle_key(key);
+                    return self.handle_key_blackboard(key);
                 }
             }
         }
@@ -687,21 +930,15 @@ mod tests {
     pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
-    fn test_initial_focus_is_tree() {
+    fn test_initial_focus_is_composer() {
         let app = App::default();
-        assert_eq!(app.focused_pane(), FocusedPane::Tree);
-        assert_eq!(app.focus, FocusedPane::Tree);
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+        assert_eq!(app.focus, FocusedPane::Composer);
     }
 
     #[test]
     fn test_tab_cycles_focus_forward() {
         let mut app = App::default();
-        assert_eq!(app.focused_pane(), FocusedPane::Tree);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane(), FocusedPane::Transcript);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -709,17 +946,17 @@ mod tests {
 
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Tree);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Transcript);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
     }
 
     #[test]
     fn test_backtab_cycles_focus_backward() {
         let mut app = App::default();
-        assert_eq!(app.focused_pane(), FocusedPane::Tree);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane(), FocusedPane::Blackboard);
-
-        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
         app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
@@ -727,15 +964,21 @@ mod tests {
 
         app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Tree);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Blackboard);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
     }
 
     #[test]
     fn test_shift_tab_cycles_focus_backward() {
         let mut app = App::default();
-        assert_eq!(app.focused_pane(), FocusedPane::Tree);
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
-        assert_eq!(app.focused_pane(), FocusedPane::Blackboard);
+        assert_eq!(app.focused_pane(), FocusedPane::Transcript);
     }
 
     #[test]
@@ -744,16 +987,16 @@ mod tests {
         app.set_blackboard_collapsed(true);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Tree);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Transcript);
 
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane(), FocusedPane::Tree);
-
         app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+        assert_eq!(app.focused_pane(), FocusedPane::Transcript);
     }
 
     #[test]
@@ -780,6 +1023,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ctrl_q_and_ctrl_c_quit_from_composer() {
+        let mut app1 = App::new();
+        app1.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app1.should_quit());
+
+        let mut app2 = App::new();
+        app2.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app2.should_quit());
+    }
+
+    #[test]
     fn test_composer_typing_immunity_for_bracket_keys() {
         let mut app = App::new();
         app.set_focus(FocusPane::Composer);
@@ -792,25 +1046,36 @@ mod tests {
     }
 
     #[test]
-    fn test_composer_esc_returns_to_tree_focus() {
+    fn test_composer_esc_returns_to_tree_focus_when_idle_and_cancels_when_streaming() {
         let mut app = App::new();
         app.focus = FocusPane::Composer;
 
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
         assert_eq!(app.focus, FocusPane::Tree);
+
+        app.set_focus(FocusPane::Composer);
+        app.thread_statuses
+            .insert(app.active_thread_id.clone(), "streaming".to_string());
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::CancelTurn {
+                thread_id: app.active_thread_id.clone()
+            })
+        );
     }
 
     #[test]
     fn test_composer_input_routing() {
         let mut app = App::default();
+        app.set_focus(FocusedPane::Tree);
 
         // Input ignored when not in Composer
         app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(app.composer_input(), "");
 
         // Focus Composer
-        app.focused_pane = FocusedPane::Composer;
+        app.set_focus(FocusedPane::Composer);
         app.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert_eq!(app.composer_input(), "hi");
@@ -819,5 +1084,212 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.composer_input(), "h");
         assert_eq!(app.cursor_position, 1);
+    }
+
+    #[test]
+    fn test_composer_command_parsing_dispatches_actions() {
+        let mut app = App::default();
+        app.active_thread_id = "t-main".to_string();
+
+        app.input_buffer = "!cargo test".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.active_transcript_md.contains("cargo test"));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::RunShell {
+                thread_id: "t-main".to_string(),
+                command: "cargo test".to_string(),
+            })
+        );
+
+        app.input_buffer = "/branch feature-x".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::ForkBranch {
+                source_thread_id: "t-main".to_string(),
+                title: Some("feature-x".to_string()),
+            })
+        );
+
+        app.input_buffer = "/fork".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::ForkBranch {
+                source_thread_id: "t-main".to_string(),
+                title: None,
+            })
+        );
+
+        app.input_buffer = "/wb set arch two-tier".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::UpsertBlackboard {
+                key: "arch".to_string(),
+                value: "two-tier".to_string(),
+            })
+        );
+
+        app.input_buffer = "/pin db sqlite".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::UpsertBlackboard {
+                key: "db".to_string(),
+                value: "sqlite".to_string(),
+            })
+        );
+
+        app.input_buffer = "/wb del arch".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::DeleteBlackboard {
+                key: "arch".to_string(),
+            })
+        );
+
+        app.input_buffer = "explain tree".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.active_transcript_md.contains("# User: explain tree"));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::SendPrompt {
+                thread_id: "t-main".to_string(),
+                prompt: "explain tree".to_string(),
+            })
+        );
+
+        app.input_buffer = "/quit".to_string();
+        app.cursor_position = app.input_buffer.len();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn test_permission_modal_intercepts_keys_and_queues_multiple() {
+        let mut app = App::default();
+        app.push_permission(PendingPermission {
+            request_id: "req-1".to_string(),
+            description: "Run git status".to_string(),
+        });
+        app.push_permission(PendingPermission {
+            request_id: "req-2".to_string(),
+            description: "Write file".to_string(),
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.composer_input(), "");
+        assert!(app.pending_actions.is_empty());
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::ResolvePermission {
+                request_id: "req-1".to_string(),
+                approved: true,
+            })
+        );
+        assert_eq!(
+            app.pending_permission.as_ref().map(|p| p.request_id.as_str()),
+            Some("req-2")
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::ResolvePermission {
+                request_id: "req-2".to_string(),
+                approved: false,
+            })
+        );
+        assert!(app.pending_permission.is_none());
+    }
+
+    #[test]
+    fn test_ctrl_n_forks_and_tree_enter_switches_thread_to_composer() {
+        let mut app = App::default();
+        app.active_thread_id = "t-1".to_string();
+        app.thread_transcripts
+            .insert("t-1".to_string(), "# User: root\n\n".to_string());
+        app.thread_transcripts
+            .insert("t-2".to_string(), "# User: branch\n\n".to_string());
+        app.active_transcript_md = "# User: root\n\n".to_string();
+        app.threads = vec![
+            ThreadItem {
+                id: "t-1".to_string(),
+                title: "Root".to_string(),
+                anchors: Vec::new(),
+            },
+            ThreadItem {
+                id: "t-2".to_string(),
+                title: "Branch".to_string(),
+                anchors: Vec::new(),
+            },
+        ];
+        app.sync_anchors_and_blackboard();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::ForkBranch {
+                source_thread_id: "t-1".to_string(),
+                title: None,
+            })
+        );
+
+        app.set_focus(FocusedPane::Tree);
+        let t2_idx = app
+            .tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == "t-2"))
+            .unwrap();
+        app.tree.select_index(t2_idx);
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_thread_id(), "t-2");
+        assert!(app.active_transcript_md.contains("branch"));
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    }
+
+    #[test]
+    fn test_blackboard_navigation_and_editing_hotkeys() {
+        let mut app = App::default();
+        app.upsert_blackboard_entry("k1", "v1");
+        app.upsert_blackboard_entry("k2", "v2");
+        app.set_focus(FocusedPane::Blackboard);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.blackboard_selected, 1);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+        assert_eq!(app.composer_input(), "/wb set k2 v2");
+
+        app.set_focus(FocusedPane::Blackboard);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.blackboard_selected, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::DeleteBlackboard {
+                key: "k1".to_string(),
+            })
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+        assert_eq!(app.composer_input(), "/wb set ");
     }
 }

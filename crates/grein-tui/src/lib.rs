@@ -23,10 +23,10 @@ use std::sync::Arc;
 
 pub use app::{
     AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, FocusDirection, FocusPane,
-    FocusedPane, PaneFocus, ThreadItem, TreeAction, TuiComponent, TuiError,
+    FocusedPane, PaneFocus, PendingPermission, ThreadItem, TreeAction, TuiComponent, TuiError,
 };
 pub use engine_port::TuiEnginePort;
-pub use runner::{draw_frame, handle_event, handle_key_event, TerminalGuard};
+pub use runner::{draw_frame, draw_frame_mut, handle_event, handle_key_event, TerminalGuard};
 pub use transcript::{TranscriptMessage, TranscriptPane};
 
 pub async fn run_with_engine(engine: Arc<dyn TuiEnginePort>) -> std::io::Result<()> {

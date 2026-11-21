@@ -12,18 +12,39 @@ fn test_terminal_guard_raii_lifecycle() {
 }
 
 #[tokio::test]
-async fn test_runner_event_loop_quits_on_q_key() {
+async fn test_runner_event_loop_quits_on_q_key_outside_composer_and_ctrl_q_anywhere() {
     let backend = TestBackend::new(80, 24);
     let _terminal = Terminal::new(backend).expect("failed to create test terminal");
     let mut app_state = grein_tui::state::AppState::new();
+    assert_eq!(app_state.focused_pane(), FocusedPane::Composer);
 
+    let q_in_composer =
+        crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    let exit_in_composer = grein_tui::runner::handle_event(&mut app_state, q_in_composer)
+        .expect("handling event should succeed");
+    assert!(
+        !exit_in_composer,
+        "'q' inside Composer must type 'q' rather than quitting"
+    );
+
+    let ctrl_q =
+        crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    let exit_ctrl_q = grein_tui::runner::handle_event(&mut app_state, ctrl_q)
+        .expect("handling event should succeed");
+    assert!(exit_ctrl_q, "Ctrl+Q must signal event loop termination from Composer");
+
+    let mut tree_app = grein_tui::state::AppState::new();
+    tree_app.set_focus(FocusedPane::Tree);
     let quit_event =
         crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
 
-    let exit_requested = grein_tui::runner::handle_event(&mut app_state, quit_event)
+    let exit_requested = grein_tui::runner::handle_event(&mut tree_app, quit_event)
         .expect("handling event should succeed");
 
-    assert!(exit_requested, "'q' key must signal event loop termination");
+    assert!(
+        exit_requested,
+        "'q' key outside Composer must signal event loop termination"
+    );
 }
 
 #[tokio::test]
@@ -202,15 +223,15 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
     );
     // Blackboard pane assertions
     assert!(
-        screen.contains("Blackboard") && screen.contains("Active Thread:"),
-        "Blackboard pane must render active thread notes"
+        screen.contains("Blackboard") && screen.contains("No shared facts yet"),
+        "Blackboard pane must render whiteboard empty-state hint when empty"
     );
     // Composer pane & status bar assertions
     assert!(
         screen.contains("Composer")
             && screen.contains("Draft line 1")
             && screen.contains("Draft line 2")
-            && screen.contains("Enter: Submit"),
+            && screen.contains("Enter: Send"),
         "Composer pane must auto-grow for multi-line draft and display keybinding status bar"
     );
 }

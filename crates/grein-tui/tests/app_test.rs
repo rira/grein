@@ -6,14 +6,8 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 #[test]
-fn default_focus_starts_on_sidebar_and_cycles_forward_through_four_panes() {
+fn default_focus_starts_on_composer_and_cycles_forward_through_four_panes() {
     let mut app = App::default();
-    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
-
-    app.handle_key_event(key(KeyCode::Tab));
-    assert_eq!(app.focused_pane(), FocusPane::Transcript);
-
-    app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
     app.handle_key_event(key(KeyCode::Tab));
@@ -21,17 +15,17 @@ fn default_focus_starts_on_sidebar_and_cycles_forward_through_four_panes() {
 
     app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.focused_pane(), FocusPane::Sidebar);
+
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Transcript);
+
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
 }
 
 #[test]
 fn backtab_cycles_focus_backward_through_four_panes() {
     let mut app = App::default();
-    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
-
-    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-    assert_eq!(app.focused_pane(), FocusPane::Inspector);
-
-    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
     app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
@@ -39,11 +33,18 @@ fn backtab_cycles_focus_backward_through_four_panes() {
 
     app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(app.focused_pane(), FocusPane::Sidebar);
+
+    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.focused_pane(), FocusPane::Inspector);
+
+    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
 }
 
 #[test]
 fn character_input_routes_to_composer_only_when_composer_focused() {
     let mut app = App::default();
+    app.set_focused_pane(FocusPane::Sidebar);
 
     // Typing while Sidebar is focused does not mutate composer buffer
     app.handle_key_event(key(KeyCode::Char('x')));
@@ -63,7 +64,7 @@ fn character_input_routes_to_composer_only_when_composer_focused() {
 }
 
 #[test]
-fn quit_key_stops_app_only_outside_composer_focus() {
+fn quit_key_stops_app_only_outside_composer_focus_and_ctrl_q_quits_anywhere() {
     let mut app = App::default();
     app.set_focused_pane(FocusPane::Composer);
 
@@ -71,7 +72,11 @@ fn quit_key_stops_app_only_outside_composer_focus() {
     assert!(app.is_running());
     assert_eq!(app.composer_input(), "q");
 
-    app.set_focused_pane(FocusPane::Sidebar);
-    app.handle_key_event(key(KeyCode::Char('q')));
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     assert!(!app.is_running());
+
+    let mut app2 = App::default();
+    app2.set_focused_pane(FocusPane::Sidebar);
+    app2.handle_key_event(key(KeyCode::Char('q')));
+    assert!(!app2.is_running());
 }

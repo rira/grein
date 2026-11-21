@@ -18,11 +18,14 @@ use ratatui::backend::Backend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::app::{AnchorItem, App, FocusedPane, ThreadItem, TreeAction, TuiError};
+use crate::app::{
+    AnchorItem, App, AppAction, FocusedPane, PendingPermission, ThreadItem, TreeAction, TuiError,
+};
 use crate::engine_port::{HydratedSession, TuiEngineEvent, TuiEnginePort};
 
 const USER_PREFIX: &str = "# User: ";
 const AGENT_HEADER: &str = "## Agent (agy)";
+const ASSISTANT_HEADER: &str = "## Assistant";
 
 pub struct TerminalGuard {
     active: bool,
@@ -54,6 +57,11 @@ pub fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> io::Resu
     Ok(())
 }
 
+pub fn draw_frame_mut<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+    terminal.draw(|frame| crate::render::render_mut(frame, app))?;
+    Ok(())
+}
+
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
     if let Event::Key(key) = event {
         let _ = handle_key_event(app, key);
@@ -72,7 +80,7 @@ fn collect_turns(transcript: &str) -> Vec<(AuthorRole, String)> {
                 turns.push((role, content.trim().to_string()));
             }
             current = Some((AuthorRole::User, rest.to_string()));
-        } else if line == AGENT_HEADER {
+        } else if line == AGENT_HEADER || line == ASSISTANT_HEADER {
             if let Some((role, content)) = current.take() {
                 turns.push((role, content.trim().to_string()));
             }
@@ -97,6 +105,115 @@ fn render_node(role: &AuthorRole, content: &str) -> String {
     }
 }
 
+fn ensure_paragraph_break(buf: &mut String) {
+    if !buf.is_empty() {
+        if !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        if !buf.ends_with("\n\n") {
+            buf.push('\n');
+        }
+    }
+}
+
+fn parse_wb_kv(rest: &str) -> Option<(String, String)> {
+    let trimmed = rest.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let key = parts.next()?.trim();
+    let value = parts.next()?.trim();
+    if key.is_empty() || value.is_empty() {
+        None
+    } else {
+        Some((key.to_string(), value.to_string()))
+    }
+}
+
+fn parse_anchors_for_transcript(transcript: &str) -> Vec<AnchorItem> {
+    let parsed = grein_core::anchor::parse_anchors(transcript);
+    let mut anchor_items: Vec<AnchorItem> = parsed
+        .into_iter()
+        .map(|a| AnchorItem {
+            id: a.slug,
+            label: a.title,
+        })
+        .collect();
+
+    if anchor_items.is_empty() {
+        let turns = collect_turns(transcript);
+        for (idx, (role, content)) in turns.iter().enumerate() {
+            if *role == AuthorRole::User {
+                let label = content.lines().next().unwrap_or("Turn").to_string();
+                anchor_items.push(AnchorItem {
+                    id: format!("anchor-{}", idx + 1),
+                    label,
+                });
+            }
+        }
+    }
+    anchor_items
+}
+
+fn rebuild_tree_nodes(app: &mut App) {
+    let mut nodes = Vec::new();
+    for thread in &app.threads {
+        nodes.push(crate::ui::tree::TreeNode::Thread(
+            crate::ui::tree::ThreadNode {
+                id: thread.id.clone(),
+                title: thread.title.clone(),
+            },
+        ));
+        for anchor in &thread.anchors {
+            nodes.push(crate::ui::tree::TreeNode::Anchor(
+                crate::ui::tree::AnchorNode {
+                    id: anchor.id.clone(),
+                    thread_id: thread.id.clone(),
+                    label: anchor.label.clone(),
+                },
+            ));
+        }
+    }
+    let prev_selected = app.tree.selected_index();
+    let prev_active = app.tree.active_anchor_id().map(str::to_string);
+    let node_count = nodes.len();
+    app.tree = crate::ui::tree::TreeState::new(nodes);
+    if let Some(idx) = prev_selected {
+        if node_count > 0 {
+            app.tree.select_index(idx.min(node_count - 1));
+        }
+    }
+    if let Some(active_id) = prev_active {
+        app.tree.set_active_anchor_id(Some(active_id));
+    }
+}
+
+fn with_thread_transcript_mut<F>(app: &mut App, thread_id: &str, f: F)
+where
+    F: FnOnce(&mut String),
+{
+    if thread_id == app.active_thread_id {
+        f(&mut app.active_transcript_md);
+        app.thread_transcripts
+            .insert(thread_id.to_string(), app.active_transcript_md.clone());
+    } else {
+        let entry = app
+            .thread_transcripts
+            .entry(thread_id.to_string())
+            .or_default();
+        f(entry);
+    }
+}
+
+fn format_tool_result(tool_name: &str, output: &str) -> String {
+    let trimmed = output.trim_end_matches(['\r', '\n']);
+    if trimmed.trim().is_empty() {
+        format!("> ✓ `{tool_name}`\n")
+    } else if !trimmed.contains('\n') {
+        format!("> ✓ `{tool_name}`: {}\n", trimmed.trim())
+    } else {
+        format!("> ✓ `{tool_name}`:\n```text\n{trimmed}\n```\n")
+    }
+}
+
 impl App {
     pub fn submit_composer_prompt(&mut self, prompt: impl Into<String>) {
         let prompt = prompt.into();
@@ -104,16 +221,87 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
-        if !self.active_transcript_md.is_empty() && !self.active_transcript_md.ends_with("\n\n") {
-            if !self.active_transcript_md.ends_with('\n') {
-                self.active_transcript_md.push('\n');
+
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            let command = rest.trim();
+            if !command.is_empty() {
+                ensure_paragraph_break(&mut self.active_transcript_md);
+                self.active_transcript_md
+                    .push_str(&format!("> $ {command}\n\n"));
+                self.sync_anchors_and_blackboard();
+                self.thread_statuses
+                    .insert(self.active_thread_id.clone(), "executing".to_string());
+                self.pending_actions.push_back(AppAction::RunShell {
+                    thread_id: self.active_thread_id.clone(),
+                    command: command.to_string(),
+                });
             }
-            self.active_transcript_md.push('\n');
+            return;
         }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let head = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim();
+
+        match head {
+            "/branch" | "/fork" => {
+                let title = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.to_string())
+                };
+                self.pending_actions.push_back(AppAction::ForkBranch {
+                    source_thread_id: self.active_thread_id.clone(),
+                    title,
+                });
+                return;
+            }
+            "/pin" => {
+                if let Some((key, value)) = parse_wb_kv(rest) {
+                    self.pending_actions
+                        .push_back(AppAction::UpsertBlackboard { key, value });
+                }
+                return;
+            }
+            "/wb" => {
+                let mut sub = rest.splitn(2, char::is_whitespace);
+                match sub.next().unwrap_or("") {
+                    "set" => {
+                        if let Some((key, value)) = parse_wb_kv(sub.next().unwrap_or("")) {
+                            self.pending_actions
+                                .push_back(AppAction::UpsertBlackboard { key, value });
+                        }
+                    }
+                    "del" => {
+                        let key = sub.next().unwrap_or("").trim();
+                        if !key.is_empty() {
+                            self.pending_actions.push_back(AppAction::DeleteBlackboard {
+                                key: key.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            "/quit" => {
+                self.should_quit = true;
+                return;
+            }
+            _ => {}
+        }
+
+        ensure_paragraph_break(&mut self.active_transcript_md);
         self.active_transcript_md
             .push_str(&render_node(&AuthorRole::User, trimmed));
         self.last_submitted_prompt = Some(trimmed.to_string());
         self.sync_anchors_and_blackboard();
+        self.thread_statuses
+            .insert(self.active_thread_id.clone(), "streaming".to_string());
+        self.pending_actions.push_back(AppAction::SendPrompt {
+            thread_id: self.active_thread_id.clone(),
+            prompt: trimmed.to_string(),
+        });
     }
 
     pub fn apply_agent_response(&mut self, response: &str) {
@@ -133,13 +321,7 @@ impl App {
             self.active_transcript_md.push_str(clean);
             self.active_transcript_md.push_str("\n\n");
         } else {
-            if !self.active_transcript_md.is_empty() && !self.active_transcript_md.ends_with("\n\n")
-            {
-                if !self.active_transcript_md.ends_with('\n') {
-                    self.active_transcript_md.push('\n');
-                }
-                self.active_transcript_md.push('\n');
-            }
+            ensure_paragraph_break(&mut self.active_transcript_md);
             self.active_transcript_md
                 .push_str(&render_node(&AuthorRole::Assistant, clean));
         }
@@ -160,86 +342,37 @@ impl App {
                         .to_string()
                 })
                 .unwrap_or_else(|| "Active Session".to_string());
+            let new_id = if self.active_thread_id.is_empty() || self.active_thread_id == "trunk" {
+                let id = ThreadId::now_v7().to_string();
+                self.active_thread_id = id.clone();
+                id
+            } else {
+                self.active_thread_id.clone()
+            };
             self.threads.push(ThreadItem {
-                id: ThreadId::now_v7().to_string(),
+                id: new_id,
                 title,
                 anchors: Vec::new(),
             });
         }
 
-        let parsed = grein_core::anchor::parse_anchors(&self.active_transcript_md);
-        let mut anchor_items: Vec<AnchorItem> = parsed
-            .into_iter()
-            .map(|a| AnchorItem {
-                id: a.slug,
-                label: a.title,
-            })
-            .collect();
-
-        if anchor_items.is_empty() {
-            for (idx, (role, content)) in turns.iter().enumerate() {
-                if *role == AuthorRole::User {
-                    let label = content.lines().next().unwrap_or("Turn").to_string();
-                    anchor_items.push(AnchorItem {
-                        id: format!("anchor-{}", idx + 1),
-                        label,
-                    });
-                }
-            }
-        }
-
-        if let Some(thread) = self.threads.first_mut() {
-            if thread.id == "thread-1" {
-                thread.id = ThreadId::now_v7().to_string();
-            }
-            thread.anchors = anchor_items.clone();
-        }
-
-        let mut nodes = Vec::new();
-        for thread in &self.threads {
-            nodes.push(crate::ui::tree::TreeNode::Thread(
-                crate::ui::tree::ThreadNode {
-                    id: thread.id.clone(),
-                    title: thread.title.clone(),
-                },
-            ));
-            for anchor in &thread.anchors {
-                nodes.push(crate::ui::tree::TreeNode::Anchor(
-                    crate::ui::tree::AnchorNode {
-                        id: anchor.id.clone(),
-                        thread_id: thread.id.clone(),
-                        label: anchor.label.clone(),
-                    },
-                ));
-            }
-        }
-        let prev_selected = self.tree.selected_index();
-        let prev_active = self.tree.active_anchor_id().map(str::to_string);
-        self.tree = crate::ui::tree::TreeState::new(nodes);
-        if let Some(idx) = prev_selected {
-            self.tree.select_index(idx);
-        }
-        if let Some(active_id) = prev_active {
-            self.tree.set_active_anchor_id(Some(active_id));
-        }
-
-        let thread_title = self
-            .threads
-            .first()
-            .map(|t| t.title.as_str())
-            .unwrap_or("active-session");
-        let mut notes = format!(
-            "Active Thread: {}\nAnchors: {}\n",
-            thread_title,
-            anchor_items.len()
+        self.thread_transcripts.insert(
+            self.active_thread_id.clone(),
+            self.active_transcript_md.clone(),
         );
-        if let Some(last_prompt) = &self.last_submitted_prompt {
-            notes.push_str(&format!("Last Prompt: {}\n", last_prompt));
+
+        let anchor_items = parse_anchors_for_transcript(&self.active_transcript_md);
+        if let Some(thread) = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == self.active_thread_id)
+        {
+            thread.anchors = anchor_items;
+        } else if let Some(thread) = self.threads.first_mut() {
+            thread.anchors = anchor_items;
         }
-        for a in &anchor_items {
-            notes.push_str(&format!("- [{}] {}\n", a.id, a.label));
-        }
-        self.blackboard_notes = notes;
+
+        rebuild_tree_nodes(self);
     }
 
     pub fn persist_state_to_sqlite(&self, db_path: &Path) {
@@ -394,6 +527,7 @@ impl App {
             title,
             anchors: Vec::new(),
         }];
+        self.active_thread_id = thread.id.to_string();
 
         self.sync_anchors_and_blackboard();
 
@@ -431,78 +565,313 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<TreeActio
     Ok(None)
 }
 
+fn render_turns_md(turns: &[crate::engine_port::HydratedTurn]) -> String {
+    let mut transcript = String::new();
+    for turn in turns {
+        let role = if turn.role.eq_ignore_ascii_case("user") {
+            AuthorRole::User
+        } else {
+            AuthorRole::Assistant
+        };
+        transcript.push_str(&render_node(&role, &turn.content));
+    }
+    transcript
+}
+
 /// Seeds the app (threads, transcript nodes, blackboard) from a hydrated session.
 pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
-    app.threads = session
-        .threads
-        .iter()
-        .map(|t| ThreadItem {
+    app.threads.clear();
+    app.thread_transcripts.clear();
+    app.thread_statuses.clear();
+    app.streaming_assistant_threads.clear();
+    app.thread_thoughts.clear();
+
+    for t in &session.threads {
+        let transcript = render_turns_md(&t.turns);
+        let anchors = parse_anchors_for_transcript(&transcript);
+        app.thread_transcripts.insert(t.id.clone(), transcript);
+        app.thread_statuses
+            .entry(t.id.clone())
+            .or_insert_with(|| "idle".to_string());
+        app.threads.push(ThreadItem {
             id: t.id.clone(),
             title: t.title.clone(),
-            anchors: Vec::new(),
-        })
-        .collect();
-
-    let active = session
-        .threads
-        .iter()
-        .find(|t| t.id == session.active_thread_id)
-        .or_else(|| session.threads.first());
-    if let Some(thread) = active {
-        if let Some(pos) = app.threads.iter().position(|t| t.id == thread.id) {
-            let item = app.threads.remove(pos);
-            app.threads.insert(0, item);
-        }
-        let mut transcript = String::new();
-        for turn in &thread.turns {
-            let role = if turn.role.eq_ignore_ascii_case("user") {
-                AuthorRole::User
-            } else {
-                AuthorRole::Assistant
-            };
-            transcript.push_str(&render_node(&role, &turn.content));
-        }
-        app.active_transcript_md = transcript;
+            anchors,
+        });
     }
 
+    let active_id = if !session.active_thread_id.is_empty()
+        && session.threads.iter().any(|t| t.id == session.active_thread_id)
+    {
+        session.active_thread_id.clone()
+    } else if let Some(first) = session.threads.first() {
+        first.id.clone()
+    } else {
+        session.active_thread_id.clone()
+    };
+
+    if !active_id.is_empty() {
+        app.active_thread_id = active_id;
+    }
+    app.active_transcript_md = app
+        .thread_transcripts
+        .get(&app.active_thread_id)
+        .cloned()
+        .unwrap_or_default();
+
+    app.blackboard_entries = session.blackboard.clone();
+    app.sync_blackboard_notes();
     app.sync_anchors_and_blackboard();
-    for entry in &session.blackboard {
-        app.blackboard_notes
-            .push_str(&format!("{}: {}\n", entry.key, entry.value));
-    }
+    app.select_active_thread_in_tree();
 }
 
 /// Folds a streamed engine event into the app state.
 pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
     match event {
-        TuiEngineEvent::StreamChunk { content, .. } => app.apply_agent_response(&content),
-        TuiEngineEvent::TurnCompleted { .. } => app.sync_anchors_and_blackboard(),
-        TuiEngineEvent::ToolInvoked { tool_name, .. } => {
-            app.apply_agent_response(&format!("[tool invoked: {tool_name}]"));
+        TuiEngineEvent::StreamChunk { thread_id, content } => {
+            app.thread_thoughts.remove(&thread_id);
+            app.thread_statuses
+                .insert(thread_id.clone(), "streaming".to_string());
+            let is_first = app.streaming_assistant_threads.insert(thread_id.clone());
+            with_thread_transcript_mut(app, &thread_id, |buf| {
+                if is_first {
+                    ensure_paragraph_break(buf);
+                    buf.push_str(ASSISTANT_HEADER);
+                    buf.push('\n');
+                }
+                buf.push_str(&content);
+            });
+        }
+        TuiEngineEvent::ThoughtChunk { thread_id, content } => {
+            app.thread_thoughts
+                .entry(thread_id)
+                .or_default()
+                .push_str(&content);
+        }
+        TuiEngineEvent::ToolInvoked {
+            thread_id,
+            tool_name,
+        } => {
+            app.thread_statuses
+                .insert(thread_id.clone(), "executing".to_string());
+            let is_first = app.streaming_assistant_threads.insert(thread_id.clone());
+            with_thread_transcript_mut(app, &thread_id, |buf| {
+                if is_first {
+                    ensure_paragraph_break(buf);
+                    buf.push_str(ASSISTANT_HEADER);
+                    buf.push('\n');
+                } else if !buf.is_empty() && !buf.ends_with('\n') {
+                    buf.push('\n');
+                }
+                buf.push_str(&format!("> ⚙ tool: `{tool_name}`\n"));
+            });
         }
         TuiEngineEvent::ToolResult {
-            tool_name, output, ..
+            thread_id,
+            tool_name,
+            output,
         } => {
-            app.apply_agent_response(&format!("[tool result: {tool_name}] {output}"));
+            let is_first = app.streaming_assistant_threads.insert(thread_id.clone());
+            let formatted = format_tool_result(&tool_name, &output);
+            with_thread_transcript_mut(app, &thread_id, |buf| {
+                if is_first {
+                    ensure_paragraph_break(buf);
+                    buf.push_str(ASSISTANT_HEADER);
+                    buf.push('\n');
+                } else if !buf.is_empty() && !buf.ends_with('\n') {
+                    buf.push('\n');
+                }
+                buf.push_str(&formatted);
+            });
+        }
+        TuiEngineEvent::ShellOutput {
+            thread_id,
+            command,
+            stdout,
+            stderr,
+            exit_code,
+        } => {
+            let mut body = String::new();
+            if !stdout.is_empty() {
+                body.push_str(stdout.trim_end_matches(['\r', '\n']));
+            }
+            if !stderr.is_empty() {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str("[stderr]\n");
+                body.push_str(stderr.trim_end_matches(['\r', '\n']));
+            }
+            let block = format!("$ {command} (exit {exit_code})\n```text\n{body}\n```\n\n");
+            with_thread_transcript_mut(app, &thread_id, |buf| {
+                ensure_paragraph_break(buf);
+                buf.push_str(&block);
+            });
+            app.thread_statuses.insert(thread_id.clone(), "idle".to_string());
+            if thread_id == app.active_thread_id {
+                app.sync_anchors_and_blackboard();
+            }
+        }
+        TuiEngineEvent::ThreadCreated { thread } => {
+            if let Some(existing) = app.threads.iter_mut().find(|t| t.id == thread.id) {
+                if !thread.title.trim().is_empty() {
+                    existing.title = thread.title;
+                }
+                rebuild_tree_nodes(app);
+                return;
+            }
+            let transcript = render_turns_md(&thread.turns);
+            let anchors = parse_anchors_for_transcript(&transcript);
+            let new_id = thread.id.clone();
+            app.thread_transcripts.insert(new_id.clone(), transcript);
+            app.thread_statuses
+                .entry(new_id.clone())
+                .or_insert_with(|| "idle".to_string());
+            app.threads.push(ThreadItem {
+                id: new_id.clone(),
+                title: thread.title,
+                anchors,
+            });
+            app.switch_thread(&new_id);
+            app.set_focus(FocusedPane::Composer);
+        }
+        TuiEngineEvent::ThreadTitleUpdated { thread_id, title } => {
+            if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
+                thread.title = title;
+            }
+            rebuild_tree_nodes(app);
+        }
+        TuiEngineEvent::TurnCompleted { thread_id } => {
+            app.streaming_assistant_threads.remove(&thread_id);
+            app.thread_thoughts.remove(&thread_id);
+            app.thread_statuses
+                .insert(thread_id.clone(), "idle".to_string());
+            with_thread_transcript_mut(app, &thread_id, ensure_paragraph_break);
+            if thread_id == app.active_thread_id {
+                app.sync_anchors_and_blackboard();
+            } else {
+                let anchors = app
+                    .thread_transcripts
+                    .get(&thread_id)
+                    .map(|t| parse_anchors_for_transcript(t))
+                    .unwrap_or_default();
+                if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
+                    thread.anchors = anchors;
+                }
+                rebuild_tree_nodes(app);
+            }
         }
         TuiEngineEvent::PermissionRequested {
             request_id,
             description,
         } => {
-            app.blackboard_notes.push_str(&format!(
-                "Permission requested [{request_id}]: {description}\n"
-            ));
+            app.push_permission(PendingPermission {
+                request_id,
+                description,
+            });
         }
         TuiEngineEvent::ThreadStatusChanged { thread_id, status } => {
-            app.blackboard_notes
-                .push_str(&format!("Thread {thread_id}: {status}\n"));
+            app.thread_statuses.insert(thread_id, status);
         }
         TuiEngineEvent::BlackboardUpdated { key, value } => {
-            app.blackboard_notes.push_str(&format!("{key}: {value}\n"));
+            app.upsert_blackboard_entry(key, value);
+        }
+        TuiEngineEvent::BlackboardDeleted { key } => {
+            app.remove_blackboard_entry(&key);
         }
         TuiEngineEvent::Error { message } => {
-            app.apply_agent_response(&format!("Error: {message}"));
+            let active = app.active_thread_id.clone();
+            app.streaming_assistant_threads.remove(&active);
+            app.thread_thoughts.remove(&active);
+            app.thread_statuses
+                .insert(active.clone(), "error".to_string());
+            with_thread_transcript_mut(app, &active, |buf| {
+                ensure_paragraph_break(buf);
+                buf.push_str(&format!("Error: {message}\n\n"));
+            });
+            app.sync_anchors_and_blackboard();
         }
+    }
+}
+
+fn dispatch_action(
+    engine: Arc<dyn TuiEnginePort>,
+    action: AppAction,
+    local_ev_tx: mpsc::UnboundedSender<TuiEngineEvent>,
+    err_tx: mpsc::UnboundedSender<(Option<String>, String)>,
+) {
+    match action {
+        AppAction::SendPrompt { thread_id, prompt } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.send_turn(&thread_id, &prompt).await {
+                    let _ = err_tx.send((Some(thread_id), err.to_string()));
+                }
+            });
+        }
+        AppAction::RunShell { thread_id, command } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.run_shell_command(&thread_id, &command).await {
+                    let _ = err_tx.send((Some(thread_id), err.to_string()));
+                }
+            });
+        }
+        AppAction::ForkBranch {
+            source_thread_id,
+            title,
+        } => {
+            tokio::spawn(async move {
+                match engine.fork_branch(&source_thread_id, title.as_deref()).await {
+                    Ok(thread) => {
+                        let _ = local_ev_tx.send(TuiEngineEvent::ThreadCreated { thread });
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((Some(source_thread_id), err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::UpsertBlackboard { key, value } => {
+            tokio::spawn(async move {
+                match engine.upsert_blackboard(&key, &value).await {
+                    Ok(()) => {
+                        let _ = local_ev_tx.send(TuiEngineEvent::BlackboardUpdated { key, value });
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((None, err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::DeleteBlackboard { key } => {
+            tokio::spawn(async move {
+                match engine.delete_blackboard(&key).await {
+                    Ok(()) => {
+                        let _ = local_ev_tx.send(TuiEngineEvent::BlackboardDeleted { key });
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((None, err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::CancelTurn { thread_id } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.cancel_turn(&thread_id).await {
+                    let _ = err_tx.send((Some(thread_id), err.to_string()));
+                }
+            });
+        }
+        AppAction::ResolvePermission {
+            request_id,
+            approved,
+        } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.resolve_permission(&request_id, approved).await {
+                    let _ = err_tx.send((None, err.to_string()));
+                }
+            });
+        }
+        AppAction::Scrolled { .. } | AppAction::None => {}
     }
 }
 
@@ -530,54 +899,76 @@ fn spawn_key_reader(
 
 pub async fn run_with_engine<B: Backend>(
     terminal: &mut Terminal<B>,
+    app: App,
+    engine: Arc<dyn TuiEnginePort>,
+) -> io::Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (key_tx, key_rx) = mpsc::unbounded_channel::<Event>();
+    let reader = spawn_key_reader(Arc::clone(&stop), key_tx);
+    let result = run_with_engine_events(terminal, app, engine, key_rx).await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = reader.join();
+    result
+}
+
+pub async fn run_with_engine_events<B: Backend>(
+    terminal: &mut Terminal<B>,
     mut app: App,
     engine: Arc<dyn TuiEnginePort>,
+    mut key_rx: mpsc::UnboundedReceiver<Event>,
 ) -> io::Result<()> {
     let session = engine.hydrate_session().await?;
     apply_hydrated_session(&mut app, &session);
     let mut engine_events = engine.subscribe_events().await?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
-    let reader = spawn_key_reader(Arc::clone(&stop), key_tx);
-
+    let (local_ev_tx, mut local_ev_rx) = mpsc::unbounded_channel::<TuiEngineEvent>();
+    let (err_tx, mut err_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
-    let mut result = Ok(());
 
     loop {
-        if let Err(err) = draw_frame(terminal, &app) {
-            result = Err(err);
-            break;
-        }
+        draw_frame_mut(terminal, &mut app)?;
         if app.should_quit() {
             break;
         }
 
         tokio::select! {
-            Some(ev) = key_rx.recv() => {
-                if let Err(err) = handle_event(&mut app, ev) {
-                    result = Err(err);
+            ev_opt = key_rx.recv() => {
+                let Some(ev) = ev_opt else {
                     break;
-                }
-                if let Some(prompt) = app.last_submitted_prompt.take() {
-                    let thread_id = app
-                        .threads
-                        .first()
-                        .map(|t| t.id.clone())
-                        .unwrap_or_else(|| session.active_thread_id.clone());
-                    if let Err(err) = engine.send_turn(&thread_id, prompt.trim()).await {
-                        app.apply_agent_response(&format!("Error: {err}"));
-                    }
+                };
+                handle_event(&mut app, ev)?;
+                while let Some(action) = app.pending_actions.pop_front() {
+                    dispatch_action(
+                        Arc::clone(&engine),
+                        action,
+                        local_ev_tx.clone(),
+                        err_tx.clone(),
+                    );
                 }
             }
             Some(event) = engine_events.recv() => {
                 apply_engine_event(&mut app, event);
             }
+            Some(event) = local_ev_rx.recv() => {
+                apply_engine_event(&mut app, event);
+            }
+            Some((thread_id_opt, message)) = err_rx.recv() => {
+                let target_thread = thread_id_opt.unwrap_or_else(|| app.active_thread_id.clone());
+                app.streaming_assistant_threads.remove(&target_thread);
+                app.thread_thoughts.remove(&target_thread);
+                app.thread_statuses
+                    .insert(target_thread.clone(), "error".to_string());
+                with_thread_transcript_mut(&mut app, &target_thread, |buf| {
+                    ensure_paragraph_break(buf);
+                    buf.push_str(&format!("Error: {message}\n\n"));
+                });
+                if target_thread == app.active_thread_id {
+                    app.sync_anchors_and_blackboard();
+                }
+            }
             _ = tick.tick() => {}
         }
     }
 
-    stop.store(true, Ordering::Relaxed);
-    let _ = reader.join();
-    result
+    Ok(())
 }

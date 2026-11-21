@@ -20,11 +20,13 @@ fn test_composer_enter_updates_transcript_anchors_blackboard_and_sqlite() {
     assert_eq!(app.threads.len(), 1);
     assert!(!app.threads[0].anchors.is_empty());
     assert!(!app.tree.nodes.is_empty());
-    assert!(app.blackboard_notes.contains("Active Thread:"));
+    app.upsert_blackboard_entry("goal", "inspect");
+    assert!(app.blackboard_notes.contains("goal: inspect"));
 
     app.apply_agent_response("### Verification Plan\n- Checked SQLite persistence");
     assert!(app.active_transcript_md.contains("## Agent (agy)"));
     assert!(app.threads[0].anchors.len() >= 2);
+    assert!(app.blackboard_notes.contains("goal: inspect"));
 }
 
 #[test]
