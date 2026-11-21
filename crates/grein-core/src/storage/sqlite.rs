@@ -55,6 +55,9 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread, CoreError> {
     let anchor_id_str: String = row.get(2)?;
     let active_leaf_id_str: String = row.get(3)?;
     let status_str: String = row.get(4)?;
+    let title: String = row.get(5)?;
+    let acp_session_id: Option<String> = row.get(6)?;
+    let merged_int: i64 = row.get(7)?;
 
     let id = parse_uuid(0, &id_str)?;
     let parent_node_id = parse_uuid(1, &parent_node_id_str)?;
@@ -71,6 +74,9 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread, CoreError> {
         leaf_node_id: NodeId(active_leaf_id),
         status,
         state: status,
+        title,
+        acp_session_id,
+        merged: merged_int != 0,
     })
 }
 
@@ -151,6 +157,9 @@ impl SqliteStorage {
                 active_leaf_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                acp_session_id TEXT,
+                merged INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
                 FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
             );
@@ -183,6 +192,37 @@ impl SqliteStorage {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_blackboard_entries_key_unique ON blackboard_entries(key);
             CREATE INDEX IF NOT EXISTS idx_blackboard_entries_kind ON blackboard_entries(kind);",
         )?;
+
+        let existing_columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(threads)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut columns = HashSet::new();
+            for col in rows {
+                columns.insert(col?);
+            }
+            columns
+        };
+
+        let thread_column_migrations = [
+            (
+                "title",
+                "ALTER TABLE threads ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "acp_session_id",
+                "ALTER TABLE threads ADD COLUMN acp_session_id TEXT",
+            ),
+            (
+                "merged",
+                "ALTER TABLE threads ADD COLUMN merged INTEGER NOT NULL DEFAULT 0",
+            ),
+        ];
+        for (column_name, ddl) in thread_column_migrations {
+            if !existing_columns.contains(column_name) {
+                tx.execute(ddl, [])?;
+            }
+        }
+
         tx.commit()?;
         Ok(())
     }
@@ -235,6 +275,35 @@ impl SqliteStorage {
             Some(row) => Ok(Some(anchor_from_row(row)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn list_anchors(&self) -> Result<Vec<(AnchorId, Anchor)>, CoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, level, title, slug, line_number
+             FROM anchors
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut anchors = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id_str: String = row.get(0)?;
+            let anchor_id = AnchorId(parse_uuid(0, &id_str)?);
+            let level: u8 = row.get(1)?;
+            let title: String = row.get(2)?;
+            let slug: String = row.get(3)?;
+            let line_number: i64 = row.get(4)?;
+            anchors.push((
+                anchor_id,
+                Anchor {
+                    level,
+                    title,
+                    slug,
+                    line_number: usize::try_from(line_number).unwrap_or(0),
+                },
+            ));
+        }
+        Ok(anchors)
     }
 
     pub fn link_node_anchor<B1: Borrow<Uuid>, B2: Borrow<Uuid>>(
@@ -400,22 +469,21 @@ impl SqliteStorage {
         Ok(path)
     }
 
-    pub fn create_thread<B1: Borrow<Uuid>, B2: Borrow<Uuid>>(
+    fn insert_thread_row(
         &self,
-        parent_node_id: B1,
-        anchor_id: B2,
+        parent_node_id: &Uuid,
+        anchor_id: &Uuid,
+        title: &str,
     ) -> Result<ThreadId, CoreError> {
-        let p_ref = parent_node_id.borrow();
-        let a_ref = anchor_id.borrow();
         let conn = self.lock()?;
 
         let parent_exists: i64 = conn.query_row(
             "SELECT count(*) FROM nodes WHERE id = ?1",
-            params![p_ref.to_string()],
+            params![parent_node_id.to_string()],
             |row| row.get(0),
         )?;
         if parent_exists == 0 {
-            return Err(CoreError::NodeNotFound(p_ref.to_string()));
+            return Err(CoreError::NodeNotFound(parent_node_id.to_string()));
         }
 
         let thread_id = Uuid::now_v7();
@@ -424,26 +492,88 @@ impl SqliteStorage {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         conn.execute(
-            "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, acp_session_id, merged)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0)",
             params![
                 thread_id.to_string(),
-                p_ref.to_string(),
-                a_ref.to_string(),
-                p_ref.to_string(),
+                parent_node_id.to_string(),
+                anchor_id.to_string(),
+                parent_node_id.to_string(),
                 status_trimmed,
                 now,
+                title,
             ],
         )?;
 
         Ok(ThreadId(thread_id))
     }
 
+    pub fn create_thread<B1: Borrow<Uuid>, B2: Borrow<Uuid>>(
+        &self,
+        parent_node_id: B1,
+        anchor_id: B2,
+    ) -> Result<ThreadId, CoreError> {
+        self.insert_thread_row(parent_node_id.borrow(), anchor_id.borrow(), "")
+    }
+
+    pub fn create_thread_with_title(
+        &self,
+        parent_node_id: NodeId,
+        anchor_id: AnchorId,
+        title: &str,
+    ) -> Result<ThreadId, CoreError> {
+        self.insert_thread_row(&parent_node_id.0, &anchor_id.0, title)
+    }
+
+    fn update_thread_field<P: rusqlite::ToSql>(
+        &self,
+        thread_id: &ThreadId,
+        sql: &str,
+        value: P,
+    ) -> Result<(), CoreError> {
+        let conn = self.lock()?;
+        let rows = conn.execute(sql, params![value, thread_id.to_string()])?;
+        if rows == 0 {
+            return Err(CoreError::ThreadNotFound(thread_id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn update_thread_title(&self, thread_id: &ThreadId, title: &str) -> Result<(), CoreError> {
+        self.update_thread_field(
+            thread_id,
+            "UPDATE threads SET title = ?1 WHERE id = ?2",
+            title,
+        )
+    }
+
+    pub fn update_thread_acp_session_id(
+        &self,
+        thread_id: &ThreadId,
+        session_id: Option<&str>,
+    ) -> Result<(), CoreError> {
+        self.update_thread_field(
+            thread_id,
+            "UPDATE threads SET acp_session_id = ?1 WHERE id = ?2",
+            session_id,
+        )
+    }
+
+    pub fn mark_thread_merged(&self, thread_id: &ThreadId, merged: bool) -> Result<(), CoreError> {
+        let merged_flag = i64::from(merged);
+        self.update_thread_field(
+            thread_id,
+            "UPDATE threads SET merged = ?1 WHERE id = ?2",
+            merged_flag,
+        )
+    }
+
     pub fn get_thread<B: Borrow<Uuid>>(&self, thread_id: B) -> Result<Option<Thread>, CoreError> {
         let t_ref = thread_id.borrow();
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status FROM threads WHERE id = ?1",
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged
+             FROM threads WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![t_ref.to_string()])?;
 
@@ -456,7 +586,8 @@ impl SqliteStorage {
     pub fn list_threads(&self) -> Result<Vec<Thread>, CoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status FROM threads ORDER BY created_at ASC, rowid ASC",
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged
+             FROM threads ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query([])?;
         let mut threads = Vec::new();

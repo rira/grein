@@ -179,6 +179,14 @@ impl Blackboard {
         }
     }
 
+    pub fn from_entries(entries: impl IntoIterator<Item = BlackboardEntry>) -> Self {
+        let mut blackboard = Self::new();
+        for entry in entries {
+            blackboard.add_entry(entry);
+        }
+        blackboard
+    }
+
     pub fn entries(&self) -> &[BlackboardEntry] {
         &self.entries
     }
@@ -290,6 +298,17 @@ impl Blackboard {
             md.push_str("## Active Files Registry\n");
             for f in active_files {
                 md.push_str(&format!("- `{}`\n", f.value));
+            }
+        }
+
+        let notes = self.find_by_kind(BlackboardEntryKind::Note);
+        if !notes.is_empty() {
+            if !md.is_empty() {
+                md.push('\n');
+            }
+            md.push_str("## Notes\n");
+            for n in notes {
+                md.push_str(&format!("- **{}**: {}\n", n.key, n.value));
             }
         }
 

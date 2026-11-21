@@ -14,5 +14,6 @@ pub use blackboard::{
 };
 pub use error::CoreError;
 pub use sync::{
-    build_context_prompt, build_context_prompt_with_blackboard, ContextCompiler, ContextPayload,
+    build_context_prompt, build_context_prompt_with_blackboard, format_whiteboard_delta_prefix,
+    ContextCompiler, ContextPayload,
 };

@@ -2,11 +2,11 @@ use grein_core::blackboard::{
     Blackboard, BlackboardEntry, BlackboardEntryId, BlackboardEntryKind, BoundedScratchpad,
     KnowledgeImport,
 };
-use grein_core::model::{AuthorRole, NodeId, ThreadId};
+use grein_core::model::{AuthorRole, ConversationNode, NodeId, ThreadId};
 use grein_core::storage::sqlite::SqliteDagStorage;
 use grein_core::sync::{
-    build_context_prompt, build_context_prompt_with_blackboard, import_thread_knowledge,
-    synthesize_thread_merge, ContextCompiler, ContextPayload,
+    build_context_prompt, build_context_prompt_with_blackboard, format_whiteboard_delta_prefix,
+    import_thread_knowledge, synthesize_thread_merge, ContextCompiler, ContextPayload,
 };
 
 #[test]
@@ -204,4 +204,213 @@ fn test_bounded_scratchpad_limit_guardrail() {
     scratchpad.clear();
     assert_eq!(scratchpad.remaining_capacity(), 40);
     assert!(scratchpad.content().is_empty());
+}
+
+#[test]
+fn test_blackboard_notes_markdown_ordering_and_from_entries() {
+    let entries = vec![
+        BlackboardEntry::new("db", "SQLite WAL", BlackboardEntryKind::Decision),
+        BlackboardEntry::new(
+            "src/lib.rs",
+            "src/lib.rs",
+            BlackboardEntryKind::ActiveFile,
+        ),
+        BlackboardEntry::new(
+            "migration_tip",
+            "Run PRAGMA table_info first",
+            BlackboardEntryKind::Note,
+        ),
+        BlackboardEntry::new(
+            "retry_note",
+            "Keep backoff exponential",
+            BlackboardEntryKind::Note,
+        ),
+        BlackboardEntry::new(
+            "migration_tip",
+            "Inspect PRAGMA table_info before ALTER",
+            BlackboardEntryKind::Note,
+        ),
+    ];
+
+    let mut bb = Blackboard::from_entries(entries);
+    assert_eq!(bb.entries().len(), 4);
+    assert_eq!(
+        bb.get("migration_tip").expect("deduplicated note").value,
+        "Inspect PRAGMA table_info before ALTER"
+    );
+
+    bb.scratchpad_mut()
+        .set_content("Scratchpad tail note.")
+        .expect("scratchpad set");
+
+    let md = bb.to_markdown();
+    assert!(md.contains("## Notes\n"));
+    assert!(md.contains("- **migration_tip**: Inspect PRAGMA table_info before ALTER\n"));
+    assert!(md.contains("- **retry_note**: Keep backoff exponential\n"));
+
+    let active_files_pos = md
+        .find("## Active Files Registry")
+        .expect("Active Files Registry section");
+    let notes_pos = md.find("## Notes").expect("Notes section");
+    let scratchpad_pos = md
+        .find("## Scratchpad Notes")
+        .expect("Scratchpad Notes section");
+
+    assert!(active_files_pos < notes_pos);
+    assert!(notes_pos < scratchpad_pos);
+}
+
+#[test]
+fn test_format_whiteboard_delta_prefix() {
+    let empty_bb = Blackboard::new();
+    assert_eq!(format_whiteboard_delta_prefix(&empty_bb), "");
+
+    let mut bb = Blackboard::new();
+    bb.add_entry(BlackboardEntry::new(
+        "finding",
+        "Token TTL is 15m",
+        BlackboardEntryKind::Note,
+    ));
+
+    let prefix = format_whiteboard_delta_prefix(&bb);
+    let expected_md = bb.to_markdown();
+    assert_eq!(
+        prefix,
+        format!(
+            "[Shared Whiteboard Updated]\n{}\n\n---\n\n",
+            expected_md.trim()
+        )
+    );
+}
+
+#[test]
+fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
+    let root_id = NodeId::new_v7();
+    let trunk_1 = ConversationNode::new(
+        root_id,
+        None::<NodeId>,
+        AuthorRole::User,
+        "Oldest trunk turn with extra padding".to_string(),
+    );
+    let trunk_2 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(root_id),
+        AuthorRole::Assistant,
+        "Second trunk turn".to_string(),
+    );
+    let branch_1 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(trunk_2.id),
+        AuthorRole::User,
+        "Branch question".to_string(),
+    );
+    let branch_2 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(branch_1.id),
+        AuthorRole::ToolResult,
+        "Branch result".to_string(),
+    );
+
+    let mut payload = ContextPayload::new(
+        "Base system prompt.",
+        "## Notes\n- **invariant**: Preserve UTF-8",
+    );
+    payload.anchor_header = Some("## Auth Design".to_string());
+    payload.trunk_path = vec![trunk_1, trunk_2];
+    payload.branch_turns = vec![branch_1, branch_2];
+
+    let without_branch = payload.build_acp_system_prompt_append(false, 0);
+    assert!(without_branch.contains("Base system prompt."));
+    assert!(without_branch.contains("# Shared Blackboard Working Memory\n## Notes"));
+    assert!(without_branch.contains("# Branch Context\n## Auth Design"));
+    assert!(without_branch.contains("# Ancestor Conversation Trunk\n[user]\nOldest trunk turn"));
+    assert!(without_branch.contains("[assistant]\nSecond trunk turn"));
+    assert!(!without_branch.contains("# Branch History"));
+    assert!(!without_branch.contains("Branch question"));
+
+    let full = payload.build_acp_system_prompt_append(true, 0);
+    assert!(full.contains("# Branch History\n[user]\nBranch question\n\n[tool_result]\nBranch result"));
+
+    // UTF-8 safe truncation preserving base, whiteboard, and branch context
+    let mut utf8_payload = ContextPayload::new(
+        "Base prompt.",
+        "## Notes\n- **wb**: Keep Whiteboard Intact",
+    );
+    utf8_payload.anchor_header = Some("## Unicode Section".to_string());
+    utf8_payload.trunk_path = vec![
+        ConversationNode::new(
+            NodeId::new_v7(),
+            None::<NodeId>,
+            AuthorRole::User,
+            "Older entry 🚀✨🔥".to_string(),
+        ),
+        ConversationNode::new(
+            NodeId::new_v7(),
+            None::<NodeId>,
+            AuthorRole::Assistant,
+            format!("{} tail-marker", "🦀é日本語".repeat(30)),
+        ),
+    ];
+
+    let preserved_len = utf8_payload
+        .build_acp_system_prompt_append(false, 0)
+        .split("# Ancestor Conversation Trunk")
+        .next()
+        .unwrap()
+        .trim_end()
+        .chars()
+        .count();
+    let max_chars = preserved_len + 60;
+    let truncated = utf8_payload.build_acp_system_prompt_append(false, max_chars);
+
+    assert!(truncated.contains("Base prompt."));
+    assert!(truncated.contains("# Shared Blackboard Working Memory\n## Notes\n- **wb**: Keep Whiteboard Intact"));
+    assert!(truncated.contains("# Branch Context\n## Unicode Section"));
+    assert!(truncated.contains("tail-marker"));
+    assert!(!truncated.contains("Older entry"));
+    assert!(truncated.chars().count() <= max_chars);
+
+    // When preserved sections already exceed max_chars, preserved sections stay intact.
+    let small_limit = utf8_payload.build_acp_system_prompt_append(false, 10);
+    assert!(small_limit.contains("Base prompt."));
+    assert!(small_limit.contains("# Shared Blackboard Working Memory\n## Notes\n- **wb**: Keep Whiteboard Intact"));
+    assert!(small_limit.contains("# Branch Context\n## Unicode Section"));
+    assert!(!small_limit.contains("# Ancestor Conversation Trunk"));
+
+    // Branch turns preserved over older trunk turns when truncating with include_branch_turns=true.
+    let mut branch_payload = ContextPayload::new("Sys.", "Board.");
+    branch_payload.trunk_path = vec![ConversationNode::new(
+        NodeId::new_v7(),
+        None::<NodeId>,
+        AuthorRole::User,
+        "Very long trunk context ".repeat(10),
+    )];
+    branch_payload.branch_turns = vec![
+        ConversationNode::new(
+            NodeId::new_v7(),
+            None::<NodeId>,
+            AuthorRole::User,
+            "Old branch turn".to_string(),
+        ),
+        ConversationNode::new(
+            NodeId::new_v7(),
+            None::<NodeId>,
+            AuthorRole::Assistant,
+            "Newest branch reply".to_string(),
+        ),
+    ];
+    let branch_budget = branch_payload
+        .build_acp_system_prompt_append(true, 0)
+        .chars()
+        .count()
+        / 2;
+    let branch_trimmed = branch_payload.build_acp_system_prompt_append(true, branch_budget);
+    assert!(branch_trimmed.contains("Sys."));
+    assert!(branch_trimmed.contains("# Shared Blackboard Working Memory\nBoard."));
+    assert!(branch_trimmed.contains("Newest branch reply"));
+    assert!(branch_trimmed.chars().count() <= branch_budget);
+    assert!(!branch_trimmed.contains("Very long trunk context"));
+
+    // Empty payload produces empty string.
+    assert_eq!(ContextPayload::default().build_acp_system_prompt_append(true, 100), "");
 }

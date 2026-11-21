@@ -217,6 +217,175 @@ fn test_get_thread_returns_head_leaf_and_state() -> Result<(), Box<dyn std::erro
     assert_eq!(thread.anchor_id, anchor_id);
     assert_eq!(thread.head_node_id, root_node.id);
     assert_eq!(thread.leaf_node_id, root_node.id);
+    assert_eq!(thread.title, "");
+    assert_eq!(thread.acp_session_id, None);
+    assert!(!thread.merged);
+
+    Ok(())
+}
+
+#[test]
+fn test_author_role_as_str_and_display() {
+    assert_eq!(AuthorRole::User.as_str(), "user");
+    assert_eq!(AuthorRole::Assistant.as_str(), "assistant");
+    assert_eq!(AuthorRole::System.as_str(), "system");
+    assert_eq!(AuthorRole::ToolResult.as_str(), "tool_result");
+
+    assert_eq!(format!("{}", AuthorRole::User), "user");
+    assert_eq!(format!("{}", AuthorRole::Assistant), "assistant");
+    assert_eq!(format!("{}", AuthorRole::System), "system");
+    assert_eq!(format!("{}", AuthorRole::ToolResult), "tool_result");
+}
+
+#[test]
+fn test_thread_new_defaults_and_with_title() {
+    let tid = grein_core::model::ThreadId::new_v7();
+    let parent = NodeId::new_v7();
+    let anchor = AnchorId::new_v7();
+    let leaf = NodeId::new_v7();
+
+    let thread = Thread::new(tid, parent, anchor, leaf, ThreadLifecycleState::Idle);
+    assert_eq!(thread.title, "");
+    assert_eq!(thread.acp_session_id, None);
+    assert!(!thread.merged);
+
+    let titled = thread.with_title("Investigate auth");
+    assert_eq!(titled.title, "Investigate auth");
+    assert_eq!(titled.acp_session_id, None);
+    assert!(!titled.merged);
+}
+
+#[test]
+fn test_legacy_threads_schema_migration_adds_metadata_columns_idempotently(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_id TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_node_id TEXT NOT NULL,
+            anchor_id TEXT NOT NULL,
+            active_leaf_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+            FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );",
+    )?;
+
+    let root_id = NodeId::new_v7();
+    let thread_id = grein_core::model::ThreadId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+    conn.execute(
+        "INSERT INTO nodes (id, parent_id, role, content, created_at) VALUES (?1, NULL, 'user', 'Legacy root', 1)",
+        rusqlite::params![root_id.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at)
+         VALUES (?1, ?2, ?3, ?2, 'idle', 2)",
+        rusqlite::params![thread_id.to_string(), root_id.to_string(), anchor_id.to_string()],
+    )?;
+
+    let storage = SqliteDagStorage::new(conn)?;
+    // Re-running migrations must remain idempotent.
+    storage.run_migrations()?;
+
+    let fetched = storage
+        .get_thread(thread_id)?
+        .expect("Legacy thread must still exist after migration");
+    assert_eq!(fetched.id, thread_id);
+    assert_eq!(fetched.title, "");
+    assert_eq!(fetched.acp_session_id, None);
+    assert!(!fetched.merged);
+
+    let all = storage.list_threads()?;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0], fetched);
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_metadata_crud_operations() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    let root_node = ConversationNode::new(
+        NodeId::new_v7(),
+        None::<NodeId>,
+        AuthorRole::User,
+        "Root prompt".to_string(),
+    );
+    storage.insert_node(&root_node)?;
+
+    let anchor_id = AnchorId::new_v7();
+    let thread_id = storage.create_thread_with_title(root_node.id, anchor_id, "Initial Title")?;
+
+    let created = storage.get_thread(thread_id)?.expect("Thread must exist");
+    assert_eq!(created.title, "Initial Title");
+    assert_eq!(created.acp_session_id, None);
+    assert!(!created.merged);
+
+    storage.update_thread_title(&thread_id, "Renamed Branch")?;
+    storage.update_thread_acp_session_id(&thread_id, Some("acp-sess-123"))?;
+    storage.mark_thread_merged(&thread_id, true)?;
+
+    let updated = storage.get_thread(thread_id)?.expect("Thread must exist");
+    assert_eq!(updated.title, "Renamed Branch");
+    assert_eq!(updated.acp_session_id.as_deref(), Some("acp-sess-123"));
+    assert!(updated.merged);
+
+    let listed = storage.list_threads()?;
+    assert_eq!(listed, vec![updated]);
+
+    storage.update_thread_acp_session_id(&thread_id, None)?;
+    storage.mark_thread_merged(&thread_id, false)?;
+    let cleared = storage.get_thread(thread_id)?.expect("Thread must exist");
+    assert_eq!(cleared.acp_session_id, None);
+    assert!(!cleared.merged);
+
+    let missing_id = grein_core::model::ThreadId::new_v7();
+    assert!(storage.update_thread_title(&missing_id, "x").is_err());
+    assert!(storage
+        .update_thread_acp_session_id(&missing_id, Some("s"))
+        .is_err());
+    assert!(storage.mark_thread_merged(&missing_id, true).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_list_anchors_returns_inserted_anchors() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    assert!(storage.list_anchors()?.is_empty());
+
+    let id1 = AnchorId::new_v7();
+    let a1 = grein_core::model::Anchor {
+        level: 1,
+        title: "Architecture".to_string(),
+        slug: "architecture".to_string(),
+        line_number: 1,
+    };
+    let id2 = AnchorId::new_v7();
+    let a2 = grein_core::model::Anchor {
+        level: 2,
+        title: "Storage Layer".to_string(),
+        slug: "storage-layer".to_string(),
+        line_number: 12,
+    };
+
+    storage.insert_anchor(&id1.0, &a1)?;
+    storage.insert_anchor(&id2.0, &a2)?;
+
+    let anchors = storage.list_anchors()?;
+    assert_eq!(anchors, vec![(id1, a1), (id2, a2)]);
 
     Ok(())
 }

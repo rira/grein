@@ -92,6 +92,23 @@ pub enum AuthorRole {
     ToolResult,
 }
 
+impl AuthorRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::System => "system",
+            Self::ToolResult => "tool_result",
+        }
+    }
+}
+
+impl std::fmt::Display for AuthorRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Anchor {
     pub level: u8,
@@ -153,6 +170,12 @@ pub struct Thread {
     pub leaf_node_id: NodeId,
     pub status: ThreadStatus,
     pub state: ThreadLifecycleState,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub acp_session_id: Option<String>,
+    #[serde(default)]
+    pub merged: bool,
 }
 
 impl Thread {
@@ -174,7 +197,15 @@ impl Thread {
             leaf_node_id: a,
             status,
             state: status,
+            title: String::new(),
+            acp_session_id: None,
+            merged: false,
         }
+    }
+
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
     }
 
     pub fn id(&self) -> ThreadId {
