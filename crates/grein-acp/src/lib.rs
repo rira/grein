@@ -10,6 +10,7 @@ pub use policy::{PolicyDecision, PolicyError, PolicyGate, SecurityPolicy, Securi
 pub use runner::{SubprocessConfig, SubprocessRunner};
 pub use session::{Session, SessionError, SessionId, SessionManager, ThreadId};
 pub use stdio::{
-    AcpStdioDriver, AgentDriver, DriverEvent, JsonRpcError, JsonRpcMessage, JsonRpcNotification,
+    AcpInitializeResult, AcpPermissionOption, AcpSessionInfo, AcpStdioDriver, AcpUsage,
+    AgentDriver, DriverEvent, JsonRpcError, JsonRpcMessage, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, StdioProcessConfig, StdioProcessRunner, StdioRunnerError,
 };
