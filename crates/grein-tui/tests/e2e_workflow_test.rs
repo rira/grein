@@ -54,6 +54,7 @@ impl MockLiveEngine {
                 thread_id: trunk_id.to_string(),
                 parent_thread_id: None,
                 inherited_turn_count: 0,
+                merged: false,
             }],
             active_thread_id: trunk_id.to_string(),
             turn_completed_notify: Arc::new(Notify::new()),
@@ -259,6 +260,7 @@ impl TuiEnginePort for MockLiveEngine {
             thread_id: id.clone(),
             parent_thread_id: Some(thread_id.to_string()),
             inherited_turn_count,
+            merged: false,
         });
         guard.active_thread_id = id.clone();
         Ok(id)
@@ -1031,16 +1033,19 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             thread_id: "t-root".to_string(),
             parent_thread_id: None,
             inherited_turn_count: 0,
+            merged: false,
         },
         ThreadMeta {
             thread_id: "t-child".to_string(),
             parent_thread_id: Some("t-root".to_string()),
             inherited_turn_count: 2,
+            merged: false,
         },
         ThreadMeta {
             thread_id: "t-grand".to_string(),
             parent_thread_id: Some("t-child".to_string()),
             inherited_turn_count: 2,
+            merged: false,
         },
     ];
     let engine = MockLiveEngine::new_with_session("t-grand", threads, meta);
@@ -1141,6 +1146,7 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
                 thread_id: format!("t-{i}"),
                 parent_thread_id: None,
                 inherited_turn_count: 0,
+                merged: false,
             })
             .collect();
         (threads, meta)

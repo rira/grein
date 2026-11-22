@@ -82,21 +82,25 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     thread_id: "t-root".to_string(),
                     parent_thread_id: None,
                     inherited_turn_count: 0,
+                    merged: false,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
                     parent_thread_id: Some("t-root".to_string()),
                     inherited_turn_count: 2,
+                    merged: false,
                 },
                 ThreadMeta {
                     thread_id: "t-grandchild".to_string(),
                     parent_thread_id: Some("t-child".to_string()),
                     inherited_turn_count: 2,
+                    merged: false,
                 },
                 ThreadMeta {
                     thread_id: "t-sibling".to_string(),
                     parent_thread_id: Some("t-root".to_string()),
                     inherited_turn_count: 2,
+                    merged: false,
                 },
             ],
         },
@@ -349,11 +353,13 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     thread_id: "t-1".to_string(),
                     parent_thread_id: None,
                     inherited_turn_count: 0,
+                    merged: false,
                 },
                 ThreadMeta {
                     thread_id: "t-2".to_string(),
                     parent_thread_id: Some("t-1".to_string()),
                     inherited_turn_count: 3,
+                    merged: false,
                 },
             ])
         }
@@ -437,11 +443,13 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     thread_id: "t-root".to_string(),
                     parent_thread_id: None,
                     inherited_turn_count: 0,
+                    merged: false,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
                     parent_thread_id: Some("t-root".to_string()),
                     inherited_turn_count: 4,
+                    merged: false,
                 },
             ],
         },

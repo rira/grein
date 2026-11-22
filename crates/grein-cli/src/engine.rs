@@ -639,6 +639,7 @@ impl EngineRuntime {
                 thread_id: thread.id.0.to_string(),
                 parent_thread_id,
                 inherited_turn_count,
+                merged: thread.merged,
             });
         }
 

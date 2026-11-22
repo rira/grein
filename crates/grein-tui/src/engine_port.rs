@@ -40,6 +40,8 @@ pub struct ThreadMeta {
     pub thread_id: String,
     pub parent_thread_id: Option<String>,
     pub inherited_turn_count: usize,
+    #[serde(default)]
+    pub merged: bool,
 }
 
 /// Execution lifecycle status of a live subagent.
@@ -106,6 +108,11 @@ pub enum TuiEngineEvent {
     ThreadTitleUpdated {
         thread_id: String,
         title: String,
+    },
+    ThreadMerged {
+        thread_id: String,
+        target_thread_id: String,
+        summary: String,
     },
     ThreadMetadataUpdated {
         meta: Vec<ThreadMeta>,
@@ -193,5 +200,28 @@ pub trait TuiEnginePort: Send + Sync {
 
     async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
         Ok(Vec::new())
+    }
+
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        _summary: Option<&str>,
+    ) -> io::Result<()> {
+        self.merge_thread(source_id, target_id).await
+    }
+
+    async fn create_root(&self, _title: Option<&str>) -> io::Result<HydratedThread> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "create_root not supported",
+        ))
+    }
+
+    async fn rename_thread(&self, _thread_id: &str, _title: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rename_thread not supported",
+        ))
     }
 }

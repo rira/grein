@@ -932,6 +932,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             rebuild_tree_nodes(app);
         }
+        TuiEngineEvent::ThreadMerged { .. } => {}
         TuiEngineEvent::ThreadMetadataUpdated { meta } => {
             app.thread_meta.clear();
             for m in meta {
