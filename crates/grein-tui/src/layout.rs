@@ -58,7 +58,16 @@ pub fn compute_layout(area: Rect) -> AppLayout {
 
 /// Computes the vertical chrome layout placing the optional subagent strip and status bar below Composer.
 pub fn compute_layout_with_chrome(area: Rect, subagent_rows: u16) -> ChromeLayout {
-    if subagent_rows == 0 {
+    compute_layout_with_chrome_and_sidebar(area, subagent_rows, false)
+}
+
+/// Computes the vertical chrome layout with optional sidebar collapse (`sidebar_hidden` gives Transcript 100% width).
+pub fn compute_layout_with_chrome_and_sidebar(
+    area: Rect,
+    subagent_rows: u16,
+    sidebar_hidden: bool,
+) -> ChromeLayout {
+    let (top_area, composer_area, subagent_strip_area, status_bar_area) = if subagent_rows == 0 {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -67,14 +76,7 @@ pub fn compute_layout_with_chrome(area: Rect, subagent_rows: u16) -> ChromeLayou
                 Constraint::Length(1),
             ])
             .split(area);
-        let (tree_area, transcript_area) = split_top_panes(vertical[0]);
-        ChromeLayout {
-            tree_area,
-            transcript_area,
-            composer_area: vertical[1],
-            subagent_strip_area: None,
-            status_bar_area: vertical[2],
-        }
+        (vertical[0], vertical[1], None, vertical[2])
     } else {
         let max_strip = area.height.saturating_sub(7).max(1);
         let strip_h = subagent_rows.min(max_strip);
@@ -87,13 +89,23 @@ pub fn compute_layout_with_chrome(area: Rect, subagent_rows: u16) -> ChromeLayou
                 Constraint::Length(1),
             ])
             .split(area);
-        let (tree_area, transcript_area) = split_top_panes(vertical[0]);
-        ChromeLayout {
-            tree_area,
-            transcript_area,
-            composer_area: vertical[1],
-            subagent_strip_area: Some(vertical[2]),
-            status_bar_area: vertical[3],
-        }
+        (vertical[0], vertical[1], Some(vertical[2]), vertical[3])
+    };
+
+    let (tree_area, transcript_area) = if sidebar_hidden {
+        (
+            Rect::new(top_area.x, top_area.y, 0, top_area.height),
+            top_area,
+        )
+    } else {
+        split_top_panes(top_area)
+    };
+
+    ChromeLayout {
+        tree_area,
+        transcript_area,
+        composer_area,
+        subagent_strip_area,
+        status_bar_area,
     }
 }

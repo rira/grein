@@ -528,7 +528,7 @@ fn render_block(block: &TranscriptBlock, width: usize, out: &mut Vec<Line<'stati
             stderr,
             exit_code,
             collapsed,
-        } => render_shell_execution(command, stdout, stderr, *exit_code, *collapsed, width, out),
+        } => render_shell_execution(command, stdout, stderr, *exit_code, *collapsed, out),
         TranscriptBlock::JoinNote { text } => {
             let style = Style::default()
                 .fg(Color::DarkGray)
@@ -635,17 +635,20 @@ fn render_tool_call(
     }
 
     let gutter_style = Style::default().fg(Color::DarkGray);
-    let is_diff = looks_like_unified_diff(clean_output);
-    for body_line in clean_output.lines() {
-        let body_span = if is_diff {
-            style_diff_line(body_line)
-        } else {
-            Span::raw(body_line.to_string())
-        };
-        out.push(Line::from(vec![
-            Span::styled("│ ", gutter_style),
-            body_span,
-        ]));
+    if looks_like_unified_diff(clean_output) {
+        for body_line in clean_output.lines() {
+            out.push(Line::from(vec![
+                Span::styled("│ ", gutter_style),
+                style_diff_line(body_line),
+            ]));
+        }
+    } else {
+        for ansi_line in crate::markdown::render_ansi_text(clean_output) {
+            let mut spans = Vec::with_capacity(ansi_line.spans.len() + 1);
+            spans.push(Span::styled("│ ", gutter_style));
+            spans.extend(ansi_line.spans);
+            out.push(Line::from(spans));
+        }
     }
 }
 
@@ -700,7 +703,6 @@ fn render_shell_execution(
     stderr: &str,
     exit_code: Option<i32>,
     collapsed: bool,
-    width: usize,
     out: &mut Vec<Line<'static>>,
 ) {
     let Some(code) = exit_code else {
@@ -750,37 +752,7 @@ fn render_shell_execution(
         combined.push_str(clean_stderr);
     }
 
-    render_ansi_safe_body(&combined, width, out);
-}
-
-fn is_backtick_closing_fence(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.len() >= 3 && trimmed.bytes().all(|b| b == b'`')
-}
-
-fn render_ansi_safe_body(body: &str, width: usize, out: &mut Vec<Line<'static>>) {
-    let mut chunk: Vec<&str> = Vec::new();
-    for line in body.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if is_backtick_closing_fence(line) {
-            if !chunk.is_empty() {
-                let wrapped = format!("```ansi\n{}\n```", chunk.join("\n"));
-                out.extend(crate::markdown::render_markdown_lines_with_width(
-                    &wrapped, width,
-                ));
-                chunk.clear();
-            }
-            out.push(Line::raw(strip_ansi_sequences(line)));
-        } else {
-            chunk.push(line);
-        }
-    }
-    if !chunk.is_empty() {
-        let wrapped = format!("```ansi\n{}\n```", chunk.join("\n"));
-        out.extend(crate::markdown::render_markdown_lines_with_width(
-            &wrapped, width,
-        ));
-    }
+    out.extend(crate::markdown::render_ansi_text(&combined));
 }
 
 fn parse_fence_open(line: &str) -> Option<(char, usize)> {
@@ -814,7 +786,7 @@ fn is_fence_close(line: &str, fence_ch: char, min_len: usize) -> bool {
     count >= min_len && rest[count..].trim().is_empty()
 }
 
-fn extract_last_fenced_code_block(markdown: &str, last_code: &mut Option<String>) {
+pub(crate) fn extract_last_fenced_code_block(markdown: &str, last_code: &mut Option<String>) {
     let mut active_fence: Option<(char, usize, Vec<&str>)> = None;
     for line in markdown.lines() {
         match &mut active_fence {

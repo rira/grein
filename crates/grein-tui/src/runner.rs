@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -20,9 +23,14 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::app::{
-    AnchorItem, App, AppAction, FocusedPane, PendingPermission, ThreadItem, TreeAction, TuiError,
+    find_config_option, match_config_choice, AnchorItem, App, AppAction, CopyMode, FocusedPane,
+    PendingPermission, ThreadItem, TreeAction, TuiError,
 };
-use crate::engine_port::{HydratedSession, ThreadMeta, TuiEngineEvent, TuiEnginePort};
+use crate::engine_port::{
+    AgentOptionsSnapshot, AgentSlashCommand, HydratedSession, ThreadMeta, TuiEngineEvent,
+    TuiEnginePort,
+};
+use crate::transcript::{ThreadTranscript, TranscriptBlock};
 
 const USER_PREFIX: &str = "# User: ";
 const AGENT_HEADER: &str = "## Agent (agy)";
@@ -30,6 +38,7 @@ const ASSISTANT_HEADER: &str = "## Assistant";
 
 pub struct TerminalGuard {
     active: bool,
+    keyboard_enhanced: bool,
 }
 
 impl TerminalGuard {
@@ -37,9 +46,27 @@ impl TerminalGuard {
         if io::stdout().is_terminal() && io::stdin().is_terminal() {
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen)?;
-            Ok(Self { active: true })
+            let keyboard_enhanced =
+                if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+                    execute!(
+                        io::stdout(),
+                        PushKeyboardEnhancementFlags(
+                            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        )
+                    )
+                    .is_ok()
+                } else {
+                    false
+                };
+            Ok(Self {
+                active: true,
+                keyboard_enhanced,
+            })
         } else {
-            Ok(Self { active: false })
+            Ok(Self {
+                active: false,
+                keyboard_enhanced: false,
+            })
         }
     }
 }
@@ -47,6 +74,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.active {
+            if self.keyboard_enhanced {
+                let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+            }
             let _ = disable_raw_mode();
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
         }
@@ -328,6 +358,57 @@ where
     }
 }
 
+fn sync_thread_blocks_md(app: &mut App, thread_id: &str) {
+    let md = if thread_id == app.active_thread_id {
+        app.active_transcript_md.clone()
+    } else {
+        app.thread_transcripts
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    };
+    app.thread_blocks_synced_md
+        .insert(thread_id.to_string(), md);
+}
+
+fn build_blocks_from_turns(turns: &[crate::engine_port::HydratedTurn]) -> ThreadTranscript {
+    let mut blocks = ThreadTranscript::new();
+    for turn in turns {
+        if turn.role.eq_ignore_ascii_case("user") {
+            blocks.push_user(&turn.content);
+        } else {
+            blocks.blocks.push(TranscriptBlock::AssistantMarkdown {
+                content: turn.content.clone(),
+            });
+        }
+    }
+    blocks
+}
+
+fn parse_config_arg(rest: &str) -> (bool, String) {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return (false, String::new());
+    }
+    if let Some(after) = trimmed.strip_prefix("--default") {
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            return (true, after.trim().to_string());
+        }
+    }
+    if let Some(before) = trimmed.strip_suffix("--default") {
+        if before.ends_with(char::is_whitespace) {
+            return (true, before.trim().to_string());
+        }
+    }
+    let mut split = trimmed.splitn(2, char::is_whitespace);
+    if let (Some(first), Some(second)) = (split.next(), split.next()) {
+        if first.eq_ignore_ascii_case("default") && !second.trim().is_empty() {
+            return (true, second.trim().to_string());
+        }
+    }
+    (false, trimmed.to_string())
+}
+
 fn format_tool_result(tool_name: &str, output: &str) -> String {
     let trimmed = output.trim_end_matches(['\r', '\n']);
     if trimmed.trim().is_empty() {
@@ -340,6 +421,57 @@ fn format_tool_result(tool_name: &str, output: &str) -> String {
 }
 
 impl App {
+    pub(crate) fn record_agent_commands_note(
+        &mut self,
+        thread_id: &str,
+        commands: &[AgentSlashCommand],
+    ) {
+        if commands.is_empty() {
+            self.status_notice = Some("No agent commands advertised".to_string());
+            return;
+        }
+        let mut names = Vec::with_capacity(commands.len());
+        let mut lines = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            let cmd_name = if cmd.name.starts_with('/') {
+                cmd.name.clone()
+            } else {
+                format!("/{}", cmd.name)
+            };
+            names.push(cmd_name.clone());
+            if cmd.description.trim().is_empty() {
+                lines.push(cmd_name);
+            } else {
+                lines.push(format!("{cmd_name} — {}", cmd.description.trim()));
+            }
+        }
+        let note = format!("Agent commands:\n{}", lines.join("\n"));
+        let md_note = lines
+            .iter()
+            .map(|l| format!("> ↳ {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        with_thread_transcript_mut(self, thread_id, |buf| {
+            ensure_paragraph_break(buf);
+            buf.push_str(&md_note);
+            buf.push_str("\n\n");
+        });
+        if thread_id == self.active_thread_id {
+            self.sync_anchors();
+        }
+        let resolved_id = if thread_id == "trunk" && self.active_thread_id != "trunk" {
+            self.active_thread_id.clone()
+        } else {
+            thread_id.to_string()
+        };
+        self.thread_blocks
+            .entry(resolved_id.clone())
+            .or_default()
+            .push_join_note(note);
+        sync_thread_blocks_md(self, &resolved_id);
+        self.status_notice = Some(format!("Commands: {}", names.join(", ")));
+    }
+
     pub fn submit_composer_prompt(&mut self, prompt: impl Into<String>) {
         let prompt = prompt.into();
         let trimmed = prompt.trim();
@@ -354,14 +486,21 @@ impl App {
                 self.active_transcript_md
                     .push_str(&format!("> $ {command}\n\n"));
                 self.sync_anchors();
+                let active_id = self.active_thread_id.clone();
+                self.thread_blocks
+                    .entry(active_id.clone())
+                    .or_default()
+                    .push_shell_pending(command);
+                sync_thread_blocks_md(self, &active_id);
+                self.transcript_viewport_mut(&active_id).scroll_to_bottom();
                 self.status_notice = None;
-                self.thread_active_tool.remove(&self.active_thread_id);
+                self.thread_active_tool.remove(&active_id);
                 self.thread_turn_started_ms
-                    .insert(self.active_thread_id.clone(), now_epoch_ms());
+                    .insert(active_id.clone(), now_epoch_ms());
                 self.thread_statuses
-                    .insert(self.active_thread_id.clone(), "executing".to_string());
+                    .insert(active_id.clone(), "executing".to_string());
                 self.pending_actions.push_back(AppAction::RunShell {
-                    thread_id: self.active_thread_id.clone(),
+                    thread_id: active_id,
                     command: command.to_string(),
                 });
             }
@@ -378,7 +517,89 @@ impl App {
 
         match head {
             "/?" | "/help" => {
+                self.help_scroll_offset = 0;
                 self.show_help_modal = true;
+                return;
+            }
+            "/zoom" => {
+                self.toggle_sidebar_zoom();
+                return;
+            }
+            "/copy" => {
+                match rest {
+                    "" => self.copy_transcript_content(CopyMode::LastReply),
+                    "code" => self.copy_transcript_content(CopyMode::CodeBlock),
+                    "all" => self.copy_transcript_content(CopyMode::All),
+                    _ => {
+                        self.status_notice = Some("Usage: /copy [code|all]".to_string());
+                    }
+                }
+                return;
+            }
+            "/commands" => {
+                let active_id = self.active_thread_id.clone();
+                if let Some(cmds) = self.thread_commands.get(&active_id).cloned() {
+                    if !cmds.is_empty() {
+                        self.record_agent_commands_note(&active_id, &cmds);
+                        return;
+                    }
+                }
+                self.status_notice = Some("Fetching agent commands...".to_string());
+                self.pending_actions
+                    .push_back(AppAction::FetchAgentCommands {
+                        thread_id: active_id,
+                    });
+                return;
+            }
+            "/model" | "/mode" | "/thinking" | "/effort" => {
+                let target_config_id = match head {
+                    "/model" => "model",
+                    "/mode" => "mode",
+                    _ => "thought_level",
+                };
+                let (set_default, query) = parse_config_arg(rest);
+                let active_id = self.active_thread_id.clone();
+                if query.is_empty() {
+                    self.pending_actions
+                        .push_back(AppAction::OpenConfigPicker {
+                            thread_id: active_id,
+                            config_id: target_config_id.to_string(),
+                        });
+                    return;
+                }
+                if let Some(opt) = self
+                    .thread_config_options
+                    .get(&active_id)
+                    .and_then(|opts| find_config_option(opts, target_config_id))
+                    .cloned()
+                {
+                    if opt.options.is_empty() {
+                        self.pending_actions.push_back(AppAction::SetAgentConfig {
+                            thread_id: active_id,
+                            config_id: opt.id,
+                            value: query,
+                            set_default,
+                        });
+                    } else if let Some(choice) = match_config_choice(&opt.options, &query) {
+                        self.pending_actions.push_back(AppAction::SetAgentConfig {
+                            thread_id: active_id,
+                            config_id: opt.id,
+                            value: choice.value.clone(),
+                            set_default,
+                        });
+                    } else {
+                        self.status_notice =
+                            Some(format!("No {} option matching '{query}'", opt.name));
+                    }
+                } else {
+                    self.pending_actions
+                        .push_back(AppAction::ApplyAgentConfigQuery {
+                            thread_id: active_id,
+                            config_id: target_config_id.to_string(),
+                            query,
+                            set_default,
+                        });
+                }
                 return;
             }
             "/delete" | "/close" => {
@@ -450,14 +671,21 @@ impl App {
             .push_str(&render_node(&AuthorRole::User, trimmed));
         self.last_submitted_prompt = Some(trimmed.to_string());
         self.sync_anchors();
+        let active_id = self.active_thread_id.clone();
+        self.thread_blocks
+            .entry(active_id.clone())
+            .or_default()
+            .push_user(trimmed);
+        sync_thread_blocks_md(self, &active_id);
+        self.transcript_viewport_mut(&active_id).scroll_to_bottom();
         self.status_notice = None;
-        self.thread_active_tool.remove(&self.active_thread_id);
+        self.thread_active_tool.remove(&active_id);
         self.thread_turn_started_ms
-            .insert(self.active_thread_id.clone(), now_epoch_ms());
+            .insert(active_id.clone(), now_epoch_ms());
         self.thread_statuses
-            .insert(self.active_thread_id.clone(), "streaming".to_string());
+            .insert(active_id.clone(), "streaming".to_string());
         self.pending_actions.push_back(AppAction::SendPrompt {
-            thread_id: self.active_thread_id.clone(),
+            thread_id: active_id,
             prompt: trimmed.to_string(),
         });
     }
@@ -484,6 +712,21 @@ impl App {
                 .push_str(&render_node(&AuthorRole::Assistant, clean));
         }
         self.sync_anchors();
+        let active_id = self.active_thread_id.clone();
+        let blocks = self.thread_blocks.entry(active_id.clone()).or_default();
+        if has_open_agent_turn {
+            if let Some(TranscriptBlock::AssistantMarkdown { content }) = blocks.blocks.last_mut() {
+                if !content.is_empty() && !clean.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(clean);
+            } else {
+                blocks.append_assistant_chunk(clean);
+            }
+        } else {
+            blocks.append_assistant_chunk(clean);
+        }
+        sync_thread_blocks_md(self, &active_id);
     }
 
     pub fn sync_anchors(&mut self) {
@@ -500,6 +743,7 @@ impl App {
                         .to_string()
                 })
                 .unwrap_or_else(|| "Active Session".to_string());
+            let old_id = self.active_thread_id.clone();
             let new_id = if self.active_thread_id.is_empty() || self.active_thread_id == "trunk" {
                 let id = ThreadId::now_v7().to_string();
                 self.active_thread_id = id.clone();
@@ -507,6 +751,19 @@ impl App {
             } else {
                 self.active_thread_id.clone()
             };
+            if old_id != new_id {
+                if let Some(prev_blocks) = self.thread_blocks.remove(&old_id) {
+                    self.thread_blocks.insert(new_id.clone(), prev_blocks);
+                }
+                if let Some(prev_synced) = self.thread_blocks_synced_md.remove(&old_id) {
+                    self.thread_blocks_synced_md
+                        .insert(new_id.clone(), prev_synced);
+                }
+                if let Some(prev_vp) = self.thread_viewports.remove(&old_id) {
+                    self.thread_viewports.insert(new_id.clone(), prev_vp);
+                }
+                self.thread_transcripts.remove(&old_id);
+            }
             self.threads.push(ThreadItem {
                 id: new_id,
                 title,
@@ -658,10 +915,18 @@ impl App {
         };
 
         let mut reconstructed = String::new();
+        let mut blocks = ThreadTranscript::new();
         let mut first_user_content: Option<String> = None;
         for node in &trunk {
-            if node.role == AuthorRole::User && first_user_content.is_none() {
-                first_user_content = Some(node.content.clone());
+            if node.role == AuthorRole::User {
+                if first_user_content.is_none() {
+                    first_user_content = Some(node.content.clone());
+                }
+                blocks.push_user(&node.content);
+            } else {
+                blocks.blocks.push(TranscriptBlock::AssistantMarkdown {
+                    content: node.content.clone(),
+                });
             }
             reconstructed.push_str(&render_node(&node.role, &node.content));
         }
@@ -676,14 +941,19 @@ impl App {
             .or(first_user_content)
             .unwrap_or_else(|| "Active Session".to_string());
 
+        let tid_str = thread.id.to_string();
         self.threads = vec![ThreadItem {
-            id: thread.id.to_string(),
+            id: tid_str.clone(),
             title,
             anchors: Vec::new(),
         }];
-        self.active_thread_id = thread.id.to_string();
+        self.active_thread_id = tid_str.clone();
+        self.thread_blocks.clear();
+        self.thread_blocks_synced_md.clear();
 
         self.sync_anchors();
+        self.thread_blocks.insert(tid_str.clone(), blocks);
+        sync_thread_blocks_md(self, &tid_str);
     }
 }
 
@@ -726,20 +996,30 @@ fn render_turns_md(turns: &[crate::engine_port::HydratedTurn]) -> String {
 pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.threads.clear();
     app.thread_transcripts.clear();
+    app.thread_blocks.clear();
+    app.thread_blocks_synced_md.clear();
     app.thread_statuses.clear();
     app.streaming_assistant_threads.clear();
     app.thread_thoughts.clear();
     app.thread_meta.clear();
     app.thread_subagents.clear();
     app.thread_agent_meta.clear();
+    app.thread_config_options.clear();
+    app.thread_commands.clear();
     app.thread_active_tool.clear();
     app.thread_turn_started_ms.clear();
+    app.config_picker = None;
+    app.help_scroll_offset = 0;
     app.status_notice = None;
     app.pending_rename_thread_id = None;
 
     for t in &session.threads {
         let transcript = render_turns_md(&t.turns);
+        let blocks = build_blocks_from_turns(&t.turns);
         let anchors = parse_anchors_for_transcript(&transcript);
+        app.thread_blocks_synced_md
+            .insert(t.id.clone(), transcript.clone());
+        app.thread_blocks.insert(t.id.clone(), blocks);
         app.thread_transcripts.insert(t.id.clone(), transcript);
         app.thread_statuses
             .entry(t.id.clone())
@@ -793,6 +1073,11 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 }
                 buf.push_str(&content);
             });
+            app.thread_blocks
+                .entry(thread_id.clone())
+                .or_default()
+                .append_assistant_chunk(&content);
+            sync_thread_blocks_md(app, &thread_id);
         }
         TuiEngineEvent::ThoughtChunk { thread_id, content } => {
             app.thread_turn_started_ms
@@ -815,7 +1100,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
         TuiEngineEvent::ToolInvoked {
             thread_id,
             tool_name,
-            ..
+            tool_call_id,
+            summary,
         } => {
             app.thread_thoughts.remove(&thread_id);
             app.thread_turn_started_ms
@@ -836,12 +1122,18 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 }
                 buf.push_str(&format!("> ⚙ tool: `{tool_name}`\n"));
             });
+            app.thread_blocks
+                .entry(thread_id.clone())
+                .or_default()
+                .start_tool_call(tool_call_id, tool_name, summary);
+            sync_thread_blocks_md(app, &thread_id);
         }
         TuiEngineEvent::ToolResult {
             thread_id,
             tool_name,
             output,
-            ..
+            tool_call_id,
+            is_error,
         } => {
             app.thread_thoughts.remove(&thread_id);
             app.thread_active_tool.remove(&thread_id);
@@ -866,6 +1158,11 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 }
                 buf.push_str(&formatted);
             });
+            app.thread_blocks
+                .entry(thread_id.clone())
+                .or_default()
+                .complete_tool_call(tool_call_id.as_deref(), &tool_name, output, is_error);
+            sync_thread_blocks_md(app, &thread_id);
         }
         TuiEngineEvent::ToolActivityUpdated {
             thread_id,
@@ -923,6 +1220,11 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 ensure_paragraph_break(buf);
                 buf.push_str(&block);
             });
+            app.thread_blocks
+                .entry(thread_id.clone())
+                .or_default()
+                .complete_shell(&command, stdout, stderr, exit_code);
+            sync_thread_blocks_md(app, &thread_id);
             app.thread_active_tool.remove(&thread_id);
             app.thread_turn_started_ms.remove(&thread_id);
             app.thread_statuses.insert(thread_id.clone(), "idle".to_string());
@@ -939,8 +1241,12 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 return;
             }
             let transcript = render_turns_md(&thread.turns);
+            let blocks = build_blocks_from_turns(&thread.turns);
             let anchors = parse_anchors_for_transcript(&transcript);
             let new_id = thread.id.clone();
+            app.thread_blocks_synced_md
+                .insert(new_id.clone(), transcript.clone());
+            app.thread_blocks.insert(new_id.clone(), blocks);
             app.thread_transcripts.insert(new_id.clone(), transcript);
             app.thread_statuses
                 .entry(new_id.clone())
@@ -982,15 +1288,21 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 .unwrap_or_else(|| thread_id.clone());
             if has_target {
                 let clean_summary = summary.trim();
-                let note = if clean_summary.is_empty() {
-                    format!("> ↳ Joined from {source_title}\n\n")
+                let join_note = if clean_summary.is_empty() {
+                    format!("Joined from {source_title}")
                 } else {
-                    format!("> ↳ Joined from {source_title}: {clean_summary}\n\n")
+                    format!("Joined from {source_title}: {clean_summary}")
                 };
+                let note = format!("> ↳ {join_note}\n\n");
                 with_thread_transcript_mut(app, &target_thread_id, |buf| {
                     ensure_paragraph_break(buf);
                     buf.push_str(&note);
                 });
+                app.thread_blocks
+                    .entry(target_thread_id.clone())
+                    .or_default()
+                    .push_join_note(join_note);
+                sync_thread_blocks_md(app, &target_thread_id);
                 if target_thread_id == app.active_thread_id {
                     app.sync_anchors();
                 }
@@ -1019,6 +1331,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
         } => {
             app.threads.retain(|t| t.id != thread_id);
             app.thread_transcripts.remove(&thread_id);
+            app.thread_blocks.remove(&thread_id);
+            app.thread_blocks_synced_md.remove(&thread_id);
             app.thread_statuses.remove(&thread_id);
             app.streaming_assistant_threads.remove(&thread_id);
             app.thread_thoughts.remove(&thread_id);
@@ -1027,8 +1341,17 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.thread_meta.remove(&thread_id);
             app.thread_subagents.remove(&thread_id);
             app.thread_agent_meta.remove(&thread_id);
+            app.thread_config_options.remove(&thread_id);
+            app.thread_commands.remove(&thread_id);
             app.thread_active_tool.remove(&thread_id);
             app.thread_turn_started_ms.remove(&thread_id);
+            if app
+                .config_picker
+                .as_ref()
+                .is_some_and(|p| p.thread_id == thread_id)
+            {
+                app.config_picker = None;
+            }
             app.status_notice = None;
             app.pending_rename_thread_id = None;
 
@@ -1078,7 +1401,30 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 entry.1 = mode;
             }
         }
-        TuiEngineEvent::AgentConfigUpdated { .. } | TuiEngineEvent::AgentCommandsUpdated { .. } => {
+        TuiEngineEvent::AgentConfigUpdated {
+            thread_id,
+            config_options,
+        } => {
+            app.sync_agent_meta_from_config_options(&thread_id, &config_options);
+            if let Some(ref mut picker) = app.config_picker {
+                if picker.thread_id == thread_id {
+                    if let Some(opt) = find_config_option(&config_options, &picker.config_id) {
+                        picker.current_value = opt.current_value.clone();
+                        if !opt.options.is_empty() {
+                            picker.options = opt.options.clone();
+                            picker.selected_index =
+                                picker.selected_index.min(picker.options.len() - 1);
+                        }
+                    }
+                }
+            }
+            app.thread_config_options.insert(thread_id, config_options);
+        }
+        TuiEngineEvent::AgentCommandsUpdated {
+            thread_id,
+            commands,
+        } => {
+            app.thread_commands.insert(thread_id, commands);
         }
         TuiEngineEvent::SubagentUpdated {
             thread_id,
@@ -1110,6 +1456,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.thread_statuses
                 .insert(thread_id.clone(), "idle".to_string());
             with_thread_transcript_mut(app, &thread_id, ensure_paragraph_break);
+            sync_thread_blocks_md(app, &thread_id);
             if thread_id == app.active_thread_id {
                 app.sync_anchors();
             } else {
@@ -1157,6 +1504,11 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 ensure_paragraph_break(buf);
                 buf.push_str(&format!("Error: {message}\n\n"));
             });
+            app.thread_blocks
+                .entry(active.clone())
+                .or_default()
+                .push_error(message);
+            sync_thread_blocks_md(app, &active);
             app.sync_anchors();
         }
     }
@@ -1166,6 +1518,25 @@ enum RunnerLocalEvent {
     Engine(TuiEngineEvent),
     OptimisticThreadMeta(ThreadMeta),
     StatusNotice(String),
+    OpenConfigPicker {
+        snapshot: AgentOptionsSnapshot,
+        config_id: String,
+    },
+    ResolveConfigQuery {
+        snapshot: AgentOptionsSnapshot,
+        config_id: String,
+        query: String,
+        set_default: bool,
+    },
+    ConfigApplied {
+        snapshot: AgentOptionsSnapshot,
+        config_id: String,
+        value: String,
+        set_default: bool,
+    },
+    CommandsFetched {
+        snapshot: AgentOptionsSnapshot,
+    },
     MergeFallback {
         thread_id: String,
         target_thread_id: String,
@@ -1336,7 +1707,113 @@ fn dispatch_action(
                 }
             });
         }
+        AppAction::OpenConfigPicker {
+            thread_id,
+            config_id,
+        } => {
+            tokio::spawn(async move {
+                match engine.agent_options(&thread_id).await {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::OpenConfigPicker {
+                            snapshot,
+                            config_id,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Failed to load options: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::SetAgentConfig {
+            thread_id,
+            config_id,
+            value,
+            set_default,
+        } => {
+            tokio::spawn(async move {
+                match engine
+                    .set_agent_config(&thread_id, &config_id, &value, set_default)
+                    .await
+                {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::ConfigApplied {
+                            snapshot,
+                            config_id,
+                            value,
+                            set_default,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Config update failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::ApplyAgentConfigQuery {
+            thread_id,
+            config_id,
+            query,
+            set_default,
+        } => {
+            tokio::spawn(async move {
+                match engine.agent_options(&thread_id).await {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::ResolveConfigQuery {
+                            snapshot,
+                            config_id,
+                            query,
+                            set_default,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Failed to load options: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::FetchAgentCommands { thread_id } => {
+            tokio::spawn(async move {
+                match engine.agent_options(&thread_id).await {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::CommandsFetched { snapshot });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Failed to load commands: {err}"
+                        )));
+                    }
+                }
+            });
+        }
         AppAction::Scrolled { .. } | AppAction::None => {}
+    }
+}
+
+fn cache_snapshot_options(app: &mut App, snapshot: &AgentOptionsSnapshot) {
+    if !snapshot.config_options.is_empty() {
+        apply_engine_event(
+            app,
+            TuiEngineEvent::AgentConfigUpdated {
+                thread_id: snapshot.thread_id.clone(),
+                config_options: snapshot.config_options.clone(),
+            },
+        );
+    }
+    if !snapshot.available_commands.is_empty() {
+        apply_engine_event(
+            app,
+            TuiEngineEvent::AgentCommandsUpdated {
+                thread_id: snapshot.thread_id.clone(),
+                commands: snapshot.available_commands.clone(),
+            },
+        );
     }
 }
 
@@ -1460,6 +1937,79 @@ pub async fn run_with_engine_events<B: Backend>(
                     RunnerLocalEvent::StatusNotice(notice) => {
                         app.status_notice = Some(notice);
                     }
+                    RunnerLocalEvent::OpenConfigPicker {
+                        snapshot,
+                        config_id,
+                    } => {
+                        cache_snapshot_options(&mut app, &snapshot);
+                        app.open_config_picker_from_options(&snapshot.thread_id, &config_id);
+                    }
+                    RunnerLocalEvent::ResolveConfigQuery {
+                        snapshot,
+                        config_id,
+                        query,
+                        set_default,
+                    } => {
+                        cache_snapshot_options(&mut app, &snapshot);
+                        let tid = snapshot.thread_id.clone();
+                        if let Some(opt) = app
+                            .thread_config_options
+                            .get(&tid)
+                            .and_then(|opts| find_config_option(opts, &config_id))
+                            .cloned()
+                        {
+                            if opt.options.is_empty() {
+                                app.pending_actions.push_back(AppAction::SetAgentConfig {
+                                    thread_id: tid,
+                                    config_id: opt.id,
+                                    value: query,
+                                    set_default,
+                                });
+                            } else if let Some(choice) = match_config_choice(&opt.options, &query) {
+                                app.pending_actions.push_back(AppAction::SetAgentConfig {
+                                    thread_id: tid,
+                                    config_id: opt.id,
+                                    value: choice.value.clone(),
+                                    set_default,
+                                });
+                            } else {
+                                app.status_notice =
+                                    Some(format!("No {} option matching '{query}'", opt.name));
+                            }
+                        } else {
+                            app.status_notice =
+                                Some(format!("Option '{config_id}' not exposed by agent"));
+                        }
+                    }
+                    RunnerLocalEvent::ConfigApplied {
+                        snapshot,
+                        config_id,
+                        value,
+                        set_default,
+                    } => {
+                        cache_snapshot_options(&mut app, &snapshot);
+                        let tid = if snapshot.thread_id.is_empty() {
+                            app.active_thread_id.clone()
+                        } else {
+                            snapshot.thread_id
+                        };
+                        if snapshot.config_options.is_empty() {
+                            if let Some(opts) = app.thread_config_options.get_mut(&tid) {
+                                if let Some(opt) = opts.iter_mut().find(|o| o.id == config_id) {
+                                    opt.current_value = value.clone();
+                                }
+                                let cloned = opts.clone();
+                                app.sync_agent_meta_from_config_options(&tid, &cloned);
+                            }
+                        }
+                        let scope = if set_default { "default" } else { "branch" };
+                        app.status_notice = Some(format!("Set {config_id} = {value} ({scope})"));
+                    }
+                    RunnerLocalEvent::CommandsFetched { snapshot } => {
+                        cache_snapshot_options(&mut app, &snapshot);
+                        let tid = snapshot.thread_id.clone();
+                        app.record_agent_commands_note(&tid, &snapshot.available_commands);
+                    }
                     RunnerLocalEvent::MergeFallback {
                         thread_id,
                         target_thread_id,
@@ -1490,6 +2040,19 @@ pub async fn run_with_engine_events<B: Backend>(
                         }
                     }
                 }
+                while let Some(action) = app.pending_actions.pop_front() {
+                    if let AppAction::MergeBranch { ref source_thread_id, .. } = action {
+                        *pending_local_merges
+                            .entry(source_thread_id.clone())
+                            .or_default() += 1;
+                    }
+                    dispatch_action(
+                        Arc::clone(&engine),
+                        action,
+                        local_ev_tx.clone(),
+                        err_tx.clone(),
+                    );
+                }
             }
             Some((thread_id_opt, message)) = err_rx.recv() => {
                 let target_thread = thread_id_opt.unwrap_or_else(|| app.active_thread_id.clone());
@@ -1503,6 +2066,11 @@ pub async fn run_with_engine_events<B: Backend>(
                     ensure_paragraph_break(buf);
                     buf.push_str(&format!("Error: {message}\n\n"));
                 });
+                app.thread_blocks
+                    .entry(target_thread.clone())
+                    .or_default()
+                    .push_error(message);
+                sync_thread_blocks_md(&mut app, &target_thread);
                 if target_thread == app.active_thread_id {
                     app.sync_anchors();
                 }

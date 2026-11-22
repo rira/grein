@@ -3,9 +3,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::IsTerminal;
 use thiserror::Error;
 
-use crate::engine_port::{SubagentSnapshot, ThreadMeta};
+use crate::engine_port::{
+    AgentConfigChoice, AgentConfigOption, AgentSlashCommand, SubagentSnapshot, ThreadMeta,
+};
 use crate::runner::{compute_ordered_thread_entries, OrderedThreadEntry};
-use crate::transcript::TranscriptViewport;
+use crate::transcript::{
+    extract_last_fenced_code_block, ThreadTranscript, TranscriptBlock, TranscriptViewport,
+};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TuiError {
@@ -37,6 +41,17 @@ pub enum FocusDirection {
 pub struct PendingPermission {
     pub request_id: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPickerModal {
+    pub thread_id: String,
+    pub config_id: String,
+    pub title: String,
+    pub current_value: String,
+    pub options: Vec<AgentConfigChoice>,
+    pub selected_index: usize,
+    pub set_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +89,25 @@ pub enum AppAction {
     ResolvePermission {
         request_id: String,
         approved: bool,
+    },
+    OpenConfigPicker {
+        thread_id: String,
+        config_id: String,
+    },
+    SetAgentConfig {
+        thread_id: String,
+        config_id: String,
+        value: String,
+        set_default: bool,
+    },
+    ApplyAgentConfigQuery {
+        thread_id: String,
+        config_id: String,
+        query: String,
+        set_default: bool,
+    },
+    FetchAgentCommands {
+        thread_id: String,
     },
 }
 
@@ -189,6 +223,8 @@ pub struct App {
     pub last_submitted_prompt: Option<String>,
     pub active_thread_id: String,
     pub thread_transcripts: BTreeMap<String, String>,
+    pub thread_blocks: BTreeMap<String, ThreadTranscript>,
+    pub thread_blocks_synced_md: BTreeMap<String, String>,
     pub thread_statuses: BTreeMap<String, String>,
     pub streaming_assistant_threads: BTreeSet<String>,
     pub thread_thoughts: BTreeMap<String, String>,
@@ -201,12 +237,20 @@ pub struct App {
     pub thread_meta: HashMap<String, ThreadMeta>,
     pub thread_subagents: HashMap<String, Vec<SubagentSnapshot>>,
     pub thread_agent_meta: HashMap<String, (Option<String>, Option<String>)>,
+    pub thread_config_options: HashMap<String, Vec<AgentConfigOption>>,
+    pub thread_commands: HashMap<String, Vec<AgentSlashCommand>>,
     pub thread_active_tool: HashMap<String, Option<String>>,
     pub thread_turn_started_ms: HashMap<String, u64>,
     pub tick_count: u64,
     pub show_help_modal: bool,
+    pub help_scroll_offset: u16,
+    pub config_picker: Option<ConfigPickerModal>,
+    pub sidebar_hidden: bool,
+    pub composer_scroll_y: u16,
+    pub transcript_viewport_height: u16,
     pub status_notice: Option<String>,
     pub pending_rename_thread_id: Option<String>,
+    pub last_copied_text: Option<String>,
 }
 
 pub type AppState = App;
@@ -227,6 +271,8 @@ impl Default for App {
             last_submitted_prompt: None,
             active_thread_id: "trunk".to_string(),
             thread_transcripts: BTreeMap::new(),
+            thread_blocks: BTreeMap::new(),
+            thread_blocks_synced_md: BTreeMap::new(),
             thread_statuses: BTreeMap::new(),
             streaming_assistant_threads: BTreeSet::new(),
             thread_thoughts: BTreeMap::new(),
@@ -239,12 +285,20 @@ impl Default for App {
             thread_meta: HashMap::new(),
             thread_subagents: HashMap::new(),
             thread_agent_meta: HashMap::new(),
+            thread_config_options: HashMap::new(),
+            thread_commands: HashMap::new(),
             thread_active_tool: HashMap::new(),
             thread_turn_started_ms: HashMap::new(),
             tick_count: 0,
             show_help_modal: false,
+            help_scroll_offset: 0,
+            config_picker: None,
+            sidebar_hidden: false,
+            composer_scroll_y: 0,
+            transcript_viewport_height: 0,
             status_notice: None,
             pending_rename_thread_id: None,
+            last_copied_text: None,
         }
     }
 }
@@ -328,6 +382,137 @@ fn step_wrapped(pos: usize, len: usize, forward: bool) -> usize {
     } else {
         (pos + len - 1) % len
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyMode {
+    LastReply,
+    CodeBlock,
+    All,
+}
+
+pub(crate) fn is_config_option_kind(opt: &AgentConfigOption, kind: &str) -> bool {
+    let id = opt.id.to_ascii_lowercase();
+    let cat = opt.category.as_deref().unwrap_or("").to_ascii_lowercase();
+    match kind {
+        "model" => id == "model" || cat == "model",
+        "mode" => id == "mode" || cat == "mode",
+        "thought_level" | "thinking" | "effort" => matches!(
+            id.as_str(),
+            "thought_level" | "thinking" | "effort" | "reasoning" | "reasoning_effort"
+        ) || matches!(
+            cat.as_str(),
+            "thought_level" | "thinking" | "effort" | "reasoning" | "reasoning_effort"
+        ),
+        _ => id.eq_ignore_ascii_case(kind) || cat.eq_ignore_ascii_case(kind),
+    }
+}
+
+pub(crate) fn find_config_option<'a>(
+    options: &'a [AgentConfigOption],
+    requested_id: &str,
+) -> Option<&'a AgentConfigOption> {
+    if let Some(exact) = options
+        .iter()
+        .find(|opt| is_config_option_kind(opt, requested_id))
+    {
+        return Some(exact);
+    }
+    let needle = requested_id.to_ascii_lowercase();
+    options.iter().find(|opt| {
+        let id = opt.id.to_ascii_lowercase();
+        let cat = opt.category.as_deref().unwrap_or("").to_ascii_lowercase();
+        if needle == "thought_level" || needle == "thinking" || needle == "effort" {
+            id.contains("thought")
+                || id.contains("think")
+                || id.contains("effort")
+                || cat.contains("thought")
+                || cat.contains("think")
+                || cat.contains("effort")
+        } else {
+            id.contains(&needle) || cat.contains(&needle)
+        }
+    })
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut chars = needle.chars();
+    let Some(mut cur) = chars.next() else {
+        return true;
+    };
+    for h in haystack.chars() {
+        if h == cur {
+            if let Some(next) = chars.next() {
+                cur = next;
+            } else {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn match_config_choice<'a>(
+    choices: &'a [AgentConfigChoice],
+    query: &str,
+) -> Option<&'a AgentConfigChoice> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() || choices.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(u8, usize, &'a AgentConfigChoice)> = None;
+    for choice in choices {
+        let val = choice.value.to_ascii_lowercase();
+        let name = choice.name.to_ascii_lowercase();
+        let tier = if val == q || name == q {
+            Some(0u8)
+        } else if val.starts_with(&q) || name.starts_with(&q) {
+            Some(1u8)
+        } else if val.contains(&q) || name.contains(&q) {
+            Some(2u8)
+        } else if is_subsequence(&q, &val) || is_subsequence(&q, &name) {
+            Some(3u8)
+        } else {
+            None
+        };
+        if let Some(t) = tier {
+            let len = choice.value.len();
+            let replace = match best {
+                None => true,
+                Some((bt, bl, _)) => t < bt || (t == bt && len < bl),
+            };
+            if replace {
+                best = Some((t, len, choice));
+            }
+        }
+    }
+    best.map(|(_, _, c)| c)
+}
+
+fn extract_last_assistant_md(md: &str) -> Option<String> {
+    let mut last_start: Option<usize> = None;
+    for marker in ["## Agent (agy)\n", "## Assistant\n"] {
+        if let Some(idx) = md.rfind(marker) {
+            let start = idx + marker.len();
+            if last_start.is_none_or(|prev| start > prev) {
+                last_start = Some(start);
+            }
+        }
+    }
+    if let Some(start) = last_start {
+        let tail = &md[start..];
+        let end = tail
+            .find("\n# User: ")
+            .or_else(|| tail.find("\n$ "))
+            .unwrap_or(tail.len());
+        let body = tail[..end].trim();
+        if !body.is_empty() {
+            return Some(body.to_string());
+        }
+    }
+    let trimmed = md.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 impl App {
@@ -661,6 +846,241 @@ impl App {
         }
     }
 
+    fn half_page_scroll_lines(&self) -> usize {
+        if self.transcript_viewport_height > 0 {
+            (self.transcript_viewport_height as usize / 2).max(1)
+        } else {
+            10
+        }
+    }
+
+    pub(crate) fn has_synchronized_blocks(&self, thread_id: &str, display_md: &str) -> bool {
+        match self.thread_blocks.get(thread_id) {
+            Some(blocks) if !blocks.is_empty() => {
+                display_md.is_empty()
+                    || self
+                        .thread_blocks_synced_md
+                        .get(thread_id)
+                        .is_some_and(|synced| synced == display_md)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn sync_agent_meta_from_config_options(
+        &mut self,
+        thread_id: &str,
+        options: &[AgentConfigOption],
+    ) {
+        let entry = self
+            .thread_agent_meta
+            .entry(thread_id.to_string())
+            .or_default();
+        if let Some(model_opt) = find_config_option(options, "model") {
+            if !model_opt.current_value.trim().is_empty() {
+                entry.0 = Some(model_opt.current_value.clone());
+            }
+        }
+        if let Some(mode_opt) = find_config_option(options, "mode") {
+            if !mode_opt.current_value.trim().is_empty() {
+                entry.1 = Some(mode_opt.current_value.clone());
+            }
+        }
+    }
+
+    pub fn open_config_picker_from_options(&mut self, thread_id: &str, config_id: &str) -> bool {
+        let Some(opts) = self.thread_config_options.get(thread_id) else {
+            self.status_notice = Some(format!("No options exposed for {config_id}"));
+            return false;
+        };
+        let Some(opt) = find_config_option(opts, config_id) else {
+            self.status_notice = Some(format!("Option '{config_id}' not exposed by agent"));
+            return false;
+        };
+        if opt.options.is_empty() {
+            self.status_notice = Some(format!("No choices available for {}", opt.name));
+            return false;
+        }
+        let selected_index = opt
+            .options
+            .iter()
+            .position(|c| c.value == opt.current_value)
+            .unwrap_or(0);
+        let title = if opt.name.trim().is_empty() {
+            opt.id.clone()
+        } else {
+            opt.name.clone()
+        };
+        self.config_picker = Some(ConfigPickerModal {
+            thread_id: thread_id.to_string(),
+            config_id: opt.id.clone(),
+            title,
+            current_value: opt.current_value.clone(),
+            options: opt.options.clone(),
+            selected_index,
+            set_default: false,
+        });
+        true
+    }
+
+    pub fn toggle_transcript_cards(&mut self) {
+        let target_id = self.transcript_scroll_target_id();
+        let Some(blocks) = self.thread_blocks.get_mut(&target_id) else {
+            self.status_notice = Some("No collapsible tool/shell cards".to_string());
+            return;
+        };
+        let expanded = blocks.toggle_all_collapsible();
+        if expanded {
+            self.status_notice = Some("Expanded tool/shell cards".to_string());
+        } else if blocks.blocks.iter().any(|b| {
+            matches!(
+                b,
+                TranscriptBlock::ToolCall {
+                    collapsed: true,
+                    ..
+                } | TranscriptBlock::ShellExecution {
+                    collapsed: true,
+                    ..
+                }
+            )
+        }) {
+            self.status_notice = Some("Collapsed tool/shell cards".to_string());
+        } else {
+            self.status_notice = Some("No collapsible tool/shell cards".to_string());
+        }
+    }
+
+    pub fn toggle_sidebar_zoom(&mut self) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        self.status_notice = Some(if self.sidebar_hidden {
+            "Sidebar hidden (copy zoom)".to_string()
+        } else {
+            "Sidebar shown".to_string()
+        });
+    }
+
+    pub(crate) fn copy_transcript_content(&mut self, mode: CopyMode) {
+        let target_id = self.transcript_scroll_target_id();
+        let display_md = if target_id == self.active_thread_id {
+            self.active_transcript_md.as_str()
+        } else {
+            self.thread_transcripts
+                .get(&target_id)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        let use_blocks = self.has_synchronized_blocks(&target_id, display_md);
+
+        let extracted = match mode {
+            CopyMode::LastReply => {
+                if use_blocks {
+                    self.thread_blocks
+                        .get(&target_id)
+                        .and_then(ThreadTranscript::latest_assistant_text)
+                } else {
+                    extract_last_assistant_md(display_md)
+                }
+            }
+            CopyMode::CodeBlock => {
+                if use_blocks {
+                    self.thread_blocks
+                        .get(&target_id)
+                        .and_then(ThreadTranscript::latest_code_block)
+                } else {
+                    let mut last_code = None;
+                    extract_last_fenced_code_block(display_md, &mut last_code);
+                    last_code
+                }
+            }
+            CopyMode::All => {
+                if use_blocks {
+                    self.thread_blocks
+                        .get(&target_id)
+                        .map(ThreadTranscript::full_plain_text)
+                        .filter(|s| !s.trim().is_empty())
+                } else {
+                    let trimmed = display_md.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                }
+            }
+        };
+
+        let Some(text) = extracted else {
+            self.status_notice = Some(match mode {
+                CopyMode::LastReply => "Nothing to copy (no assistant reply yet)".to_string(),
+                CopyMode::CodeBlock => "Nothing to copy (no code block found)".to_string(),
+                CopyMode::All => "Nothing to copy (transcript is empty)".to_string(),
+            });
+            return;
+        };
+
+        let kind = match mode {
+            CopyMode::LastReply => "last reply",
+            CopyMode::CodeBlock => "code block",
+            CopyMode::All => "transcript",
+        };
+        let char_count = text.chars().count();
+        self.last_copied_text = Some(text.clone());
+        match crate::clipboard::copy_to_clipboard(&text) {
+            Ok(backend) => {
+                self.status_notice =
+                    Some(format!("Copied {kind} ({char_count} chars) via {backend}"));
+            }
+            Err(err) => {
+                self.status_notice = Some(format!(
+                    "Copy failed for {kind} ({char_count} chars): {err}"
+                ));
+            }
+        }
+    }
+
+    fn handle_key_config_picker(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
+                if let Some(ref mut picker) = self.config_picker {
+                    picker.selected_index = picker.selected_index.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
+                if let Some(ref mut picker) = self.config_picker {
+                    if !picker.options.is_empty() {
+                        picker.selected_index =
+                            (picker.selected_index + 1).min(picker.options.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('d' | 'D') if no_ctrl_alt => {
+                if let Some(ref mut picker) = self.config_picker {
+                    picker.set_default = !picker.set_default;
+                }
+            }
+            KeyCode::Enter if no_ctrl_alt => {
+                if let Some(picker) = self.config_picker.take() {
+                    if let Some(choice) = picker
+                        .options
+                        .get(picker.selected_index)
+                        .or_else(|| picker.options.first())
+                    {
+                        self.pending_actions.push_back(AppAction::SetAgentConfig {
+                            thread_id: picker.thread_id,
+                            config_id: picker.config_id,
+                            value: choice.value.clone(),
+                            set_default: picker.set_default,
+                        });
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') if no_ctrl_alt => {
+                self.config_picker = None;
+            }
+            _ => {}
+        }
+    }
+
     fn scroll_target_transcript(&mut self, action: TranscriptScroll) {
         let target_id = self.transcript_scroll_target_id();
         let vp = self.transcript_viewport_mut(&target_id);
@@ -777,6 +1197,55 @@ impl App {
                 }
                 None
             }
+            KeyCode::Char('J') if no_ctrl_alt => {
+                self.switch_root(true);
+                None
+            }
+            KeyCode::Char('K') if no_ctrl_alt => {
+                self.switch_root(false);
+                None
+            }
+            KeyCode::Char('u' | 'U')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let lines = self.half_page_scroll_lines();
+                self.scroll_target_transcript(TranscriptScroll::Up(lines));
+                None
+            }
+            KeyCode::Char('d' | 'D')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let lines = self.half_page_scroll_lines();
+                self.scroll_target_transcript(TranscriptScroll::Down(lines));
+                None
+            }
+            KeyCode::Char('g') if no_ctrl_alt => {
+                self.scroll_target_transcript(TranscriptScroll::Top);
+                None
+            }
+            KeyCode::Char('G') if no_ctrl_alt => {
+                self.scroll_target_transcript(TranscriptScroll::Bottom);
+                None
+            }
+            KeyCode::Char('f') if no_ctrl_alt => {
+                let (source_thread_id, _) = self.selected_tree_thread_info();
+                self.status_notice = None;
+                self.pending_actions.push_back(AppAction::ForkBranch {
+                    source_thread_id,
+                    title: None,
+                });
+                None
+            }
+            KeyCode::Char('z') if no_ctrl_alt => {
+                self.toggle_sidebar_zoom();
+                None
+            }
+            KeyCode::Char('y') if no_ctrl_alt => {
+                self.copy_transcript_content(CopyMode::LastReply);
+                None
+            }
             KeyCode::Char('n') if no_ctrl_alt => {
                 self.status_notice = None;
                 self.pending_actions
@@ -873,6 +1342,14 @@ impl App {
                     Some(ch) => pos + ch.len_utf8(),
                     None => pos,
                 };
+                true
+            }
+            (KeyCode::Char('b' | 'B'), true, false) => {
+                if let Some((idx, _)) = self.input_buffer[..pos].char_indices().next_back() {
+                    self.cursor_position = idx;
+                } else {
+                    self.cursor_position = 0;
+                }
                 true
             }
             (KeyCode::Char('d' | 'D'), true, false) => {
@@ -986,9 +1463,10 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         if ctrl
+            && !alt
             && matches!(
                 key.code,
-                KeyCode::Char('c') | KeyCode::Char('q') | KeyCode::Char('Q')
+                KeyCode::Char('c' | 'C' | 'q' | 'Q')
             )
         {
             self.should_quit = true;
@@ -1011,14 +1489,37 @@ impl App {
             return true;
         }
 
+        if self.config_picker.is_some() {
+            self.handle_key_config_picker(key);
+            self.sync_focus_out();
+            return true;
+        }
+
         if self.show_help_modal {
             let no_ctrl_alt = !ctrl && !alt;
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.show_help_modal = false;
+                    self.help_scroll_offset = 0;
                 }
-                KeyCode::Char('q') | KeyCode::Char('?') if no_ctrl_alt => {
+                KeyCode::Char('q' | 'Q' | '?') if no_ctrl_alt => {
                     self.show_help_modal = false;
+                    self.help_scroll_offset = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') if no_ctrl_alt => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') if no_ctrl_alt => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
+                }
+                KeyCode::PageDown if no_ctrl_alt => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_add(5);
+                }
+                KeyCode::PageUp if no_ctrl_alt => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(5);
+                }
+                KeyCode::Home if no_ctrl_alt => {
+                    self.help_scroll_offset = 0;
                 }
                 _ => {}
             }
@@ -1100,6 +1601,7 @@ impl App {
             && !alt
             && (self.focused_pane != FocusedPane::Composer || self.input_buffer.is_empty())
         {
+            self.help_scroll_offset = 0;
             self.show_help_modal = true;
             self.sync_focus_out();
             return true;
@@ -1119,6 +1621,16 @@ impl App {
                     self.sync_focus_out();
                     return true;
                 }
+                KeyCode::Char('o' | 'O') => {
+                    self.toggle_transcript_cards();
+                    self.sync_focus_out();
+                    return true;
+                }
+                KeyCode::Char('t' | 'T') => {
+                    self.toggle_sidebar_zoom();
+                    self.sync_focus_out();
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -1134,6 +1646,11 @@ impl App {
                 }
                 KeyCode::Char('r' | 'R') => {
                     self.begin_rename_prefill();
+                    return true;
+                }
+                KeyCode::Char('y' | 'Y') => {
+                    self.copy_transcript_content(CopyMode::LastReply);
+                    self.sync_focus_out();
                     return true;
                 }
                 _ => {}
@@ -1210,6 +1727,24 @@ impl App {
                 let active = self.active_thread_id.clone();
                 self.transcript_viewport_mut(&active).scroll_to_bottom();
                 self.sync_focus_out();
+                return true;
+            }
+            KeyCode::Char('u' | 'U') if ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
+                let lines = self.half_page_scroll_lines();
+                self.scroll_target_transcript(TranscriptScroll::Up(lines));
+                return true;
+            }
+            KeyCode::Char('d' | 'D') if ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
+                let lines = self.half_page_scroll_lines();
+                self.scroll_target_transcript(TranscriptScroll::Down(lines));
+                return true;
+            }
+            KeyCode::Char('g') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
+                self.scroll_target_transcript(TranscriptScroll::Top);
+                return true;
+            }
+            KeyCode::Char('G') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
+                self.scroll_target_transcript(TranscriptScroll::Bottom);
                 return true;
             }
             _ => {

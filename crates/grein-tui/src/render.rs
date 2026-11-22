@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::app::{AppState, PaneFocus};
+use crate::app::{AppState, ConfigPickerModal, PaneFocus};
 use crate::engine_port::{SubagentSnapshot, SubagentStatus};
-use crate::layout::{compute_layout_with_chrome, subagent_strip_height};
+use crate::layout::{compute_layout_with_chrome_and_sidebar, subagent_strip_height};
 use crate::runner::{compute_ordered_thread_entries, compute_ordered_thread_indices};
 use crate::ui::tree::{compute_tree_scroll_offset, TreeNode};
 use ratatui::layout::{Position, Rect};
@@ -56,21 +56,129 @@ fn selected_tree_thread(state: &AppState) -> Option<(&str, &str)> {
     }
 }
 
-fn wrapped_line_count(lines: &[Line<'_>], inner_width: u16) -> usize {
-    let w = inner_width as usize;
-    if w == 0 {
-        return lines.len();
-    }
-    let mut total = 0usize;
-    for line in lines {
-        let lw = line.width();
-        if lw == 0 {
-            total += 1;
+fn char_display_width(ch: char) -> usize {
+    if ch.is_ascii() {
+        if ch.is_control() {
+            0
         } else {
-            total += lw.div_ceil(w);
+            1
         }
+    } else {
+        let mut buf = [0u8; 4];
+        Span::raw(&*ch.encode_utf8(&mut buf)).width()
     }
-    total
+}
+
+fn clamp_char_boundary(text: &str, pos: usize) -> usize {
+    let mut idx = pos.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+struct ComposerTextLayout {
+    lines: Vec<Line<'static>>,
+    cursor_col: u16,
+    cursor_row: u16,
+}
+
+fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> ComposerTextLayout {
+    if inner_width == 0 {
+        return ComposerTextLayout {
+            lines: vec![Line::raw("")],
+            cursor_col: 0,
+            cursor_row: 0,
+        };
+    }
+
+    let cursor_byte = clamp_char_boundary(input, cursor_pos);
+    let mut out_lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_set = false;
+    let mut line_start = 0usize;
+
+    for logical_line in input.split('\n') {
+        let mut cur_line = String::new();
+        let mut cur_w = 0usize;
+        let mut idx = 0usize;
+        let bytes = logical_line.as_bytes();
+
+        while idx < bytes.len() {
+            let ch = logical_line[idx..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                let byte_idx = line_start + idx;
+                let cw = if ch == '\t' { 1 } else { char_display_width(ch) };
+                if cur_w > 0 && cur_w + cw > inner_width {
+                    out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                    cur_w = 0;
+                }
+                if byte_idx == cursor_byte && !cursor_set {
+                    cursor_col = cur_w;
+                    cursor_row = out_lines.len();
+                    cursor_set = true;
+                }
+                cur_line.push(if ch == '\t' { ' ' } else { ch });
+                cur_w += cw;
+                idx += ch.len_utf8();
+            } else {
+                let word_start = idx;
+                let mut word_w = 0usize;
+                while idx < bytes.len() {
+                    let wch = logical_line[idx..].chars().next().unwrap();
+                    if wch.is_whitespace() {
+                        break;
+                    }
+                    word_w += char_display_width(wch);
+                    idx += wch.len_utf8();
+                }
+                let word = &logical_line[word_start..idx];
+                if cur_w > 0 && cur_w + word_w > inner_width && word_w <= inner_width {
+                    out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                    cur_w = 0;
+                }
+                for (rel_idx, wch) in word.char_indices() {
+                    let byte_idx = line_start + word_start + rel_idx;
+                    let cw = char_display_width(wch);
+                    if cur_w > 0 && cur_w + cw > inner_width {
+                        out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                        cur_w = 0;
+                    }
+                    if byte_idx == cursor_byte && !cursor_set {
+                        cursor_col = cur_w;
+                        cursor_row = out_lines.len();
+                        cursor_set = true;
+                    }
+                    cur_line.push(wch);
+                    cur_w += cw;
+                }
+            }
+        }
+
+        let line_end = line_start + logical_line.len();
+        if line_end == cursor_byte && !cursor_set {
+            if cur_w >= inner_width {
+                out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                cur_w = 0;
+            }
+            cursor_col = cur_w;
+            cursor_row = out_lines.len();
+            cursor_set = true;
+        }
+        out_lines.push(Line::from(cur_line));
+        line_start = line_end + 1;
+    }
+
+    if out_lines.is_empty() {
+        out_lines.push(Line::raw(""));
+    }
+
+    ComposerTextLayout {
+        lines: out_lines,
+        cursor_col: cursor_col.min(u16::MAX as usize) as u16,
+        cursor_row: cursor_row.min(u16::MAX as usize) as u16,
+    }
 }
 
 fn render_thread_row(
@@ -234,12 +342,26 @@ pub fn render_app(f: &mut Frame, state: &AppState) {
     let _ = render_app_inner(f, state);
 }
 
+struct RenderMetrics {
+    thread_id: String,
+    max_scroll: u16,
+    tree_scroll: u16,
+    transcript_inner_height: u16,
+    composer_scroll_y: u16,
+    help_scroll_offset: u16,
+}
+
 pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
-    let (thread_id, max_scroll, tree_scroll) = render_app_inner(f, state);
+    let metrics = render_app_inner(f, state);
     state
-        .transcript_viewport_mut(&thread_id)
-        .set_max_scroll(max_scroll as usize);
-    state.tree.scroll_offset = tree_scroll;
+        .transcript_viewport_mut(&metrics.thread_id)
+        .set_max_scroll(metrics.max_scroll as usize);
+    state.tree.scroll_offset = metrics.tree_scroll;
+    state.transcript_viewport_height = metrics.transcript_inner_height;
+    state.composer_scroll_y = metrics.composer_scroll_y;
+    if state.show_help_modal {
+        state.help_scroll_offset = metrics.help_scroll_offset;
+    }
 }
 
 fn format_elapsed_ms(started_at_ms: u64, now_ms: u64) -> String {
@@ -451,49 +573,255 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
     f.render_widget(widget, area);
 }
 
-fn render_help_modal(f: &mut Frame, area: Rect) {
+fn render_config_picker_modal(f: &mut Frame, area: Rect, picker: &ConfigPickerModal) {
+    let popup_width = area.width.saturating_sub(6).clamp(32, 74).min(area.width);
+    let content_rows = picker.options.len() + 3;
+    let popup_height = (content_rows as u16 + 2)
+        .min(area.height.saturating_sub(2).max(7))
+        .min(area.height.max(1));
+    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(format!(" Select {} ", picker.title))
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let scope_style = if picker.set_default {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    let scope_label = if picker.set_default {
+        "Default for new branches"
+    } else {
+        "This branch only"
+    };
+    let scope_alt = if picker.set_default {
+        "This branch only"
+    } else {
+        "Default for new branches"
+    };
+    let scope_line = Line::from(vec![
+        Span::styled(" Scope: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("[{scope_label}]"), scope_style),
+        Span::styled(
+            format!("  (Tab/d: {scope_alt})"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+
+    let footer_line = Line::from(Span::styled(
+        " ↑/↓/j/k Move · Enter Apply · Tab/d Scope · Esc/q Close",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let opt_height = inner.height.saturating_sub(2) as usize;
+    let mut opt_lines = Vec::with_capacity(picker.options.len());
+    for (idx, choice) in picker.options.iter().enumerate() {
+        let is_selected = idx == picker.selected_index;
+        let is_active = choice.value == picker.current_value;
+        let marker = if is_selected { " ▶ " } else { "   " };
+        let label = if !choice.name.is_empty() && choice.name != choice.value {
+            format!("{} ({})", choice.name, choice.value)
+        } else {
+            choice.value.clone()
+        };
+        let desc = choice
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty());
+
+        if is_selected {
+            let sel_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            let mut spans = vec![Span::styled(marker, sel_style)];
+            if is_active {
+                spans.push(Span::styled(
+                    "✓ ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                ));
+            } else {
+                spans.push(Span::styled("  ", sel_style));
+            }
+            spans.push(Span::styled(label, sel_style));
+            if let Some(d) = desc {
+                spans.push(Span::styled(format!(" — {d}"), sel_style));
+            }
+            opt_lines.push(Line::from(spans));
+        } else if is_active {
+            let active_style = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+            let mut spans = vec![
+                Span::raw(marker),
+                Span::styled("✓ ", active_style),
+                Span::styled(label, active_style),
+            ];
+            if let Some(d) = desc {
+                spans.push(Span::styled(
+                    format!(" — {d}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            opt_lines.push(Line::from(spans));
+        } else {
+            let mut spans = vec![Span::raw(marker), Span::raw("  "), Span::raw(label)];
+            if let Some(d) = desc {
+                spans.push(Span::styled(
+                    format!(" — {d}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            opt_lines.push(Line::from(spans));
+        }
+    }
+
+    let scroll_y = if opt_height == 0 || opt_lines.len() <= opt_height {
+        0
+    } else {
+        let max_s = opt_lines.len() - opt_height;
+        if picker.selected_index >= opt_height {
+            (picker.selected_index + 1 - opt_height).min(max_s) as u16
+        } else {
+            0
+        }
+    };
+
+    f.render_widget(
+        Paragraph::new(scope_line),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    if opt_height > 0 {
+        f.render_widget(
+            Paragraph::new(opt_lines).scroll((scroll_y, 0)),
+            Rect::new(inner.x, inner.y + 1, inner.width, opt_height as u16),
+        );
+    }
+    if inner.height >= 2 {
+        f.render_widget(
+            Paragraph::new(footer_line),
+            Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        );
+    }
+}
+
+fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
+    let section_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let key_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let rows = [
-        ("Tab / Shift+Tab", "Cycle branches in active root"),
-        ("Alt+↑/↓, PgUp/PgDn", "Scroll Transcript (Alt+Home/End top/bottom)"),
-        ("Alt+Shift+↑/↓, Alt+J/K", "Switch between top-level roots"),
-        ("Esc / Ctrl+G", "Toggle Composer / Tree (Esc cancels stream)"),
-        ("Shift+Enter", "Newline in Composer (Enter sends/activates)"),
-        ("Ctrl+A / Ctrl+E", "Move to line start / end (Home / End)"),
-        ("Alt+← / Alt+→", "Move by word (Ctrl+←/→, Alt+B / Alt+F)"),
-        ("Ctrl+K / U / W", "Kill to end / start / prev word (Alt+D next)"),
-        ("Ctrl+Y / Ctrl+D", "Yank kill ring / delete char (Ctrl+F next)"),
-        ("!cmd", "Run shell command in active context"),
-        ("/fork, /grein", "Fork new child context (/branch)"),
-        ("/root, /new", "Create new blank root context"),
-        ("/rename <name>", "Rename active or selected context"),
-        ("/join, /merge", "Join branch into parent context"),
-        ("/close, /delete", "Close active fork (>1 context)"),
-        ("/?, /help, ?", "Open this keybindings help modal"),
-        ("n / r / m (ᛇ Grein)", "New root / rename / join (x/d close, j/k/↑/↓)"),
-        ("Ctrl+N / Alt+N", "Quick-fork branch / new blank root"),
-        ("Alt+R / F2", "Rename active or selected context"),
-        ("Ctrl+C / Ctrl+Q", "Quit application"),
+
+    let sections: [(&str, &[(&str, &str)]); 3] = [
+        (
+            "── Global ──",
+            &[
+                ("Tab / Shift+Tab", "Cycle branches in active root"),
+                ("Alt+Shift+↑/↓, Alt+J/K", "Switch between top-level roots"),
+                (
+                    "Alt+↑/↓, PgUp/PgDn",
+                    "Scroll Transcript (Alt+Home/End top/btm)",
+                ),
+                ("Esc / Ctrl+G", "Toggle Composer / ᛇ Grein (Esc cancels)"),
+                (
+                    "Ctrl+N / Alt+N, Alt+R / F2",
+                    "Fork branch / new root / rename context",
+                ),
+                (
+                    "Ctrl+T / Ctrl+O / Alt+Y",
+                    "Zoom / tool cards / copy (Ctrl+C/Ctrl+Q)",
+                ),
+            ],
+        ),
+        (
+            "── ᛇ Grein Navigation ──",
+            &[
+                (
+                    "j/k/↑/↓, Enter, J / K",
+                    "Browse (preview) / activate / switch root",
+                ),
+                (
+                    "Ctrl+U / Ctrl+D, g / G",
+                    "Half-page scroll / Transcript top/bottom",
+                ),
+                (
+                    "n / r / m (ᛇ Grein)",
+                    "New root/rename/join (f fork, d/x close)",
+                ),
+                ("z / y / q (ᛇ Grein)", "Copy zoom / copy last reply / quit"),
+            ],
+        ),
+        (
+            "── Composer & Slash Commands ──",
+            &[
+                ("Shift+Enter / Ctrl+J", "Newline in Composer (Enter sends)"),
+                (
+                    "Ctrl+A / Ctrl+E",
+                    "Line start/end (Home/End, Ctrl+F / Ctrl+B)",
+                ),
+                (
+                    "Alt+←/→, Ctrl+←/→, Alt+B/F",
+                    "Word move, Ctrl+K/U/W, Ctrl+Y/Ctrl+D/Alt+D",
+                ),
+                ("!cmd", "Run shell command in active context"),
+                (
+                    "/fork, /grein, /root, /new",
+                    "Fork (/branch) / create blank root",
+                ),
+                (
+                    "/rename, /join, /merge",
+                    "Rename / join (/close, /delete, /quit)",
+                ),
+                (
+                    "/model, /mode, /thinking",
+                    "Pick model/mode/thinking (/effort)",
+                ),
+                (
+                    "/commands, /copy, /zoom",
+                    "Cmds, /copy [code|all], zoom, /?, /help, ?",
+                ),
+            ],
+        ),
     ];
-    let mut lines: Vec<Line<'static>> = rows
-        .into_iter()
-        .map(|(k, desc)| {
-            Line::from(vec![
-                Span::styled(format!(" {k:<24}"), key_style),
+
+    let mut raw_body: Vec<Line<'static>> = Vec::new();
+    for (title, rows) in sections {
+        raw_body.push(Line::from(Span::styled(format!(" {title}"), section_style)));
+        for &(k, desc) in rows {
+            raw_body.push(Line::from(vec![
+                Span::styled(format!(" {k:<27}"), key_style),
                 Span::raw(desc),
-            ])
-        })
-        .collect();
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        " Press Esc, q, ?, or Enter to close",
-        Style::default().fg(Color::DarkGray),
-    )));
+            ]));
+        }
+    }
 
     let popup_width = area.width.saturating_sub(6).clamp(30, 74).min(area.width);
-    let popup_height = (lines.len() as u16 + 2).min(area.height.max(1));
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    let wrapped_body = crate::markdown::wrap_styled_lines(raw_body, inner_width);
+
+    let popup_height = (wrapped_body.len() as u16 + 3).min(area.height.max(1));
     let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
     let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
@@ -507,14 +835,43 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         );
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
 
-    let widget = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(widget, popup_area);
+    if inner.width == 0 || inner.height == 0 {
+        return 0;
+    }
+
+    let body_height = inner.height.saturating_sub(1) as usize;
+    let max_scroll = wrapped_body
+        .len()
+        .saturating_sub(body_height)
+        .min(u16::MAX as usize) as u16;
+    let scroll_y = requested_scroll.min(max_scroll);
+
+    if body_height > 0 {
+        f.render_widget(
+            Paragraph::new(wrapped_body).scroll((scroll_y, 0)),
+            Rect::new(inner.x, inner.y, inner.width, body_height as u16),
+        );
+    }
+
+    let footer_text = if max_scroll > 0 {
+        " Press Esc, q, ?, or Enter to close (↑/↓/j/k scroll)"
+    } else {
+        " Press Esc, q, ?, or Enter to close"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer_text,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+    );
+    scroll_y
 }
 
-fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
+fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let active_id = state.active_thread_id();
     let active_subagents: &[SubagentSnapshot] = state
         .thread_subagents
@@ -522,16 +879,23 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let strip_h = subagent_strip_height(active_subagents.len());
-    let mut layout = compute_layout_with_chrome(f.area(), strip_h);
+    let mut layout =
+        compute_layout_with_chrome_and_sidebar(f.area(), strip_h, state.sidebar_hidden);
 
-    let line_count = state.input_buffer.split('\n').count().max(1) as u16;
+    let composer_inner_width = layout.composer_area.width.saturating_sub(2);
+    let composer_layout = layout_composer_text(
+        &state.input_buffer,
+        state.cursor_position,
+        composer_inner_width as usize,
+    );
+    let visual_line_count = composer_layout.lines.len().max(1) as u16;
     let max_composer_h = layout
-        .tree_area
+        .transcript_area
         .height
         .saturating_add(layout.composer_area.height)
         .saturating_sub(3)
         .max(3);
-    let desired_height = (line_count + 2).clamp(3, 10).min(max_composer_h);
+    let desired_height = (visual_line_count + 2).clamp(3, 10).min(max_composer_h);
     if desired_height > layout.composer_area.height {
         let delta = desired_height - layout.composer_area.height;
         layout.tree_area.height = layout.tree_area.height.saturating_sub(delta);
@@ -551,9 +915,13 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         || state.focused_pane == PaneFocus::Composer
         || state.focus == PaneFocus::Composer;
 
-    let tree_scroll = render_tree_view_inner(f, layout.tree_area, state);
+    let tree_scroll = if state.sidebar_hidden {
+        state.tree.scroll_offset
+    } else {
+        render_tree_view_inner(f, layout.tree_area, state)
+    };
 
-    let preview = if tree_focused {
+    let preview = if tree_focused && !state.sidebar_hidden {
         selected_tree_thread(state).filter(|(sel_id, _)| *sel_id != active_id)
     } else {
         None
@@ -568,6 +936,19 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
             .map(String::as_str)
             .unwrap_or("")
     };
+
+    let transcript_borders = if state.sidebar_hidden {
+        Borders::TOP | Borders::BOTTOM
+    } else {
+        Borders::ALL
+    };
+    let transcript_inner_width = if state.sidebar_hidden {
+        layout.transcript_area.width
+    } else {
+        layout.transcript_area.width.saturating_sub(2)
+    };
+    let transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
+    let use_blocks = state.has_synchronized_blocks(display_thread_id, display_md);
 
     let mut transcript_lines = Vec::new();
     if let Some(meta) = state.thread_meta.get(display_thread_id) {
@@ -586,18 +967,34 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
                 banner,
                 Style::default().fg(Color::DarkGray),
             )));
-            if !display_md.trim().is_empty() {
+            let has_body = if use_blocks {
+                state
+                    .thread_blocks
+                    .get(display_thread_id)
+                    .is_some_and(|b| !b.is_empty())
+            } else {
+                !display_md.trim().is_empty()
+            };
+            if has_body {
                 transcript_lines.push(Line::raw(""));
             }
         }
     }
-    let transcript_inner_width = layout.transcript_area.width.saturating_sub(2);
-    transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
-        display_md,
-        transcript_inner_width as usize,
-    ));
-    let transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
-    let visual_lines = wrapped_line_count(&transcript_lines, transcript_inner_width);
+
+    if use_blocks {
+        if let Some(blocks) = state.thread_blocks.get(display_thread_id) {
+            transcript_lines.extend(blocks.render_lines(transcript_inner_width as usize));
+        }
+    } else {
+        transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
+            display_md,
+            transcript_inner_width as usize,
+        ));
+    }
+
+    let wrapped_lines =
+        crate::markdown::wrap_styled_lines(transcript_lines, transcript_inner_width as usize);
+    let visual_lines = wrapped_lines.len();
     let max_scroll_u16 = visual_lines
         .saturating_sub(transcript_inner_height as usize)
         .min(u16::MAX as usize) as u16;
@@ -613,11 +1010,10 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
     };
     let transcript_block = Block::default()
         .title(transcript_title)
-        .borders(Borders::ALL)
+        .borders(transcript_borders)
         .border_style(border_style(transcript_focused));
-    let transcript_widget = Paragraph::new(transcript_lines)
+    let transcript_widget = Paragraph::new(wrapped_lines)
         .block(transcript_block)
-        .wrap(Wrap { trim: false })
         .scroll((transcript_scroll_y, 0));
     f.render_widget(transcript_widget, layout.transcript_area);
 
@@ -626,11 +1022,18 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         .borders(Borders::ALL)
         .border_style(border_style(composer_focused));
 
-    let inner_height = layout.composer_area.height.saturating_sub(2);
-    let scroll_y = line_count.saturating_sub(inner_height);
-    let composer_widget = Paragraph::new(state.input_buffer.as_str())
+    let inner_height = layout.composer_area.height.saturating_sub(2).max(1);
+    let max_composer_scroll = visual_line_count.saturating_sub(inner_height);
+    let mut composer_scroll_y = state.composer_scroll_y.min(max_composer_scroll);
+    if composer_layout.cursor_row < composer_scroll_y {
+        composer_scroll_y = composer_layout.cursor_row;
+    } else if composer_layout.cursor_row >= composer_scroll_y + inner_height {
+        composer_scroll_y = composer_layout.cursor_row + 1 - inner_height;
+    }
+
+    let composer_widget = Paragraph::new(composer_layout.lines)
         .block(composer_block)
-        .scroll((scroll_y, 0));
+        .scroll((composer_scroll_y, 0));
     f.render_widget(composer_widget, layout.composer_area);
 
     if let Some(strip_area) = layout.subagent_strip_area {
@@ -639,15 +1042,24 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
 
     render_status_bar(f, layout.status_bar_area, state, active_subagents.len());
 
-    if composer_focused && state.pending_permission.is_none() && !state.show_help_modal {
-        let (col, row) = state.composer_cursor_2d();
-        let inner_width = layout.composer_area.width.saturating_sub(2);
-        let visible_row = row.saturating_sub(scroll_y);
-        let cursor_x = layout.composer_area.x + 1 + col.min(inner_width.saturating_sub(1));
-        let cursor_y = layout.composer_area.y + 1 + visible_row.min(inner_height.saturating_sub(1));
+    if composer_focused
+        && state.pending_permission.is_none()
+        && state.config_picker.is_none()
+        && !state.show_help_modal
+    {
+        let visible_row = composer_layout.cursor_row.saturating_sub(composer_scroll_y);
+        let cursor_x = layout.composer_area.x
+            + 1
+            + composer_layout
+                .cursor_col
+                .min(composer_inner_width.saturating_sub(1));
+        let cursor_y = layout.composer_area.y
+            + 1
+            + visible_row.min(inner_height.saturating_sub(1));
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
 
+    let mut rendered_help_scroll = state.help_scroll_offset;
     if let Some(perm) = &state.pending_permission {
         let area = f.area();
         let popup_width = area.width.saturating_sub(8).clamp(20, 64).min(area.width);
@@ -680,11 +1092,20 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
             .block(popup_block)
             .wrap(Wrap { trim: false });
         f.render_widget(popup_widget, popup_area);
+    } else if let Some(ref picker) = state.config_picker {
+        render_config_picker_modal(f, f.area(), picker);
     } else if state.show_help_modal {
-        render_help_modal(f, f.area());
+        rendered_help_scroll = render_help_modal(f, f.area(), state.help_scroll_offset);
     }
 
-    (display_thread_id.to_string(), max_scroll_u16, tree_scroll)
+    RenderMetrics {
+        thread_id: display_thread_id.to_string(),
+        max_scroll: max_scroll_u16,
+        tree_scroll,
+        transcript_inner_height,
+        composer_scroll_y,
+        help_scroll_offset: rendered_help_scroll,
+    }
 }
 
 #[cfg(test)]

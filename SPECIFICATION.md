@@ -101,7 +101,7 @@ To ensure long-term stability and clean separation of concerns, the system split
   * `session.merge_thread(thread_id, target_thread_id?, summary?)` $\to$ `ThreadSummary`
   * `session.delete_thread(thread_id)` $\to$ `next_active_thread_id`
   * `session.cancel(thread_id)`, `session.shell(thread_id, command)`, `permissions.resolve`
-  * `events`: `StreamChunk`, `ThoughtChunk`, `ToolInvoked`, `ToolResult`, `ToolActivityUpdated`, `ShellOutput`, `PermissionRequested`, `ThreadCreated`, `ThreadTitleUpdated`, `ThreadMerged`, `ThreadMetadataUpdated`, `ThreadDeleted`, `ThreadStatusChanged`, `AgentMetaUpdated`, `SubagentUpdated`, `SubagentRemoved`, `Error`.
+*   *`events`: `StreamChunk`, `ThoughtChunk`, `ToolInvoked`, `ToolResult`, `ToolActivityUpdated`, `ShellOutput`, `PermissionRequested`, `ThreadCreated`, `ThreadTitleUpdated`, `ThreadMerged`, `ThreadMetadataUpdated`, `ThreadDeleted`, `ThreadStatusChanged`, `AgentMetaUpdated`, `AgentConfigUpdated`, `AgentCommandsUpdated`, `SubagentUpdated`, `SubagentRemoved`, `Error`.
 
 ---
 
@@ -322,15 +322,16 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 * Real-time status glyphs (`●` streaming/executing/thinking, `⚠` permission required or error) and `[joined]` suffix on merged branches.
 * **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript in the right-hand `Transcript` pane (`Transcript (Preview: <title>)`) without changing the active `Composer` thread until confirmed with `Enter`.
 
-#### Right Column (`66%` width): Full-Width `Transcript` Pane
-* Full-width Markdown rendering including headings, inline formatting, GFM tables, horizontal rules, code blocks, leaf-green `❯ ` user prompt prefix, lineage banners (`> ↳ Forked from <parent> (<N> ancestor turns in LLM context)`), join markers (`> ↳ Joined from <branch>`), and ANSI-colored PTY shell blocks (`$ cmd (exit N)`).
-* **Global Transcript Scrolling:** Independent scrollback buffer per context (`TranscriptViewport`), controllable globally from anywhere in the UI via `Alt+↑` / `Alt+↓`, `PgUp` / `PgDn`, and `Alt+Home` / `Alt+End`—including while live-previewing another branch in `ᛇ Grein`.
+#### Right Column (`66%` width, or `100%` Borderless Copy Zoom): Full-Width `Transcript` Pane
+* Full-width Markdown rendering including headings, inline formatting, syntax-highlighted code fences, GFM tables, horizontal rules, leaf-green `❯ ` user prompt prefix, lineage banners (`> ↳ Forked from <parent> (<N> ancestor turns in LLM context)`), join markers (`↳ Joined from <branch>`), collapsible tool/shell cards (`Ctrl+O` toggles all), and ANSI-colored PTY shell blocks (`$ cmd (exit N)`).
+* **Borderless-Sides Copy Zoom (`Ctrl+T`, `z` in Tree, `/zoom`):** Collapses `ᛇ Grein` and expands `Transcript` to `100%` width with `Borders::TOP | Borders::BOTTOM` only (zero left/right `│` borders) for clean terminal mouse drag-select copying, complemented by `y` / `Alt+Y` / `/copy [code|all]` (native + OSC 52 clipboard).
+* **Global Transcript Scrolling:** Independent scrollback buffer per context (`TranscriptViewport`) using exact pre-wrapped styled lines (zero bottom clipping), controllable globally from anywhere in the UI via `Alt+↑` / `Alt+↓`, `PgUp` / `PgDn`, and `Alt+Home` / `Alt+End`, or zero-modifier Tree keys (`Ctrl+U` / `Ctrl+D`, `g` / `G`)—including while live-previewing another branch in `ᛇ Grein`.
 * **External `$PAGER` Diff Integration:** Pressing `o` when inspecting a diff card suspends Ratatui and opens the colorized diff in `$PAGER` (e.g. `delta`, `git diff`, `less`), cleanly restoring the TUI on exit.
 
 #### Bottom Area: `Composer`, Optional `Subagents` Strip & Status Bar
-* **`Composer`:** Auto-grows from 3 to 10 lines for multi-line drafts, preserves an independent input draft per context, supports full Readline editing/kill-ring shortcuts, `!cmd` PTY shell execution, and slash commands.
+* **`Composer`:** Soft-wraps single and multi-line drafts to inner cell width, auto-grows from 3 to 10 lines following the active cursor row, preserves an independent input draft per context, supports full Readline editing/kill-ring shortcuts (`Ctrl+A`/`E`, `Ctrl+F`/`B`, `Alt+B`/`F`), `!cmd` PTY shell execution, and slash commands including interactive `/model`, `/mode`, `/thinking` (`/effort`), and `/commands`.
 * **`Subagents` Strip:** Auto-hiding panel below `Composer` (renders only when subagents are active on the focused context, up to 5 rows + `+N more` overflow) showing live subagent type, role, model, activity, and elapsed time.
-* **1-Line Status Bar:** Left side displays `? for help` (or `esc to cancel` while streaming/executing); right side displays `<mode> · <model> · <live_status> · <N subagents>`.
+* **1-Line Status Bar:** Left side displays `? for help` (or `esc to cancel` while streaming/executing) plus status notices; right side displays `<mode> · <model> · <live_status> · <N subagents>`.
 
 ---
 
@@ -348,41 +349,52 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | `Alt+↑` / `Alt+↓` | Global | Scroll `Transcript` up / down (including live previewed branches when browsing `ᛇ Grein`) |
 | `PgUp` / `PgDn` | Global | Page `Transcript` up / down (including live previewed branches) |
 | `Alt+Home` / `Alt+End` | Global | Jump to top / bottom of `Transcript` (re-enables auto-scroll at bottom) |
+| `Ctrl+O` | Global | Toggle all collapsible tool/shell cards on active or previewed transcript |
+| `Ctrl+T` | Global | Toggle borderless-sides Transcript copy zoom (hides/shows `ᛇ Grein`) |
+| `Alt+Y` | Global | Copy last assistant reply of active or previewed transcript to clipboard |
 | `Ctrl+N` | Global | Fork a new child branch from the active context |
 | `Alt+N` | Global | Create a new blank independent root context |
 | `Alt+R` / `F2` | Global | Prefill `/rename <title>` for active (or `ᛇ Grein`-selected) context and focus `Composer` |
-| `?` | Global (when `Composer` empty or outside `Composer`) | Open Keybindings & Commands help modal |
+| `?` | Global (when `Composer` empty or outside `Composer`) | Open scrollable Keybindings & Commands help modal (`j`/`k`/`↑`/`↓` scroll) |
 | `Ctrl+C` / `Ctrl+Q` | Global | Quit `grein` |
 | `o` | Diff card | Open selected diff in external `$PAGER` |
 
-#### `ᛇ Grein` Sidebar Keys (When Focused)
+#### `ᛇ Grein` Sidebar Keys (When Focused, Zero-Modifier Safe)
 
 | Keybinding | Action |
 | :--- | :--- |
 | `↑` / `↓` or `k` / `j` | Move selection through the tree and live-preview in `Transcript` |
+| `J` / `K` | Switch to next / previous top-level root |
+| `Ctrl+U` / `Ctrl+D` | Scroll active/previewed `Transcript` half-page up / down |
+| `g` / `G` | Jump active/previewed `Transcript` to top / bottom |
 | `Enter` | Activate selected branch/root (or anchor) and move focus to `Composer` |
+| `f` | Fork a new child branch off the selected context |
 | `n` | Create a new blank independent root context |
 | `r` | Prefill `/rename <title>` for the selected context and focus `Composer` |
 | `m` | Manually join (`/join`) the selected branch into its parent branch |
 | `d` / `x` | Close/delete the selected context (when >1 context exists) |
+| `z` | Toggle borderless-sides Transcript copy zoom |
+| `y` | Copy last assistant reply of selected/previewed context to clipboard |
 | `q` | Quit `grein` |
+
+> **OS / Terminal Portability Tip:** On macOS Terminal.app or iTerm2, configure Option as Meta/Esc+ for `Alt+` shortcuts; inside `tmux`, `Ctrl+B` in `Composer` performs Readline `backward-char` cleanly and OSC 52 passthrough (`\x1bPtmux;...`) copies directly to the host clipboard. On all platforms (including Swedish/European layouts and Wayland), zero-modifier `ᛇ Grein` keys (`J`/`K`, `g`/`G`, `Ctrl+U`/`D`, `f`, `z`, `y`) cover root switching, scrolling, branching, zoom, and copying without `Alt`.
 
 #### `Composer` Readline & Editing Keys
 
 | Keybinding | Action |
 | :--- | :--- |
 | `Enter` | Dispatch prompt, slash command, or `!cmd` shell command |
-| `Shift+Enter` / `Ctrl+Enter` / `Alt+Enter` / `Ctrl+J` | Insert newline in `Composer` |
+| `Shift+Enter` / `Ctrl+Enter` / `Alt+Enter` / `Ctrl+J` | Insert newline in `Composer` (Kitty disambiguate-escape enabled best-effort) |
 | `Ctrl+A` / `Home` | Move cursor to start of line |
 | `Ctrl+E` / `End` | Move cursor to end of line |
-| `Ctrl+F` / `→` / `←` | Move forward / backward by one character |
+| `Ctrl+F` / `→` / `Ctrl+B` / `←` | Move forward / backward by one character |
 | `Alt+←` / `Alt+→`, `Ctrl+←` / `Ctrl+→`, `Alt+B` / `Alt+F` | Move backward / forward by word |
 | `Ctrl+K` / `Ctrl+U` | Kill to end of line / kill to start of line |
 | `Ctrl+W` / `Alt+Backspace` | Kill previous word |
 | `Alt+D` / `Ctrl+Delete` / `Alt+Delete` | Kill next word |
 | `Ctrl+Y` / `Ctrl+D` | Yank from kill ring / delete character under cursor |
 
-#### Slash Commands & Shell Escape
+#### Slash Commands, ACP Config Picker & Shell Escape
 
 | Command | Action |
 | :--- | :--- |
@@ -392,7 +404,11 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | `/rename <name>` | Rename the active or selected context |
 | `/join [summary]`, `/merge [summary]` | Manually join active branch into its parent branch, committing a `DecisionLandmark` |
 | `/close [target]`, `/delete [target]` | Close/delete the active or named context (>1 context required) |
-| `/?`, `/help` | Open the Keybindings & Commands help modal |
+| `/model [arg]`, `/mode [arg]`, `/thinking [arg]` (`/effort`) | Open interactive ACP config picker modal (`Tab`/`d` toggles branch vs default) or fuzzy-match & apply argument (`--default` / `default ` prefix supported) |
+| `/commands` | List agent-advertised ACP slash commands (`AgentSlashCommand`) |
+| `/copy [code\|all]` | Copy last assistant reply, latest fenced code block, or full plain transcript to clipboard |
+| `/zoom` | Toggle borderless-sides Transcript copy zoom |
+| `/?`, `/help` | Open the scrollable Keybindings & Commands help modal |
 | `/quit` | Quit `grein` |
 
 ---

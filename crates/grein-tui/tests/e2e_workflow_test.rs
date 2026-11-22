@@ -2142,5 +2142,5 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     assert!(help_screen.contains("Alt+Shift+↑/↓, Alt+J/K"), "{help_screen}");
     assert!(help_screen.contains("Esc / Ctrl+G"), "{help_screen}");
     assert!(!help_screen.contains("/wb"), "{help_screen}");
-    assert!(!help_screen.contains("Ctrl+B"), "{help_screen}");
+    assert!(help_screen.contains("Ctrl+B"), "{help_screen}");
 }
