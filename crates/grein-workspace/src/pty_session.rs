@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,12 @@ const MAX_BATCH_BYTES: usize = 65536;
 const POLL_TIMEOUT_MS: i32 = 100;
 const DROP_SIGHUP_GRACE: Duration = Duration::from_millis(100);
 const DROP_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_OSC_PAYLOAD_BYTES: usize = 8192;
+const MAX_CSI_PARAMS: usize = 16;
+const DA1_REPLY: &[u8] = b"\x1b[?62;c";
+const DA2_REPLY: &[u8] = b"\x1b[>0;10;1c";
+const OSC10_FG_REPLY: &[u8] = b"\x1b]10;rgb:e5e5/e5e5/e5e5\x1b\\";
+const OSC11_BG_REPLY: &[u8] = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
 
 #[cfg(unix)]
 const SCRUBBED_TERMINAL_ENV_VARS: &[&str] = &[
@@ -97,6 +104,10 @@ pub struct PtyScreenSnapshot {
     pub alternate_screen: bool,
     pub exited: bool,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub scrollback_offset: usize,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl PtyScreenSnapshot {
@@ -126,8 +137,93 @@ impl PtyScreenSnapshot {
 
 struct PtyState {
     parser: vt100::Parser,
+    scrollback: VecDeque<Vec<PtyCell>>,
+    scrollback_offset: usize,
+    scroll_top: u16,
+    scroll_bottom: u16,
+    current_cwd: Option<String>,
     exited: bool,
     exit_code: Option<i32>,
+}
+
+impl PtyState {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows, cols, 0),
+            scrollback: VecDeque::new(),
+            scrollback_offset: 0,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
+            current_cwd: None,
+            exited: false,
+            exit_code: None,
+        }
+    }
+
+    fn scroll_region_active(&self) -> bool {
+        let (rows, _) = self.parser.screen().size();
+        self.scroll_top != 0 || self.scroll_bottom != rows.saturating_sub(1)
+    }
+
+    fn push_scrollback_row(&mut self, row: Vec<PtyCell>) {
+        if self.scrollback.len() >= DEFAULT_SCROLLBACK_LEN {
+            self.scrollback.pop_front();
+        }
+        self.scrollback.push_back(row);
+        if self.scrollback_offset > 0 {
+            self.scrollback_offset = self.scrollback.len().min(self.scrollback_offset + 1);
+        }
+    }
+
+    fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+        let (rows, _) = self.parser.screen().size();
+        let max_row = rows.saturating_sub(1);
+        let top = top.saturating_sub(1);
+        let bottom = if bottom == 0 {
+            max_row
+        } else {
+            (bottom - 1).min(max_row)
+        };
+        if top < bottom {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        } else {
+            self.scroll_top = 0;
+            self.scroll_bottom = max_row;
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let (old_rows, _) = self.parser.screen().size();
+        if self.scroll_bottom == old_rows.saturating_sub(1) {
+            self.scroll_bottom = rows.saturating_sub(1);
+        }
+        if self.scroll_bottom >= rows {
+            self.scroll_bottom = rows.saturating_sub(1);
+        }
+        if self.scroll_bottom < self.scroll_top {
+            self.scroll_top = 0;
+        }
+        self.parser.set_size(rows, cols);
+        self.clamp_scrollback_offset(self.scrollback_offset);
+    }
+
+    fn reset(&mut self) {
+        let (rows, _) = self.parser.screen().size();
+        self.scrollback.clear();
+        self.scrollback_offset = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows.saturating_sub(1);
+    }
+
+    fn clamp_scrollback_offset(&mut self, target: usize) -> usize {
+        if self.parser.screen().alternate_screen() {
+            self.scrollback_offset = 0;
+        } else {
+            self.scrollback_offset = target.min(self.scrollback.len());
+        }
+        self.scrollback_offset
+    }
 }
 
 #[cfg(unix)]
@@ -295,11 +391,7 @@ impl InteractivePtySession {
 
         let master = Arc::new(master_fd);
         let write_lock = Arc::new(Mutex::new(()));
-        let state = Arc::new(Mutex::new(PtyState {
-            parser: vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK_LEN),
-            exited: false,
-            exit_code: None,
-        }));
+        let state = Arc::new(Mutex::new(PtyState::new(rows, cols)));
         let child_proc = Arc::new(Mutex::new(ChildProcess {
             pid: pid_t,
             reaped: false,
@@ -334,6 +426,20 @@ impl InteractivePtySession {
     pub fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         {
+            if !bytes.is_empty() {
+                let snapped = {
+                    let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if guard.scrollback_offset > 0 {
+                        guard.scrollback_offset = 0;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if snapped {
+                    (self.on_update)();
+                }
+            }
             write_all_to_fd(
                 self.master.as_raw_fd(),
                 &self.write_lock,
@@ -359,10 +465,39 @@ impl InteractivePtySession {
         set_pty_winsize(self.master.as_raw_fd(), rows, cols)?;
         {
             let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            guard.parser.set_size(rows, cols);
+            guard.resize(rows, cols);
         }
         (self.on_update)();
         Ok(())
+    }
+
+    /// Sets the scrollback viewport offset (clamped to available scrollback rows).
+    pub fn set_scrollback(&self, offset: usize) -> usize {
+        let resolved = {
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.clamp_scrollback_offset(offset)
+        };
+        (self.on_update)();
+        resolved
+    }
+
+    /// Adjusts the scrollback viewport offset by `delta` rows (positive scrolls up).
+    pub fn scroll_by(&self, delta: isize) -> usize {
+        let resolved = {
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let next = if delta >= 0 {
+                guard
+                    .scrollback_offset
+                    .saturating_add(usize::try_from(delta).unwrap_or(0))
+            } else {
+                guard
+                    .scrollback_offset
+                    .saturating_sub(delta.unsigned_abs())
+            };
+            guard.clamp_scrollback_offset(next)
+        };
+        (self.on_update)();
+        resolved
     }
 
     /// Captures a consistent snapshot of the current VT100 screen and exit state.
@@ -371,27 +506,29 @@ impl InteractivePtySession {
         let screen = guard.parser.screen();
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
+        let alternate_screen = screen.alternate_screen();
+        let scrollback_offset = if alternate_screen {
+            0
+        } else {
+            guard.scrollback_offset.min(guard.scrollback.len())
+        };
 
-        let mut cells = Vec::with_capacity(usize::from(rows));
-        for r in 0..rows {
-            let mut row_cells = Vec::with_capacity(usize::from(cols));
-            for c in 0..cols {
-                let cell = match screen.cell(r, c) {
-                    Some(vt_cell) => PtyCell {
-                        contents: vt_cell.contents(),
-                        fg: map_vt100_color(vt_cell.fgcolor()),
-                        bg: map_vt100_color(vt_cell.bgcolor()),
-                        bold: vt_cell.bold(),
-                        italic: vt_cell.italic(),
-                        underline: vt_cell.underline(),
-                        inverse: vt_cell.inverse(),
-                        is_wide_continuation: vt_cell.is_wide_continuation(),
-                    },
-                    None => PtyCell::default(),
-                };
-                row_cells.push(cell);
+        let row_count = usize::from(rows);
+        let from_scrollback = scrollback_offset.min(row_count);
+        let sb_start = guard.scrollback.len().saturating_sub(scrollback_offset);
+
+        let mut cells = Vec::with_capacity(row_count);
+        for idx in 0..from_scrollback {
+            if let Some(sb_row) = guard.scrollback.get(sb_start + idx) {
+                cells.push(fit_row_to_cols(sb_row, cols));
             }
-            cells.push(row_cells);
+        }
+        let live_rows = row_count.saturating_sub(from_scrollback);
+        for r in 0..rows {
+            if usize::from(r) >= live_rows {
+                break;
+            }
+            cells.push(capture_screen_row(screen, r, cols));
         }
 
         PtyScreenSnapshot {
@@ -403,9 +540,11 @@ impl InteractivePtySession {
             hide_cursor: screen.hide_cursor(),
             application_cursor: screen.application_cursor(),
             bracketed_paste: screen.bracketed_paste(),
-            alternate_screen: screen.alternate_screen(),
+            alternate_screen,
             exited: guard.exited,
             exit_code: guard.exit_code,
+            scrollback_offset,
+            cwd: guard.current_cwd.clone(),
         }
     }
 
@@ -463,74 +602,472 @@ impl Drop for InteractivePtySession {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum DsrState {
-    #[default]
-    Idle,
-    Esc,
-    Csi,
-    Csi5,
-    Csi6,
-    CsiQ,
-    CsiQ6,
+fn capture_screen_row(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<PtyCell> {
+    let mut row_cells = Vec::with_capacity(usize::from(cols));
+    for c in 0..cols {
+        let cell = match screen.cell(row, c) {
+            Some(vt_cell) => PtyCell {
+                contents: vt_cell.contents(),
+                fg: map_vt100_color(vt_cell.fgcolor()),
+                bg: map_vt100_color(vt_cell.bgcolor()),
+                bold: vt_cell.bold(),
+                italic: vt_cell.italic(),
+                underline: vt_cell.underline(),
+                inverse: vt_cell.inverse(),
+                is_wide_continuation: vt_cell.is_wide_continuation(),
+            },
+            None => PtyCell::default(),
+        };
+        row_cells.push(cell);
+    }
+    row_cells
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DsrQuery {
+fn fit_row_to_cols(row: &[PtyCell], cols: u16) -> Vec<PtyCell> {
+    let target_len = usize::from(cols);
+    if row.len() == target_len {
+        return row.to_vec();
+    }
+    let mut fitted = Vec::with_capacity(target_len);
+    if row.len() < target_len {
+        fitted.extend_from_slice(row);
+        fitted.resize_with(target_len, PtyCell::default);
+    } else {
+        fitted.extend_from_slice(&row[..target_len]);
+        if target_len > 0
+            && row
+                .get(target_len)
+                .is_some_and(|next| next.is_wide_continuation)
+        {
+            fitted[target_len - 1].contents.clear();
+        }
+    }
+    fitted
+}
+
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ScanState {
+    #[default]
+    Ground,
+    Utf8 {
+        remaining: u8,
+    },
+    Esc,
+    EscIntermediate,
+    CsiEntry,
+    CsiParam,
+    CsiIntermediate,
+    CsiIgnore,
+    OscString,
+    OscEsc,
+    DcsString,
+    DcsEsc,
+}
+
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScannerEvent {
     DeviceStatus,
     CursorPosition,
     DecCursorPosition,
+    PrimaryDeviceAttributes,
+    SecondaryDeviceAttributes,
+    OscForegroundColorQuery,
+    OscBackgroundColorQuery,
+    OscCwd(String),
+    ScrollRegion { top: u16, bottom: u16 },
+    ScrollUp(u16),
+    Reset,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Default)]
-struct DsrScanner {
-    state: DsrState,
+struct TerminalScanner {
+    state: ScanState,
+    csi_prefix: Option<u8>,
+    csi_params: [u16; MAX_CSI_PARAMS],
+    csi_param_len: usize,
+    csi_current_param: Option<u16>,
+    csi_has_intermediate: bool,
+    csi_ignore: bool,
+    osc_buf: Vec<u8>,
+    osc_overflow: bool,
 }
 
-impl DsrScanner {
-    fn feed_byte(&mut self, byte: u8) -> Option<DsrQuery> {
-        match (self.state, byte) {
-            (_, 0x1b) => {
-                self.state = DsrState::Esc;
+#[cfg(any(unix, test))]
+impl TerminalScanner {
+    fn executes_c0(&self) -> bool {
+        matches!(
+            self.state,
+            ScanState::Ground
+                | ScanState::Esc
+                | ScanState::EscIntermediate
+                | ScanState::CsiEntry
+                | ScanState::CsiParam
+                | ScanState::CsiIntermediate
+                | ScanState::CsiIgnore
+                | ScanState::OscEsc
+                | ScanState::DcsEsc
+        )
+    }
+
+    fn will_print_byte(&self, byte: u8) -> bool {
+        match self.state {
+            ScanState::Ground => (0x20..=0x7e).contains(&byte),
+            ScanState::Utf8 { remaining } => remaining == 1 || !(0x80..=0xbf).contains(&byte),
+            _ => false,
+        }
+    }
+
+    fn reset_csi(&mut self) {
+        self.csi_prefix = None;
+        self.csi_param_len = 0;
+        self.csi_current_param = None;
+        self.csi_has_intermediate = false;
+        self.csi_ignore = false;
+    }
+
+    fn reset_osc(&mut self) {
+        self.osc_buf.clear();
+        self.osc_overflow = false;
+    }
+
+    fn push_csi_param(&mut self, value: u16) {
+        if self.csi_param_len < MAX_CSI_PARAMS {
+            self.csi_params[self.csi_param_len] = value;
+            self.csi_param_len += 1;
+        } else {
+            self.csi_ignore = true;
+        }
+    }
+
+    fn finish_csi(&mut self, final_byte: u8) -> Option<ScannerEvent> {
+        if self.csi_current_param.is_some() || self.csi_param_len > 0 {
+            let val = self.csi_current_param.take().unwrap_or(0);
+            self.push_csi_param(val);
+        }
+        self.state = ScanState::Ground;
+        if self.csi_ignore || self.csi_has_intermediate {
+            return None;
+        }
+        let params = &self.csi_params[..self.csi_param_len];
+        match (self.csi_prefix, final_byte, params) {
+            (None, b'n', &[5]) => Some(ScannerEvent::DeviceStatus),
+            (None, b'n', &[6]) => Some(ScannerEvent::CursorPosition),
+            (Some(b'?'), b'n', &[6]) => Some(ScannerEvent::DecCursorPosition),
+            (None, b'c', &[] | &[0]) => Some(ScannerEvent::PrimaryDeviceAttributes),
+            (Some(b'>'), b'c', &[] | &[0]) => Some(ScannerEvent::SecondaryDeviceAttributes),
+            (None, b'r', _) => Some(ScannerEvent::ScrollRegion {
+                top: params.first().copied().unwrap_or(0),
+                bottom: params.get(1).copied().unwrap_or(0),
+            }),
+            (None, b'S', _) => Some(ScannerEvent::ScrollUp(
+                params.first().copied().unwrap_or(0).max(1),
+            )),
+            _ => None,
+        }
+    }
+
+    fn finish_osc(&mut self) -> Option<ScannerEvent> {
+        let event = if self.osc_overflow {
+            None
+        } else {
+            parse_osc_payload(&self.osc_buf)
+        };
+        self.reset_osc();
+        self.state = ScanState::Ground;
+        event
+    }
+
+    fn handle_esc_byte(&mut self, byte: u8) -> Option<ScannerEvent> {
+        match byte {
+            0x1b => {
+                self.state = ScanState::Esc;
                 None
             }
-            (DsrState::Esc, b'[') => {
-                self.state = DsrState::Csi;
+            0x18 | 0x1a => {
+                self.state = ScanState::Ground;
                 None
             }
-            (DsrState::Csi, b'5') => {
-                self.state = DsrState::Csi5;
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => None,
+            b'[' => {
+                self.reset_csi();
+                self.state = ScanState::CsiEntry;
                 None
             }
-            (DsrState::Csi, b'6') => {
-                self.state = DsrState::Csi6;
+            b']' => {
+                self.reset_osc();
+                self.state = ScanState::OscString;
                 None
             }
-            (DsrState::Csi, b'?') => {
-                self.state = DsrState::CsiQ;
+            b'P' | b'X' | b'^' | b'_' => {
+                self.state = ScanState::DcsString;
                 None
             }
-            (DsrState::CsiQ, b'6') => {
-                self.state = DsrState::CsiQ6;
+            0x20..=0x2f => {
+                self.state = ScanState::EscIntermediate;
                 None
             }
-            (DsrState::Csi5, b'n') => {
-                self.state = DsrState::Idle;
-                Some(DsrQuery::DeviceStatus)
-            }
-            (DsrState::Csi6, b'n') => {
-                self.state = DsrState::Idle;
-                Some(DsrQuery::CursorPosition)
-            }
-            (DsrState::CsiQ6, b'n') => {
-                self.state = DsrState::Idle;
-                Some(DsrQuery::DecCursorPosition)
+            b'c' => {
+                self.state = ScanState::Ground;
+                Some(ScannerEvent::Reset)
             }
             _ => {
-                self.state = DsrState::Idle;
+                self.state = ScanState::Ground;
                 None
             }
         }
+    }
+
+    fn feed_byte(&mut self, byte: u8) -> Option<ScannerEvent> {
+        if let ScanState::Utf8 { remaining } = self.state {
+            if (0x80..=0xbf).contains(&byte) && remaining > 1 {
+                self.state = ScanState::Utf8 {
+                    remaining: remaining - 1,
+                };
+            } else {
+                self.state = ScanState::Ground;
+            }
+            return None;
+        }
+
+        match self.state {
+            ScanState::Ground => match byte {
+                0x1b => {
+                    self.state = ScanState::Esc;
+                    None
+                }
+                0xc2..=0xdf => {
+                    self.state = ScanState::Utf8 { remaining: 1 };
+                    None
+                }
+                0xe0..=0xef => {
+                    self.state = ScanState::Utf8 { remaining: 2 };
+                    None
+                }
+                0xf0..=0xf4 => {
+                    self.state = ScanState::Utf8 { remaining: 3 };
+                    None
+                }
+                _ => None,
+            },
+            ScanState::Utf8 { .. } => unreachable!(),
+            ScanState::Esc => self.handle_esc_byte(byte),
+            ScanState::EscIntermediate => match byte {
+                0x1b => {
+                    self.state = ScanState::Esc;
+                    None
+                }
+                0x18 | 0x1a => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x20..=0x2f | 0x7f => None,
+                _ => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+            },
+            ScanState::CsiEntry | ScanState::CsiParam => match byte {
+                0x1b => {
+                    self.state = ScanState::Esc;
+                    None
+                }
+                0x18 | 0x1a => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => None,
+                b'0'..=b'9' => {
+                    let digit = u16::from(byte - b'0');
+                    let next = self
+                        .csi_current_param
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(digit);
+                    self.csi_current_param = Some(next);
+                    self.state = ScanState::CsiParam;
+                    None
+                }
+                b';' => {
+                    let val = self.csi_current_param.take().unwrap_or(0);
+                    self.push_csi_param(val);
+                    self.state = ScanState::CsiParam;
+                    None
+                }
+                b':' => {
+                    self.csi_ignore = true;
+                    self.state = ScanState::CsiParam;
+                    None
+                }
+                0x3c..=0x3f => {
+                    if self.state == ScanState::CsiEntry {
+                        self.csi_prefix = Some(byte);
+                        self.state = ScanState::CsiParam;
+                    } else {
+                        self.csi_ignore = true;
+                        self.state = ScanState::CsiIgnore;
+                    }
+                    None
+                }
+                0x20..=0x2f => {
+                    self.csi_has_intermediate = true;
+                    self.state = ScanState::CsiIntermediate;
+                    None
+                }
+                0x40..=0x7e => self.finish_csi(byte),
+                _ => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+            },
+            ScanState::CsiIntermediate => match byte {
+                0x1b => {
+                    self.state = ScanState::Esc;
+                    None
+                }
+                0x18 | 0x1a => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x20..=0x2f | 0x7f => None,
+                0x30..=0x3f => {
+                    self.state = ScanState::CsiIgnore;
+                    None
+                }
+                0x40..=0x7e => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+                _ => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+            },
+            ScanState::CsiIgnore => match byte {
+                0x1b => {
+                    self.state = ScanState::Esc;
+                    None
+                }
+                0x18 | 0x1a | 0x40..=0x7e => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+                0x00..=0x3f | 0x7f => None,
+                _ => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+            },
+            ScanState::OscString => match byte {
+                0x07 => self.finish_osc(),
+                0x1b => {
+                    self.state = ScanState::OscEsc;
+                    None
+                }
+                0x18 | 0x1a => {
+                    self.reset_osc();
+                    self.state = ScanState::Ground;
+                    None
+                }
+                0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => None,
+                _ => {
+                    if !self.osc_overflow {
+                        if self.osc_buf.len() < MAX_OSC_PAYLOAD_BYTES {
+                            self.osc_buf.push(byte);
+                        } else {
+                            self.osc_overflow = true;
+                        }
+                    }
+                    None
+                }
+            },
+            ScanState::OscEsc => {
+                if byte == b'\\' {
+                    self.finish_osc()
+                } else {
+                    self.reset_osc();
+                    self.handle_esc_byte(byte)
+                }
+            }
+            ScanState::DcsString => match byte {
+                0x1b => {
+                    self.state = ScanState::DcsEsc;
+                    None
+                }
+                0x18 | 0x1a | 0x9c => {
+                    self.state = ScanState::Ground;
+                    None
+                }
+                _ => None,
+            },
+            ScanState::DcsEsc => {
+                if byte == b'\\' {
+                    self.state = ScanState::Ground;
+                    None
+                } else {
+                    self.handle_esc_byte(byte)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+fn parse_osc_payload(payload: &[u8]) -> Option<ScannerEvent> {
+    let sep = payload.iter().position(|&b| b == b';')?;
+    let code = &payload[..sep];
+    let value = &payload[sep + 1..];
+    match code {
+        b"10" if value == b"?" => Some(ScannerEvent::OscForegroundColorQuery),
+        b"11" if value == b"?" => Some(ScannerEvent::OscBackgroundColorQuery),
+        b"7" => parse_osc7_cwd(value).map(ScannerEvent::OscCwd),
+        _ => None,
+    }
+}
+
+#[cfg(any(unix, test))]
+fn parse_osc7_cwd(value: &[u8]) -> Option<String> {
+    const FILE_SCHEME: &[u8] = b"file://";
+    if value.len() < FILE_SCHEME.len()
+        || !value[..FILE_SCHEME.len()].eq_ignore_ascii_case(FILE_SCHEME)
+    {
+        return None;
+    }
+    let after_scheme = &value[FILE_SCHEME.len()..];
+    let slash_pos = after_scheme.iter().position(|&b| b == b'/')?;
+    percent_decode_utf8(&after_scheme[slash_pos..])
+}
+
+#[cfg(any(unix, test))]
+fn percent_decode_utf8(bytes: &[u8]) -> Option<String> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if out.contains(&0) {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(any(unix, test))]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -812,7 +1349,7 @@ fn spawn_reader_thread(
     thread::Builder::new()
         .name("grein-pty-reader".to_string())
         .spawn(move || {
-            let mut dsr = DsrScanner::default();
+            let mut scanner = TerminalScanner::default();
             let mut read_buf = [0u8; READ_CHUNK_SIZE];
             let mut batch = Vec::with_capacity(READ_CHUNK_SIZE);
 
@@ -884,7 +1421,7 @@ fn spawn_reader_thread(
                     if !batch.is_empty() {
                         process_pty_chunk(
                             &batch,
-                            &mut dsr,
+                            &mut scanner,
                             &state,
                             master.as_raw_fd(),
                             &write_lock,
@@ -918,10 +1455,133 @@ fn spawn_reader_thread(
         })
 }
 
+#[cfg(any(unix, test))]
+fn did_wrap_scroll(screen: &vt100::Screen, rows: u16, cols: u16, prev_col: u16) -> bool {
+    let (new_row, new_col) = screen.cursor_position();
+    if new_row != rows - 1 {
+        return false;
+    }
+    if prev_col >= cols {
+        new_col < prev_col || (cols == 1 && new_col == 1)
+    } else {
+        new_col == 2
+            && screen
+                .cell(rows - 1, 1)
+                .is_some_and(|c| c.is_wide_continuation())
+            && (cols > 3 || new_col < prev_col)
+    }
+}
+
+#[cfg(any(unix, test))]
+fn apply_scanner_event(
+    event: ScannerEvent,
+    guard: &mut PtyState,
+    responses: &mut Vec<Vec<u8>>,
+) {
+    match event {
+        ScannerEvent::DeviceStatus => {
+            responses.push(b"\x1b[0n".to_vec());
+        }
+        ScannerEvent::CursorPosition => {
+            let (row, col) = guard.parser.screen().cursor_position();
+            responses.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+        }
+        ScannerEvent::DecCursorPosition => {
+            let (row, col) = guard.parser.screen().cursor_position();
+            responses.push(format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes());
+        }
+        ScannerEvent::PrimaryDeviceAttributes => {
+            responses.push(DA1_REPLY.to_vec());
+        }
+        ScannerEvent::SecondaryDeviceAttributes => {
+            responses.push(DA2_REPLY.to_vec());
+        }
+        ScannerEvent::OscForegroundColorQuery => {
+            responses.push(OSC10_FG_REPLY.to_vec());
+        }
+        ScannerEvent::OscBackgroundColorQuery => {
+            responses.push(OSC11_BG_REPLY.to_vec());
+        }
+        ScannerEvent::OscCwd(cwd) => {
+            guard.current_cwd = Some(cwd);
+        }
+        ScannerEvent::ScrollRegion { top, bottom } => {
+            guard.set_scroll_region(top, bottom);
+        }
+        ScannerEvent::ScrollUp(_) => {}
+        ScannerEvent::Reset => {
+            guard.reset();
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+fn process_pty_bytes(
+    data: &[u8],
+    scanner: &mut TerminalScanner,
+    guard: &mut PtyState,
+    responses: &mut Vec<Vec<u8>>,
+) {
+    for &byte in data {
+        let (rows, cols) = guard.parser.screen().size();
+        let alt = guard.parser.screen().alternate_screen();
+        let can_scroll = !alt && !guard.scroll_region_active() && rows > 0 && cols > 0;
+        let prev_pos = guard.parser.screen().cursor_position();
+
+        let candidate_lf_scroll = can_scroll
+            && scanner.executes_c0()
+            && matches!(byte, 0x0a..=0x0c)
+            && prev_pos.0 == rows - 1;
+        let candidate_wrap_scroll = can_scroll
+            && scanner.will_print_byte(byte)
+            && prev_pos.0 == rows - 1
+            && prev_pos.1 >= cols.saturating_sub(2);
+        let candidate_row0 = if candidate_lf_scroll || candidate_wrap_scroll {
+            Some(capture_screen_row(guard.parser.screen(), 0, cols))
+        } else {
+            None
+        };
+
+        let event = scanner.feed_byte(byte);
+        let candidate_su_rows = match event {
+            Some(ScannerEvent::ScrollUp(count)) if can_scroll => {
+                let actual = count.min(rows);
+                Some(
+                    (0..actual)
+                        .map(|r| capture_screen_row(guard.parser.screen(), r, cols))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        };
+
+        guard.parser.process(std::slice::from_ref(&byte));
+        if guard.parser.screen().alternate_screen() {
+            guard.scrollback_offset = 0;
+        }
+
+        if let Some(row0) = candidate_row0 {
+            let scrolled = candidate_lf_scroll
+                || did_wrap_scroll(guard.parser.screen(), rows, cols, prev_pos.1);
+            if scrolled {
+                guard.push_scrollback_row(row0);
+            }
+        }
+        if let Some(su_rows) = candidate_su_rows {
+            for row in su_rows {
+                guard.push_scrollback_row(row);
+            }
+        }
+        if let Some(ev) = event {
+            apply_scanner_event(ev, guard, responses);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn process_pty_chunk(
     data: &[u8],
-    dsr: &mut DsrScanner,
+    scanner: &mut TerminalScanner,
     state: &Mutex<PtyState>,
     master_fd: RawFd,
     write_lock: &Mutex<()>,
@@ -931,27 +1591,7 @@ fn process_pty_chunk(
     let mut responses: Vec<Vec<u8>> = Vec::new();
     {
         let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut start = 0usize;
-        for (idx, &byte) in data.iter().enumerate() {
-            if let Some(query) = dsr.feed_byte(byte) {
-                guard.parser.process(&data[start..=idx]);
-                start = idx + 1;
-                let (row, col) = guard.parser.screen().cursor_position();
-                let reply = match query {
-                    DsrQuery::DeviceStatus => b"\x1b[0n".to_vec(),
-                    DsrQuery::CursorPosition => {
-                        format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
-                    }
-                    DsrQuery::DecCursorPosition => {
-                        format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes()
-                    }
-                };
-                responses.push(reply);
-            }
-        }
-        if start < data.len() {
-            guard.parser.process(&data[start..]);
-        }
+        process_pty_bytes(data, scanner, &mut guard, &mut responses);
     }
 
     for reply in responses {
@@ -1016,36 +1656,228 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dsr_scanner_handles_split_and_back_to_back_queries() {
-        let mut scanner = DsrScanner::default();
-        let stream = b"abc\x1b[6n\x1b[5n\x1b[38;2;1;2;3m\x1b[?6n";
+    fn test_scanner_handles_split_and_back_to_back_queries() {
+        let mut scanner = TerminalScanner::default();
+        let stream = b"abc\x1b[6n\x1b[5n\x1b[38;2;1;2;3m\x1b[?6n\x1b[c\x1b[0c\x1b[>c\x1b[>0c\x1b]10;?\x07\x1b]11;?\x1b\\";
         let mut detected = Vec::new();
         for &byte in stream {
-            if let Some(query) = scanner.feed_byte(byte) {
-                detected.push(query);
+            if let Some(event) = scanner.feed_byte(byte) {
+                detected.push(event);
             }
         }
         assert_eq!(
             detected,
             vec![
-                DsrQuery::CursorPosition,
-                DsrQuery::DeviceStatus,
-                DsrQuery::DecCursorPosition,
+                ScannerEvent::CursorPosition,
+                ScannerEvent::DeviceStatus,
+                ScannerEvent::DecCursorPosition,
+                ScannerEvent::PrimaryDeviceAttributes,
+                ScannerEvent::PrimaryDeviceAttributes,
+                ScannerEvent::SecondaryDeviceAttributes,
+                ScannerEvent::SecondaryDeviceAttributes,
+                ScannerEvent::OscForegroundColorQuery,
+                ScannerEvent::OscBackgroundColorQuery,
             ]
         );
     }
 
     #[test]
-    fn test_dsr_scanner_recovers_from_interrupted_escape_sequence() {
-        let mut scanner = DsrScanner::default();
-        let stream = b"\x1b[6\x1b[5n";
+    fn test_scanner_ignores_non_zero_da_and_malformed_sequences() {
+        let mut scanner = TerminalScanner::default();
+        let stream = b"\x1b[1c\x1b[>1c\x1b[?c\x1b[?5n\x1b]10;rgb:11/22/33\x07\x1b]7;http://localhost/tmp\x07\x1b]7;file://localhost\x07\x1b[5n";
         let mut detected = Vec::new();
         for &byte in stream {
-            if let Some(query) = scanner.feed_byte(byte) {
-                detected.push(query);
+            if let Some(event) = scanner.feed_byte(byte) {
+                detected.push(event);
             }
         }
-        assert_eq!(detected, vec![DsrQuery::DeviceStatus]);
+        assert_eq!(detected, vec![ScannerEvent::DeviceStatus]);
+    }
+
+    #[test]
+    fn test_scanner_recovers_from_interrupted_escape_and_osc_sequences() {
+        let mut scanner = TerminalScanner::default();
+        let stream = b"\x1b[6\x1b[5n\x1b]7;file:///unterminated\x1b[>0c\x1b]7;file:///tmp/next\x1b\\";
+        let mut detected = Vec::new();
+        for &byte in stream {
+            if let Some(event) = scanner.feed_byte(byte) {
+                detected.push(event);
+            }
+        }
+        assert_eq!(
+            detected,
+            vec![
+                ScannerEvent::DeviceStatus,
+                ScannerEvent::SecondaryDeviceAttributes,
+                ScannerEvent::OscCwd("/tmp/next".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scanner_bounds_oversized_osc_payload_and_recovers() {
+        let mut scanner = TerminalScanner::default();
+        let mut stream = b"\x1b]7;file:///".to_vec();
+        stream.resize(stream.len() + MAX_OSC_PAYLOAD_BYTES + 256, b'a');
+        stream.extend_from_slice(b"\x07\x1b]7;file:///tmp/recovered\x07\x1b[c");
+
+        let mut detected = Vec::new();
+        for &byte in &stream {
+            if let Some(event) = scanner.feed_byte(byte) {
+                detected.push(event);
+            }
+        }
+        assert_eq!(scanner.osc_buf.len(), 0);
+        assert!(!scanner.osc_overflow);
+        assert_eq!(
+            detected,
+            vec![
+                ScannerEvent::OscCwd("/tmp/recovered".to_string()),
+                ScannerEvent::PrimaryDeviceAttributes,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_osc7_cwd_variants() {
+        assert_eq!(
+            parse_osc7_cwd(b"file://localhost/tmp/my%20dir"),
+            Some("/tmp/my dir".to_string())
+        );
+        assert_eq!(
+            parse_osc7_cwd(b"file:///tmp/plain%2Bpath"),
+            Some("/tmp/plain+path".to_string())
+        );
+        assert_eq!(
+            parse_osc7_cwd(b"file://devbox.local/tmp/plus+kept/caf%C3%A9"),
+            Some("/tmp/plus+kept/café".to_string())
+        );
+        assert_eq!(parse_osc7_cwd(b"file:///tmp/bad%FFutf8"), None);
+        assert_eq!(parse_osc7_cwd(b"file:///tmp/nul%00byte"), None);
+        assert_eq!(parse_osc7_cwd(b"file://localhost"), None);
+        assert_eq!(parse_osc7_cwd(b"https://localhost/tmp"), None);
+    }
+
+    #[test]
+    fn test_pty_snapshot_serde_defaults_new_fields() {
+        let json = r#"{
+            "rows": 24,
+            "cols": 80,
+            "cells": [],
+            "cursor_row": 0,
+            "cursor_col": 0,
+            "hide_cursor": false,
+            "application_cursor": false,
+            "bracketed_paste": false,
+            "alternate_screen": false,
+            "exited": false,
+            "exit_code": null
+        }"#;
+        let snap: PtyScreenSnapshot = serde_json::from_str(json).expect("deserialize legacy snapshot");
+        assert_eq!(snap.scrollback_offset, 0);
+        assert_eq!(snap.cwd, None);
+    }
+
+    #[test]
+    fn test_fit_row_to_cols_handles_padding_and_split_wide_char() {
+        let row = vec![
+            PtyCell {
+                contents: "📦".to_string(),
+                ..PtyCell::default()
+            },
+            PtyCell {
+                is_wide_continuation: true,
+                ..PtyCell::default()
+            },
+            PtyCell {
+                contents: "A".to_string(),
+                ..PtyCell::default()
+            },
+        ];
+
+        let wider = fit_row_to_cols(&row, 5);
+        assert_eq!(wider.len(), 5);
+        assert_eq!(wider[0].contents, "📦");
+        assert_eq!(wider[2].contents, "A");
+        assert_eq!(wider[4], PtyCell::default());
+
+        let split_wide = fit_row_to_cols(&row, 1);
+        assert_eq!(split_wide.len(), 1);
+        assert_eq!(split_wide[0].contents, "");
+    }
+
+    #[test]
+    fn test_process_pty_bytes_split_chunks_and_scrollback_edge_cases() {
+        let mut scanner = TerminalScanner::default();
+        let mut state = PtyState::new(4, 10);
+        let mut responses = Vec::new();
+
+        // Split probe sequences across single-byte boundaries
+        let probe_stream =
+            b"\x1b[2;3H\x1b[6n\x1b[?6n\x1b[c\x1b[>0c\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]7;file:///tmp/a%20b\x1b\\";
+        for chunk in probe_stream.chunks(2) {
+            process_pty_bytes(chunk, &mut scanner, &mut state, &mut responses);
+        }
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b[2;3R".to_vec(),
+                b"\x1b[?2;3R".to_vec(),
+                DA1_REPLY.to_vec(),
+                DA2_REPLY.to_vec(),
+                OSC10_FG_REPLY.to_vec(),
+                OSC11_BG_REPLY.to_vec(),
+            ]
+        );
+        assert_eq!(state.current_cwd.as_deref(), Some("/tmp/a b"));
+
+        // Wrap-scroll + LF-scroll + CSI S scrollback capture
+        process_pty_bytes(b"\x1b[1;1H", &mut scanner, &mut state, &mut responses);
+        for i in 1..=8 {
+            let line = format!("L{i:02}\n");
+            process_pty_bytes(line.as_bytes(), &mut scanner, &mut state, &mut responses);
+        }
+        assert!(state.scrollback.len() >= 5);
+
+        // Pin viewport while new line scrolls in
+        assert_eq!(state.clamp_scrollback_offset(3), 3);
+        let pinned_first = state.scrollback[state.scrollback.len() - 3][0].contents.clone();
+        process_pty_bytes(b"NEW\n", &mut scanner, &mut state, &mut responses);
+        assert_eq!(state.scrollback_offset, 4);
+        assert_eq!(
+            state.scrollback[state.scrollback.len() - state.scrollback_offset][0].contents,
+            pinned_first
+        );
+
+        // Scroll region active (DECSTBM) does not push into scrollback
+        let before_region = state.scrollback.len();
+        process_pty_bytes(
+            b"\x1b[2;3r\x1b[3;1HA\nB\nC\n\x1b[r",
+            &mut scanner,
+            &mut state,
+            &mut responses,
+        );
+        assert_eq!(state.scrollback.len(), before_region);
+
+        // Alternate screen forces offset to 0 without erasing saved scrollback
+        process_pty_bytes(b"\x1b[?1049hALT\n\n\n\n\n", &mut scanner, &mut state, &mut responses);
+        assert_eq!(state.scrollback_offset, 0);
+        assert_eq!(state.clamp_scrollback_offset(5), 0);
+        assert_eq!(state.scrollback.len(), before_region);
+        process_pty_bytes(b"\x1b[?1049l", &mut scanner, &mut state, &mut responses);
+        assert_eq!(state.clamp_scrollback_offset(5), 5);
+
+        // Line wrap + CSI S scroll into scrollback cleanly
+        let before_wrap_and_su = state.scrollback.len();
+        process_pty_bytes(b"\x1b[4;1H1234567890WRAP", &mut scanner, &mut state, &mut responses);
+        assert_eq!(state.scrollback.len(), before_wrap_and_su + 1);
+        process_pty_bytes(b"\x1b[2S", &mut scanner, &mut state, &mut responses);
+        assert_eq!(state.scrollback.len(), before_wrap_and_su + 3);
+
+        // Full reset clears scrollback
+        process_pty_bytes(b"\x1bc", &mut scanner, &mut state, &mut responses);
+        assert!(state.scrollback.is_empty());
+        assert_eq!(state.scrollback_offset, 0);
     }
 
     #[test]

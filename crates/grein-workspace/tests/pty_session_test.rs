@@ -287,6 +287,148 @@ fn test_dsr_cursor_and_status_queries_are_answered() {
 }
 
 #[test]
+fn test_da1_da2_and_osc_color_queries_are_answered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let signal = UpdateSignal::new();
+    let session =
+        InteractivePtySession::spawn(dir.path(), 24, 160, Some("/bin/sh"), signal.callback())
+            .expect("spawn pty session");
+
+    session
+        .write_bytes(
+            b"stty raw -echo; \
+              printf '\\033[c'; da1=$(dd bs=1 count=7 2>/dev/null); \
+              printf '\\033[0c'; da1z=$(dd bs=1 count=7 2>/dev/null); \
+              printf '\\033[>c'; da2=$(dd bs=1 count=10 2>/dev/null); \
+              printf '\\033[>0c'; da2z=$(dd bs=1 count=10 2>/dev/null); \
+              printf '\\033]10;?\\007'; fg=$(dd bs=1 count=25 2>/dev/null); \
+              printf '\\033]11;?\\033\\\\'; bg=$(dd bs=1 count=25 2>/dev/null); \
+              stty sane; \
+              printf '\\nPROBE_OK=%s|%s|%s|%s|%s|%s\\n' \
+              \"$(printf '%s' \"$da1\" | tr '\\033' 'E')\" \
+              \"$(printf '%s' \"$da1z\" | tr '\\033' 'E')\" \
+              \"$(printf '%s' \"$da2\" | tr '\\033' 'E')\" \
+              \"$(printf '%s' \"$da2z\" | tr '\\033' 'E')\" \
+              \"$(printf '%s' \"$fg\" | tr '\\033' 'E')\" \
+              \"$(printf '%s' \"$bg\" | tr '\\033' 'E')\"\n",
+        )
+        .expect("run capability probe script");
+
+    signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|line| {
+            line.trim()
+                == "PROBE_OK=E[?62;c|E[?62;c|E[>0;10;1c|E[>0;10;1c|E]10;rgb:e5e5/e5e5/e5e5E\\|E]11;rgb:0000/0000/0000E\\"
+        })
+    });
+}
+
+#[test]
+fn test_osc7_live_cwd_tracking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let signal = UpdateSignal::new();
+    let session =
+        InteractivePtySession::spawn(dir.path(), 24, 120, Some("/bin/sh"), signal.callback())
+            .expect("spawn pty session");
+
+    assert_eq!(session.snapshot().cwd, None);
+
+    session
+        .write_bytes(b"printf '\\033]7;file://localhost/tmp/my%%20dir\\007\\n'\n")
+        .expect("emit osc 7 bel");
+    let snap = signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.cwd.as_deref() == Some("/tmp/my dir")
+    });
+    assert_eq!(snap.cwd.as_deref(), Some("/tmp/my dir"));
+
+    session
+        .write_bytes(b"printf '\\033]7;file:///tmp/plain%%2Bpath\\033\\\\\\n'\n")
+        .expect("emit osc 7 st");
+    let snap = signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.cwd.as_deref() == Some("/tmp/plain+path")
+    });
+    assert_eq!(snap.cwd.as_deref(), Some("/tmp/plain+path"));
+
+    session
+        .write_bytes(b"printf '\\033]7;file:///tmp/caf%%C3%%A9\\007\\n'\n")
+        .expect("emit osc 7 utf8");
+    let snap = signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.cwd.as_deref() == Some("/tmp/café")
+    });
+    assert_eq!(snap.cwd.as_deref(), Some("/tmp/café"));
+}
+
+#[test]
+fn test_scrollback_navigation_and_write_snaps_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let signal = UpdateSignal::new();
+    let session =
+        InteractivePtySession::spawn(dir.path(), 10, 80, Some("/bin/sh"), signal.callback())
+            .expect("spawn 10-row pty session");
+
+    session
+        .write_bytes(
+            b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf 'SEQ_%02d\\n' \"$i\"; i=$((i+1)); done; printf 'SEQ_DONE\\n'\n",
+        )
+        .expect("flood 50 lines");
+
+    let live = signal.wait_for(&session, Duration::from_secs(5), |s| {
+        let text = s.plain_text();
+        text.lines().any(|line| line.trim() == "SEQ_50")
+            && text.lines().any(|line| line.trim() == "SEQ_DONE")
+    });
+    assert_eq!(live.scrollback_offset, 0);
+    assert!(
+        !live.plain_text().lines().any(|line| line.trim() == "SEQ_01"),
+        "SEQ_01 should have scrolled off the 10-row live viewport"
+    );
+
+    let offset = session.scroll_by(15);
+    assert_eq!(offset, 15);
+    let scrolled = session.snapshot();
+    assert_eq!(scrolled.scrollback_offset, 15);
+    let scrolled_text = scrolled.plain_text();
+    assert!(
+        !scrolled_text.lines().any(|line| line.trim() == "SEQ_50"),
+        "live bottom line SEQ_50 should not be visible when scrolled up 15 rows:\n{scrolled_text}"
+    );
+    assert!(
+        scrolled_text.contains("SEQ_3"),
+        "older SEQ_3x lines should be visible when scrolled up 15 rows:\n{scrolled_text}"
+    );
+
+    let max_offset = session.scroll_by(10_000);
+    assert!(max_offset >= 40, "expected >= 40 scrollback rows, got {max_offset}");
+    let top = session.snapshot();
+    assert_eq!(top.scrollback_offset, max_offset);
+    assert!(
+        top.plain_text().lines().any(|line| line.trim() == "SEQ_01"),
+        "scrolling to top should expose SEQ_01:\n{}",
+        top.plain_text()
+    );
+
+    let stepped_down = session.scroll_by(-5);
+    assert_eq!(stepped_down, max_offset - 5);
+
+    let reset_offset = session.set_scrollback(0);
+    assert_eq!(reset_offset, 0);
+    let back_live = session.snapshot();
+    assert_eq!(back_live.scrollback_offset, 0);
+    assert!(
+        back_live
+            .plain_text()
+            .lines()
+            .any(|line| line.trim() == "SEQ_50")
+    );
+
+    assert_eq!(session.scroll_by(15), 15);
+    assert_eq!(session.snapshot().scrollback_offset, 15);
+
+    session.write_bytes(b"\n").expect("write newline while scrolled");
+    let snapped = session.snapshot();
+    assert_eq!(snapped.scrollback_offset, 0);
+}
+
+#[test]
 fn test_plain_text_skips_wide_continuations_and_trims_trailing_spaces() {
     let snap = PtyScreenSnapshot {
         rows: 2,
