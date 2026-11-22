@@ -13,4 +13,5 @@ pub use blackboard::{
     BoundedScratchpad, DecisionLandmark, KnowledgeImport,
 };
 pub use error::CoreError;
+pub use model::ThreadKind;
 pub use sync::{build_context_prompt, ContextCompiler, ContextPayload};

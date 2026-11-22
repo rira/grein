@@ -1,7 +1,8 @@
 use grein_core::model::{
-    AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadLifecycleState,
+    AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadLifecycleState,
 };
 use grein_core::storage::sqlite::SqliteDagStorage;
+use grein_core::{CoreError, ThreadKind};
 
 #[test]
 fn test_sqlite_storage_initialization_runs_migrations() {
@@ -248,11 +249,15 @@ fn test_thread_new_defaults_and_with_title() {
     assert_eq!(thread.title, "");
     assert_eq!(thread.acp_session_id, None);
     assert!(!thread.merged);
+    assert_eq!(thread.kind, ThreadKind::Agent);
+    assert_eq!(thread.cwd, None);
 
     let titled = thread.with_title("Investigate auth");
     assert_eq!(titled.title, "Investigate auth");
     assert_eq!(titled.acp_session_id, None);
     assert!(!titled.merged);
+    assert_eq!(titled.kind, ThreadKind::Agent);
+    assert_eq!(titled.cwd, None);
 }
 
 #[test]
@@ -305,6 +310,8 @@ fn test_legacy_threads_schema_migration_adds_metadata_columns_idempotently(
     assert_eq!(fetched.acp_session_id, None);
     assert!(!fetched.merged);
     assert_eq!(fetched.parent_thread_id, None);
+    assert_eq!(fetched.kind, ThreadKind::Agent);
+    assert_eq!(fetched.cwd, None);
 
     let all = storage.list_threads()?;
     assert_eq!(all.len(), 1);
@@ -448,6 +455,241 @@ fn test_create_thread_with_parent_and_reparent_child_threads(
         storage.get_thread(leaf_tid)?.unwrap().parent_thread_id,
         None
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_legacy_threads_migration_adds_kind_and_cwd_idempotently(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_id TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_node_id TEXT NOT NULL,
+            anchor_id TEXT NOT NULL,
+            active_leaf_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            acp_session_id TEXT,
+            merged INTEGER NOT NULL DEFAULT 0,
+            parent_thread_id TEXT,
+            FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+            FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );",
+    )?;
+
+    let root_id = NodeId::new_v7();
+    let thread_id = ThreadId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+    conn.execute(
+        "INSERT INTO nodes (id, parent_id, role, content, created_at) VALUES (?1, NULL, 'user', 'Legacy root', 1)",
+        rusqlite::params![root_id.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title)
+         VALUES (?1, ?2, ?3, ?2, 'idle', 2, 'Pre-terminal thread')",
+        rusqlite::params![thread_id.to_string(), root_id.to_string(), anchor_id.to_string()],
+    )?;
+
+    let storage = SqliteDagStorage::new(conn)?;
+    storage.run_migrations()?;
+
+    let fetched = storage
+        .get_thread(thread_id)?
+        .expect("Legacy thread must still exist after migration");
+    assert_eq!(fetched.id, thread_id);
+    assert_eq!(fetched.title, "Pre-terminal thread");
+    assert_eq!(fetched.kind, ThreadKind::Agent);
+    assert_eq!(fetched.cwd, None);
+
+    let listed = storage.list_threads()?;
+    assert_eq!(listed, vec![fetched]);
+
+    Ok(())
+}
+
+#[test]
+fn test_terminal_thread_kind_and_cwd_roundtrip_and_fk_invariants(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    let root_node = ConversationNode::new_root(AuthorRole::System, "");
+    storage.insert_node(&root_node)?;
+
+    let agent_id = storage.create_thread_with_kind(
+        root_node.id,
+        AnchorId::new_v7(),
+        Some("Agent"),
+        None,
+        ThreadKind::Agent,
+        None,
+    )?;
+
+    let term_id = storage.create_thread_with_kind(
+        root_node.id,
+        AnchorId::new_v7(),
+        Some("Shell"),
+        Some(agent_id),
+        ThreadKind::Terminal,
+        Some("/tmp/wt-path"),
+    )?;
+
+    let custom_leaf = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(root_node.id),
+        AuthorRole::User,
+        "turn".to_string(),
+    );
+    storage.insert_node(&custom_leaf)?;
+
+    let direct_thread = Thread::new(
+        ThreadId::new_v7(),
+        root_node.id,
+        AnchorId::new_v7(),
+        custom_leaf.id,
+        ThreadLifecycleState::Idle,
+    )
+    .with_title("Direct Terminal")
+    .with_kind(ThreadKind::Terminal)
+    .with_cwd("/tmp/wt-direct");
+    storage.insert_thread(&direct_thread)?;
+
+    let fetched_term = storage
+        .get_thread(term_id)?
+        .expect("Terminal thread should exist");
+    assert_eq!(fetched_term.kind, ThreadKind::Terminal);
+    assert_eq!(fetched_term.cwd.as_deref(), Some("/tmp/wt-path"));
+    assert_eq!(fetched_term.parent_thread_id, Some(agent_id));
+    assert_eq!(fetched_term.title, "Shell");
+
+    let fetched_direct = storage
+        .get_thread(direct_thread.id)?
+        .expect("Inserted terminal thread should exist");
+    assert_eq!(fetched_direct.kind, ThreadKind::Terminal);
+    assert_eq!(fetched_direct.cwd.as_deref(), Some("/tmp/wt-direct"));
+    assert_eq!(fetched_direct.active_leaf_id, custom_leaf.id);
+
+    let all = storage.list_threads()?;
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[0].kind, ThreadKind::Agent);
+    assert_eq!(all[0].cwd, None);
+    assert_eq!(all[1], fetched_term);
+    assert_eq!(all[2], fetched_direct);
+
+    let missing_node = NodeId::new_v7();
+    let err_missing_parent = storage.create_thread_with_kind(
+        missing_node,
+        AnchorId::new_v7(),
+        Some("Bad"),
+        None,
+        ThreadKind::Terminal,
+        Some("/tmp/wt"),
+    );
+    assert!(matches!(
+        err_missing_parent,
+        Err(CoreError::NodeNotFound(_))
+    ));
+
+    let bad_leaf_thread = Thread::new(
+        ThreadId::new_v7(),
+        root_node.id,
+        AnchorId::new_v7(),
+        missing_node,
+        ThreadLifecycleState::Idle,
+    )
+    .with_kind(ThreadKind::Terminal);
+    let err_missing_leaf = storage.insert_thread(&bad_leaf_thread);
+    assert!(matches!(err_missing_leaf, Err(CoreError::NodeNotFound(_))));
+
+    Ok(())
+}
+
+#[test]
+fn test_update_thread_cwd_set_clear_and_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    let root_node = ConversationNode::new_root(AuthorRole::User, "hi");
+    storage.insert_node(&root_node)?;
+
+    let thread_id = storage.create_thread_with_kind(
+        root_node.id,
+        AnchorId::new_v7(),
+        Some("Worktree Term"),
+        None,
+        ThreadKind::Terminal,
+        Some("/old/wt"),
+    )?;
+
+    storage.update_thread_cwd(&thread_id, Some("/new/wt"))?;
+    let updated = storage
+        .get_thread(thread_id)?
+        .expect("Thread should exist after cwd update");
+    assert_eq!(updated.cwd.as_deref(), Some("/new/wt"));
+    assert_eq!(updated.kind, ThreadKind::Terminal);
+
+    storage.update_thread_cwd(&thread_id, None)?;
+    let cleared = storage
+        .get_thread(thread_id)?
+        .expect("Thread should exist after cwd clear");
+    assert_eq!(cleared.cwd, None);
+
+    let missing_id = ThreadId::new_v7();
+    let missing_err = storage.update_thread_cwd(&missing_id, Some("/nope"));
+    assert!(matches!(missing_err, Err(CoreError::ThreadNotFound(_))));
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_json_serde_backward_compatibility_and_kind_roundtrip(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tid = ThreadId::new_v7();
+    let node_id = NodeId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+
+    let legacy_json = serde_json::json!({
+        "id": tid,
+        "parent_node_id": node_id,
+        "head_node_id": node_id,
+        "anchor_id": anchor_id,
+        "active_leaf_id": node_id,
+        "leaf_node_id": node_id,
+        "status": "idle",
+        "state": "idle",
+        "title": "Legacy Thread",
+        "acp_session_id": null,
+        "merged": false,
+        "parent_thread_id": null
+    })
+    .to_string();
+
+    let parsed: Thread = serde_json::from_str(&legacy_json)?;
+    assert_eq!(parsed.id, tid);
+    assert_eq!(parsed.title, "Legacy Thread");
+    assert_eq!(parsed.kind, ThreadKind::Agent);
+    assert_eq!(parsed.cwd, None);
+
+    let term = Thread::new(tid, node_id, anchor_id, node_id, ThreadLifecycleState::Idle)
+        .with_kind(ThreadKind::Terminal)
+        .with_cwd("/tmp/wt-path");
+    let serialized = serde_json::to_string(&term)?;
+    assert!(serialized.contains("\"kind\":\"terminal\""));
+    assert!(serialized.contains("\"cwd\":\"/tmp/wt-path\""));
+
+    let roundtripped: Thread = serde_json::from_str(&serialized)?;
+    assert_eq!(roundtripped, term);
+    assert_eq!(roundtripped.kind(), ThreadKind::Terminal);
+    assert_eq!(roundtripped.cwd(), Some("/tmp/wt-path"));
 
     Ok(())
 }

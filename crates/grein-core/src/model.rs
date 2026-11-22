@@ -164,6 +164,43 @@ pub enum ThreadStatus {
 pub type ThreadLifecycleState = ThreadStatus;
 pub type ThreadState = ThreadStatus;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadKind {
+    #[default]
+    Agent,
+    Terminal,
+}
+
+impl ThreadKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ThreadKind {
+    type Err = crate::error::CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "agent" => Ok(Self::Agent),
+            "terminal" => Ok(Self::Terminal),
+            other => Err(crate::error::CoreError::Serialization(
+                serde::de::Error::custom(format!("Unknown thread kind: {other}")),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
@@ -182,6 +219,10 @@ pub struct Thread {
     pub merged: bool,
     #[serde(default)]
     pub parent_thread_id: Option<ThreadId>,
+    #[serde(default)]
+    pub kind: ThreadKind,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl Thread {
@@ -207,11 +248,23 @@ impl Thread {
             acp_session_id: None,
             merged: false,
             parent_thread_id: None,
+            kind: ThreadKind::default(),
+            cwd: None,
         }
     }
 
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    pub fn with_kind(mut self, kind: ThreadKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
         self
     }
 
@@ -245,5 +298,13 @@ impl Thread {
 
     pub fn state(&self) -> ThreadStatus {
         self.state
+    }
+
+    pub fn kind(&self) -> ThreadKind {
+        self.kind
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
     }
 }
