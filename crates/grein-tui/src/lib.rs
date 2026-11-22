@@ -21,6 +21,7 @@ pub mod syntax;
 pub mod transcript;
 pub mod ui;
 pub mod views;
+pub mod vt_input;
 
 use std::sync::Arc;
 

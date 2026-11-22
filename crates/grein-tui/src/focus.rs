@@ -52,7 +52,9 @@ impl From<crate::app::FocusedPane> for PaneFocus {
     fn from(pane: crate::app::FocusedPane) -> Self {
         match pane {
             crate::app::FocusedPane::Tree => Self::Sidebar,
-            crate::app::FocusedPane::Transcript => Self::Transcript,
+            crate::app::FocusedPane::Transcript | crate::app::FocusedPane::Terminal => {
+                Self::Transcript
+            }
             crate::app::FocusedPane::Composer => Self::Composer,
         }
     }

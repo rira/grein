@@ -51,6 +51,7 @@ Each message node represents an immutable conversational event (`ConversationNod
 Each branch head (`Thread`) tracks explicit tree lineage and lifecycle state:
 * `id` (`ThreadId`), `parent_node_id` (`NodeId`), `active_leaf_id` (`NodeId`), `anchor_id` (`AnchorId`).
 * `parent_thread_id`: `Option<ThreadId>` (`None` for top-level roots; explicit parent thread ID for forked child branches).
+* `kind` (`ThreadKind`: `Agent` or `Terminal`), `cwd` (`Option<String>`, inherited from parent or assigned via opt-in `/worktree` or `/term [path]`).
 * `title`, `status` (`ThreadStatus`), `acp_session_id` (`Option<String>`), `merged` (`bool`, rendered as `[joined]` when committed back to parent).
 
 #### Anchor Extraction & Filtering Algorithm
@@ -100,8 +101,11 @@ To ensure long-term stability and clean separation of concerns, the system split
   * `session.send_turn` / `session.send_thread_turn(thread_id, prompt)` $\to$ `TurnDispatchResult`
   * `session.merge_thread(thread_id, target_thread_id?, summary?)` $\to$ `ThreadSummary`
   * `session.delete_thread(thread_id)` $\to$ `next_active_thread_id`
+  * `session.create_terminal(parent_thread_id?, title?, cwd?, rows, cols)` $\to$ `ThreadSummary`
+  * `pty.write(thread_id, bytes)`, `pty.resize(thread_id, rows, cols)`, `pty.snapshot(thread_id, rows, cols)` $\to$ `PtyScreenSnapshot`
+  * `workspace.ensure_thread_worktree(thread_id)` $\to$ `cwd` (opt-in isolated worktree assignment)
   * `session.cancel(thread_id)`, `session.shell(thread_id, command)`, `permissions.resolve`
-*   *`events`: `StreamChunk`, `ThoughtChunk`, `ToolInvoked`, `ToolResult`, `ToolActivityUpdated`, `ShellOutput`, `PermissionRequested`, `ThreadCreated`, `ThreadTitleUpdated`, `ThreadMerged`, `ThreadMetadataUpdated`, `ThreadDeleted`, `ThreadStatusChanged`, `AgentMetaUpdated`, `AgentConfigUpdated`, `AgentCommandsUpdated`, `SubagentUpdated`, `SubagentRemoved`, `Error`.
+*   *`events`: `StreamChunk`, `ThoughtChunk`, `ToolInvoked`, `ToolResult`, `ToolActivityUpdated`, `ShellOutput`, `PtyScreenUpdated`, `PtyExited`, `PermissionRequested`, `ThreadCreated`, `ThreadTitleUpdated`, `ThreadMerged`, `ThreadMetadataUpdated`, `ThreadDeleted`, `ThreadStatusChanged`, `AgentMetaUpdated`, `AgentConfigUpdated`, `AgentCommandsUpdated`, `SubagentUpdated`, `SubagentRemoved`, `Error`.
 
 ---
 
@@ -318,13 +322,14 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 ```
 
 #### Left Column (`34%` width): `ᛇ Grein` Context Tree Sidebar
-* Displays the full multi-root conversation forest: top-level roots marked with `ᛉ`, and child branches nested depth-first via `parent_thread_id` with Unicode box-drawing connectors (`├─`, `└─`, `│`).
+* Displays the full multi-root mixed Agent + Terminal forest: top-level Agent roots marked with `ᛉ`, Terminal nodes marked with `>_` (plus `[exit N]` / `[exited]` badge when terminated), and child branches nested depth-first via `parent_thread_id` with Unicode box-drawing connectors (`├─`, `└─`, `│`).
 * Real-time status glyphs (`●` streaming/executing/thinking, `⚠` permission required or error) and `[joined]` suffix on merged branches.
-* **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript in the right-hand `Transcript` pane (`Transcript (Preview: <title>)`) without changing the active `Composer` thread until confirmed with `Enter`.
+* **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript (`Transcript (Preview: <title>)`) or live VT100 terminal screen (`Terminal (Preview: <title>)`) while keeping focus in `ᛇ Grein` until confirmed with `Enter`, `l`, or `Tab` (on a terminal node).
 
-#### Right Column (`66%` width, or `100%` Borderless Copy Zoom): Full-Width `Transcript` Pane
-* Full-width Markdown rendering including headings, inline formatting, syntax-highlighted code fences, GFM tables, horizontal rules, leaf-green `❯ ` user prompt prefix, lineage banners (`> ↳ Forked from <parent> (<N> ancestor turns in LLM context)`), join markers (`↳ Joined from <branch>`), collapsible tool/shell cards (`Ctrl+O` toggles all), and ANSI-colored PTY shell blocks (`$ cmd (exit N)`).
-* **Borderless-Sides Copy Zoom (`Ctrl+T`, `z` in Tree, `/zoom`):** Collapses `ᛇ Grein` and expands `Transcript` to `100%` width with `Borders::TOP | Borders::BOTTOM` only (zero left/right `│` borders) for clean terminal mouse drag-select copying, complemented by `y` / `Alt+Y` / `/copy [code|all]` (native + OSC 52 clipboard).
+#### Right Column (`66%` width, or `100%` Borderless Copy Zoom): Dual-Mode `Transcript` / Live `Terminal` Pane
+* **Agent Mode (`ThreadKind::Agent`):** Full-width Markdown rendering including headings, inline formatting, syntax-highlighted code fences, GFM tables, horizontal rules, leaf-green `❯ ` user prompt prefix, lineage banners (`> ↳ Forked from <parent> (<N> ancestor turns in LLM context)`), join markers (`↳ Joined from <branch>`), collapsible tool/shell cards (`Ctrl+O` toggles all), and ANSI-colored PTY shell blocks (`$ cmd (exit N)`).
+* **Terminal Mode (`ThreadKind::Terminal`):** Hides `Composer` completely and expands the right pane to full height above the status bar (or `100%` full-screen width when zoomed via `Ctrl+T`), rendering `PtyScreenSnapshot` cell-by-cell (`Default`/`Indexed`/`Rgb` colors, bold/italic/underline/inverse, wide UTF-8 cells skipping `is_wide_continuation`, and clamped cursor positioning when `FocusedPane::Terminal` is active). Cold reopens fetch `pty_snapshot` automatically and pane dimension changes emit `pty_resize`.
+* **Borderless-Sides Copy Zoom (`Ctrl+T`, `z` in Tree, `/zoom`):** Collapses `ᛇ Grein` and expands the right pane to `100%` width with `Borders::TOP | Borders::BOTTOM` only (zero left/right `│` borders) for clean terminal mouse drag-select copying, complemented by `y` / `Alt+Y` / `/copy [code|all]` (copying `PtyScreenSnapshot::plain_text()` on terminal threads via native + OSC 52 clipboard).
 * **Global Transcript Scrolling:** Independent scrollback buffer per context (`TranscriptViewport`) using exact pre-wrapped styled lines (zero bottom clipping), controllable globally from anywhere in the UI via `Alt+↑` / `Alt+↓`, `PgUp` / `PgDn`, and `Alt+Home` / `Alt+End`, or zero-modifier Tree keys (`Ctrl+U` / `Ctrl+D`, `g` / `G`)—including while live-previewing another branch in `ᛇ Grein`.
 * **External `$PAGER` Diff Integration:** Pressing `o` when inspecting a diff card suspends Ratatui and opens the colorized diff in `$PAGER` (e.g. `delta`, `git diff`, `less`), cleanly restoring the TUI on exit.
 
@@ -341,9 +346,9 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 
 | Keybinding | Scope | Action |
 | :--- | :--- | :--- |
-| `Esc` | Global | Cancel active streaming/executing turn; otherwise toggle focus between `Composer` and `ᛇ Grein` sidebar |
-| `Ctrl+G` | Global | Toggle focus between `Composer` and `ᛇ Grein` sidebar without cancelling active turns |
-| `Tab` / `Shift+Tab` | Global | Cycle forward / backward across branches within the active root's subtree (no-op on lone roots) |
+| `Esc` | Global (outside `Terminal`) | Cancel active streaming/executing turn; otherwise toggle focus between `Composer`/`Terminal` and `ᛇ Grein` sidebar (inside `Terminal`, `Esc` passes `\x1b` to PTY) |
+| `Ctrl+G` | Global (incl. `Terminal`) | Toggle focus between `Composer`/`Terminal` and `ᛇ Grein` sidebar without cancelling turns or forwarding `\x07` to PTY |
+| `Tab` / `Shift+Tab` | Global (outside `Terminal`) | Cycle branches within the active root's subtree (`Tab` in `ᛇ Grein` on a terminal node enters `Terminal`; inside `Terminal`, `Tab` sends `\t` to PTY) |
 | `Alt+Shift+↑` / `Alt+Shift+↓` | Global | Switch to previous / next top-level root |
 | `Alt+J` / `Alt+K` | Global | Switch to next / previous top-level root |
 | `Alt+↑` / `Alt+↓` | Global | Scroll `Transcript` up / down (including live previewed branches when browsing `ᛇ Grein`) |
@@ -363,11 +368,12 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 
 | Keybinding | Action |
 | :--- | :--- |
-| `↑` / `↓` or `k` / `j` | Move selection through the tree and live-preview in `Transcript` |
+| `↑` / `↓` or `k` / `j` | Move selection through the tree and live-preview in `Transcript` / `Terminal` |
 | `J` / `K` | Switch to next / previous top-level root |
 | `Ctrl+U` / `Ctrl+D` | Scroll active/previewed `Transcript` half-page up / down |
 | `g` / `G` | Jump active/previewed `Transcript` to top / bottom |
-| `Enter` | Activate selected branch/root (or anchor) and move focus to `Composer` |
+| `Enter` / `l` | Activate selected branch/root (or anchor) and focus `Composer` (or `Terminal` for `>_` nodes) |
+| `t` / `T` | Open a child terminal under the active context (`t`, inherits `cwd`) or a blank root terminal (`T`) |
 | `f` | Fork a new child branch off the selected context |
 | `n` | Create a new blank independent root context |
 | `r` | Prefill `/rename <title>` for the selected context and focus `Composer` |
@@ -399,6 +405,8 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | Command | Action |
 | :--- | :--- |
 | `!cmd` | Execute shell command in a PTY under the active context (`$ cmd (exit N)` with ANSI rendering) |
+| `/term [path]` | Spawn an interactive child PTY terminal (inheriting active context's `cwd` or overriding with `[path]`) and focus `Terminal` |
+| `/worktree` | Opt-in allocate/attach an isolated git worktree `cwd` for the active thread (inherited by child terminals) |
 | `/fork [title]`, `/branch [title]`, `/grein [title]` | Fork a new child branch off the active context (`parent_thread_id`) |
 | `/root [title]`, `/new [title]` | Create a new blank independent root context |
 | `/rename <name>` | Rename the active or selected context |
@@ -419,7 +427,9 @@ To give instant situational awareness across all active roots and branches witho
 
 | Indicator | Location | Color | Semantic Meaning |
 | :--- | :--- | :--- | :--- |
-| `ᛉ` | `ᛇ Grein` root row (when idle) | Green | Top-level independent root context |
+| `ᛉ` | `ᛇ Grein` root row (when idle) | Green | Top-level independent root Agent context |
+| `>_` | `ᛇ Grein` terminal row | Cyan / Dark Gray / Red | Interactive PTY terminal context (running / exited 0 / exited non-zero) |
+| `[exit N]` | `ᛇ Grein` terminal suffix | Dark Gray / Red | Exit status badge rendered once a PTY process exits |
 | `├─` / `└─` / `│` | `ᛇ Grein` child rows | Dark Gray | Depth-first tree connectors showing `parent_thread_id` hierarchy |
 | `●` | `ᛇ Grein` row | Yellow | Context is actively `streaming`, `executing`, or `thinking` |
 | `⚠` | `ᛇ Grein` row & Status Bar | Red | Context requires tool permission or hit an error |

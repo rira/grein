@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -27,8 +27,8 @@ use crate::app::{
     PendingPermission, ThreadItem, TreeAction, TuiError,
 };
 use crate::engine_port::{
-    AgentOptionsSnapshot, AgentSlashCommand, HydratedSession, ThreadMeta, TuiEngineEvent,
-    TuiEnginePort,
+    AgentOptionsSnapshot, AgentSlashCommand, HydratedSession, PtyScreenSnapshot, ThreadMeta,
+    TuiEngineEvent, TuiEnginePort,
 };
 use crate::transcript::{ThreadTranscript, TranscriptBlock};
 
@@ -45,7 +45,7 @@ impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
         if io::stdout().is_terminal() && io::stdin().is_terminal() {
             enable_raw_mode()?;
-            execute!(io::stdout(), EnterAlternateScreen)?;
+            execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
             let keyboard_enhanced =
                 if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
                     execute!(
@@ -78,7 +78,7 @@ impl Drop for TerminalGuard {
                 let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
             }
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         }
     }
 }
@@ -94,8 +94,18 @@ pub fn draw_frame_mut<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> 
 }
 
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
-    if let Event::Key(key) = event {
-        let _ = handle_key_event(app, key);
+    match event {
+        Event::Key(key) => {
+            let _ = handle_key_event(app, key);
+        }
+        Event::Paste(text) => {
+            let _ = app.handle_paste_event(&text);
+        }
+        Event::Resize(w, h) => {
+            app.last_frame_area = Some(ratatui::layout::Rect::new(0, 0, w, h));
+            app.maybe_queue_terminal_resize();
+        }
+        _ => {}
     }
     Ok(app.should_quit())
 }
@@ -409,6 +419,22 @@ fn parse_config_arg(rest: &str) -> (bool, String) {
     (false, trimmed.to_string())
 }
 
+fn parse_term_cwd(rest: &str) -> Option<String> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        trimmed[1..trimmed.len() - 1].trim()
+    } else {
+        trimmed
+    };
+    (!unquoted.is_empty()).then(|| unquoted.to_string())
+}
+
 fn format_tool_result(tool_name: &str, output: &str) -> String {
     let trimmed = output.trim_end_matches(['\r', '\n']);
     if trimmed.trim().is_empty() {
@@ -650,6 +676,7 @@ impl App {
                         thread_id,
                         title: rest.to_string(),
                     });
+                    self.sync_focus_for_active_thread();
                 }
                 return;
             }
@@ -657,6 +684,21 @@ impl App {
                 let source_thread_id = self.active_thread_id.clone();
                 let summary = (!rest.is_empty()).then(|| rest.to_string());
                 self.request_join_thread(source_thread_id, summary);
+                return;
+            }
+            "/term" => {
+                let cwd = parse_term_cwd(rest);
+                let active_id = self.active_thread_id.clone();
+                self.dispatch_create_terminal(Some(active_id), cwd);
+                return;
+            }
+            "/worktree" => {
+                let active_id = self.active_thread_id.clone();
+                self.status_notice = Some("Allocating worktree...".to_string());
+                self.pending_actions
+                    .push_back(AppAction::EnsureThreadWorktree {
+                        thread_id: active_id,
+                    });
                 return;
             }
             "/quit" => {
@@ -1008,6 +1050,9 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.thread_commands.clear();
     app.thread_active_tool.clear();
     app.thread_turn_started_ms.clear();
+    app.pty_screens.clear();
+    app.pty_exit_codes.clear();
+    app.last_pty_sizes.clear();
     app.config_picker = None;
     app.help_scroll_offset = 0;
     app.status_notice = None;
@@ -1257,7 +1302,12 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 anchors,
             });
             app.switch_thread(&new_id);
-            app.set_focus(FocusedPane::Composer);
+            if app.is_terminal_thread(&new_id) {
+                app.set_focus(FocusedPane::Terminal);
+                app.maybe_request_pty_snapshot(&new_id);
+            } else {
+                app.set_focus(FocusedPane::Composer);
+            }
         }
         TuiEngineEvent::ThreadTitleUpdated { thread_id, title } => {
             if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
@@ -1326,6 +1376,10 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 app.thread_meta.insert(m.thread_id.clone(), m);
             }
             rebuild_tree_nodes(app);
+            app.sync_focus_for_active_thread();
+            let active = app.active_thread_id.clone();
+            app.maybe_request_pty_snapshot(&active);
+            app.maybe_queue_terminal_resize();
         }
         TuiEngineEvent::ThreadDeleted {
             thread_id,
@@ -1347,6 +1401,9 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.thread_commands.remove(&thread_id);
             app.thread_active_tool.remove(&thread_id);
             app.thread_turn_started_ms.remove(&thread_id);
+            app.pty_screens.remove(&thread_id);
+            app.pty_exit_codes.remove(&thread_id);
+            app.last_pty_sizes.remove(&thread_id);
             if app
                 .config_picker
                 .as_ref()
@@ -1389,6 +1446,9 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
 
             rebuild_tree_nodes(app);
             app.select_active_thread_in_tree();
+            app.sync_focus_for_active_thread();
+            let active = app.active_thread_id.clone();
+            app.maybe_request_pty_snapshot(&active);
         }
         TuiEngineEvent::AgentMetaUpdated {
             thread_id,
@@ -1494,7 +1554,38 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             app.thread_statuses.insert(thread_id, status);
         }
-        TuiEngineEvent::PtyScreenUpdated { .. } | TuiEngineEvent::PtyExited { .. } => {}
+        TuiEngineEvent::PtyScreenUpdated { thread_id, snapshot } => {
+            if snapshot.exited {
+                app.pty_exit_codes
+                    .insert(thread_id.clone(), snapshot.exit_code);
+                let status = if snapshot.exit_code.is_some_and(|c| c != 0) {
+                    "error"
+                } else {
+                    "idle"
+                };
+                app.thread_statuses
+                    .insert(thread_id.clone(), status.to_string());
+            } else {
+                app.pty_exit_codes.remove(&thread_id);
+            }
+            app.pty_screens.insert(thread_id, snapshot);
+        }
+        TuiEngineEvent::PtyExited {
+            thread_id,
+            exit_code,
+        } => {
+            app.pty_exit_codes.insert(thread_id.clone(), exit_code);
+            if let Some(snap) = app.pty_screens.get_mut(&thread_id) {
+                snap.exited = true;
+                snap.exit_code = exit_code;
+            }
+            let status = if exit_code.is_some_and(|c| c != 0) {
+                "error"
+            } else {
+                "idle"
+            };
+            app.thread_statuses.insert(thread_id, status.to_string());
+        }
         TuiEngineEvent::Error { message } => {
             let active = app.active_thread_id.clone();
             app.streaming_assistant_threads.remove(&active);
@@ -1546,6 +1637,14 @@ enum RunnerLocalEvent {
         summary: Option<String>,
     },
     MergeAborted(String),
+    PtySnapshotLoaded {
+        thread_id: String,
+        snapshot: PtyScreenSnapshot,
+    },
+    WorktreeReady {
+        thread_id: String,
+        path: String,
+    },
 }
 
 async fn poll_metadata_to_local(
@@ -1797,7 +1896,134 @@ fn dispatch_action(
                 }
             });
         }
+        AppAction::CreateTerminal {
+            parent_thread_id,
+            title,
+            cwd,
+            rows,
+            cols,
+        } => {
+            tokio::spawn(async move {
+                match engine
+                    .create_terminal(
+                        parent_thread_id.as_deref(),
+                        title.as_deref(),
+                        cwd.as_deref(),
+                        rows,
+                        cols,
+                    )
+                    .await
+                {
+                    Ok(thread) => {
+                        let optimistic = ThreadMeta {
+                            thread_id: thread.id.clone(),
+                            parent_thread_id,
+                            inherited_turn_count: 0,
+                            merged: false,
+                            kind: grein_core::ThreadKind::Terminal,
+                            cwd,
+                        };
+                        let _ =
+                            local_ev_tx.send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::ThreadCreated { thread },
+                        ));
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Create terminal failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::PtyWrite { thread_id, bytes } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.pty_write(&thread_id, bytes).await {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Terminal input failed: {err}"
+                    )));
+                }
+            });
+        }
+        AppAction::PtyResize {
+            thread_id,
+            rows,
+            cols,
+        } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.pty_resize(&thread_id, rows, cols).await {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Terminal resize failed: {err}"
+                    )));
+                }
+            });
+        }
+        AppAction::PtySnapshot {
+            thread_id,
+            rows,
+            cols,
+        } => {
+            tokio::spawn(async move {
+                match engine.pty_snapshot(&thread_id, rows, cols).await {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::PtySnapshotLoaded {
+                            thread_id,
+                            snapshot,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Terminal snapshot failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::EnsureThreadWorktree { thread_id } => {
+            tokio::spawn(async move {
+                match engine.ensure_thread_worktree(&thread_id).await {
+                    Ok(path) => {
+                        let _ = local_ev_tx
+                            .send(RunnerLocalEvent::WorktreeReady { thread_id, path });
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Worktree failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
         AppAction::Scrolled { .. } | AppAction::None => {}
+    }
+}
+
+fn drain_pending_actions(
+    app: &mut App,
+    engine: &Arc<dyn TuiEnginePort>,
+    local_ev_tx: &mpsc::UnboundedSender<RunnerLocalEvent>,
+    err_tx: &mpsc::UnboundedSender<(Option<String>, String)>,
+    pending_local_merges: &mut HashMap<String, usize>,
+) {
+    while let Some(action) = app.pending_actions.pop_front() {
+        if let AppAction::MergeBranch {
+            ref source_thread_id,
+            ..
+        } = action
+        {
+            *pending_local_merges
+                .entry(source_thread_id.clone())
+                .or_default() += 1;
+        }
+        dispatch_action(
+            Arc::clone(engine),
+            action,
+            local_ev_tx.clone(),
+            err_tx.clone(),
+        );
     }
 }
 
@@ -1900,9 +2126,23 @@ pub async fn run_with_engine_events<B: Backend>(
         handle_streamed_engine_event(&mut app, event, &mut pending_local_merges);
     }
     let mut tick = tokio::time::interval(Duration::from_millis(50));
+    drain_pending_actions(
+        &mut app,
+        &engine,
+        &local_ev_tx,
+        &err_tx,
+        &mut pending_local_merges,
+    );
 
     loop {
         draw_frame_mut(terminal, &mut app)?;
+        drain_pending_actions(
+            &mut app,
+            &engine,
+            &local_ev_tx,
+            &err_tx,
+            &mut pending_local_merges,
+        );
         if app.should_quit() {
             break;
         }
@@ -1913,19 +2153,13 @@ pub async fn run_with_engine_events<B: Backend>(
                     break;
                 };
                 handle_event(&mut app, ev)?;
-                while let Some(action) = app.pending_actions.pop_front() {
-                    if let AppAction::MergeBranch { ref source_thread_id, .. } = action {
-                        *pending_local_merges
-                            .entry(source_thread_id.clone())
-                            .or_default() += 1;
-                    }
-                    dispatch_action(
-                        Arc::clone(&engine),
-                        action,
-                        local_ev_tx.clone(),
-                        err_tx.clone(),
-                    );
-                }
+                drain_pending_actions(
+                    &mut app,
+                    &engine,
+                    &local_ev_tx,
+                    &err_tx,
+                    &mut pending_local_merges,
+                );
             }
             Some(event) = engine_events.recv() => {
                 handle_streamed_engine_event(&mut app, event, &mut pending_local_merges);
@@ -1937,10 +2171,25 @@ pub async fn run_with_engine_events<B: Backend>(
                         if !app.thread_meta.contains_key(&meta.thread_id) {
                             app.thread_meta.insert(meta.thread_id.clone(), meta);
                             rebuild_tree_nodes(&mut app);
+                            app.sync_focus_for_active_thread();
+                            let active = app.active_thread_id.clone();
+                            app.maybe_request_pty_snapshot(&active);
                         }
                     }
                     RunnerLocalEvent::StatusNotice(notice) => {
                         app.status_notice = Some(notice);
+                    }
+                    RunnerLocalEvent::PtySnapshotLoaded { thread_id, snapshot } => {
+                        apply_engine_event(
+                            &mut app,
+                            TuiEngineEvent::PtyScreenUpdated { thread_id, snapshot },
+                        );
+                    }
+                    RunnerLocalEvent::WorktreeReady { thread_id, path } => {
+                        if let Some(meta) = app.thread_meta.get_mut(&thread_id) {
+                            meta.cwd = Some(path.clone());
+                        }
+                        app.status_notice = Some(format!("Worktree ready: {path}"));
                     }
                     RunnerLocalEvent::OpenConfigPicker {
                         snapshot,
@@ -2045,19 +2294,13 @@ pub async fn run_with_engine_events<B: Backend>(
                         }
                     }
                 }
-                while let Some(action) = app.pending_actions.pop_front() {
-                    if let AppAction::MergeBranch { ref source_thread_id, .. } = action {
-                        *pending_local_merges
-                            .entry(source_thread_id.clone())
-                            .or_default() += 1;
-                    }
-                    dispatch_action(
-                        Arc::clone(&engine),
-                        action,
-                        local_ev_tx.clone(),
-                        err_tx.clone(),
-                    );
-                }
+                drain_pending_actions(
+                    &mut app,
+                    &engine,
+                    &local_ev_tx,
+                    &err_tx,
+                    &mut pending_local_merges,
+                );
             }
             Some((thread_id_opt, message)) = err_rx.recv() => {
                 let target_thread = thread_id_opt.unwrap_or_else(|| app.active_thread_id.clone());

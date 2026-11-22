@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::app::{AppState, ConfigPickerModal, PaneFocus};
-use crate::engine_port::{SubagentSnapshot, SubagentStatus};
-use crate::layout::{compute_layout_with_chrome_and_sidebar, subagent_strip_height};
+use crate::engine_port::{PtyCell, PtyColor, SubagentSnapshot, SubagentStatus};
+use crate::layout::{compute_layout_with_options, subagent_strip_height};
 use crate::runner::{compute_ordered_thread_entries, compute_ordered_thread_indices};
 use crate::ui::tree::{compute_tree_scroll_offset, TreeNode};
 use ratatui::layout::{Position, Rect};
@@ -191,8 +191,30 @@ fn render_thread_row(
 ) -> Line<'static> {
     let is_active = id == state.active_thread_id;
     let is_merged = state.thread_meta.get(id).is_some_and(|m| m.merged);
-    let glyph_opt =
-        thread_status_glyph(state.thread_statuses.get(id).map(String::as_str), depth);
+    let is_terminal = state.is_terminal_thread(id);
+    let exit_code_opt = state.terminal_exit_code(id);
+    let glyph_opt = if is_terminal {
+        let color = match exit_code_opt {
+            Some(Some(c)) if c != 0 => Color::Red,
+            Some(_) => Color::DarkGray,
+            None => Color::Cyan,
+        };
+        Some((">_", color))
+    } else {
+        thread_status_glyph(state.thread_statuses.get(id).map(String::as_str), depth)
+    };
+    let exit_badge = exit_code_opt.map(|code_opt| {
+        let label = match code_opt {
+            Some(c) => format!(" [exit {c}]"),
+            None => " [exited]".to_string(),
+        };
+        let color = if code_opt.is_some_and(|c| c != 0) {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
+        (label, color)
+    });
 
     if is_selected {
         let style = Style::default()
@@ -203,6 +225,12 @@ fn render_thread_row(
             None => format!("{prefix}{title}"),
         };
         let mut spans = vec![Span::styled(label, style)];
+        if let Some((badge, color)) = exit_badge {
+            spans.push(Span::styled(
+                badge,
+                Style::default().fg(color).add_modifier(Modifier::REVERSED),
+            ));
+        }
         if is_merged {
             spans.push(Span::styled(
                 " [joined]",
@@ -231,6 +259,9 @@ fn render_thread_row(
             ));
         }
         spans.push(Span::styled(title.to_string(), title_style));
+        if let Some((badge, color)) = exit_badge {
+            spans.push(Span::styled(badge, Style::default().fg(color)));
+        }
         if is_merged {
             spans.push(Span::styled(
                 " [joined]",
@@ -349,6 +380,9 @@ struct RenderMetrics {
     transcript_inner_height: u16,
     composer_scroll_y: u16,
     help_scroll_offset: u16,
+    frame_area: Rect,
+    terminal_inner_size: Option<(u16, u16)>,
+    display_is_preview: bool,
 }
 
 pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
@@ -359,6 +393,23 @@ pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
     state.tree.scroll_offset = metrics.tree_scroll;
     state.transcript_viewport_height = metrics.transcript_inner_height;
     state.composer_scroll_y = metrics.composer_scroll_y;
+    state.last_frame_area = Some(metrics.frame_area);
+    if let Some((rows, cols)) = metrics.terminal_inner_size {
+        if rows >= 1 && cols >= 1 {
+            state.terminal_pane_size = (rows, cols);
+            if !metrics.display_is_preview && state.active_is_terminal() {
+                let active_id = state.active_thread_id.clone();
+                if state.last_pty_sizes.get(&active_id).copied() != Some((rows, cols)) {
+                    state.last_pty_sizes.insert(active_id.clone(), (rows, cols));
+                    state.pending_actions.push_back(crate::app::AppAction::PtyResize {
+                        thread_id: active_id,
+                        rows,
+                        cols,
+                    });
+                }
+            }
+        }
+    }
     if state.show_help_modal {
         state.help_scroll_offset = metrics.help_scroll_offset;
     }
@@ -454,6 +505,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
     }
 
     let active_id = state.active_thread_id();
+    let active_is_terminal = state.is_terminal_thread(active_id);
     let status = state
         .thread_statuses
         .get(active_id)
@@ -470,41 +522,66 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
         .map(String::as_str)
         .filter(|t| !t.trim().is_empty());
 
-    let is_busy = matches!(status, "streaming" | "executing" | "thinking")
-        || active_tool.is_some()
-        || thought.is_some();
+    let is_busy = !active_is_terminal
+        && (matches!(status, "streaming" | "executing" | "thinking")
+            || active_tool.is_some()
+            || thought.is_some());
 
-    let left_hint = if is_busy {
+    let left_hint = if active_is_terminal && state.focused_pane == PaneFocus::Terminal {
+        "Ctrl+G for tree"
+    } else if is_busy {
         "esc to cancel"
     } else {
         "? for help"
     };
 
-    let (model_opt, mode_opt) = state
-        .thread_agent_meta
-        .get(active_id)
-        .map(|(m, md)| (m.as_deref(), md.as_deref()))
-        .unwrap_or((None, None));
-    let mode = mode_opt.filter(|s| !s.trim().is_empty()).unwrap_or("agent");
-    let model = model_opt
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("default");
-
-    let spin = SPINNER_FRAMES[(state.tick_count as usize) % SPINNER_FRAMES.len()];
-    let (live_status, status_color) = if let Some(tool) = active_tool {
-        (format!("{spin} tool: {tool}"), Color::Yellow)
-    } else if let Some(th) = thought {
-        let preview = truncate_single_line(th, 24);
-        (format!("{spin} thinking: {preview}"), Color::Yellow)
+    let (mode, model, live_status, status_color) = if active_is_terminal {
+        let cwd_label = state
+            .thread_meta
+            .get(active_id)
+            .and_then(|m| m.cwd.as_deref())
+            .filter(|s| !s.trim().is_empty())
+            .map(|c| truncate_single_line(c, 28))
+            .unwrap_or_else(|| "pty".to_string());
+        let (st, col) = match state.terminal_exit_code(active_id) {
+            Some(Some(0)) => ("✓ exit 0".to_string(), Color::DarkGray),
+            Some(Some(code)) => (format!("✖ exit {code}"), Color::Red),
+            Some(None) => ("✓ exited".to_string(), Color::DarkGray),
+            None => ("● running".to_string(), Color::Green),
+        };
+        ("terminal".to_string(), cwd_label, st, col)
     } else {
-        match status {
-            "thinking" => (format!("{spin} thinking"), Color::Yellow),
-            "executing" => (format!("{spin} executing"), Color::Yellow),
-            "streaming" => (format!("{spin} streaming"), Color::Yellow),
-            "error" => ("⚠ error".to_string(), Color::Red),
-            "permission" | "permission_required" => ("⚠ permission".to_string(), Color::Red),
-            _ => ("✓ idle".to_string(), Color::Green),
-        }
+        let (model_opt, mode_opt) = state
+            .thread_agent_meta
+            .get(active_id)
+            .map(|(m, md)| (m.as_deref(), md.as_deref()))
+            .unwrap_or((None, None));
+        let mode = mode_opt
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("agent")
+            .to_string();
+        let model = model_opt
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("default")
+            .to_string();
+
+        let spin = SPINNER_FRAMES[(state.tick_count as usize) % SPINNER_FRAMES.len()];
+        let (live_status, status_color) = if let Some(tool) = active_tool {
+            (format!("{spin} tool: {tool}"), Color::Yellow)
+        } else if let Some(th) = thought {
+            let preview = truncate_single_line(th, 24);
+            (format!("{spin} thinking: {preview}"), Color::Yellow)
+        } else {
+            match status {
+                "thinking" => (format!("{spin} thinking"), Color::Yellow),
+                "executing" => (format!("{spin} executing"), Color::Yellow),
+                "streaming" => (format!("{spin} streaming"), Color::Yellow),
+                "error" => ("⚠ error".to_string(), Color::Red),
+                "permission" | "permission_required" => ("⚠ permission".to_string(), Color::Red),
+                _ => ("✓ idle".to_string(), Color::Green),
+            }
+        };
+        (mode, model, live_status, status_color)
     };
 
     let sa_label = if subagent_count == 1 {
@@ -744,7 +821,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                     "Alt+↑/↓, PgUp/PgDn",
                     "Scroll Transcript (Alt+Home/End top/btm)",
                 ),
-                ("Esc / Ctrl+G", "Toggle Composer / ᛇ Grein (Esc cancels)"),
+                ("Esc / Ctrl+G", "Toggle Composer/Term & Tree (Esc cancels)"),
                 (
                     "Ctrl+N / Alt+N, Alt+R / F2",
                     "Fork branch / new root / rename context",
@@ -759,8 +836,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
             "── ᛇ Grein Navigation ──",
             &[
                 (
-                    "j/k/↑/↓, Enter, J / K",
-                    "Browse (preview) / activate / switch root",
+                    "j/k/↑/↓, Enter/l, J / K",
+                    "Browse (preview) / enter / switch root",
                 ),
                 (
                     "Ctrl+U / Ctrl+D, g / G",
@@ -770,7 +847,10 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                     "n / r / m (ᛇ Grein)",
                     "New root/rename/join (f fork, d/x close)",
                 ),
-                ("z / y / q (ᛇ Grein)", "Copy zoom / copy last reply / quit"),
+                (
+                    "t / T, z / y / q (ᛇ Grein)",
+                    "Child/root terminal, zoom / copy / quit",
+                ),
             ],
         ),
         (
@@ -785,7 +865,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                     "Alt+←/→, Ctrl+←/→, Alt+B/F",
                     "Word move, Ctrl+K/U/W, Ctrl+Y/Ctrl+D/Alt+D",
                 ),
-                ("!cmd", "Run shell command in active context"),
+                ("!cmd, /term [path]", "Shell cmd / open terminal (/worktree)"),
                 (
                     "/fork, /grein, /root, /new",
                     "Fork (/branch) / create blank root",
@@ -871,49 +951,208 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
     scroll_y
 }
 
+fn map_pty_color(color: PtyColor) -> Color {
+    match color {
+        PtyColor::Default => Color::Reset,
+        PtyColor::Indexed(idx) => Color::Indexed(idx),
+        PtyColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn pty_cell_style(cell: &PtyCell) -> Style {
+    let mut style = Style::default()
+        .fg(map_pty_color(cell.fg))
+        .bg(map_pty_color(cell.bg));
+    if cell.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if cell.inverse {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+fn render_terminal_pane(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    display_thread_id: &str,
+    preview_title: Option<&str>,
+    terminal_focused: bool,
+) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    let borders = if state.sidebar_hidden {
+        Borders::TOP | Borders::BOTTOM
+    } else {
+        Borders::ALL
+    };
+    let thread_title = state
+        .threads
+        .iter()
+        .find(|t| t.id == display_thread_id)
+        .map(|t| t.title.as_str())
+        .unwrap_or("Terminal");
+    let exit_suffix = match state.terminal_exit_code(display_thread_id) {
+        Some(Some(c)) => format!(" [exit {c}]"),
+        Some(None) => " [exited]".to_string(),
+        None => String::new(),
+    };
+    let title = match preview_title {
+        Some(t) => format!(" Terminal (Preview: {t}){exit_suffix} "),
+        None => {
+            if let Some(cwd) = state
+                .thread_meta
+                .get(display_thread_id)
+                .and_then(|m| m.cwd.as_deref())
+                .filter(|s| !s.trim().is_empty())
+            {
+                format!(" Terminal: {thread_title} ({cwd}){exit_suffix} ")
+            } else {
+                format!(" Terminal: {thread_title}{exit_suffix} ")
+            }
+        }
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(borders)
+        .border_style(border_style(terminal_focused));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    if let Some(snap) = state.pty_screens.get(display_thread_id) {
+        let buf = f.buffer_mut();
+        for r in 0..inner.height {
+            let Some(row) = snap.cells.get(r as usize) else {
+                break;
+            };
+            let y = inner.y + r;
+            for c in 0..inner.width {
+                let Some(cell) = row.get(c as usize) else {
+                    break;
+                };
+                if cell.is_wide_continuation {
+                    continue;
+                }
+                let x = inner.x + c;
+                let style = pty_cell_style(cell);
+                let sym = if cell.contents.is_empty() {
+                    " "
+                } else {
+                    cell.contents.as_str()
+                };
+                let w = Span::raw(sym).width();
+                let remaining = (inner.width - c) as usize;
+                if w == 0 || w > remaining {
+                    buf[(x, y)].set_symbol(" ").set_style(style);
+                } else {
+                    buf.set_stringn(x, y, sym, remaining, style);
+                }
+            }
+        }
+
+        if terminal_focused
+            && preview_title.is_none()
+            && !snap.hide_cursor
+            && !snap.exited
+            && state.pending_permission.is_none()
+            && state.config_picker.is_none()
+            && !state.show_help_modal
+        {
+            let cursor_x = inner.x + snap.cursor_col.min(inner.width.saturating_sub(1));
+            let cursor_y = inner.y + snap.cursor_row.min(inner.height.saturating_sub(1));
+            f.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
+    } else {
+        let msg = if state.terminal_exit_code(display_thread_id).is_some() {
+            "Terminal process exited"
+        } else {
+            "Starting terminal..."
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+    }
+
+    Some((inner.height, inner.width))
+}
+
 fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let active_id = state.active_thread_id();
+    let active_is_terminal = state.is_terminal_thread(active_id);
+    let show_composer = !active_is_terminal || state.pending_rename_thread_id.is_some();
     let active_subagents: &[SubagentSnapshot] = state
         .thread_subagents
         .get(active_id)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let strip_h = subagent_strip_height(active_subagents.len());
-    let mut layout =
-        compute_layout_with_chrome_and_sidebar(f.area(), strip_h, state.sidebar_hidden);
-
-    let composer_inner_width = layout.composer_area.width.saturating_sub(2);
-    let composer_layout = layout_composer_text(
-        &state.input_buffer,
-        state.cursor_position,
-        composer_inner_width as usize,
+    let mut layout = compute_layout_with_options(
+        f.area(),
+        strip_h,
+        state.sidebar_hidden,
+        !show_composer,
     );
-    let visual_line_count = composer_layout.lines.len().max(1) as u16;
-    let max_composer_h = layout
-        .transcript_area
-        .height
-        .saturating_add(layout.composer_area.height)
-        .saturating_sub(3)
-        .max(3);
-    let desired_height = (visual_line_count + 2).clamp(3, 10).min(max_composer_h);
-    if desired_height > layout.composer_area.height {
-        let delta = desired_height - layout.composer_area.height;
-        layout.tree_area.height = layout.tree_area.height.saturating_sub(delta);
-        layout.transcript_area.height = layout.transcript_area.height.saturating_sub(delta);
-        layout.composer_area.y = layout.composer_area.y.saturating_sub(delta);
-        layout.composer_area.height = desired_height;
-    }
+
+    let (composer_layout, visual_line_count) = if show_composer && layout.composer_area.height > 0
+    {
+        let composer_inner_width = layout.composer_area.width.saturating_sub(2);
+        let composer_layout = layout_composer_text(
+            &state.input_buffer,
+            state.cursor_position,
+            composer_inner_width as usize,
+        );
+        let visual_line_count = composer_layout.lines.len().max(1) as u16;
+        let max_composer_h = layout
+            .transcript_area
+            .height
+            .saturating_add(layout.composer_area.height)
+            .saturating_sub(3)
+            .max(3);
+        let desired_height = (visual_line_count + 2).clamp(3, 10).min(max_composer_h);
+        if desired_height > layout.composer_area.height {
+            let delta = desired_height - layout.composer_area.height;
+            layout.tree_area.height = layout.tree_area.height.saturating_sub(delta);
+            layout.transcript_area.height = layout.transcript_area.height.saturating_sub(delta);
+            layout.composer_area.y = layout.composer_area.y.saturating_sub(delta);
+            layout.composer_area.height = desired_height;
+        }
+        (Some(composer_layout), visual_line_count)
+    } else {
+        (None, 0)
+    };
 
     let focused_debug = format!("{:?}", state.focused_pane());
     let tree_focused = state.active_focus == PaneFocus::Tree
         || state.focused_pane == PaneFocus::Tree
         || state.focus == PaneFocus::Tree;
     let transcript_focused = focused_debug.contains("Transcript");
-    let composer_focused = focused_debug.contains("Composer")
-        || focused_debug.contains("Input")
-        || state.active_focus == PaneFocus::Composer
-        || state.focused_pane == PaneFocus::Composer
-        || state.focus == PaneFocus::Composer;
+    let terminal_focused = state.active_focus == PaneFocus::Terminal
+        || state.focused_pane == PaneFocus::Terminal
+        || state.focus == PaneFocus::Terminal;
+    let composer_focused = show_composer
+        && (focused_debug.contains("Composer")
+            || focused_debug.contains("Input")
+            || state.active_focus == PaneFocus::Composer
+            || state.focused_pane == PaneFocus::Composer
+            || state.focus == PaneFocus::Composer);
 
     let tree_scroll = if state.sidebar_hidden {
         state.tree.scroll_offset
@@ -927,137 +1166,158 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         None
     };
     let display_thread_id = preview.map(|(id, _)| id).unwrap_or(active_id);
-    let display_md: &str = if display_thread_id == active_id {
-        &state.active_transcript_md
-    } else {
-        state
-            .thread_transcripts
-            .get(display_thread_id)
-            .map(String::as_str)
-            .unwrap_or("")
-    };
+    let display_is_terminal = state.is_terminal_thread(display_thread_id);
 
-    let transcript_borders = if state.sidebar_hidden {
-        Borders::TOP | Borders::BOTTOM
-    } else {
-        Borders::ALL
-    };
-    let transcript_inner_width = if state.sidebar_hidden {
-        layout.transcript_area.width
-    } else {
-        layout.transcript_area.width.saturating_sub(2)
-    };
-    let transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
-    let use_blocks = state.has_synchronized_blocks(display_thread_id, display_md);
+    let mut max_scroll_u16 = 0u16;
+    let mut transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
+    let mut terminal_inner_size = None;
 
-    let mut transcript_lines = Vec::new();
-    if let Some(meta) = state.thread_meta.get(display_thread_id) {
-        if let Some(ref parent_id) = meta.parent_thread_id {
-            let parent_title = state
-                .threads
-                .iter()
-                .find(|t| t.id == *parent_id)
-                .map(|t| t.title.as_str())
-                .unwrap_or(parent_id.as_str());
-            let banner = format!(
-                "> ↳ Forked from {parent_title} ({} ancestor turns in LLM context)",
-                meta.inherited_turn_count
-            );
-            transcript_lines.push(Line::from(Span::styled(
-                banner,
-                Style::default().fg(Color::DarkGray),
-            )));
-            let has_body = if use_blocks {
-                state
-                    .thread_blocks
-                    .get(display_thread_id)
-                    .is_some_and(|b| !b.is_empty())
-            } else {
-                !display_md.trim().is_empty()
-            };
-            if has_body {
-                transcript_lines.push(Line::raw(""));
+    if display_is_terminal {
+        terminal_inner_size = render_terminal_pane(
+            f,
+            layout.transcript_area,
+            state,
+            display_thread_id,
+            preview.map(|(_, title)| title),
+            terminal_focused,
+        );
+    } else {
+        let display_md: &str = if display_thread_id == active_id {
+            &state.active_transcript_md
+        } else {
+            state
+                .thread_transcripts
+                .get(display_thread_id)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+
+        let transcript_borders = if state.sidebar_hidden {
+            Borders::TOP | Borders::BOTTOM
+        } else {
+            Borders::ALL
+        };
+        let transcript_inner_width = if state.sidebar_hidden {
+            layout.transcript_area.width
+        } else {
+            layout.transcript_area.width.saturating_sub(2)
+        };
+        transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
+        let use_blocks = state.has_synchronized_blocks(display_thread_id, display_md);
+
+        let mut transcript_lines = Vec::new();
+        if let Some(meta) = state.thread_meta.get(display_thread_id) {
+            if let Some(ref parent_id) = meta.parent_thread_id {
+                let parent_title = state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == *parent_id)
+                    .map(|t| t.title.as_str())
+                    .unwrap_or(parent_id.as_str());
+                let banner = format!(
+                    "> ↳ Forked from {parent_title} ({} ancestor turns in LLM context)",
+                    meta.inherited_turn_count
+                );
+                transcript_lines.push(Line::from(Span::styled(
+                    banner,
+                    Style::default().fg(Color::DarkGray),
+                )));
+                let has_body = if use_blocks {
+                    state
+                        .thread_blocks
+                        .get(display_thread_id)
+                        .is_some_and(|b| !b.is_empty())
+                } else {
+                    !display_md.trim().is_empty()
+                };
+                if has_body {
+                    transcript_lines.push(Line::raw(""));
+                }
             }
         }
-    }
 
-    if use_blocks {
-        if let Some(blocks) = state.thread_blocks.get(display_thread_id) {
-            transcript_lines.extend(blocks.render_lines(transcript_inner_width as usize));
+        if use_blocks {
+            if let Some(blocks) = state.thread_blocks.get(display_thread_id) {
+                transcript_lines.extend(blocks.render_lines(transcript_inner_width as usize));
+            }
+        } else {
+            transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
+                display_md,
+                transcript_inner_width as usize,
+            ));
         }
-    } else {
-        transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
-            display_md,
-            transcript_inner_width as usize,
-        ));
+
+        let wrapped_lines =
+            crate::markdown::wrap_styled_lines(transcript_lines, transcript_inner_width as usize);
+        let visual_lines = wrapped_lines.len();
+        max_scroll_u16 = visual_lines
+            .saturating_sub(transcript_inner_height as usize)
+            .min(u16::MAX as usize) as u16;
+        let vp = state.transcript_viewport(display_thread_id);
+        let transcript_scroll_y = if vp.auto_scroll() {
+            max_scroll_u16
+        } else {
+            (vp.scroll_offset() as u16).min(max_scroll_u16)
+        };
+        let transcript_title = match preview {
+            Some((_, title)) => format!(" Transcript (Preview: {title}) "),
+            None => " Transcript ".to_string(),
+        };
+        let transcript_block = Block::default()
+            .title(transcript_title)
+            .borders(transcript_borders)
+            .border_style(border_style(transcript_focused));
+        let transcript_widget = Paragraph::new(wrapped_lines)
+            .block(transcript_block)
+            .scroll((transcript_scroll_y, 0));
+        f.render_widget(transcript_widget, layout.transcript_area);
     }
 
-    let wrapped_lines =
-        crate::markdown::wrap_styled_lines(transcript_lines, transcript_inner_width as usize);
-    let visual_lines = wrapped_lines.len();
-    let max_scroll_u16 = visual_lines
-        .saturating_sub(transcript_inner_height as usize)
-        .min(u16::MAX as usize) as u16;
-    let vp = state.transcript_viewport(display_thread_id);
-    let transcript_scroll_y = if vp.auto_scroll() {
-        max_scroll_u16
-    } else {
-        (vp.scroll_offset() as u16).min(max_scroll_u16)
-    };
-    let transcript_title = match preview {
-        Some((_, title)) => format!(" Transcript (Preview: {title}) "),
-        None => " Transcript ".to_string(),
-    };
-    let transcript_block = Block::default()
-        .title(transcript_title)
-        .borders(transcript_borders)
-        .border_style(border_style(transcript_focused));
-    let transcript_widget = Paragraph::new(wrapped_lines)
-        .block(transcript_block)
-        .scroll((transcript_scroll_y, 0));
-    f.render_widget(transcript_widget, layout.transcript_area);
+    let mut composer_scroll_y = state.composer_scroll_y;
+    if let Some(composer_layout) = composer_layout {
+        let composer_inner_width = layout.composer_area.width.saturating_sub(2);
+        let composer_block = Block::default()
+            .title(" Composer ")
+            .borders(Borders::ALL)
+            .border_style(border_style(composer_focused));
 
-    let composer_block = Block::default()
-        .title(" Composer ")
-        .borders(Borders::ALL)
-        .border_style(border_style(composer_focused));
+        let inner_height = layout.composer_area.height.saturating_sub(2).max(1);
+        let max_composer_scroll = visual_line_count.saturating_sub(inner_height);
+        composer_scroll_y = state.composer_scroll_y.min(max_composer_scroll);
+        if composer_layout.cursor_row < composer_scroll_y {
+            composer_scroll_y = composer_layout.cursor_row;
+        } else if composer_layout.cursor_row >= composer_scroll_y + inner_height {
+            composer_scroll_y = composer_layout.cursor_row + 1 - inner_height;
+        }
 
-    let inner_height = layout.composer_area.height.saturating_sub(2).max(1);
-    let max_composer_scroll = visual_line_count.saturating_sub(inner_height);
-    let mut composer_scroll_y = state.composer_scroll_y.min(max_composer_scroll);
-    if composer_layout.cursor_row < composer_scroll_y {
-        composer_scroll_y = composer_layout.cursor_row;
-    } else if composer_layout.cursor_row >= composer_scroll_y + inner_height {
-        composer_scroll_y = composer_layout.cursor_row + 1 - inner_height;
+        let composer_widget = Paragraph::new(composer_layout.lines)
+            .block(composer_block)
+            .scroll((composer_scroll_y, 0));
+        f.render_widget(composer_widget, layout.composer_area);
+
+        if composer_focused
+            && state.pending_permission.is_none()
+            && state.config_picker.is_none()
+            && !state.show_help_modal
+        {
+            let visible_row = composer_layout.cursor_row.saturating_sub(composer_scroll_y);
+            let cursor_x = layout.composer_area.x
+                + 1
+                + composer_layout
+                    .cursor_col
+                    .min(composer_inner_width.saturating_sub(1));
+            let cursor_y = layout.composer_area.y
+                + 1
+                + visible_row.min(inner_height.saturating_sub(1));
+            f.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
     }
-
-    let composer_widget = Paragraph::new(composer_layout.lines)
-        .block(composer_block)
-        .scroll((composer_scroll_y, 0));
-    f.render_widget(composer_widget, layout.composer_area);
 
     if let Some(strip_area) = layout.subagent_strip_area {
         render_subagent_strip(f, strip_area, active_subagents);
     }
 
     render_status_bar(f, layout.status_bar_area, state, active_subagents.len());
-
-    if composer_focused
-        && state.pending_permission.is_none()
-        && state.config_picker.is_none()
-        && !state.show_help_modal
-    {
-        let visible_row = composer_layout.cursor_row.saturating_sub(composer_scroll_y);
-        let cursor_x = layout.composer_area.x
-            + 1
-            + composer_layout
-                .cursor_col
-                .min(composer_inner_width.saturating_sub(1));
-        let cursor_y = layout.composer_area.y
-            + 1
-            + visible_row.min(inner_height.saturating_sub(1));
-        f.set_cursor_position(Position::new(cursor_x, cursor_y));
-    }
 
     let mut rendered_help_scroll = state.help_scroll_offset;
     if let Some(perm) = &state.pending_permission {
@@ -1105,6 +1365,9 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         transcript_inner_height,
         composer_scroll_y,
         help_scroll_offset: rendered_help_scroll,
+        frame_area: f.area(),
+        terminal_inner_size,
+        display_is_preview: preview.is_some(),
     }
 }
 

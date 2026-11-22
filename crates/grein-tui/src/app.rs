@@ -4,7 +4,8 @@ use std::io::IsTerminal;
 use thiserror::Error;
 
 use crate::engine_port::{
-    AgentConfigChoice, AgentConfigOption, AgentSlashCommand, SubagentSnapshot, ThreadMeta,
+    AgentConfigChoice, AgentConfigOption, AgentSlashCommand, PtyScreenSnapshot, SubagentSnapshot,
+    ThreadMeta,
 };
 use crate::runner::{compute_ordered_thread_entries, OrderedThreadEntry};
 use crate::transcript::{
@@ -29,6 +30,7 @@ pub enum FocusedPane {
     Transcript,
     #[default]
     Composer,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,6 +111,30 @@ pub enum AppAction {
     FetchAgentCommands {
         thread_id: String,
     },
+    CreateTerminal {
+        parent_thread_id: Option<String>,
+        title: Option<String>,
+        cwd: Option<String>,
+        rows: u16,
+        cols: u16,
+    },
+    PtyWrite {
+        thread_id: String,
+        bytes: Vec<u8>,
+    },
+    PtyResize {
+        thread_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    PtySnapshot {
+        thread_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    EnsureThreadWorktree {
+        thread_id: String,
+    },
 }
 
 pub trait TuiComponent {
@@ -132,11 +158,13 @@ impl FocusedPane {
                 Self::Tree => Self::Transcript,
                 Self::Transcript => Self::Composer,
                 Self::Composer => Self::Tree,
+                Self::Terminal => Self::Tree,
             },
             FocusDirection::Backward => match self {
                 Self::Tree => Self::Composer,
                 Self::Composer => Self::Transcript,
                 Self::Transcript => Self::Tree,
+                Self::Terminal => Self::Tree,
             },
         }
     }
@@ -146,6 +174,7 @@ impl FocusedPane {
             Self::Tree => Self::Composer,
             Self::Composer => Self::Transcript,
             Self::Transcript => Self::Tree,
+            Self::Terminal => Self::Tree,
         }
     }
 }
@@ -251,6 +280,11 @@ pub struct App {
     pub status_notice: Option<String>,
     pub pending_rename_thread_id: Option<String>,
     pub last_copied_text: Option<String>,
+    pub pty_screens: HashMap<String, PtyScreenSnapshot>,
+    pub pty_exit_codes: HashMap<String, Option<i32>>,
+    pub last_pty_sizes: HashMap<String, (u16, u16)>,
+    pub terminal_pane_size: (u16, u16),
+    pub last_frame_area: Option<ratatui::layout::Rect>,
 }
 
 pub type AppState = App;
@@ -299,6 +333,11 @@ impl Default for App {
             status_notice: None,
             pending_rename_thread_id: None,
             last_copied_text: None,
+            pty_screens: HashMap::new(),
+            pty_exit_codes: HashMap::new(),
+            last_pty_sizes: HashMap::new(),
+            terminal_pane_size: (0, 0),
+            last_frame_area: None,
         }
     }
 }
@@ -531,6 +570,157 @@ impl App {
         &self.active_thread_id
     }
 
+    pub fn is_terminal_thread(&self, thread_id: &str) -> bool {
+        self.thread_meta
+            .get(thread_id)
+            .is_some_and(|m| m.kind == grein_core::ThreadKind::Terminal)
+    }
+
+    pub fn active_is_terminal(&self) -> bool {
+        self.is_terminal_thread(&self.active_thread_id)
+    }
+
+    pub fn terminal_exit_code(&self, thread_id: &str) -> Option<Option<i32>> {
+        if let Some(&code) = self.pty_exit_codes.get(thread_id) {
+            Some(code)
+        } else {
+            self.pty_screens
+                .get(thread_id)
+                .filter(|s| s.exited)
+                .map(|s| s.exit_code)
+        }
+    }
+
+    pub fn current_terminal_dims_or_default(&self) -> (u16, u16) {
+        if self.terminal_pane_size.0 >= 1 && self.terminal_pane_size.1 >= 1 {
+            return self.terminal_pane_size;
+        }
+        if let Some(area) = self.last_frame_area {
+            let sub_count = self
+                .thread_subagents
+                .get(&self.active_thread_id)
+                .map_or(0, Vec::len);
+            let strip_h = crate::layout::subagent_strip_height(sub_count);
+            let (rows, cols) =
+                crate::layout::terminal_inner_size(area, strip_h, self.sidebar_hidden);
+            if rows >= 1 && cols >= 1 {
+                return (rows, cols);
+            }
+        }
+        (24, 80)
+    }
+
+    pub(crate) fn maybe_request_pty_snapshot(&mut self, thread_id: &str) {
+        if !self.is_terminal_thread(thread_id) || self.pty_screens.contains_key(thread_id) {
+            return;
+        }
+        let already_queued = self.pending_actions.iter().any(|a| {
+            matches!(a, AppAction::PtySnapshot { thread_id: tid, .. } if tid == thread_id)
+        });
+        if already_queued {
+            return;
+        }
+        let (rows, cols) = self.current_terminal_dims_or_default();
+        self.pending_actions.push_back(AppAction::PtySnapshot {
+            thread_id: thread_id.to_string(),
+            rows,
+            cols,
+        });
+    }
+
+    pub(crate) fn maybe_queue_terminal_resize(&mut self) {
+        if !self.active_is_terminal() {
+            return;
+        }
+        let Some(area) = self.last_frame_area else {
+            return;
+        };
+        let sub_count = self
+            .thread_subagents
+            .get(&self.active_thread_id)
+            .map_or(0, Vec::len);
+        let strip_h = crate::layout::subagent_strip_height(sub_count);
+        let (rows, cols) =
+            crate::layout::terminal_inner_size(area, strip_h, self.sidebar_hidden);
+        if rows >= 1 && cols >= 1 {
+            self.terminal_pane_size = (rows, cols);
+            if self.last_pty_sizes.get(&self.active_thread_id).copied() != Some((rows, cols)) {
+                self.last_pty_sizes
+                    .insert(self.active_thread_id.clone(), (rows, cols));
+                self.pending_actions.push_back(AppAction::PtyResize {
+                    thread_id: self.active_thread_id.clone(),
+                    rows,
+                    cols,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn sync_focus_for_active_thread(&mut self) {
+        if self.active_is_terminal() {
+            if matches!(
+                self.focused_pane,
+                FocusedPane::Composer | FocusedPane::Transcript
+            ) {
+                self.focused_pane = FocusedPane::Terminal;
+                self.sync_focus_out();
+            }
+        } else if self.focused_pane == FocusedPane::Terminal {
+            self.focused_pane = FocusedPane::Composer;
+            self.sync_focus_out();
+        }
+    }
+
+    pub(crate) fn dispatch_create_terminal(
+        &mut self,
+        parent_thread_id: Option<String>,
+        cwd: Option<String>,
+    ) {
+        let (rows, cols) = self.current_terminal_dims_or_default();
+        self.status_notice = None;
+        self.pending_actions.push_back(AppAction::CreateTerminal {
+            parent_thread_id,
+            title: None,
+            cwd,
+            rows,
+            cols,
+        });
+    }
+
+    fn has_active_modal(&self) -> bool {
+        self.pending_permission.is_some() || self.config_picker.is_some() || self.show_help_modal
+    }
+
+    pub fn handle_paste_event(&mut self, text: &str) -> bool {
+        self.sync_focus_in();
+        if self.has_active_modal() {
+            return false;
+        }
+        if self.focused_pane == FocusedPane::Terminal {
+            let bracketed = self
+                .pty_screens
+                .get(&self.active_thread_id)
+                .is_some_and(|s| s.bracketed_paste);
+            let bytes = crate::vt_input::encode_paste(text, bracketed);
+            if !bytes.is_empty() {
+                self.pending_actions.push_back(AppAction::PtyWrite {
+                    thread_id: self.active_thread_id.clone(),
+                    bytes,
+                });
+            }
+            self.sync_focus_out();
+            return true;
+        }
+        if self.focused_pane == FocusedPane::Composer {
+            let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
+            self.input_buffer.insert_str(pos, text);
+            self.cursor_position = pos + text.len();
+            self.sync_focus_out();
+            return true;
+        }
+        false
+    }
+
     pub fn switch_thread(&mut self, thread_id: impl Into<String>) {
         let target_thread = thread_id.into();
         self.pending_rename_thread_id = None;
@@ -558,6 +748,10 @@ impl App {
             .or_default();
         self.sync_anchors();
         self.select_active_thread_in_tree();
+        self.sync_focus_for_active_thread();
+        let active_id = self.active_thread_id.clone();
+        self.maybe_request_pty_snapshot(&active_id);
+        self.maybe_queue_terminal_resize();
     }
 
     pub fn select_active_thread_in_tree(&mut self) {
@@ -741,9 +935,14 @@ impl App {
     }
 
     fn toggle_composer_tree_focus(&mut self) {
-        if self.focused_pane == FocusedPane::Composer {
+        if matches!(
+            self.focused_pane,
+            FocusedPane::Composer | FocusedPane::Terminal
+        ) {
             self.pending_rename_thread_id = None;
             self.focused_pane = FocusedPane::Tree;
+        } else if self.active_is_terminal() {
+            self.focused_pane = FocusedPane::Terminal;
         } else {
             self.focused_pane = FocusedPane::Composer;
         }
@@ -957,10 +1156,25 @@ impl App {
         } else {
             "Sidebar shown".to_string()
         });
+        self.maybe_queue_terminal_resize();
     }
 
     pub(crate) fn copy_transcript_content(&mut self, mode: CopyMode) {
         let target_id = self.transcript_scroll_target_id();
+        if self.is_terminal_thread(&target_id) {
+            let text_opt = self
+                .pty_screens
+                .get(&target_id)
+                .map(PtyScreenSnapshot::plain_text)
+                .filter(|s| !s.trim().is_empty());
+            let Some(text) = text_opt else {
+                self.status_notice =
+                    Some("Nothing to copy (terminal screen is empty)".to_string());
+                return;
+            };
+            self.finish_copy_to_clipboard("terminal screen", text);
+            return;
+        }
         let display_md = if target_id == self.active_thread_id {
             self.active_transcript_md.as_str()
         } else {
@@ -1019,6 +1233,10 @@ impl App {
             CopyMode::CodeBlock => "code block",
             CopyMode::All => "transcript",
         };
+        self.finish_copy_to_clipboard(kind, text);
+    }
+
+    fn finish_copy_to_clipboard(&mut self, kind: &str, text: String) {
         let char_count = text.chars().count();
         self.last_copied_text = Some(text.clone());
         match crate::clipboard::copy_to_clipboard(&text) {
@@ -1252,6 +1470,14 @@ impl App {
                     .push_back(AppAction::CreateRoot { title: None });
                 None
             }
+            KeyCode::Char('t') if no_ctrl_alt => {
+                self.dispatch_create_terminal(Some(self.active_thread_id.clone()), None);
+                None
+            }
+            KeyCode::Char('T') if no_ctrl_alt => {
+                self.dispatch_create_terminal(None, None);
+                None
+            }
             KeyCode::Char('r') if no_ctrl_alt => {
                 self.begin_rename_prefill();
                 None
@@ -1266,7 +1492,7 @@ impl App {
                 self.request_delete_thread(target_id);
                 None
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('l') if no_ctrl_alt || key.code == KeyCode::Enter => {
                 if let Some(idx) = self.tree.selected_index() {
                     match self.tree.nodes.get(idx).cloned() {
                         Some(crate::ui::tree::TreeNode::Anchor(anchor)) => {
@@ -1282,7 +1508,11 @@ impl App {
                         }
                         Some(crate::ui::tree::TreeNode::Thread(thread)) => {
                             self.switch_thread(&thread.id);
-                            self.focused_pane = FocusedPane::Composer;
+                            self.focused_pane = if self.is_terminal_thread(&thread.id) {
+                                FocusedPane::Terminal
+                            } else {
+                                FocusedPane::Composer
+                            };
                             self.sync_focus_out();
                             return None;
                         }
@@ -1462,14 +1692,28 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        if ctrl && !alt && matches!(key.code, KeyCode::Char('q' | 'Q')) {
+            self.should_quit = true;
+            self.sync_focus_out();
+            return true;
+        }
+
         if ctrl
             && !alt
-            && matches!(
-                key.code,
-                KeyCode::Char('c' | 'C' | 'q' | 'Q')
-            )
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+            && (self.focused_pane != FocusedPane::Terminal || self.has_active_modal())
         {
             self.should_quit = true;
+            self.sync_focus_out();
+            return true;
+        }
+
+        if self.focused_pane == FocusedPane::Terminal
+            && ctrl
+            && !alt
+            && matches!(key.code, KeyCode::Char('g' | 'G'))
+        {
+            self.focused_pane = FocusedPane::Tree;
             self.sync_focus_out();
             return true;
         }
@@ -1525,6 +1769,30 @@ impl App {
             }
             self.sync_focus_out();
             return true;
+        }
+
+        if self.focused_pane == FocusedPane::Terminal {
+            if ctrl && !alt && matches!(key.code, KeyCode::Char('t' | 'T')) {
+                self.toggle_sidebar_zoom();
+                self.sync_focus_out();
+                return true;
+            }
+            let app_cursor = self
+                .pty_screens
+                .get(&self.active_thread_id)
+                .is_some_and(|s| s.application_cursor);
+            if let Some(bytes) = crate::vt_input::encode_key_event(key, app_cursor) {
+                if !bytes.is_empty() {
+                    self.pending_actions.push_back(AppAction::PtyWrite {
+                        thread_id: self.active_thread_id.clone(),
+                        bytes,
+                    });
+                }
+                self.sync_focus_out();
+                return true;
+            }
+            self.sync_focus_out();
+            return false;
         }
 
         // Global Transcript scrolling (active thread, or previewed thread when focused in Tree)
@@ -1584,6 +1852,15 @@ impl App {
         // Global Branch cycling within active root: Tab / Shift+Tab / BackTab
         match key.code {
             KeyCode::Tab if !ctrl && !alt => {
+                if self.focused_pane == FocusedPane::Tree && !shift {
+                    let (sel_id, _) = self.selected_tree_thread_info();
+                    if self.is_terminal_thread(&sel_id) {
+                        self.switch_thread(&sel_id);
+                        self.focused_pane = FocusedPane::Terminal;
+                        self.sync_focus_out();
+                        return true;
+                    }
+                }
                 self.cycle_branch_in_active_root(!shift);
                 self.sync_focus_out();
                 return true;
@@ -1682,7 +1959,11 @@ impl App {
                 return true;
             }
             if self.focused_pane == FocusedPane::Tree {
-                self.focused_pane = FocusedPane::Composer;
+                self.focused_pane = if self.active_is_terminal() {
+                    FocusedPane::Terminal
+                } else {
+                    FocusedPane::Composer
+                };
                 self.sync_focus_out();
                 return true;
             }
@@ -1745,6 +2026,16 @@ impl App {
             }
             KeyCode::Char('G') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
                 self.scroll_target_transcript(TranscriptScroll::Bottom);
+                return true;
+            }
+            KeyCode::Char('t') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
+                self.dispatch_create_terminal(Some(self.active_thread_id.clone()), None);
+                self.sync_focus_out();
+                return true;
+            }
+            KeyCode::Char('T') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
+                self.dispatch_create_terminal(None, None);
+                self.sync_focus_out();
                 return true;
             }
             _ => {

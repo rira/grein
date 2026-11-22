@@ -67,7 +67,48 @@ pub fn compute_layout_with_chrome_and_sidebar(
     subagent_rows: u16,
     sidebar_hidden: bool,
 ) -> ChromeLayout {
-    let (top_area, composer_area, subagent_strip_area, status_bar_area) = if subagent_rows == 0 {
+    compute_layout_with_options(area, subagent_rows, sidebar_hidden, false)
+}
+
+/// Computes the chrome layout, optionally hiding the Composer when a Terminal thread is active.
+pub fn compute_layout_with_options(
+    area: Rect,
+    subagent_rows: u16,
+    sidebar_hidden: bool,
+    composer_hidden: bool,
+) -> ChromeLayout {
+    let status_h = u16::from(area.height > 0);
+    let (top_area, composer_area, subagent_strip_area, status_bar_area) = if composer_hidden {
+        if subagent_rows == 0 {
+            let vertical = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(status_h)])
+                .split(area);
+            (
+                vertical[0],
+                Rect::new(area.x, vertical[1].y, area.width, 0),
+                None,
+                vertical[1],
+            )
+        } else {
+            let max_strip = area.height.saturating_sub(4).max(1);
+            let strip_h = subagent_rows.min(max_strip);
+            let vertical = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(0),
+                    Constraint::Length(strip_h),
+                    Constraint::Length(status_h),
+                ])
+                .split(area);
+            (
+                vertical[0],
+                Rect::new(area.x, vertical[1].y, area.width, 0),
+                Some(vertical[1]),
+                vertical[2],
+            )
+        }
+    } else if subagent_rows == 0 {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -108,4 +149,17 @@ pub fn compute_layout_with_chrome_and_sidebar(
         subagent_strip_area,
         status_bar_area,
     }
+}
+
+/// Computes the inner `(rows, cols)` of the Terminal pane for a given outer terminal frame area.
+pub fn terminal_inner_size(area: Rect, subagent_rows: u16, sidebar_hidden: bool) -> (u16, u16) {
+    let layout = compute_layout_with_options(area, subagent_rows, sidebar_hidden, true);
+    let term = layout.transcript_area;
+    let inner_cols = if sidebar_hidden {
+        term.width
+    } else {
+        term.width.saturating_sub(2)
+    };
+    let inner_rows = term.height.saturating_sub(2);
+    (inner_rows, inner_cols)
 }

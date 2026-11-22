@@ -50,7 +50,7 @@ impl From<crate::app::FocusedPane> for PaneFocus {
     fn from(pane: crate::app::FocusedPane) -> Self {
         match pane {
             crate::app::FocusedPane::Tree => Self::Workspace,
-            crate::app::FocusedPane::Transcript => Self::Logs,
+            crate::app::FocusedPane::Transcript | crate::app::FocusedPane::Terminal => Self::Logs,
             crate::app::FocusedPane::Composer => Self::Composer,
         }
     }
