@@ -635,7 +635,7 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('d') if no_ctrl_alt => {
+            KeyCode::Char('d') | KeyCode::Char('x') if no_ctrl_alt => {
                 let target_id = self
                     .tree
                     .selected_index()

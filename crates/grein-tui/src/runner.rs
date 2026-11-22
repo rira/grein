@@ -331,7 +331,7 @@ impl App {
                 self.show_help_modal = true;
                 return;
             }
-            "/delete" => {
+            "/delete" | "/close" => {
                 let target_id = if rest.is_empty() {
                     Some(self.active_thread_id.clone())
                 } else {
@@ -347,7 +347,7 @@ impl App {
                 }
                 return;
             }
-            "/branch" | "/fork" => {
+            "/branch" | "/fork" | "/grein" => {
                 let title = if rest.is_empty() {
                     None
                 } else {

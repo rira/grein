@@ -260,11 +260,32 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
         Some(AppAction::DeleteThread("t-2".to_string()))
     );
 
+    app.handle_key_event(key(KeyCode::Char('x')));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::DeleteThread("t-2".to_string()))
+    );
+
     app.set_focus(FocusedPane::Composer);
     app.submit_composer_prompt("/delete");
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::DeleteThread("t-2".to_string()))
+    );
+
+    app.submit_composer_prompt("/close");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::DeleteThread("t-2".to_string()))
+    );
+
+    app.submit_composer_prompt("/grein alt-idea");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::ForkBranch {
+            source_thread_id: "t-2".to_string(),
+            title: Some("alt-idea".to_string()),
+        })
     );
 
     // Handling ThreadDeleted removes branch state, switches active thread, rebuilds tree
