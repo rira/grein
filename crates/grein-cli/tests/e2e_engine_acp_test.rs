@@ -509,3 +509,135 @@ async fn live_agy_acp_smoke() {
         "expected CEDAR_99 from live agy branch via Shared Whiteboard injection, got: {reply2}"
     );
 }
+
+#[tokio::test]
+async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("join_and_blank_root.db");
+    let cfg = fake_acp_config(temp.path());
+
+    let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+        .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("ensure main");
+
+    // Seed Main with a secret conversation turn.
+    engine
+        .send_turn_for_thread(&main.thread_id, "MAIN_SECRET_TURN_ALPHA")
+        .await
+        .expect("main turn");
+
+    // Fork branch_a and branch_b off Main.
+    let branch_a = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("Auth Research"))
+        .await
+        .expect("fork branch_a");
+    let branch_b = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("Sibling Consumer"))
+        .await
+        .expect("fork branch_b");
+
+    engine
+        .send_turn_for_thread(&branch_a.thread_id, "analyze auth tokens")
+        .await
+        .expect("branch_a turn");
+    engine
+        .send_turn_for_thread(&branch_b.thread_id, "initial sibling prompt")
+        .await
+        .expect("branch_b turn 1");
+
+    // Run /join on branch_a -> promotes Decision to Blackboard & commits DecisionLandmark onto Main.
+    let joined = engine
+        .merge_thread_with_summary(
+            &branch_a.thread_id,
+            None,
+            Some("LANDMARK_ED25519_SELECTED"),
+        )
+        .await
+        .expect("join branch_a");
+    assert!(joined.merged);
+
+    // Live sibling receives [Shared Whiteboard Updated] delta on its next prompt.
+    engine
+        .send_turn_for_thread(&branch_b.thread_id, "ECHO_LAST_PROMPT after join")
+        .await
+        .expect("branch_b turn 2");
+    let branch_b_turns = engine
+        .get_thread_transcript(&branch_b.thread_id)
+        .await
+        .expect("branch_b transcript");
+    let echoed = &branch_b_turns.last().unwrap().content;
+    assert!(echoed.contains("[Shared Whiteboard Updated]"));
+    assert!(echoed.contains("LANDMARK_ED25519_SELECTED"));
+
+    // New child forked from Main after /join receives Decision Landmark in systemPrompt.append.
+    let branch_c = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("Post-Join Child"))
+        .await
+        .expect("fork branch_c");
+    engine
+        .send_turn_for_thread(&branch_c.thread_id, "DUMP_SYSTEM_PROMPT")
+        .await
+        .expect("branch_c dump");
+    let branch_c_turns = engine
+        .get_thread_transcript(&branch_c.thread_id)
+        .await
+        .expect("branch_c transcript");
+    let branch_c_sys = &branch_c_turns.last().unwrap().content;
+    assert!(branch_c_sys.contains("MAIN_SECRET_TURN_ALPHA"));
+    assert!(branch_c_sys.contains("# Decision Landmarks"));
+    assert!(branch_c_sys.contains("LANDMARK_ED25519_SELECTED"));
+
+    // Blank Root Context Invariant: create a brand-new root after Main turns and /join landmark.
+    let fresh_root = engine
+        .create_root_thread(Some("Blank Root"))
+        .await
+        .expect("create_root_thread");
+    assert_eq!(fresh_root.title, "Blank Root");
+    assert!(
+        engine
+            .get_thread_transcript(&fresh_root.thread_id)
+            .await
+            .expect("fresh_root initial transcript")
+            .is_empty(),
+        "new root must start with empty transcript"
+    );
+    let meta = engine.thread_metadata().await.expect("metadata");
+    let fresh_meta = meta
+        .iter()
+        .find(|m| m.thread_id == fresh_root.thread_id)
+        .expect("fresh_root meta");
+    assert_eq!(fresh_meta.parent_thread_id, None);
+    assert_eq!(fresh_meta.inherited_turn_count, 0);
+
+    // Run DUMP_SYSTEM_PROMPT on fresh_root: ZERO Main turns or Decision Landmarks may leak.
+    engine
+        .send_turn_for_thread(&fresh_root.thread_id, "DUMP_SYSTEM_PROMPT")
+        .await
+        .expect("fresh_root dump");
+    let fresh_turns = engine
+        .get_thread_transcript(&fresh_root.thread_id)
+        .await
+        .expect("fresh_root transcript after dump");
+    let fresh_sys = &fresh_turns.last().unwrap().content;
+    assert!(
+        !fresh_sys.contains("MAIN_SECRET_TURN_ALPHA"),
+        "Main turns must NOT leak into fresh root systemPrompt.append: {fresh_sys}"
+    );
+    assert!(
+        !fresh_sys.contains("# Ancestor Conversation Trunk"),
+        "fresh root must NOT have ancestor trunk section: {fresh_sys}"
+    );
+    assert!(
+        !fresh_sys.contains("# Decision Landmarks"),
+        "Main Decision Landmarks must NOT leak into fresh root: {fresh_sys}"
+    );
+    assert!(
+        !fresh_sys.contains("[Decision Landmark"),
+        "Main DecisionLandmark nodes must NOT leak into fresh root: {fresh_sys}"
+    );
+    // Session-wide Shared Context Blackboard still applies cleanly.
+    assert!(
+        fresh_sys.contains("# Shared Blackboard Working Memory"),
+        "session-wide Blackboard still applies to new root: {fresh_sys}"
+    );
+}

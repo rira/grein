@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use grein_cli::args::{AttachArgs, Command, DaemonArgs};
 use grein_cli::engine::{
-    DaemonEngine, InProcessEngine, PermissionDecisionPayload, UnixSocketEngineClient,
+    slugify_anchor, truncate_chars_with_ellipsis, DaemonEngine, InProcessEngine,
+    PermissionDecisionPayload, UnixSocketEngineClient,
 };
 use grein_tui::engine_port::{
     HydratedBlackboardEntry, HydratedSession, HydratedThread, HydratedTurn, ThreadMeta,
@@ -49,6 +50,41 @@ impl<E> EngineClientPort<E> {
 
     fn emit(&self, event: TuiEngineEvent) {
         let _ = self.events_tx.send(event);
+    }
+}
+
+impl<E: DaemonEngine> EngineClientPort<E> {
+    async fn load_hydrated_turns(&self, thread_id: &str) -> io::Result<Vec<HydratedTurn>> {
+        let entries = self
+            .client
+            .get_thread_transcript(thread_id)
+            .await
+            .map_err(to_io)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| HydratedTurn {
+                id: entry.node_id,
+                role: entry.role,
+                content: entry.content,
+            })
+            .collect())
+    }
+
+    async fn fetch_and_emit_thread_metadata(&self) -> Option<Vec<ThreadMeta>> {
+        match self.client.thread_metadata().await {
+            Ok(meta) => {
+                if !meta.is_empty() {
+                    self.emit(TuiEngineEvent::ThreadMetadataUpdated { meta: meta.clone() });
+                }
+                Some(meta)
+            }
+            Err(err) => {
+                self.emit(TuiEngineEvent::Error {
+                    message: err.to_string(),
+                });
+                None
+            }
+        }
     }
 }
 
@@ -101,11 +137,7 @@ where
             .first()
             .map(|t| t.id.clone())
             .unwrap_or(main.thread_id);
-        if let Ok(meta) = self.client.thread_metadata().await {
-            if !meta.is_empty() {
-                self.emit(TuiEngineEvent::ThreadMetadataUpdated { meta });
-            }
-        }
+        let _ = self.fetch_and_emit_thread_metadata().await;
         if let Ok(agent_metas) = self.client.agent_metadata().await {
             for entry in agent_metas {
                 if entry.model.is_some() || entry.mode.is_some() {
@@ -222,6 +254,17 @@ where
             .fork_thread_with_title(source, title)
             .await
             .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let turns = self.load_hydrated_turns(&forked.thread_id).await?;
+            self.emit(TuiEngineEvent::ThreadCreated {
+                thread: HydratedThread {
+                    id: forked.thread_id.clone(),
+                    title: forked.title,
+                    turns,
+                },
+            });
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
         Ok(forked.thread_id)
     }
 
@@ -235,29 +278,106 @@ where
             .fork_thread_with_title(Some(source_thread_id), title)
             .await
             .map_err(to_io)?;
-        let entries = self
-            .client
-            .get_thread_transcript(&forked.thread_id)
-            .await
-            .map_err(to_io)?;
-        let turns = entries
-            .into_iter()
-            .map(|entry| HydratedTurn {
-                id: entry.node_id,
-                role: entry.role,
-                content: entry.content,
-            })
-            .collect();
-        Ok(HydratedThread {
+        let turns = self.load_hydrated_turns(&forked.thread_id).await?;
+        let hydrated = HydratedThread {
             id: forked.thread_id,
             title: forked.title,
             turns,
-        })
+        };
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::ThreadCreated {
+                thread: hydrated.clone(),
+            });
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(hydrated)
+    }
+
+    async fn create_root(&self, title: Option<&str>) -> io::Result<HydratedThread> {
+        let created = self.client.create_root_thread(title).await.map_err(to_io)?;
+        let hydrated = HydratedThread {
+            id: created.thread_id,
+            title: created.title,
+            turns: Vec::new(),
+        };
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::ThreadCreated {
+                thread: hydrated.clone(),
+            });
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(hydrated)
+    }
+
+    async fn rename_thread(&self, thread_id: &str, title: &str) -> io::Result<()> {
+        let renamed = self
+            .client
+            .rename_thread(thread_id, title)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::ThreadTitleUpdated {
+                thread_id: renamed.thread_id,
+                title: renamed.title,
+            });
+        }
+        Ok(())
     }
 
     async fn merge_thread(&self, source_id: &str, target_id: &str) -> io::Result<()> {
-        tracing::debug!(target_id, "merging thread into active trunk");
-        self.client.merge_thread(source_id).await.map_err(to_io)?;
+        self.merge_thread_with_summary(source_id, target_id, None)
+            .await
+    }
+
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        summary: Option<&str>,
+    ) -> io::Result<()> {
+        let target_opt = (!target_id.trim().is_empty()).then_some(target_id.trim());
+        let merged = self
+            .client
+            .merge_thread_with_summary(source_id, target_opt, summary)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let bb_key = format!("join:{}", slugify_anchor(&merged.title));
+            let resolved_summary = match summary.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(explicit) => truncate_chars_with_ellipsis(explicit, 400),
+                None => self
+                    .client
+                    .blackboard_list()
+                    .await
+                    .ok()
+                    .and_then(|entries| entries.into_iter().find(|e| e.key == bb_key))
+                    .map(|e| e.value)
+                    .unwrap_or_default(),
+            };
+            if !resolved_summary.is_empty() {
+                self.emit(TuiEngineEvent::BlackboardUpdated {
+                    key: bb_key,
+                    value: resolved_summary.clone(),
+                });
+            }
+            let meta_opt = self.fetch_and_emit_thread_metadata().await;
+            let resolved_target = target_opt
+                .filter(|t| *t != merged.thread_id)
+                .map(str::to_string)
+                .or_else(|| {
+                    meta_opt.and_then(|meta| {
+                        meta.into_iter()
+                            .find(|m| m.thread_id == merged.thread_id)
+                            .and_then(|m| m.parent_thread_id)
+                    })
+                })
+                .unwrap_or_default();
+            self.emit(TuiEngineEvent::ThreadMerged {
+                thread_id: merged.thread_id,
+                target_thread_id: resolved_target,
+                summary: resolved_summary,
+            });
+        }
         Ok(())
     }
 
@@ -316,10 +436,13 @@ where
     }
 
     async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
-        self.client
-            .thread_metadata()
-            .await
-            .map_err(|e| e.to_string())
+        self.client.thread_metadata().await.map_err(|e| {
+            let msg = e.to_string();
+            self.emit(TuiEngineEvent::Error {
+                message: msg.clone(),
+            });
+            msg
+        })
     }
 
     async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
@@ -594,9 +717,12 @@ done
         let port2 = EngineClientPort::new(reopened);
         let hydrated = port2.hydrate_session().await.expect("rehydrate");
         assert_eq!(hydrated.threads.len(), 1);
-        assert_eq!(hydrated.threads[0].turns.len(), 2);
+        assert_eq!(hydrated.threads[0].turns.len(), 3);
         assert_eq!(hydrated.threads[0].turns[0].content, "ping acp");
         assert_eq!(hydrated.threads[0].turns[1].content, "Mocked TUI Reply");
+        assert!(hydrated.threads[0].turns[2]
+            .content
+            .contains("[Decision Landmark"));
     }
 
     #[tokio::test]
@@ -652,6 +778,19 @@ done
             ) -> Result<ThreadSummary, EngineError> {
                 unreachable!()
             }
+            async fn create_root_thread(
+                &self,
+                _title: Option<&str>,
+            ) -> Result<ThreadSummary, EngineError> {
+                unreachable!()
+            }
+            async fn rename_thread(
+                &self,
+                _thread_id: &str,
+                _title: &str,
+            ) -> Result<ThreadSummary, EngineError> {
+                unreachable!()
+            }
             async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
                 Ok(vec![self.ensure_main_thread().await?])
             }
@@ -665,6 +804,14 @@ done
                 Ok(Vec::new())
             }
             async fn merge_thread(&self, _thread_id: &str) -> Result<ThreadSummary, EngineError> {
+                unreachable!()
+            }
+            async fn merge_thread_with_summary(
+                &self,
+                _source_id: &str,
+                _target_id: Option<&str>,
+                _summary: Option<&str>,
+            ) -> Result<ThreadSummary, EngineError> {
                 unreachable!()
             }
             async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
@@ -731,6 +878,124 @@ done
         assert!(
             saw_bg_err,
             "async background TuiEngineEvent::Error must be forwarded to TUI"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_offline_fallbacks_and_metadata_error_forwarding() {
+        use grein_cli::engine::{
+            BlackboardEntry, EngineError, EngineEvent, SessionSnapshot, ShellCommandResult,
+            ThreadSummary, TranscriptEntry, TurnDispatchResult,
+        };
+
+        let engine = InProcessEngine::in_memory().expect("in_memory");
+        let port = EngineClientPort::new(engine);
+        let session = port.hydrate_session().await.expect("hydrate");
+        let main_id = session.active_thread_id.clone();
+
+        // Notice: subscribe_events NOT called -> has_live_stream == false!
+        // Drain initial events via direct receiver? Actually subscribe_events on InProcessEngine
+        // would flip has_live_stream to true. So test offline EngineClientPort with a no-stream
+        // DaemonEngine wrapper or test create_root/rename/merge before subscribe_events!
+        let root2 = port.create_root(Some("Offline Root")).await.expect("create_root");
+        assert_eq!(root2.title, "Offline Root");
+        port.rename_thread(&root2.id, "Renamed Offline Root")
+            .await
+            .expect("rename");
+        let forked = port
+            .fork_branch(&main_id, Some("Offline Branch"))
+            .await
+            .expect("fork_branch");
+        port.merge_thread_with_summary(&forked.id, &main_id, Some("Offline decision"))
+            .await
+            .expect("merge_thread_with_summary");
+
+        let mut rx = port.events_rx.lock().await.take().expect("events_rx");
+        let mut offline_evs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            offline_evs.push(ev);
+        }
+        assert!(offline_evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCreated { thread } if thread.id == root2.id
+        )));
+        assert!(offline_evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &root2.id && title == "Renamed Offline Root"
+        )));
+        assert!(offline_evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCreated { thread } if thread.id == forked.id
+        )));
+        assert!(offline_evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadMerged { thread_id, target_thread_id, summary }
+                if thread_id == &forked.id
+                    && target_thread_id == &main_id
+                    && summary == "Offline decision"
+        )));
+        assert!(offline_evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::BlackboardUpdated { key, value }
+                if key == "join:offline-branch" && value == "Offline decision"
+        )));
+
+        struct FailingMetaEngine;
+        #[async_trait::async_trait]
+        impl DaemonEngine for FailingMetaEngine {
+            async fn ping(&self) -> Result<(), EngineError> { Ok(()) }
+            async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
+                Ok(ThreadSummary {
+                    thread_id: "t-1".into(),
+                    title: "Main".into(),
+                    parent_node_id: "n-1".into(),
+                    active_leaf_id: "n-1".into(),
+                    merged: false,
+                    status: Default::default(),
+                })
+            }
+            async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+            async fn send_turn_for_thread(&self, _: &str, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+            async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn fork_thread_with_title(&self, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn create_root_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn rename_thread(&self, _: &str, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
+                Ok(vec![self.ensure_main_thread().await?])
+            }
+            async fn get_transcript(&self) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
+            async fn get_thread_transcript(&self, _: &str) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
+            async fn merge_thread(&self, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn merge_thread_with_summary(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> { Ok(Vec::new()) }
+            async fn blackboard_upsert(&self, _: &str, _: &str) -> Result<BlackboardEntry, EngineError> { unreachable!() }
+            async fn blackboard_delete(&self, _: &str) -> Result<bool, EngineError> { Ok(false) }
+            async fn resolve_permission(&self, _: PermissionDecisionPayload) -> Result<EngineEvent, EngineError> { unreachable!() }
+            async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> { Ok(()) }
+            async fn run_shell_command(&self, _: &str, _: &str) -> Result<ShellCommandResult, EngineError> { unreachable!() }
+            async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> { unreachable!() }
+            async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
+                Err(EngineError::Storage("metadata db failure".to_string()))
+            }
+        }
+
+        let err_port = EngineClientPort::new(FailingMetaEngine);
+        let mut err_rx = err_port.subscribe_events().await.expect("subscribe");
+        let _ = err_port.hydrate_session().await.expect("hydrate succeeds");
+        assert!(err_port.thread_metadata().await.is_err());
+
+        let mut err_evs = Vec::new();
+        while let Ok(ev) = err_rx.try_recv() {
+            err_evs.push(ev);
+        }
+        assert!(
+            err_evs
+                .iter()
+                .filter(|e| matches!(e, TuiEngineEvent::Error { message } if message.contains("metadata db failure")))
+                .count()
+                >= 2,
+            "thread_metadata Err must emit TuiEngineEvent::Error instead of ignoring: {err_evs:?}"
         );
     }
 }

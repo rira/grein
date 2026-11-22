@@ -292,6 +292,53 @@ mod tests {
         );
         assert_eq!(client.list_threads().await.expect("after delete").len(), 1);
 
+        let root2_val = raw_client
+            .session_create_root_thread(Some("Second Root"))
+            .await
+            .expect("session_create_root_thread");
+        let root2_id = root2_val["result"]["thread_id"]
+            .as_str()
+            .expect("root2 id")
+            .to_string();
+        assert_eq!(root2_val["result"]["title"], "Second Root");
+
+        let renamed_val = raw_client
+            .session_rename_thread(&root2_id, "Renamed Root")
+            .await
+            .expect("session_rename_thread");
+        assert_eq!(renamed_val["result"]["title"], "Renamed Root");
+
+        let forked2 = client
+            .fork_thread_with_title(Some(&root2_id), Some("Socket Join Branch"))
+            .await
+            .expect("fork2");
+        let joined_val = raw_client
+            .session_merge_thread_with_summary(
+                &forked2.thread_id,
+                Some(&main.thread_id),
+                Some("Decided over JSON-RPC"),
+            )
+            .await
+            .expect("session_merge_thread_with_summary");
+        assert_eq!(joined_val["result"]["merged"], true);
+
+        let mut post_events = Vec::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(150), rx.recv()).await {
+            post_events.push(ev);
+        }
+        assert!(post_events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &root2_id && title == "Renamed Root"
+        )));
+        assert!(post_events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadMerged { thread_id, target_thread_id, summary }
+                if thread_id == &forked2.thread_id
+                    && target_thread_id == &main.thread_id
+                    && summary == "Decided over JSON-RPC"
+        )));
+
         server.abort();
     }
 }

@@ -58,12 +58,17 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread, CoreError> {
     let title: String = row.get(5)?;
     let acp_session_id: Option<String> = row.get(6)?;
     let merged_int: i64 = row.get(7)?;
+    let parent_thread_id_str: Option<String> = row.get(8)?;
 
     let id = parse_uuid(0, &id_str)?;
     let parent_node_id = parse_uuid(1, &parent_node_id_str)?;
     let anchor_id = parse_uuid(2, &anchor_id_str)?;
     let active_leaf_id = parse_uuid(3, &active_leaf_id_str)?;
     let status: ThreadStatus = serde_json::from_str(&format!("\"{}\"", status_str))?;
+    let parent_thread_id = match parent_thread_id_str {
+        Some(s) if !s.trim().is_empty() => Some(ThreadId(parse_uuid(8, s.trim())?)),
+        _ => None,
+    };
 
     Ok(Thread {
         id: ThreadId(id),
@@ -77,6 +82,7 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread, CoreError> {
         title,
         acp_session_id,
         merged: merged_int != 0,
+        parent_thread_id,
     })
 }
 
@@ -160,6 +166,7 @@ impl SqliteStorage {
                 title TEXT NOT NULL DEFAULT '',
                 acp_session_id TEXT,
                 merged INTEGER NOT NULL DEFAULT 0,
+                parent_thread_id TEXT,
                 FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
                 FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
             );
@@ -215,6 +222,10 @@ impl SqliteStorage {
             (
                 "merged",
                 "ALTER TABLE threads ADD COLUMN merged INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "parent_thread_id",
+                "ALTER TABLE threads ADD COLUMN parent_thread_id TEXT",
             ),
         ];
         for (column_name, ddl) in thread_column_migrations {
@@ -474,6 +485,7 @@ impl SqliteStorage {
         parent_node_id: &Uuid,
         anchor_id: &Uuid,
         title: &str,
+        parent_thread_id: Option<ThreadId>,
     ) -> Result<ThreadId, CoreError> {
         let conn = self.lock()?;
 
@@ -490,10 +502,11 @@ impl SqliteStorage {
         let status_str = serde_json::to_string(&ThreadStatus::Idle)?;
         let status_trimmed = status_str.trim_matches('"');
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let parent_thread_str = parent_thread_id.map(|id| id.0.to_string());
 
         conn.execute(
-            "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, acp_session_id, merged)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0)",
+            "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, acp_session_id, merged, parent_thread_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, ?8)",
             params![
                 thread_id.to_string(),
                 parent_node_id.to_string(),
@@ -502,10 +515,26 @@ impl SqliteStorage {
                 status_trimmed,
                 now,
                 title,
+                parent_thread_str,
             ],
         )?;
 
         Ok(ThreadId(thread_id))
+    }
+
+    pub fn create_thread_with_parent(
+        &self,
+        parent_node_id: NodeId,
+        anchor_id: AnchorId,
+        title: Option<&str>,
+        parent_thread_id: Option<ThreadId>,
+    ) -> Result<ThreadId, CoreError> {
+        self.insert_thread_row(
+            &parent_node_id.0,
+            &anchor_id.0,
+            title.unwrap_or(""),
+            parent_thread_id,
+        )
     }
 
     pub fn create_thread<B1: Borrow<Uuid>, B2: Borrow<Uuid>>(
@@ -513,7 +542,12 @@ impl SqliteStorage {
         parent_node_id: B1,
         anchor_id: B2,
     ) -> Result<ThreadId, CoreError> {
-        self.insert_thread_row(parent_node_id.borrow(), anchor_id.borrow(), "")
+        self.create_thread_with_parent(
+            NodeId(*parent_node_id.borrow()),
+            AnchorId(*anchor_id.borrow()),
+            None,
+            None,
+        )
     }
 
     pub fn create_thread_with_title(
@@ -522,7 +556,21 @@ impl SqliteStorage {
         anchor_id: AnchorId,
         title: &str,
     ) -> Result<ThreadId, CoreError> {
-        self.insert_thread_row(&parent_node_id.0, &anchor_id.0, title)
+        self.create_thread_with_parent(parent_node_id, anchor_id, Some(title), None)
+    }
+
+    pub fn reparent_child_threads(
+        &self,
+        old_parent_id: &ThreadId,
+        new_parent_id: Option<&ThreadId>,
+    ) -> Result<usize, CoreError> {
+        let conn = self.lock()?;
+        let new_parent_str = new_parent_id.map(|id| id.0.to_string());
+        let affected = conn.execute(
+            "UPDATE threads SET parent_thread_id = ?1 WHERE parent_thread_id = ?2",
+            params![new_parent_str, old_parent_id.0.to_string()],
+        )?;
+        Ok(affected)
     }
 
     fn update_thread_field<P: rusqlite::ToSql>(
@@ -572,7 +620,7 @@ impl SqliteStorage {
         let t_ref = thread_id.borrow();
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged, parent_thread_id
              FROM threads WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![t_ref.to_string()])?;
@@ -586,7 +634,7 @@ impl SqliteStorage {
     pub fn list_threads(&self) -> Result<Vec<Thread>, CoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged, parent_thread_id
              FROM threads ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query([])?;

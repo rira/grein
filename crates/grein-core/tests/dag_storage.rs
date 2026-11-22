@@ -304,6 +304,7 @@ fn test_legacy_threads_schema_migration_adds_metadata_columns_idempotently(
     assert_eq!(fetched.title, "");
     assert_eq!(fetched.acp_session_id, None);
     assert!(!fetched.merged);
+    assert_eq!(fetched.parent_thread_id, None);
 
     let all = storage.list_threads()?;
     assert_eq!(all.len(), 1);
@@ -386,6 +387,67 @@ fn test_list_anchors_returns_inserted_anchors() -> Result<(), Box<dyn std::error
 
     let anchors = storage.list_anchors()?;
     assert_eq!(anchors, vec![(id1, a1), (id2, a2)]);
+
+    Ok(())
+}
+
+#[test]
+fn test_create_thread_with_parent_and_reparent_child_threads(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    let root_node = ConversationNode::new_root(AuthorRole::System, "");
+    assert_eq!(root_node.parent_id, None);
+    assert_eq!(root_node.role, AuthorRole::System);
+    assert_eq!(root_node.content, "");
+    storage.insert_node(&root_node)?;
+
+    let root_tid = storage.create_thread_with_parent(
+        root_node.id,
+        AnchorId::new_v7(),
+        Some("Main"),
+        None,
+    )?;
+    let mid_tid = storage.create_thread_with_parent(
+        root_node.id,
+        AnchorId::new_v7(),
+        Some("Mid"),
+        Some(root_tid),
+    )?;
+    let leaf_tid = storage.create_thread_with_parent(
+        root_node.id,
+        AnchorId::new_v7(),
+        Some("Leaf"),
+        Some(mid_tid),
+    )?;
+
+    assert_eq!(
+        storage.get_thread(root_tid)?.unwrap().parent_thread_id,
+        None
+    );
+    assert_eq!(
+        storage.get_thread(mid_tid)?.unwrap().parent_thread_id,
+        Some(root_tid)
+    );
+    assert_eq!(
+        storage.get_thread(leaf_tid)?.unwrap().parent_thread_id,
+        Some(mid_tid)
+    );
+
+    let reparented_to_grandparent = storage.reparent_child_threads(&mid_tid, Some(&root_tid))?;
+    assert_eq!(reparented_to_grandparent, 1);
+    assert_eq!(
+        storage.get_thread(leaf_tid)?.unwrap().parent_thread_id,
+        Some(root_tid)
+    );
+
+    let promoted_to_root = storage.reparent_child_threads(&root_tid, None)?;
+    assert_eq!(promoted_to_root, 2);
+    assert_eq!(storage.get_thread(mid_tid)?.unwrap().parent_thread_id, None);
+    assert_eq!(
+        storage.get_thread(leaf_tid)?.unwrap().parent_thread_id,
+        None
+    );
 
     Ok(())
 }

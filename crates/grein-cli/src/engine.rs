@@ -9,11 +9,14 @@ use grein_acp::{
     AcpPermissionOption, AcpStdioDriver, DriverEvent, StdioProcessConfig, StdioProcessRunner,
 };
 use grein_core::blackboard::{Blackboard, BlackboardEntry as CoreBlackboardEntry, BlackboardEntryKind};
+use grein_core::error::CoreError;
 use grein_core::model::{
     Anchor, AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadStatus,
 };
 use grein_core::storage::sqlite::SqliteStorage;
-use grein_core::sync::{format_whiteboard_delta_prefix, ContextCompiler};
+use grein_core::sync::{
+    format_whiteboard_delta_prefix, synthesize_thread_merge, ContextCompiler,
+};
 use grein_tui::engine_port::{
     HydratedThread, HydratedTurn, SubagentSnapshot, SubagentStatus, ThreadMeta, TuiEngineEvent,
 };
@@ -217,6 +220,12 @@ pub trait DaemonEngine: Send + Sync {
         source_thread_or_node: Option<&str>,
         title: Option<&str>,
     ) -> Result<ThreadSummary, EngineError>;
+    async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError>;
+    async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<ThreadSummary, EngineError>;
     async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError>;
     async fn get_transcript(&self) -> Result<Vec<TranscriptEntry>, EngineError>;
     async fn get_thread_transcript(
@@ -224,6 +233,12 @@ pub trait DaemonEngine: Send + Sync {
         thread_id: &str,
     ) -> Result<Vec<TranscriptEntry>, EngineError>;
     async fn merge_thread(&self, thread_id: &str) -> Result<ThreadSummary, EngineError>;
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError>;
     async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError>;
     async fn blackboard_upsert(
         &self,
@@ -356,7 +371,7 @@ fn parse_typed_id<T: DeserializeOwned>(raw: &str) -> Option<T> {
     serde_json::from_value(Value::String(normalized.to_string())).ok()
 }
 
-fn slugify_anchor(title: &str) -> String {
+pub fn slugify_anchor(title: &str) -> String {
     let mut slug = String::with_capacity(title.len());
     let mut prev_dash = false;
     for c in title.chars() {
@@ -376,6 +391,19 @@ fn slugify_anchor(title: &str) -> String {
     } else {
         slug
     }
+}
+
+pub fn truncate_chars_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return text.chars().take(max_chars).collect();
+    }
+    let mut out: String = text.chars().take(max_chars - 3).collect();
+    out.push_str("...");
+    out
 }
 
 fn is_internal_root_node(node: &ConversationNode) -> bool {
@@ -562,6 +590,7 @@ impl EngineRuntime {
         if threads.is_empty() {
             return Ok(Vec::new());
         }
+        let known_ids: HashSet<ThreadId> = threads.iter().map(|t| t.id).collect();
         let nodes = self.storage.list_nodes().map_err(storage_err)?;
         let nodes_by_id: HashMap<NodeId, ConversationNode> =
             nodes.into_iter().map(|n| (n.id, n)).collect();
@@ -572,24 +601,17 @@ impl EngineRuntime {
             let path = path_from_node_map(thread.active_leaf_id, &nodes_by_id);
             let parent_pos = path.iter().position(|n| n.id == thread.parent_node_id);
 
-            if idx == 0 {
-                if let Some(first_node) = path.first() {
-                    if first_node.id == thread.parent_node_id {
-                        node_owner.entry(first_node.id).or_insert(thread.id);
-                    }
+            if idx == 0 || path.first().is_some_and(|n| n.id == thread.parent_node_id) {
+                for node in &path {
+                    node_owner.entry(node.id).or_insert(thread.id);
                 }
-            }
-
-            match parent_pos {
-                Some(p_idx) => {
-                    for node in path.iter().skip(p_idx + 1) {
-                        node_owner.entry(node.id).or_insert(thread.id);
-                    }
+            } else if let Some(p_idx) = parent_pos {
+                for node in path.iter().skip(p_idx + 1) {
+                    node_owner.entry(node.id).or_insert(thread.id);
                 }
-                None => {
-                    for node in &path {
-                        node_owner.entry(node.id).or_insert(thread.id);
-                    }
+            } else {
+                for node in &path {
+                    node_owner.entry(node.id).or_insert(thread.id);
                 }
             }
         }
@@ -602,7 +624,12 @@ impl EngineRuntime {
                 && trunk[0].id == thread.parent_node_id
                 && !is_internal_root_node(trunk[0]);
 
-            let parent_thread_id = if idx == 0
+            let parent_thread_id = if let Some(explicit_pid) = thread
+                .parent_thread_id
+                .filter(|pid| *pid != thread.id && known_ids.contains(pid))
+            {
+                Some(explicit_pid.0.to_string())
+            } else if idx == 0
                 && trunk.len() <= 1
                 && trunk.first().is_some_and(|n| n.id == thread.parent_node_id)
             {
@@ -1365,6 +1392,30 @@ impl InProcessEngine {
         DaemonEngine::fork_thread_with_title(self, source_thread_or_node, title).await
     }
 
+    pub async fn create_root_thread(
+        &self,
+        title: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::create_root_thread(self, title).await
+    }
+
+    pub async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::rename_thread(self, thread_id, title).await
+    }
+
+    pub async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::merge_thread_with_summary(self, source_id, target_id, summary).await
+    }
+
     pub async fn get_thread_transcript(
         &self,
         thread_id: &str,
@@ -1789,35 +1840,38 @@ impl DaemonEngine for InProcessEngine {
         title: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
         let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-        let parent_node_id = match source_thread_or_node.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(raw) => {
-                if let Some(tid) = parse_typed_id::<ThreadId>(raw) {
-                    if let Some(thread) = self.runtime.storage.get_thread(tid).map_err(storage_err)? {
-                        thread.active_leaf_id
-                    } else if let Some(node) = self
-                        .runtime
-                        .storage
-                        .get_node(NodeId(tid.0))
-                        .map_err(storage_err)?
-                    {
-                        node.id
+        let (parent_node_id, parent_thread_id) =
+            match source_thread_or_node.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(raw) => {
+                    if let Some(tid) = parse_typed_id::<ThreadId>(raw) {
+                        if let Some(thread) =
+                            self.runtime.storage.get_thread(tid).map_err(storage_err)?
+                        {
+                            (thread.active_leaf_id, Some(thread.id))
+                        } else if let Some(node) = self
+                            .runtime
+                            .storage
+                            .get_node(NodeId(tid.0))
+                            .map_err(storage_err)?
+                        {
+                            (node.id, None)
+                        } else {
+                            return Err(EngineError::NotFound(format!("thread or node {raw}")));
+                        }
                     } else {
                         return Err(EngineError::NotFound(format!("thread or node {raw}")));
                     }
-                } else {
-                    return Err(EngineError::NotFound(format!("thread or node {raw}")));
                 }
-            }
-            None => {
-                if let Some(first) = existing_threads.first() {
-                    first.active_leaf_id
-                } else if let Some(last_node) = self.runtime.lock()?.last_node {
-                    last_node
-                } else {
-                    return Err(EngineError::NotFound("no turns recorded".to_string()));
+                None => {
+                    if let Some(first) = existing_threads.first() {
+                        (first.active_leaf_id, Some(first.id))
+                    } else if let Some(last_node) = self.runtime.lock()?.last_node {
+                        (last_node, None)
+                    } else {
+                        return Err(EngineError::NotFound("no turns recorded".to_string()));
+                    }
                 }
-            }
-        };
+            };
 
         let resolved_title = match title.map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
@@ -1844,7 +1898,12 @@ impl DaemonEngine for InProcessEngine {
         let tid = self
             .runtime
             .storage
-            .create_thread_with_title(parent_node_id, anchor_id, &resolved_title)
+            .create_thread_with_parent(
+                parent_node_id,
+                anchor_id,
+                Some(&resolved_title),
+                parent_thread_id,
+            )
             .map_err(storage_err)?;
         let created = self
             .runtime
@@ -1875,6 +1934,115 @@ impl DaemonEngine for InProcessEngine {
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
             .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        Ok(summary)
+    }
+
+    async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
+        let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
+        let resolved_title = match title.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => t.to_string(),
+            None => {
+                let meta_before = self.runtime.compute_thread_metadata()?;
+                let mut n = meta_before
+                    .iter()
+                    .filter(|m| m.parent_thread_id.is_none())
+                    .count()
+                    + 1;
+                while existing_threads
+                    .iter()
+                    .any(|t| t.title == format!("Root {n}"))
+                {
+                    n += 1;
+                }
+                format!("Root {n}")
+            }
+        };
+
+        let root_node = ConversationNode::new_root(AuthorRole::System, "");
+        self.runtime
+            .storage
+            .insert_node(&root_node)
+            .map_err(storage_err)?;
+
+        let anchor_id = AnchorId::new();
+        let anchor = Anchor {
+            level: 1,
+            title: resolved_title.clone(),
+            slug: slugify_anchor(&resolved_title),
+            line_number: 1,
+        };
+        self.runtime
+            .storage
+            .insert_anchor(&anchor_id.0, &anchor)
+            .map_err(storage_err)?;
+
+        let tid = self
+            .runtime
+            .storage
+            .create_thread_with_parent(root_node.id, anchor_id, Some(&resolved_title), None)
+            .map_err(storage_err)?;
+        {
+            let mut state = self.runtime.lock()?;
+            state.last_node = Some(root_node.id);
+        }
+
+        let created = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::Storage("created root thread missing".to_string()))?;
+
+        let summary = thread_to_summary(&created, false);
+        self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
+            thread: HydratedThread {
+                id: summary.thread_id.clone(),
+                title: summary.title.clone(),
+                turns: Vec::new(),
+            },
+        });
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        Ok(summary)
+    }
+
+    async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<ThreadSummary, EngineError> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Err(EngineError::InvalidParams(
+                "title must not be empty".to_string(),
+            ));
+        }
+
+        let tid: ThreadId = parse_typed_id(thread_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        self.runtime
+            .storage
+            .update_thread_title(&tid, trimmed)
+            .map_err(|e| match e {
+                CoreError::ThreadNotFound(_) => EngineError::NotFound(format!("thread {thread_id}")),
+                other => storage_err(other),
+            })?;
+
+        let updated = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
+        let is_first = threads.first().is_some_and(|t| t.id == updated.id);
+        let summary = thread_to_summary(&updated, is_first);
+
+        self.runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
+            thread_id: summary.thread_id.clone(),
+            title: summary.title.clone(),
+        });
         Ok(summary)
     }
 
@@ -1916,28 +2084,161 @@ impl DaemonEngine for InProcessEngine {
     }
 
     async fn merge_thread(&self, thread_id: &str) -> Result<ThreadSummary, EngineError> {
-        let tid: ThreadId = parse_typed_id(thread_id)
-            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        if self
+        DaemonEngine::merge_thread_with_summary(self, thread_id, None, None).await
+    }
+
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        let source_tid: ThreadId = parse_typed_id(source_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {source_id}")))?;
+        let source = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(source_tid)
             .map_err(storage_err)?
-            .is_none()
-        {
-            return Err(EngineError::NotFound(format!("thread {thread_id}")));
-        }
+            .ok_or_else(|| EngineError::NotFound(format!("thread {source_id}")))?;
+
+        let explicit_target = match target_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => match parse_typed_id::<ThreadId>(raw) {
+                Some(tid) if tid != source_tid => {
+                    self.runtime.storage.get_thread(tid).map_err(storage_err)?
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        let target_thread = match explicit_target {
+            Some(t) => Some(t),
+            None => {
+                let meta = self.runtime.compute_thread_metadata()?;
+                let parent_tid = meta
+                    .into_iter()
+                    .find(|m| m.thread_id == source.id.0.to_string())
+                    .and_then(|m| m.parent_thread_id)
+                    .and_then(|pid| parse_typed_id::<ThreadId>(&pid))
+                    .filter(|tid| *tid != source_tid);
+                match parent_tid {
+                    Some(pid) => self.runtime.storage.get_thread(pid).map_err(storage_err)?,
+                    None => None,
+                }
+            }
+        };
+
+        let source_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
+        let source_is_first = source_threads.first().is_some_and(|t| t.id == source.id);
+        let source_title = thread_to_summary(&source, source_is_first).title;
+        let resolved_summary = match summary.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(explicit) => truncate_chars_with_ellipsis(explicit, 400),
+            None => {
+                let turns = self.runtime.load_thread_turns(&source)?;
+                let raw_digest = turns
+                    .iter()
+                    .rev()
+                    .find(|t| t.role == "assistant" && !t.content.trim().is_empty())
+                    .or_else(|| {
+                        turns
+                            .iter()
+                            .rev()
+                            .find(|t| t.role == "user" && !t.content.trim().is_empty())
+                    })
+                    .or_else(|| turns.iter().rev().find(|t| !t.content.trim().is_empty()))
+                    .map(|t| t.content.as_str())
+                    .unwrap_or(source_title.as_str());
+                let normalized = raw_digest.split_whitespace().collect::<Vec<_>>().join(" ");
+                truncate_chars_with_ellipsis(&normalized, 400)
+            }
+        };
+
+        let bb_key = format!("join:{}", slugify_anchor(&source_title));
+        let bb_entry = CoreBlackboardEntry::new(
+            bb_key.clone(),
+            resolved_summary.clone(),
+            BlackboardEntryKind::Decision,
+        );
         self.runtime
             .storage
-            .mark_thread_merged(&tid, true)
+            .insert_blackboard_entry(&bb_entry)
+            .map_err(storage_err)?;
+        self.runtime.emit_tui(TuiEngineEvent::BlackboardUpdated {
+            key: bb_key,
+            value: resolved_summary.clone(),
+        });
+
+        let mut target_thread_id = String::new();
+        if let Some(target) = target_thread {
+            if target.id != source_tid {
+                let target_id_str = target.id.0.to_string();
+                let target_cmd_tx = {
+                    let state = self.runtime.lock()?;
+                    state
+                        .active_acp_sessions
+                        .get(&target_id_str)
+                        .map(|s| s.cmd_tx.clone())
+                };
+                if let Some(cmd_tx) = target_cmd_tx {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if cmd_tx
+                        .send(SessionListenerCmd::PrepareSolicited { reply_tx })
+                        .is_ok()
+                    {
+                        let _ = reply_rx.await;
+                    }
+                }
+                let fresh_target = self
+                    .runtime
+                    .storage
+                    .get_thread(target.id)
+                    .map_err(storage_err)?
+                    .ok_or_else(|| EngineError::NotFound(format!("thread {target_id_str}")))?;
+                let landmark_node = synthesize_thread_merge(
+                    source_tid,
+                    &source_title,
+                    &resolved_summary,
+                    Some(fresh_target.active_leaf_id),
+                )
+                .map_err(storage_err)?;
+                self.runtime
+                    .storage
+                    .insert_node(&landmark_node)
+                    .map_err(storage_err)?;
+                self.runtime
+                    .storage
+                    .update_thread_leaf(fresh_target.id, landmark_node.id)
+                    .map_err(storage_err)?;
+                {
+                    let mut state = self.runtime.lock()?;
+                    state.last_node = Some(landmark_node.id);
+                }
+                target_thread_id = target_id_str;
+            }
+        }
+
+        self.runtime
+            .storage
+            .mark_thread_merged(&source_tid, true)
             .map_err(storage_err)?;
         let updated = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(source_tid)
             .map_err(storage_err)?
-            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        Ok(thread_to_summary(&updated, false))
+            .ok_or_else(|| EngineError::NotFound(format!("thread {source_id}")))?;
+
+        self.runtime.emit_tui(TuiEngineEvent::ThreadMerged {
+            thread_id: updated.id.0.to_string(),
+            target_thread_id,
+            summary: resolved_summary,
+        });
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+
+        Ok(thread_to_summary(&updated, source_is_first))
     }
 
     async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
@@ -2109,9 +2410,11 @@ impl DaemonEngine for InProcessEngine {
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-        if !threads.iter().any(|t| t.id == tid) {
-            return Err(EngineError::NotFound(format!("thread {thread_id}")));
-        }
+        let deleted_thread = threads
+            .iter()
+            .find(|t| t.id == tid)
+            .cloned()
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         if threads.len() <= 1 {
             return Err(EngineError::InvalidParams(
                 "cannot delete the only thread".to_string(),
@@ -2150,6 +2453,14 @@ impl DaemonEngine for InProcessEngine {
             }
         }
 
+        let reparent_target = deleted_thread
+            .parent_thread_id
+            .as_ref()
+            .filter(|pid| **pid != tid && threads.iter().any(|t| t.id == **pid));
+        self.runtime
+            .storage
+            .reparent_child_threads(&tid, reparent_target)
+            .map_err(storage_err)?;
         self.runtime
             .storage
             .delete_thread(tid)
@@ -2235,6 +2546,15 @@ async fn route(
             let title = params.get("title").and_then(Value::as_str);
             to_json(&engine.fork_thread_with_title(source, title).await?)?
         }
+        "session.create_root_thread" => {
+            let title = params.get("title").and_then(Value::as_str);
+            to_json(&engine.create_root_thread(title).await?)?
+        }
+        "session.rename_thread" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let title = required_str(params, "title")?;
+            to_json(&engine.rename_thread(thread_id, title).await?)?
+        }
         "session.list_threads" => to_json(&engine.list_threads().await?)?,
         "session.get_transcript" => {
             if let Some(tid) = params.get("thread_id").and_then(Value::as_str) {
@@ -2243,11 +2563,19 @@ async fn route(
                 to_json(&engine.get_transcript().await?)?
             }
         }
-        "session.merge_thread" => to_json(
-            &engine
-                .merge_thread(required_str(params, "thread_id")?)
-                .await?,
-        )?,
+        "session.merge_thread" => {
+            let source_id = required_str(params, "thread_id")?;
+            let target_id = params
+                .get("target_thread_id")
+                .or_else(|| params.get("target_id"))
+                .and_then(Value::as_str);
+            let summary = params.get("summary").and_then(Value::as_str);
+            to_json(
+                &engine
+                    .merge_thread_with_summary(source_id, target_id, summary)
+                    .await?,
+            )?
+        }
         "session.thread_metadata" => to_json(&engine.thread_metadata().await?)?,
         "session.delete_thread" => {
             let thread_id = required_str(params, "thread_id")?;
@@ -2439,6 +2767,27 @@ impl DaemonEngine for UnixSocketEngineClient {
             .await
     }
 
+    async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
+        let mut params = serde_json::Map::new();
+        if let Some(title) = title {
+            params.insert("title".to_string(), json!(title));
+        }
+        self.call_typed("session.create_root_thread", Value::Object(params))
+            .await
+    }
+
+    async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.call_typed(
+            "session.rename_thread",
+            json!({"thread_id": thread_id, "title": title}),
+        )
+        .await
+    }
+
     async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
         self.call_typed("session.list_threads", json!({})).await
     }
@@ -2459,7 +2808,24 @@ impl DaemonEngine for UnixSocketEngineClient {
     }
 
     async fn merge_thread(&self, thread_id: &str) -> Result<ThreadSummary, EngineError> {
-        self.call_typed("session.merge_thread", json!({"thread_id": thread_id}))
+        self.merge_thread_with_summary(thread_id, None, None).await
+    }
+
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        let mut params = serde_json::Map::new();
+        params.insert("thread_id".to_string(), json!(source_id));
+        if let Some(target_id) = target_id {
+            params.insert("target_thread_id".to_string(), json!(target_id));
+        }
+        if let Some(summary) = summary {
+            params.insert("summary".to_string(), json!(summary));
+        }
+        self.call_typed("session.merge_thread", Value::Object(params))
             .await
     }
 
@@ -2659,6 +3025,24 @@ impl DaemonEngine for EngineClient {
         }
     }
 
+    async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
+        match self {
+            Self::InProcess(e) => e.create_root_thread(title).await,
+            Self::Socket(e) => e.create_root_thread(title).await,
+        }
+    }
+
+    async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<ThreadSummary, EngineError> {
+        match self {
+            Self::InProcess(e) => e.rename_thread(thread_id, title).await,
+            Self::Socket(e) => e.rename_thread(thread_id, title).await,
+        }
+    }
+
     async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
         match self {
             Self::InProcess(e) => e.list_threads().await,
@@ -2687,6 +3071,24 @@ impl DaemonEngine for EngineClient {
         match self {
             Self::InProcess(e) => e.merge_thread(thread_id).await,
             Self::Socket(e) => e.merge_thread(thread_id).await,
+        }
+    }
+
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        match self {
+            Self::InProcess(e) => {
+                e.merge_thread_with_summary(source_id, target_id, summary)
+                    .await
+            }
+            Self::Socket(e) => {
+                e.merge_thread_with_summary(source_id, target_id, summary)
+                    .await
+            }
         }
     }
 
@@ -2965,12 +3367,14 @@ mod tests {
         assert!(threads[1].merged);
 
         let bb = reopened.blackboard_list().await.expect("reopened bb");
-        assert_eq!(bb.len(), 1);
-        assert_eq!(bb[0].key, "arch");
-        assert_eq!(bb[0].value, "two-tier");
+        assert_eq!(bb.len(), 2);
+        assert!(bb.iter().any(|e| e.key == "arch" && e.value == "two-tier"));
+        assert!(bb
+            .iter()
+            .any(|e| e.key == "join:feat-auth" && e.value == "feat-auth"));
 
         let snap = reopened.snapshot().await.expect("reopened snapshot");
-        assert_eq!(snap.blackboard_entries, 1);
+        assert_eq!(snap.blackboard_entries, 2);
         assert_eq!(snap.thread_count, 2);
     }
 
@@ -3940,5 +4344,311 @@ done
             TuiEngineEvent::SubagentUpdated { subagent, .. }
                 if subagent.id == "sa-fail" && subagent.status == SubagentStatus::Failed
         )));
+    }
+
+    #[tokio::test]
+    async fn test_empty_branch_fork_lineage_multi_root_rename_and_delete_across_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("lineage.db");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+
+        // Rename Main and verify empty title is rejected.
+        assert!(engine.rename_thread(&main.thread_id, "   ").await.is_err());
+        let renamed_main = engine
+            .rename_thread(&main.thread_id, "Primary Root")
+            .await
+            .expect("rename main");
+        assert_eq!(renamed_main.title, "Primary Root");
+
+        // 3-level empty-branch fork: Primary Root -> Branch 5 (0 turns) -> Branch 6 (0 turns).
+        let b5 = engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("Branch 5"))
+            .await
+            .expect("fork b5");
+        let b6 = engine
+            .fork_thread_with_title(Some(&b5.thread_id), Some("Branch 6"))
+            .await
+            .expect("fork b6");
+
+        // Create second root and rename it.
+        let root2 = engine.create_root_thread(None).await.expect("create root2");
+        assert_eq!(root2.title, "Root 2");
+        let renamed_root2 = engine
+            .rename_thread(&root2.thread_id, "Secondary Root")
+            .await
+            .expect("rename root2");
+        assert_eq!(renamed_root2.title, "Secondary Root");
+        let root2_child = engine
+            .fork_thread_with_title(Some(&root2.thread_id), Some("Root2 Child"))
+            .await
+            .expect("fork root2 child");
+
+        drop(engine);
+        let reopened =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                .expect("reopen");
+        let ensured = reopened.ensure_main_thread().await.expect("ensure_main_thread");
+        assert_eq!(ensured.title, "Primary Root");
+
+        let threads = reopened.list_threads().await.expect("list");
+        assert_eq!(
+            threads
+                .iter()
+                .find(|t| t.thread_id == root2.thread_id)
+                .unwrap()
+                .title,
+            "Secondary Root"
+        );
+
+        let meta = reopened.thread_metadata().await.expect("meta");
+        let m_main = meta.iter().find(|m| m.thread_id == main.thread_id).unwrap();
+        let m_b5 = meta.iter().find(|m| m.thread_id == b5.thread_id).unwrap();
+        let m_b6 = meta.iter().find(|m| m.thread_id == b6.thread_id).unwrap();
+        let m_root2 = meta.iter().find(|m| m.thread_id == root2.thread_id).unwrap();
+        let m_r2c = meta
+            .iter()
+            .find(|m| m.thread_id == root2_child.thread_id)
+            .unwrap();
+
+        assert_eq!(m_main.parent_thread_id, None);
+        assert_eq!(m_b5.parent_thread_id.as_deref(), Some(main.thread_id.as_str()));
+        assert_eq!(m_b6.parent_thread_id.as_deref(), Some(b5.thread_id.as_str()));
+        assert_eq!(m_root2.parent_thread_id, None);
+        assert_eq!(m_root2.inherited_turn_count, 0);
+        assert_eq!(
+            m_r2c.parent_thread_id.as_deref(),
+            Some(root2.thread_id.as_str())
+        );
+
+        // Deleting intermediate parent b5 reparents b6 to main.
+        reopened.delete_thread(&b5.thread_id).await.expect("delete b5");
+        let meta_after_mid = reopened.thread_metadata().await.expect("meta mid");
+        let m_b6_after = meta_after_mid
+            .iter()
+            .find(|m| m.thread_id == b6.thread_id)
+            .unwrap();
+        assert_eq!(
+            m_b6_after.parent_thread_id.as_deref(),
+            Some(main.thread_id.as_str())
+        );
+
+        // Deleting root2 promotes root2_child to root cleanly.
+        reopened
+            .delete_thread(&root2.thread_id)
+            .await
+            .expect("delete root2");
+        let meta_after_root2 = reopened.thread_metadata().await.expect("meta root2");
+        let m_r2c_after = meta_after_root2
+            .iter()
+            .find(|m| m.thread_id == root2_child.thread_id)
+            .unwrap();
+        assert_eq!(m_r2c_after.parent_thread_id, None);
+
+        // Deleting Primary Root does NOT recreate Main and promotes b6 to root.
+        reopened
+            .delete_thread(&main.thread_id)
+            .await
+            .expect("delete main");
+        let remaining = reopened.list_threads().await.expect("remaining");
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.iter().any(|t| t.title == "Main" || t.title == "Primary Root"));
+        let meta_final = reopened.thread_metadata().await.expect("meta final");
+        assert!(meta_final.iter().all(|m| m.parent_thread_id.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_null_parent_thread_id_infers_nesting_under_main_and_other_roots() {
+        let storage = SqliteStorage::in_memory().expect("sqlite");
+        let r1 = ConversationNode::new_root(AuthorRole::System, "");
+        storage.insert_node(&r1).unwrap();
+        let main_tid = storage
+            .create_thread_with_title(r1.id, AnchorId::new(), "Main")
+            .unwrap();
+        let u1 = ConversationNode::new(NodeId::new(), Some(r1.id), AuthorRole::User, "hi".into());
+        storage.insert_node(&u1).unwrap();
+        storage.update_thread_leaf(main_tid, u1.id).unwrap();
+
+        let main_child_tid = storage
+            .create_thread_with_title(u1.id, AnchorId::new(), "Legacy Main Child")
+            .unwrap();
+
+        // Second root at idx > 0 with 0 turns and a legacy child with parent_thread_id = None.
+        let r2 = ConversationNode::new_root(AuthorRole::System, "");
+        storage.insert_node(&r2).unwrap();
+        let root2_tid = storage
+            .create_thread_with_title(r2.id, AnchorId::new(), "Root 2")
+            .unwrap();
+        let r2_child_tid = storage
+            .create_thread_with_title(r2.id, AnchorId::new(), "Legacy Root2 Child")
+            .unwrap();
+
+        let engine = InProcessEngine::from_storage(storage).expect("engine");
+        let meta = engine.thread_metadata().await.expect("meta");
+        assert_eq!(meta.len(), 4);
+
+        let m_main = meta
+            .iter()
+            .find(|m| m.thread_id == main_tid.0.to_string())
+            .unwrap();
+        let m_mc = meta
+            .iter()
+            .find(|m| m.thread_id == main_child_tid.0.to_string())
+            .unwrap();
+        let m_r2 = meta
+            .iter()
+            .find(|m| m.thread_id == root2_tid.0.to_string())
+            .unwrap();
+        let m_r2c = meta
+            .iter()
+            .find(|m| m.thread_id == r2_child_tid.0.to_string())
+            .unwrap();
+
+        assert_eq!(m_main.parent_thread_id, None);
+        assert_eq!(
+            m_mc.parent_thread_id.as_deref(),
+            Some(main_tid.0.to_string().as_str())
+        );
+        assert_eq!(m_r2.parent_thread_id, None);
+        assert_eq!(
+            m_r2c.parent_thread_id.as_deref(),
+            Some(root2_tid.0.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manual_join_promotes_decision_commits_landmark_and_updates_sibling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("join.db");
+        let capture_path = temp.path().join("join_capture.jsonl");
+
+        let mock_script = r#"
+sess_counter=0
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$GREIN_CAPTURE"
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"mock","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-%s"}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/prompt"'*)
+            case "$line" in
+                *'"sessionId":"sess-1"'*) sid="sess-1" ;;
+                *'"sessionId":"sess-2"'*) sid="sess-2" ;;
+                *) sid="sess-3" ;;
+            esac
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Branch decision: use SQLite WAL mode."}}}}\n' "$sid"
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        let wrapper = format!(
+            "#!/bin/sh\nexport GREIN_CAPTURE={:?}\n{}\n",
+            capture_path.to_string_lossy(),
+            mock_script
+        );
+        let script_path = write_executable_script(temp.path(), "mock_join.sh", &wrapper);
+        let cfg = AcpBackendConfig {
+            command: script_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        };
+
+        let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+            .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        engine
+            .send_turn_for_thread(&main.thread_id, "kickoff")
+            .await
+            .expect("main turn");
+
+        let branch_a = engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("Storage Choice"))
+            .await
+            .expect("fork a");
+        let branch_b = engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("Sibling"))
+            .await
+            .expect("fork b");
+
+        engine
+            .send_turn_for_thread(&branch_a.thread_id, "choose storage")
+            .await
+            .expect("branch_a turn");
+        engine
+            .send_turn_for_thread(&branch_b.thread_id, "sibling initial")
+            .await
+            .expect("branch_b turn 1");
+
+        let mut rx = engine.subscribe_tui_events();
+        let merged = engine
+            .merge_thread_with_summary(&branch_a.thread_id, None, None)
+            .await
+            .expect("merge_thread_with_summary");
+        assert!(merged.merged);
+
+        let mut evs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            evs.push(ev);
+        }
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::BlackboardUpdated { key, value }
+                if key == "join:storage-choice" && value.contains("SQLite WAL mode")
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadMerged { thread_id, target_thread_id, summary }
+                if thread_id == &branch_a.thread_id
+                    && target_thread_id == &main.thread_id
+                    && summary.contains("SQLite WAL mode")
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadMetadataUpdated { meta }
+                if meta.iter().any(|m| m.thread_id == branch_a.thread_id && m.merged)
+        )));
+
+        let bb = engine.blackboard_list().await.expect("bb");
+        assert!(bb.iter().any(|e| e.key == "join:storage-choice" && e.value.contains("SQLite WAL mode")));
+
+        let main_transcript = engine
+            .get_thread_transcript(&main.thread_id)
+            .await
+            .expect("main transcript");
+        assert!(main_transcript.iter().any(|t| {
+            t.content.contains("[Decision Landmark") && t.content.contains("SQLite WAL mode")
+        }));
+
+        // Live sibling branch receives [Shared Whiteboard Updated] delta on its next prompt.
+        engine
+            .send_turn_for_thread(&branch_b.thread_id, "sibling after join")
+            .await
+            .expect("branch_b turn 2");
+
+        let frames: Vec<Value> = std::fs::read_to_string(&capture_path)
+            .expect("capture")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let prompts: Vec<&str> = frames
+            .iter()
+            .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/prompt"))
+            .map(|f| f["params"]["prompt"][0]["text"].as_str().unwrap())
+            .collect();
+        let last_prompt = prompts.last().copied().unwrap();
+        assert!(last_prompt.contains("[Shared Whiteboard Updated]"));
+        assert!(last_prompt.contains("join:storage-choice"));
+        assert!(last_prompt.contains("SQLite WAL mode"));
+        assert!(last_prompt.ends_with("sibling after join"));
     }
 }

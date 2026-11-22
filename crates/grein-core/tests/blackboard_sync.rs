@@ -414,3 +414,78 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
     // Empty payload produces empty string.
     assert_eq!(ContextPayload::default().build_acp_system_prompt_append(true, 100), "");
 }
+
+#[test]
+fn test_build_acp_system_prompt_append_preserves_decision_landmarks_across_truncation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    let root = ConversationNode::new(
+        NodeId::new_v7(),
+        None::<NodeId>,
+        AuthorRole::System,
+        "".to_string(),
+    );
+    storage.insert_node(&root)?;
+
+    let old_turn = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(root.id),
+        AuthorRole::User,
+        "Very long legacy trunk turn ".repeat(30),
+    );
+    storage.insert_node(&old_turn)?;
+
+    let source_tid = ThreadId::new_v7();
+    let landmark_node = synthesize_thread_merge(
+        source_tid,
+        "Auth Protocol",
+        "Adopted Ed25519 tokens with 15m TTL",
+        Some(old_turn.id),
+    )?;
+    storage.insert_node(&landmark_node)?;
+
+    let recent_turn = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(landmark_node.id),
+        AuthorRole::User,
+        "Follow-up trunk turn ".repeat(20),
+    );
+    storage.insert_node(&recent_turn)?;
+
+    let child_tid = storage.create_thread(recent_turn.id, grein_core::model::AnchorId::new_v7())?;
+    let branch_turn = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(recent_turn.id),
+        AuthorRole::Assistant,
+        "Branch working note".to_string(),
+    );
+    storage.insert_node(&branch_turn)?;
+    storage.update_thread_leaf(child_tid, branch_turn.id)?;
+
+    let mut bb = Blackboard::new();
+    bb.add_decision("bb_key", "Blackboard fact");
+
+    let payload = ContextCompiler::new("System base.")
+        .compile_thread_context(&storage, child_tid, &bb)?;
+    assert_eq!(payload.decision_landmarks.len(), 1);
+
+    let full = payload.build_acp_system_prompt_append(true, 0);
+    assert!(full.contains("System base."));
+    assert!(full.contains("# Shared Blackboard Working Memory"));
+    assert!(full.contains("# Decision Landmarks"));
+    assert!(full.contains("Adopted Ed25519 tokens with 15m TTL"));
+
+    let small_budget = 260;
+    let truncated = payload.build_acp_system_prompt_append(true, small_budget);
+    assert!(truncated.contains("System base."));
+    assert!(truncated.contains("# Shared Blackboard Working Memory"));
+    assert!(truncated.contains("# Decision Landmarks"));
+    assert!(
+        truncated.contains("Adopted Ed25519 tokens with 15m TTL"),
+        "decision_landmarks must survive history truncation: {truncated}"
+    );
+    assert!(!truncated.contains("Very long legacy trunk turn"));
+
+    Ok(())
+}

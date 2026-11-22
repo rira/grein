@@ -102,8 +102,50 @@ impl DaemonClient {
         self.json_rpc("session.get_transcript", params).await
     }
 
+    pub async fn session_create_root_thread(
+        &mut self,
+        title: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(t) = title {
+            params.insert("title".to_string(), json!(t));
+        }
+        self.json_rpc("session.create_root_thread", Value::Object(params))
+            .await
+    }
+
+    pub async fn session_rename_thread(
+        &mut self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.rename_thread",
+            json!({"thread_id": thread_id, "title": title}),
+        )
+        .await
+    }
+
     pub async fn session_merge_thread(&mut self, thread_id: &str) -> Result<Value, std::io::Error> {
         self.json_rpc("session.merge_thread", json!({"thread_id": thread_id}))
+            .await
+    }
+
+    pub async fn session_merge_thread_with_summary(
+        &mut self,
+        thread_id: &str,
+        target_thread_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        params.insert("thread_id".to_string(), json!(thread_id));
+        if let Some(target) = target_thread_id {
+            params.insert("target_thread_id".to_string(), json!(target));
+        }
+        if let Some(sum) = summary {
+            params.insert("summary".to_string(), json!(sum));
+        }
+        self.json_rpc("session.merge_thread", Value::Object(params))
             .await
     }
 

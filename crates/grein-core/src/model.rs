@@ -140,6 +140,10 @@ impl ConversationNode {
         }
     }
 
+    pub fn new_root(role: AuthorRole, content: impl Into<String>) -> Self {
+        Self::new(NodeId::new(), None::<NodeId>, role, content.into())
+    }
+
     pub fn id(&self) -> NodeId {
         self.id
     }
@@ -176,6 +180,8 @@ pub struct Thread {
     pub acp_session_id: Option<String>,
     #[serde(default)]
     pub merged: bool,
+    #[serde(default)]
+    pub parent_thread_id: Option<ThreadId>,
 }
 
 impl Thread {
@@ -200,6 +206,7 @@ impl Thread {
             title: String::new(),
             acp_session_id: None,
             merged: false,
+            parent_thread_id: None,
         }
     }
 

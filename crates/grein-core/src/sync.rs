@@ -69,6 +69,19 @@ impl ContextPayload {
                 self.blackboard_notes.trim()
             ));
         }
+        let landmarks: Vec<&str> = self
+            .decision_landmarks
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !landmarks.is_empty() {
+            preserved_sections.push(format!(
+                "# Decision Landmarks\n{}",
+                landmarks.join("\n\n")
+            ));
+        }
         if let Some(header) = self.anchor_header.as_deref() {
             if !header.trim().is_empty() {
                 preserved_sections.push(format!("# Branch Context\n{}", header.trim()));
