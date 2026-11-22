@@ -466,10 +466,10 @@ where
             turns: Vec::new(),
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {
+            let _ = self.fetch_and_emit_thread_metadata().await;
             self.emit(TuiEngineEvent::ThreadCreated {
                 thread: hydrated.clone(),
             });
-            let _ = self.fetch_and_emit_thread_metadata().await;
         }
         Ok(hydrated)
     }
@@ -1236,6 +1236,69 @@ done
         assert!(
             saw_output,
             "EngineClientPort must drive PTY in worktree cwd; last screen:\n{last_screen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_create_terminal_non_live_emits_metadata_before_created() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work_dir = temp.path().join("term_port_dir");
+        std::fs::create_dir_all(&work_dir).expect("mkdir");
+        let canonical_dir = std::fs::canonicalize(&work_dir).expect("canonical");
+        let db_path = temp.path().join("port_order.db");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, canonical_dir.clone(), None)
+                .expect("open");
+        let port = EngineClientPort::new(engine);
+
+        let session = port.hydrate_session().await.expect("hydrate");
+        let mut rx = port.events_rx.lock().await.take().expect("events_rx");
+        while rx.try_recv().is_ok() {}
+
+        let term = port
+            .create_terminal(
+                Some(&session.active_thread_id),
+                Some("Offline Term"),
+                None,
+                24,
+                80,
+            )
+            .await
+            .expect("create_terminal");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        let meta_idx = events
+            .iter()
+            .position(|ev| {
+                matches!(
+                    ev,
+                    TuiEngineEvent::ThreadMetadataUpdated { meta }
+                        if meta.iter().any(|m| {
+                            m.thread_id == term.id
+                                && m.kind == grein_core::model::ThreadKind::Terminal
+                                && m.cwd.as_deref() == Some(canonical_dir.to_string_lossy().as_ref())
+                        })
+                )
+            })
+            .expect("expected ThreadMetadataUpdated containing new terminal meta");
+        let created_idx = events
+            .iter()
+            .position(|ev| {
+                matches!(
+                    ev,
+                    TuiEngineEvent::ThreadCreated { thread } if thread.id == term.id
+                )
+            })
+            .expect("expected ThreadCreated for terminal");
+
+        assert!(
+            meta_idx < created_idx,
+            "non-live EngineClientPort ThreadMetadataUpdated (idx {meta_idx}) must precede ThreadCreated (idx {created_idx}): {events:?}"
         );
     }
 }

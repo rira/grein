@@ -666,3 +666,238 @@ done
 
     server.abort();
 }
+
+#[tokio::test]
+async fn test_cold_reopen_pending_pty_resize_before_pty_snapshot() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let work_dir = temp.path().join("workspace");
+    std::fs::create_dir_all(&work_dir).expect("mkdir");
+    let canonical_work = std::fs::canonicalize(&work_dir).expect("canonical");
+    let db_path = temp.path().join("pending_resize.db");
+
+    let term_id = {
+        let engine = InProcessEngine::open_with_config(&db_path, canonical_work.clone(), None)
+            .expect("open 1");
+        let _main = engine.ensure_main_thread().await.expect("main");
+        let term = engine
+            .create_terminal(None, Some("Cold Resize Term"), None, 24, 80)
+            .await
+            .expect("create term");
+        term.thread_id
+    };
+
+    let reopened = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+        .expect("reopen");
+
+    reopened
+        .pty_resize(&term_id, 42, 132)
+        .await
+        .expect("pending pty_resize before snapshot");
+
+    let snap = reopened
+        .pty_snapshot(&term_id, 24, 80)
+        .await
+        .expect("lazy pty_snapshot");
+    assert_eq!(
+        (snap.rows, snap.cols),
+        (42, 132),
+        "cold-reopen lazy pty_snapshot must preserve pending pty_resize dimensions instead of 24x80"
+    );
+
+    reopened
+        .pty_write(&term_id, b"printf '\\nCOLD_RESIZE_OK\\n'\n".to_vec())
+        .await
+        .expect("pty_write");
+    wait_for_pty_snapshot(&reopened, &term_id, 0, 0, Duration::from_secs(5), |s| {
+        s.rows == 42
+            && s.cols == 132
+            && s.plain_text().lines().any(|l| l.trim() == "COLD_RESIZE_OK")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_daemon_socket_attach_rpcs_unblocked_during_streaming_turn() {
+    use grein_cli::engine::PermissionDecisionPayload;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    init_test_git_repo(&repo_root);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+
+    let db_path = temp.path().join("daemon_unblock.db");
+    let socket_path = temp.path().join("daemon_unblock.sock");
+
+    let acp_script = write_executable_script(
+        temp.path(),
+        "interactive_acp.sh",
+        r#"#!/bin/sh
+sess_counter=0
+while IFS= read -r line; do
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"interactive","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-%s"}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/prompt"'*)
+            if printf '%s' "$line" | grep -q "wait-cancel"; then
+                while IFS= read -r next_line; do
+                    if printf '%s' "$next_line" | grep -q '"method":"session/cancel"'; then
+                        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}\n' "$id"
+                        break
+                    fi
+                done
+            elif printf '%s' "$line" | grep -q "wait-perm"; then
+                printf '{"jsonrpc":"2.0","id":"perm-rpc","method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"tc-rpc","name":"run_command","title":"Run"},"options":[{"optionId":"allow_once","name":"Allow","kind":"allow_once"},{"optionId":"reject_once","name":"Reject","kind":"reject_once"}]}}\n'
+                IFS= read -r _perm_reply
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"perm-unblocked"}}}}\n'
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            else
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            fi
+            ;;
+    esac
+done
+"#,
+    );
+    let cfg = AcpBackendConfig {
+        command: acp_script.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        auth_method: None,
+        cwd: canonical_repo.clone(),
+    };
+    let engine = Arc::new(
+        InProcessEngine::open_with_config(&db_path, canonical_repo, Some(cfg)).expect("open"),
+    );
+
+    let sock_clone = socket_path.clone();
+    let engine_clone = Arc::clone(&engine);
+    let server = tokio::spawn(async move {
+        let _ = run_daemon_with_engine(sock_clone, engine_clone).await;
+    });
+
+    for _ in 0..50 {
+        if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let client = Arc::new(
+        UnixSocketEngineClient::connect(&socket_path)
+            .await
+            .expect("connect"),
+    );
+    let mut rx = client
+        .subscribe_events()
+        .await
+        .expect("subscribe")
+        .expect("event receiver");
+
+    let main = client.ensure_main_thread().await.expect("main");
+    let wt_branch = client
+        .fork_thread_with_title(Some(&main.thread_id), Some("wt-branch"))
+        .await
+        .expect("fork wt");
+    let del_branch = client
+        .fork_thread_with_title(Some(&main.thread_id), Some("del-branch"))
+        .await
+        .expect("fork del");
+
+    // 1. In-flight turn waiting for cancel: thread_metadata, ensure_thread_worktree, delete_thread, and cancel_turn must not block.
+    let turn_client = Arc::clone(&client);
+    let main_id = main.thread_id.clone();
+    let cancel_turn_task = tokio::spawn(async move {
+        turn_client
+            .send_turn_for_thread(&main_id, "wait-cancel")
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        !cancel_turn_task.is_finished(),
+        "wait-cancel turn must still be in flight"
+    );
+
+    let meta = timeout(Duration::from_millis(500), client.thread_metadata())
+        .await
+        .expect("thread_metadata must not block behind send_turn")
+        .expect("thread_metadata ok");
+    assert_eq!(meta.len(), 3);
+
+    let wt_path = timeout(
+        Duration::from_millis(2000),
+        client.ensure_thread_worktree(&wt_branch.thread_id),
+    )
+    .await
+    .expect("ensure_thread_worktree must not block behind send_turn")
+    .expect("ensure_thread_worktree ok");
+    assert!(Path::new(&wt_path).join(".git").exists());
+
+    let next_active = timeout(
+        Duration::from_millis(500),
+        client.delete_thread(&del_branch.thread_id),
+    )
+    .await
+    .expect("delete_thread must not block behind send_turn")
+    .expect("delete_thread ok");
+    assert_eq!(next_active, main.thread_id);
+
+    timeout(Duration::from_millis(500), client.cancel_turn(&main.thread_id))
+        .await
+        .expect("cancel_turn must not block behind send_turn")
+        .expect("cancel_turn ok");
+
+    timeout(Duration::from_secs(2), cancel_turn_task)
+        .await
+        .expect("cancelled turn should finish promptly")
+        .expect("join")
+        .expect("turn ok");
+
+    // 2. In-flight turn waiting for permission: resolve_permission must not deadlock behind send_turn.
+    let turn_client2 = Arc::clone(&client);
+    let main_id2 = main.thread_id.clone();
+    let perm_turn_task = tokio::spawn(async move {
+        turn_client2
+            .send_turn_for_thread(&main_id2, "wait-perm")
+            .await
+    });
+
+    let perm_req_id = timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Some(TuiEngineEvent::PermissionRequested { request_id, .. }) => {
+                    return request_id;
+                }
+                Some(_) => continue,
+                None => panic!("event stream closed before PermissionRequested"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for PermissionRequested");
+
+    timeout(
+        Duration::from_millis(500),
+        client.resolve_permission(PermissionDecisionPayload {
+            request_id: perm_req_id,
+            allow: true,
+        }),
+    )
+    .await
+    .expect("resolve_permission must not deadlock behind send_turn")
+    .expect("resolve_permission ok");
+
+    timeout(Duration::from_secs(2), perm_turn_task)
+        .await
+        .expect("permission turn should finish promptly")
+        .expect("join")
+        .expect("perm turn ok");
+
+    server.abort();
+}

@@ -402,6 +402,7 @@ struct EngineRuntime {
     subagent_watch: Mutex<Arc<SubagentWatcher>>,
     unsolicited_quiet_timeout: Mutex<Duration>,
     active_pty_sessions: Arc<Mutex<HashMap<String, Arc<InteractivePtySession>>>>,
+    pending_pty_sizes: Arc<Mutex<HashMap<String, (u16, u16)>>>,
     pty_exited_threads: Mutex<HashSet<String>>,
     pty_notify_tx: mpsc::UnboundedSender<String>,
     pty_notify_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
@@ -1508,21 +1509,50 @@ impl EngineRuntime {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
+    fn expand_leading_tilde(raw: &str, home_dir: Option<&str>) -> Option<PathBuf> {
+        let home = home_dir.filter(|h| !h.is_empty())?;
+        if raw == "~" {
+            return Some(PathBuf::from(home));
+        }
+        raw.strip_prefix("~/").map(|rest| {
+            let trimmed_rest = rest.trim_start_matches('/');
+            if trimmed_rest.is_empty() {
+                PathBuf::from(home)
+            } else {
+                PathBuf::from(home).join(trimmed_rest)
+            }
+        })
+    }
+
     fn resolve_terminal_cwd(
         &self,
         explicit_cwd: Option<&str>,
         parent_thread: Option<&Thread>,
+    ) -> Result<String, EngineError> {
+        let home_dir = std::env::var("HOME").ok();
+        self.resolve_terminal_cwd_with_home(explicit_cwd, parent_thread, home_dir.as_deref())
+    }
+
+    fn resolve_terminal_cwd_with_home(
+        &self,
+        explicit_cwd: Option<&str>,
+        parent_thread: Option<&Thread>,
+        home_dir: Option<&str>,
     ) -> Result<String, EngineError> {
         let base_dir = parent_thread
             .map(|p| self.resolve_thread_cwd(p))
             .unwrap_or_else(|| self.cwd.clone());
         let candidate = match explicit_cwd.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => {
-                let raw_path = Path::new(raw);
-                if raw_path.is_absolute() {
-                    raw_path.to_path_buf()
+                if let Some(expanded) = Self::expand_leading_tilde(raw, home_dir) {
+                    expanded
                 } else {
-                    base_dir.join(raw_path)
+                    let raw_path = Path::new(raw);
+                    if raw_path.is_absolute() {
+                        raw_path.to_path_buf()
+                    } else {
+                        base_dir.join(raw_path)
+                    }
                 }
             }
             None => base_dir,
@@ -1584,7 +1614,7 @@ impl EngineRuntime {
         thread: &Thread,
         rows: u16,
         cols: u16,
-    ) -> Result<Arc<InteractivePtySession>, EngineError> {
+    ) -> Result<(Arc<InteractivePtySession>, bool), EngineError> {
         if let Some(existing) = self
             .active_pty_sessions
             .lock()
@@ -1592,22 +1622,52 @@ impl EngineRuntime {
             .get(thread_id)
             .cloned()
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         let _guard = self.acquire_thread_turn_lock(thread_id).await?;
-        if let Some(existing) = self
-            .active_pty_sessions
+        let pending_size = {
+            let sessions = self
+                .active_pty_sessions
+                .lock()
+                .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?;
+            if let Some(existing) = sessions.get(thread_id).cloned() {
+                return Ok((existing, false));
+            }
+            self.pending_pty_sizes
+                .lock()
+                .map_err(|_| EngineError::Storage("pending pty sizes map poisoned".to_string()))?
+                .remove(thread_id)
+        };
+
+        let (spawn_rows, spawn_cols, used_pending) = match pending_size {
+            Some((pending_rows, pending_cols)) => (pending_rows, pending_cols, true),
+            None => (
+                if rows == 0 { 24 } else { rows },
+                if cols == 0 { 80 } else { cols },
+                false,
+            ),
+        };
+        let cwd = self.resolve_thread_cwd(thread);
+        let session = self
+            .spawn_pty_for_thread(thread_id, cwd, spawn_rows, spawn_cols)
+            .await?;
+
+        let race_pending = self
+            .pending_pty_sizes
             .lock()
-            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
-            .get(thread_id)
-            .cloned()
-        {
-            return Ok(existing);
+            .map_err(|_| EngineError::Storage("pending pty sizes map poisoned".to_string()))?
+            .remove(thread_id);
+        if let Some((later_rows, later_cols)) = race_pending {
+            let s_clone = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || s_clone.resize(later_rows, later_cols))
+                .await
+                .map_err(|e| EngineError::Transport(format!("PTY resize task panicked: {e}")))?
+                .map_err(|e| EngineError::Transport(format!("PTY resize failed: {e}")))?;
+            return Ok((session, true));
         }
 
-        let cwd = self.resolve_thread_cwd(thread);
-        self.spawn_pty_for_thread(thread_id, cwd, rows, cols).await
+        Ok((session, used_pending))
     }
 
     fn require_terminal_thread(&self, thread_id: &str) -> Result<(ThreadId, Thread), EngineError> {
@@ -2317,6 +2377,7 @@ impl InProcessEngine {
                 subagent_watch: Mutex::new(watcher),
                 unsolicited_quiet_timeout: Mutex::new(UNSOLICITED_QUIET_TIMEOUT),
                 active_pty_sessions: Arc::new(Mutex::new(HashMap::new())),
+                pending_pty_sizes: Arc::new(Mutex::new(HashMap::new())),
                 pty_exited_threads: Mutex::new(HashSet::new()),
                 pty_notify_tx,
                 pty_notify_rx: Mutex::new(Some(pty_notify_rx)),
@@ -3374,6 +3435,9 @@ impl DaemonEngine for InProcessEngine {
             .lock()
             .ok()
             .and_then(|mut map| map.remove(thread_id));
+        if let Ok(mut pending) = self.runtime.pending_pty_sizes.lock() {
+            pending.remove(thread_id);
+        }
         if let Ok(mut exited) = self.runtime.pty_exited_threads.lock() {
             exited.remove(thread_id);
         }
@@ -3743,6 +3807,9 @@ impl DaemonEngine for InProcessEngine {
             .spawn_pty_for_thread(&tid_str, PathBuf::from(&resolved_cwd), rows, cols)
             .await
         {
+            if let Ok(mut pending) = self.runtime.pending_pty_sizes.lock() {
+                pending.remove(&tid_str);
+            }
             let _ = self.runtime.storage.delete_thread(tid);
             return Err(err);
         }
@@ -3754,6 +3821,9 @@ impl DaemonEngine for InProcessEngine {
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::Storage("created terminal thread missing".to_string()))?;
         let summary = thread_to_summary(&created, false);
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
         self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
@@ -3761,15 +3831,12 @@ impl DaemonEngine for InProcessEngine {
                 turns: Vec::new(),
             },
         });
-        let meta = self.runtime.compute_thread_metadata()?;
-        self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
         Ok(summary)
     }
 
     async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
         let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
-        let session = self
+        let (session, _) = self
             .runtime
             .ensure_pty_session(thread_id, &thread, 24, 80)
             .await?;
@@ -3784,18 +3851,30 @@ impl DaemonEngine for InProcessEngine {
         if rows == 0 || cols == 0 {
             return Ok(());
         }
-        let session = self
-            .runtime
-            .active_pty_sessions
-            .lock()
-            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
-            .get(thread_id)
-            .cloned();
+        let target_rows = rows.max(4);
+        let target_cols = cols.max(10);
+        let session = {
+            let sessions = self
+                .runtime
+                .active_pty_sessions
+                .lock()
+                .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?;
+            if let Some(existing) = sessions.get(thread_id).cloned() {
+                Some(existing)
+            } else {
+                self.runtime
+                    .pending_pty_sizes
+                    .lock()
+                    .map_err(|_| {
+                        EngineError::Storage("pending pty sizes map poisoned".to_string())
+                    })?
+                    .insert(thread_id.to_string(), (target_rows, target_cols));
+                None
+            }
+        };
         let Some(session) = session else {
             return Ok(());
         };
-        let target_rows = rows.max(4);
-        let target_cols = cols.max(10);
         tokio::task::spawn_blocking(move || session.resize(target_rows, target_cols))
             .await
             .map_err(|e| EngineError::Transport(format!("PTY resize task panicked: {e}")))?
@@ -3809,12 +3888,12 @@ impl DaemonEngine for InProcessEngine {
         cols: u16,
     ) -> Result<TuiPtyScreenSnapshot, EngineError> {
         let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
-        let session = self
+        let (session, used_pending) = self
             .runtime
             .ensure_pty_session(thread_id, &thread, rows, cols)
             .await?;
         let snap = session.snapshot();
-        if rows > 0 && cols > 0 {
+        if !used_pending && rows > 0 && cols > 0 {
             let target_rows = rows.max(4);
             let target_cols = cols.max(10);
             if snap.rows != target_rows || snap.cols != target_cols {
@@ -4160,14 +4239,31 @@ impl UnixSocketEngineClient {
         })
     }
 
-    fn parse_rpc_response(line: &str) -> Result<Value, EngineError> {
+    fn is_stale_daemon_terminal_rpc(method: &str) -> bool {
+        matches!(
+            method,
+            "session.create_terminal"
+                | "session.pty_write"
+                | "session.pty_resize"
+                | "session.pty_snapshot"
+                | "session.ensure_thread_worktree"
+        )
+    }
+
+    fn parse_rpc_response(method: &str, line: &str) -> Result<Value, EngineError> {
         let response: Value =
             serde_json::from_str(line.trim()).map_err(|e| EngineError::Protocol(e.to_string()))?;
         if let Some(error) = response.get("error") {
+            let code = error.get("code").and_then(Value::as_i64);
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown rpc error");
+            if code == Some(-32601) && Self::is_stale_daemon_terminal_rpc(method) {
+                return Err(EngineError::Protocol(format!(
+                    "running `grein daemon` appears outdated and needs to be restarted (`{method}`: {message})"
+                )));
+            }
             return Err(EngineError::Protocol(message.to_string()));
         }
         response
@@ -4197,7 +4293,7 @@ impl UnixSocketEngineClient {
         if read == 0 {
             return Err(EngineError::Transport("daemon closed connection".into()));
         }
-        Self::parse_rpc_response(&line)
+        Self::parse_rpc_response(method, &line)
     }
 
     async fn call_dedicated(&self, method: &str, params: Value) -> Result<Value, EngineError> {
@@ -4224,7 +4320,7 @@ impl UnixSocketEngineClient {
         if read_bytes == 0 {
             return Err(EngineError::Transport("daemon closed connection".into()));
         }
-        Self::parse_rpc_response(&line)
+        Self::parse_rpc_response(method, &line)
     }
 
     async fn call_typed<T: DeserializeOwned>(
@@ -4417,12 +4513,12 @@ impl DaemonEngine for UnixSocketEngineClient {
         &self,
         decision: PermissionDecisionPayload,
     ) -> Result<EngineEvent, EngineError> {
-        self.call_typed("permissions.resolve", to_json(&decision)?)
+        self.call_dedicated_typed("permissions.resolve", to_json(&decision)?)
             .await
     }
 
     async fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
-        self.call("session.cancel", json!({"thread_id": thread_id}))
+        self.call_dedicated("session.cancel", json!({"thread_id": thread_id}))
             .await
             .map(|_| ())
     }
@@ -4507,12 +4603,13 @@ impl DaemonEngine for UnixSocketEngineClient {
     }
 
     async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
-        self.call_typed("session.thread_metadata", json!({})).await
+        self.call_dedicated_typed("session.thread_metadata", json!({}))
+            .await
     }
 
     async fn delete_thread(&self, thread_id: &str) -> Result<String, EngineError> {
         let val = self
-            .call("session.delete_thread", json!({"thread_id": thread_id}))
+            .call_dedicated("session.delete_thread", json!({"thread_id": thread_id}))
             .await?;
         val.get("next_active_thread_id")
             .and_then(Value::as_str)
@@ -4605,7 +4702,7 @@ impl DaemonEngine for UnixSocketEngineClient {
 
     async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         let val = self
-            .call(
+            .call_dedicated(
                 "session.ensure_thread_worktree",
                 json!({"thread_id": thread_id}),
             )
@@ -6802,5 +6899,265 @@ done
         assert_eq!(metas[0].mode.as_deref(), Some("plan"));
         assert_eq!(metas[0].available_commands.len(), 1);
         assert!(metas[0].config_options.iter().any(|o| o.id == "thought_level"));
+    }
+
+    #[tokio::test]
+    async fn test_create_terminal_emits_metadata_updated_before_thread_created() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work_dir = temp.path().join("term_dir");
+        std::fs::create_dir_all(&work_dir).expect("mkdir");
+        let canonical_dir = std::fs::canonicalize(&work_dir).expect("canonical");
+        let db_path = temp.path().join("term_order.db");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, canonical_dir.clone(), None)
+                .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        let mut rx = engine.subscribe_tui_events();
+
+        let term = engine
+            .create_terminal(Some(&main.thread_id), Some("Ordered Term"), None, 24, 80)
+            .await
+            .expect("create_terminal");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        let meta_idx = events
+            .iter()
+            .position(|ev| {
+                matches!(
+                    ev,
+                    TuiEngineEvent::ThreadMetadataUpdated { meta }
+                        if meta.iter().any(|m| {
+                            m.thread_id == term.thread_id
+                                && m.kind == ThreadKind::Terminal
+                                && m.cwd.as_deref() == Some(canonical_dir.to_string_lossy().as_ref())
+                        })
+                )
+            })
+            .expect("expected ThreadMetadataUpdated containing new terminal meta");
+        let created_idx = events
+            .iter()
+            .position(|ev| {
+                matches!(
+                    ev,
+                    TuiEngineEvent::ThreadCreated { thread } if thread.id == term.thread_id
+                )
+            })
+            .expect("expected ThreadCreated for terminal");
+
+        assert!(
+            meta_idx < created_idx,
+            "ThreadMetadataUpdated (idx {meta_idx}) must precede ThreadCreated (idx {created_idx}): {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_client_stale_daemon_32601_hint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("stale.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Value = serde_json::from_str(&line).expect("json");
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let method = req
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let resp = rpc_error(id, -32601, format!("method not found: {method}"));
+                        if write.write_all(format!("{resp}\n").as_bytes()).await.is_err()
+                            || write.flush().await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = UnixSocketEngineClient::connect(&socket_path)
+            .await
+            .expect("connect");
+
+        let err_create = client
+            .create_terminal(None, None, None, 24, 80)
+            .await
+            .expect_err("create_terminal should fail");
+        let err_write = client
+            .pty_write("t-1", b"echo hi\n".to_vec())
+            .await
+            .expect_err("pty_write should fail");
+        let err_resize = client
+            .pty_resize("t-1", 30, 100)
+            .await
+            .expect_err("pty_resize should fail");
+        let err_snap = client
+            .pty_snapshot("t-1", 30, 100)
+            .await
+            .expect_err("pty_snapshot should fail");
+        let err_wt = client
+            .ensure_thread_worktree("t-1")
+            .await
+            .expect_err("ensure_thread_worktree should fail");
+
+        for (name, err) in [
+            ("create_terminal", err_create),
+            ("pty_write", err_write),
+            ("pty_resize", err_resize),
+            ("pty_snapshot", err_snap),
+            ("ensure_thread_worktree", err_wt),
+        ] {
+            let msg = err.to_string().to_ascii_lowercase();
+            assert!(
+                msg.contains("grein daemon")
+                    && msg.contains("outdated")
+                    && msg.contains("restart"),
+                "{name} -32601 error must explain stale grein daemon needs restart, got: {err}"
+            );
+        }
+
+        let err_ping = client.ping().await.expect_err("ping -32601");
+        let ping_msg = err_ping.to_string().to_ascii_lowercase();
+        assert!(
+            !ping_msg.contains("outdated"),
+            "unrelated -32601 method should keep standard protocol error, got: {err_ping}"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn test_resolve_terminal_cwd_tilde_edge_cases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("ws");
+        let home = temp.path().join("fake_home");
+        let home_sub = home.join("sub");
+        std::fs::create_dir_all(&workspace).expect("mkdir ws");
+        std::fs::create_dir_all(&home_sub).expect("mkdir home_sub");
+        let canonical_home = std::fs::canonicalize(&home).expect("canonical home");
+        let canonical_sub = std::fs::canonicalize(&home_sub).expect("canonical sub");
+
+        let db_path = temp.path().join("tilde_unit.db");
+        let engine = InProcessEngine::open_with_config(&db_path, workspace, None).expect("open");
+        let home_str = canonical_home.to_string_lossy().into_owned();
+
+        assert_eq!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~"), None, Some(&home_str))
+                .expect("~ resolves"),
+            home_str
+        );
+        assert_eq!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~/"), None, Some(&home_str))
+                .expect("~/ resolves"),
+            home_str
+        );
+        assert_eq!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~/sub"), None, Some(&home_str))
+                .expect("~/sub resolves"),
+            canonical_sub.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~//sub"), None, Some(&home_str))
+                .expect("~//sub resolves without dropping home prefix"),
+            canonical_sub.to_string_lossy().as_ref()
+        );
+
+        // Unset or empty HOME does not expand tilde.
+        assert!(matches!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~"), None, None),
+            Err(EngineError::InvalidParams(_))
+        ));
+        assert!(matches!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~/sub"), None, Some("")),
+            Err(EngineError::InvalidParams(_))
+        ));
+        // ~otheruser is not expanded to $HOME.
+        assert!(matches!(
+            engine
+                .runtime
+                .resolve_terminal_cwd_with_home(Some("~otheruser/sub"), None, Some(&home_str)),
+            Err(EngineError::InvalidParams(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_pending_pty_sizes_clamping_and_delete_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("pending_clamp.db");
+
+        let term_id = {
+            let engine =
+                InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                    .expect("open");
+            let _main = engine.ensure_main_thread().await.expect("main");
+            let term = engine
+                .create_terminal(None, Some("Clamp Term"), None, 24, 80)
+                .await
+                .expect("create");
+            term.thread_id
+        };
+
+        let reopened =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                .expect("reopen");
+        reopened
+            .pty_resize(&term_id, 2, 5)
+            .await
+            .expect("clamped pending resize");
+        assert_eq!(
+            reopened
+                .runtime
+                .pending_pty_sizes
+                .lock()
+                .unwrap()
+                .get(&term_id)
+                .copied(),
+            Some((4, 10))
+        );
+
+        // Zero resize leaves pending size untouched.
+        reopened.pty_resize(&term_id, 0, 80).await.expect("zero resize");
+        assert_eq!(
+            reopened
+                .runtime
+                .pending_pty_sizes
+                .lock()
+                .unwrap()
+                .get(&term_id)
+                .copied(),
+            Some((4, 10))
+        );
+
+        reopened.delete_thread(&term_id).await.expect("delete");
+        assert!(!reopened
+            .runtime
+            .pending_pty_sizes
+            .lock()
+            .unwrap()
+            .contains_key(&term_id));
     }
 }
