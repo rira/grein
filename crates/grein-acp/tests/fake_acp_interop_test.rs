@@ -583,3 +583,114 @@ async fn test_fake_acp_permission_request_allow_deny_and_cancel() {
         "FAKE_ACP_LOG env var should log permission response frame"
     );
 }
+
+#[tokio::test]
+async fn test_fake_acp_unsolicited_subagent_wakeup_over_persistent_stream() {
+    let driver = spawn_fake_driver(Vec::new(), Vec::new()).await;
+
+    driver.initialize().await.expect("init");
+    driver.authenticate("oauth-personal").await.expect("auth");
+    let sess = driver
+        .new_session(Path::new("/tmp"), None)
+        .await
+        .expect("new_session");
+
+    let mut rx = driver.subscribe_session(&sess.session_id);
+    driver
+        .submit_prompt(&sess.session_id, "SPAWN_SUBAGENT_WAKEUP")
+        .await
+        .expect("submit_prompt SPAWN_SUBAGENT_WAKEUP");
+
+    let initial_events = collect_turn_events(&mut rx).await;
+    assert_eq!(
+        initial_events,
+        vec![
+            DriverEvent::ToolCall {
+                session_id: sess.session_id.clone(),
+                tool_call_id: "tc-subagent-1".into(),
+                name: "invoke_subagent".into(),
+                title: "Launching background subagent".into(),
+                args: json!({
+                    "Role": "Background Code Checker",
+                    "TypeName": "research",
+                    "Prompt": "check codebase",
+                }),
+                status: "in_progress".into(),
+            },
+            DriverEvent::ToolCallUpdate {
+                session_id: sess.session_id.clone(),
+                tool_call_id: "tc-subagent-1".into(),
+                name: String::new(),
+                status: "completed".into(),
+                output: String::new(),
+            },
+            DriverEvent::StreamChunk {
+                session_id: sess.session_id.clone(),
+                text: "Spawned background subagent.".into(),
+            },
+            DriverEvent::PromptCompleted {
+                session_id: sess.session_id.clone(),
+                stop_reason: "end_turn".into(),
+                usage: None,
+            },
+        ]
+    );
+
+    let wakeup_chunk = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("timed out waiting for unsolicited wakeup chunk")
+        .expect("persistent receiver should stay open for unsolicited wakeup");
+    match &wakeup_chunk {
+        DriverEvent::StreamChunk { session_id, text } => {
+            assert_eq!(session_id, &sess.session_id);
+            assert!(
+                text.contains("WAKEUP_OK"),
+                "expected WAKEUP_OK in unsolicited chunk, got: {text:?}"
+            );
+        }
+        other => panic!("expected unsolicited StreamChunk, got {other:?}"),
+    }
+
+    let wakeup_usage = timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("timed out waiting for trailing usage_update")
+        .expect("persistent receiver should receive trailing usage_update");
+    assert_eq!(
+        wakeup_usage,
+        DriverEvent::UsageUpdate {
+            session_id: sess.session_id.clone(),
+            used: 180,
+            size: 1000000,
+        }
+    );
+
+    driver
+        .submit_prompt(&sess.session_id, "ECHO_LAST_PROMPT after wakeup")
+        .await
+        .expect("follow-up submit_prompt should succeed while wakeup fired");
+    let follow_up_events = collect_turn_events(&mut rx).await;
+    assert_eq!(
+        follow_up_events,
+        vec![
+            DriverEvent::StreamChunk {
+                session_id: sess.session_id.clone(),
+                text: "ECHO_LAST_PROMPT after wakeup".into(),
+            },
+            DriverEvent::PromptCompleted {
+                session_id: sess.session_id.clone(),
+                stop_reason: "end_turn".into(),
+                usage: None,
+            },
+        ]
+    );
+
+    driver
+        .close_session(&sess.session_id)
+        .await
+        .expect("close_session should succeed");
+    let closed = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("closed persistent receiver should not hang");
+    assert!(closed.is_none());
+    driver.shutdown().await.expect("shutdown should succeed");
+}

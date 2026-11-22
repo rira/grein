@@ -269,6 +269,55 @@ class FakeAcpServer:
             self._send_response(req_id, {"stopReason": "end_turn"})
             return
 
+        if "SPAWN_SUBAGENT_WAKEUP" in prompt_text:
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-subagent-1",
+                    "name": "invoke_subagent",
+                    "title": "Launching background subagent",
+                    "status": "in_progress",
+                    "args": {
+                        "Role": "Background Code Checker",
+                        "TypeName": "research",
+                        "Prompt": "check codebase",
+                    },
+                },
+            )
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-subagent-1",
+                    "status": "completed",
+                },
+            )
+            self._send_text_chunk(session_id, "Spawned background subagent.")
+            self._send_response(req_id, {"stopReason": "end_turn"})
+
+            def _emit_wakeup() -> None:
+                if self._shutdown_event.wait(timeout=0.15):
+                    return
+                with self._state_lock:
+                    if session_id not in self._sessions:
+                        return
+                self._send_text_chunk(
+                    session_id, "\n\nWAKEUP_OK: background subagent finished"
+                )
+                self._send_update(
+                    session_id,
+                    {
+                        "sessionUpdate": "usage_update",
+                        "used": 180,
+                        "size": 1000000,
+                    },
+                )
+
+            wakeup_thread = threading.Thread(target=_emit_wakeup, daemon=True)
+            wakeup_thread.start()
+            return
+
         with self._state_lock:
             is_first_turn = session["first_turn"]
             session["first_turn"] = False
