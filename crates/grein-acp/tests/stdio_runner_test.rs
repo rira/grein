@@ -777,3 +777,361 @@ exit 1
             .any(|line| line.contains("mid-turn crash stderr"))
     );
 }
+
+#[tokio::test]
+async fn test_acp_driver_persistent_stream_receives_unsolicited_post_turn_updates() {
+    let capture = TempCaptureFile::new("persistent_unsolicited");
+    let script = r#"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$CAPTURE_FILE"
+    rest=${line#*\"id\":}
+    id=${rest%%,*}
+    id=${id%%\}*}
+    case "$line" in
+        *'"method":"session/prompt"'*)
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking-1"}}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"turn1-hello"}}}}\n'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unsolicited-msg"}}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"tool_call","toolCallId":"tc-bg","name":"run_command","title":"Background job","args":{"cmd":"echo hi"},"status":"running"}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-bg","name":"run_command","status":"completed","rawOutput":{"output":"bg-ok"}}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"usage_update","used":320,"size":100000}}}\n'
+            printf '{"jsonrpc":"2.0","id":"bg-perm-1","method":"session/request_permission","params":{"sessionId":"sess-persist","toolCall":{"toolCallId":"tc-bg-p","name":"write_file","title":"Write log","args":{"Path":"bg.log"}},"options":[{"optionId":"allow_once","name":"Allow Once","kind":"allow_once"}]}}\n'
+            ;;
+        *'"id":"bg-perm-1"'*)
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-persist","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after-perm"}}}}\n'
+            ;;
+        *'"method":"session/close"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$id"
+            break
+            ;;
+    esac
+done
+sleep 1
+"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()])
+        .with_env([("CAPTURE_FILE".to_string(), capture.path_string())]);
+    let runner = StdioProcessRunner::spawn(config).await.expect("spawn");
+    let driver = AcpStdioDriver::new(runner);
+
+    let mut persistent_rx = driver.subscribe_session("sess-persist");
+
+    driver
+        .submit_prompt("sess-persist", "turn 1")
+        .await
+        .expect("submit_prompt should succeed");
+
+    let mut received = Vec::new();
+    for _ in 0..8 {
+        let ev = timeout(Duration::from_secs(2), persistent_rx.recv())
+            .await
+            .expect("timed out waiting for persistent event")
+            .expect("persistent receiver should stay open");
+        if let DriverEvent::PermissionRequested { request_id, .. } = &ev {
+            driver
+                .respond_permission(request_id.clone(), Some("allow_once"))
+                .await
+                .expect("respond to unsolicited permission");
+        }
+        received.push(ev);
+    }
+
+    assert_eq!(
+        received,
+        vec![
+            DriverEvent::ThoughtChunk {
+                session_id: "sess-persist".into(),
+                text: "thinking-1".into(),
+            },
+            DriverEvent::StreamChunk {
+                session_id: "sess-persist".into(),
+                text: "turn1-hello".into(),
+            },
+            DriverEvent::PromptCompleted {
+                session_id: "sess-persist".into(),
+                stop_reason: "end_turn".into(),
+                usage: None,
+            },
+            DriverEvent::StreamChunk {
+                session_id: "sess-persist".into(),
+                text: "unsolicited-msg".into(),
+            },
+            DriverEvent::ToolCall {
+                session_id: "sess-persist".into(),
+                tool_call_id: "tc-bg".into(),
+                name: "run_command".into(),
+                title: "Background job".into(),
+                args: serde_json::json!({"cmd": "echo hi"}),
+                status: "running".into(),
+            },
+            DriverEvent::ToolCallUpdate {
+                session_id: "sess-persist".into(),
+                tool_call_id: "tc-bg".into(),
+                name: "run_command".into(),
+                status: "completed".into(),
+                output: "bg-ok".into(),
+            },
+            DriverEvent::UsageUpdate {
+                session_id: "sess-persist".into(),
+                used: 320,
+                size: 100000,
+            },
+            DriverEvent::PermissionRequested {
+                request_id: serde_json::json!("bg-perm-1"),
+                session_id: "sess-persist".into(),
+                tool_call_id: "tc-bg-p".into(),
+                tool_name: "write_file".into(),
+                title: "Write log".into(),
+                args: serde_json::json!({"Path": "bg.log"}),
+                options: vec![AcpPermissionOption {
+                    option_id: "allow_once".into(),
+                    name: "Allow Once".into(),
+                    kind: "allow_once".into(),
+                }],
+            },
+        ]
+    );
+
+    let after_perm = timeout(Duration::from_secs(2), persistent_rx.recv())
+        .await
+        .expect("timed out waiting for after-perm chunk")
+        .expect("persistent receiver should receive after permission reply");
+    assert_eq!(
+        after_perm,
+        DriverEvent::StreamChunk {
+            session_id: "sess-persist".into(),
+            text: "after-perm".into(),
+        }
+    );
+
+    driver
+        .close_session("sess-persist")
+        .await
+        .expect("close_session should succeed");
+    let closed = timeout(Duration::from_secs(2), persistent_rx.recv())
+        .await
+        .expect("closed persistent receiver should not hang");
+    assert!(closed.is_none());
+
+    driver.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn test_acp_driver_close_session_and_dual_dispatch_keep_send_prompt_compatible() {
+    let capture = TempCaptureFile::new("close_and_compat");
+    let script = r#"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$CAPTURE_FILE"
+    rest=${line#*\"id\":}
+    id=${rest%%,*}
+    id=${id%%\}*}
+    case "$line" in
+        *'"method":"session/prompt"'*)
+            case "$line" in
+                *'"sessionId":"sess-p"'*)
+                    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-p","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"persist-chunk"}}}}\n'
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+                    ;;
+                *'"sessionId":"sess-both"'*)
+                    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-both","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"shared-chunk"}}}}\n'
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+                    ;;
+                *'"sessionId":"sess-legacy"'*)
+                    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-legacy","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"legacy-chunk"}}}}\n'
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+                    ;;
+            esac
+            ;;
+        *'"method":"session/close"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":null}\n' "$id"
+            ;;
+    esac
+done
+"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()])
+        .with_env([("CAPTURE_FILE".to_string(), capture.path_string())]);
+    let runner = StdioProcessRunner::spawn(config).await.expect("spawn");
+    let driver = AcpStdioDriver::new(runner);
+
+    let mut rx_p = driver.subscribe_session("sess-p");
+    driver
+        .submit_prompt("sess-p", "hello")
+        .await
+        .expect("submit_prompt");
+
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_p.recv()).await.unwrap(),
+        Some(DriverEvent::StreamChunk {
+            session_id: "sess-p".into(),
+            text: "persist-chunk".into(),
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_p.recv()).await.unwrap(),
+        Some(DriverEvent::PromptCompleted {
+            session_id: "sess-p".into(),
+            stop_reason: "end_turn".into(),
+            usage: None,
+        })
+    );
+
+    driver
+        .close_session("sess-p")
+        .await
+        .expect("close_session");
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_p.recv()).await.unwrap(),
+        None
+    );
+
+    let mut rx_both_persistent = driver.subscribe_session("sess-both");
+    let mut rx_both_turn = driver
+        .send_prompt("sess-both", "dual")
+        .await
+        .expect("send_prompt dual");
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_both_turn.recv())
+            .await
+            .unwrap(),
+        Some(DriverEvent::StreamChunk {
+            session_id: "sess-both".into(),
+            text: "shared-chunk".into(),
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_both_turn.recv())
+            .await
+            .unwrap(),
+        Some(DriverEvent::PromptCompleted {
+            session_id: "sess-both".into(),
+            stop_reason: "end_turn".into(),
+            usage: None,
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_both_turn.recv())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_both_persistent.recv())
+            .await
+            .unwrap(),
+        Some(DriverEvent::StreamChunk {
+            session_id: "sess-both".into(),
+            text: "shared-chunk".into(),
+        })
+    );
+
+    let mut rx_legacy = driver
+        .send_prompt("sess-legacy", "legacy")
+        .await
+        .expect("send_prompt legacy");
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_legacy.recv())
+            .await
+            .unwrap(),
+        Some(DriverEvent::StreamChunk {
+            session_id: "sess-legacy".into(),
+            text: "legacy-chunk".into(),
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_legacy.recv())
+            .await
+            .unwrap(),
+        Some(DriverEvent::PromptCompleted {
+            session_id: "sess-legacy".into(),
+            stop_reason: "end_turn".into(),
+            usage: None,
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_legacy.recv())
+            .await
+            .unwrap(),
+        None
+    );
+
+    driver.shutdown().await.expect("shutdown");
+    assert_eq!(
+        timeout(Duration::from_secs(2), rx_both_persistent.recv())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_acp_driver_submit_prompt_error_resubscribe_and_eof_cleanup() {
+    let script = r#"
+turn=0
+while IFS= read -r line; do
+    rest=${line#*\"id\":}
+    id=${rest%%,*}
+    id=${id%%\}*}
+    case "$line" in
+        *'"method":"session/prompt"'*)
+            turn=$((turn+1))
+            if [ "$turn" -eq 1 ]; then
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"rate limited"}}\n' "$id"
+            elif [ "$turn" -eq 2 ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-err","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"recovered"}}}}\n'
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            else
+                exit 1
+            fi
+            ;;
+    esac
+done
+"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()]);
+    let runner = StdioProcessRunner::spawn(config).await.expect("spawn");
+    let driver = AcpStdioDriver::new(runner);
+
+    let mut old_rx = driver.subscribe_session("sess-err");
+    let mut new_rx = driver.subscribe_session("sess-err");
+    assert_eq!(
+        timeout(Duration::from_secs(2), old_rx.recv()).await.unwrap(),
+        None
+    );
+
+    let err = driver
+        .submit_prompt("sess-err", "fail")
+        .await
+        .expect_err("JSON-RPC error must return Err");
+    assert!(err.to_string().contains("rate limited"), "unexpected error: {err}");
+
+    driver
+        .submit_prompt("sess-err", "recover")
+        .await
+        .expect("persistent subscription must survive JSON-RPC error");
+
+    assert_eq!(
+        timeout(Duration::from_secs(2), new_rx.recv()).await.unwrap(),
+        Some(DriverEvent::StreamChunk {
+            session_id: "sess-err".into(),
+            text: "recovered".into(),
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), new_rx.recv()).await.unwrap(),
+        Some(DriverEvent::PromptCompleted {
+            session_id: "sess-err".into(),
+            stop_reason: "end_turn".into(),
+            usage: None,
+        })
+    );
+
+    let crash_err = driver
+        .submit_prompt("sess-err", "crash")
+        .await
+        .expect_err("process EOF must return Err");
+    assert!(!crash_err.to_string().is_empty());
+
+    assert_eq!(
+        timeout(Duration::from_secs(2), new_rx.recv()).await.unwrap(),
+        None
+    );
+}

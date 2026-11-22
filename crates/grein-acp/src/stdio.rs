@@ -537,10 +537,30 @@ pub trait AgentDriver: Send + Sync {
         Vec::new()
     }
 
+    fn subscribe_session(&self, _session_id: &str) -> mpsc::UnboundedReceiver<DriverEvent> {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        rx
+    }
+
+    async fn submit_prompt(
+        &self,
+        _session_id: &str,
+        _prompt: &str,
+    ) -> Result<(), StdioRunnerError> {
+        Err(StdioRunnerError::CommunicationError(
+            "submit_prompt not supported by this driver".into(),
+        ))
+    }
+
     async fn shutdown(&self) -> Result<(), StdioRunnerError>;
 }
 
-type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
+struct PendingRpc {
+    tx: oneshot::Sender<Result<serde_json::Value, String>>,
+    persistent_prompt_session: Option<String>,
+}
+
+type PendingRpcMap = Arc<Mutex<HashMap<u64, PendingRpc>>>;
 type SessionSinkMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<DriverEvent>>>>;
 
 /// AgentDriver over an ACP v1 child process speaking NDJSON JSON-RPC 2.0 on stdio.
@@ -550,6 +570,7 @@ pub struct AcpStdioDriver {
     sender: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>>,
     pending_rpc: PendingRpcMap,
     session_sinks: SessionSinkMap,
+    persistent_sinks: SessionSinkMap,
     next_id: AtomicU64,
 }
 
@@ -561,12 +582,14 @@ impl AcpStdioDriver {
         let sender = Arc::new(Mutex::new(runner.sender()));
         let pending_rpc: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
         let session_sinks: SessionSinkMap = Arc::new(Mutex::new(HashMap::new()));
+        let persistent_sinks: SessionSinkMap = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(pump(
             messages,
             Arc::clone(&sender),
             Arc::clone(&pending_rpc),
             Arc::clone(&session_sinks),
+            Arc::clone(&persistent_sinks),
         ));
 
         Self {
@@ -574,6 +597,7 @@ impl AcpStdioDriver {
             sender,
             pending_rpc,
             session_sinks,
+            persistent_sinks,
             next_id: AtomicU64::new(1),
         }
     }
@@ -592,15 +616,30 @@ impl AcpStdioDriver {
             .ok_or_else(|| StdioRunnerError::ProcessTerminated("driver is shut down".into()))
     }
 
-    async fn rpc_call(
+    fn register_pending_rpc(
+        &self,
+        persistent_prompt_session: Option<String>,
+    ) -> (u64, oneshot::Receiver<Result<serde_json::Value, String>>) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        lock(&self.pending_rpc).insert(
+            id,
+            PendingRpc {
+                tx,
+                persistent_prompt_session,
+            },
+        );
+        (id, rx)
+    }
+
+    async fn rpc_call_inner(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
+        persistent_prompt_session: Option<String>,
     ) -> Result<serde_json::Value, StdioRunnerError> {
         let sender = self.current_sender()?;
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        lock(&self.pending_rpc).insert(id, tx);
+        let (id, rx) = self.register_pending_rpc(persistent_prompt_session);
 
         let request = JsonRpcMessage::Request(JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -629,6 +668,14 @@ impl AcpStdioDriver {
                 "agent process closed before replying".into(),
             )),
         }
+    }
+
+    async fn rpc_call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, StdioRunnerError> {
+        self.rpc_call_inner(method, params, None).await
     }
 
     pub async fn initialize(&self) -> Result<AcpInitializeResult, StdioRunnerError> {
@@ -678,19 +725,43 @@ impl AcpStdioDriver {
         parse_session_info(&result)
     }
 
+    pub fn subscribe_session(&self, session_id: &str) -> mpsc::UnboundedReceiver<DriverEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sender_guard = lock(&self.sender);
+        if sender_guard.is_some() {
+            lock(&self.persistent_sinks).insert(session_id.to_string(), tx);
+        }
+        rx
+    }
+
+    pub async fn submit_prompt(
+        &self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<(), StdioRunnerError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": prompt}],
+        });
+        self.rpc_call_inner(
+            "session/prompt",
+            Some(params),
+            Some(session_id.to_string()),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn send_prompt(
         &self,
         session_id: &str,
         prompt: &str,
     ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, StdioRunnerError> {
         let sender = self.current_sender()?;
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (rpc_tx, rpc_rx) = oneshot::channel();
-
         let session_id_owned = session_id.to_string();
         lock(&self.session_sinks).insert(session_id_owned.clone(), event_tx.clone());
-        lock(&self.pending_rpc).insert(id, rpc_tx);
+        let (id, rpc_rx) = self.register_pending_rpc(None);
 
         let request = JsonRpcMessage::Request(JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -775,12 +846,18 @@ impl AcpStdioDriver {
 
     pub async fn close_session(&self, session_id: &str) -> Result<(), StdioRunnerError> {
         let params = serde_json::json!({ "sessionId": session_id });
-        self.rpc_call("session/close", Some(params)).await?;
+        let res = self.rpc_call("session/close", Some(params)).await;
+        lock(&self.persistent_sinks).remove(session_id);
+        res?;
         Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<(), StdioRunnerError> {
-        lock(&self.sender).take();
+        {
+            let mut sender_guard = lock(&self.sender);
+            sender_guard.take();
+            lock(&self.persistent_sinks).clear();
+        }
         let res = match self.runner.terminate(SHUTDOWN_GRACE).await {
             Ok(_) => Ok(()),
             Err(StdioRunnerError::ProcessTerminated(_)) => Ok(()),
@@ -837,6 +914,14 @@ impl AgentDriver for AcpStdioDriver {
         AcpStdioDriver::recent_stderr(self)
     }
 
+    fn subscribe_session(&self, session_id: &str) -> mpsc::UnboundedReceiver<DriverEvent> {
+        AcpStdioDriver::subscribe_session(self, session_id)
+    }
+
+    async fn submit_prompt(&self, session_id: &str, prompt: &str) -> Result<(), StdioRunnerError> {
+        AcpStdioDriver::submit_prompt(self, session_id, prompt).await
+    }
+
     async fn shutdown(&self) -> Result<(), StdioRunnerError> {
         AcpStdioDriver::shutdown(self).await
     }
@@ -857,9 +942,9 @@ fn remove_sink_if_same(
 }
 
 fn fail_pending_rpcs(pending_rpc: &PendingRpcMap, reason: &str) {
-    let senders: Vec<_> = lock(pending_rpc).drain().map(|(_, tx)| tx).collect();
-    for tx in senders {
-        let _ = tx.send(Err(reason.to_string()));
+    let entries: Vec<_> = lock(pending_rpc).drain().map(|(_, entry)| entry).collect();
+    for entry in entries {
+        let _ = entry.tx.send(Err(reason.to_string()));
     }
 }
 
@@ -1094,12 +1179,40 @@ fn parse_permission_request(req: &JsonRpcRequest) -> Option<(String, DriverEvent
     ))
 }
 
+fn send_or_prune(
+    sinks: &SessionSinkMap,
+    session_id: &str,
+    tx: &mpsc::UnboundedSender<DriverEvent>,
+    event: DriverEvent,
+) {
+    if tx.send(event).is_err() {
+        remove_sink_if_same(sinks, session_id, tx);
+    }
+}
+
 fn dispatch_to_session(sinks: &SessionSinkMap, session_id: &str, event: DriverEvent) {
     let tx = lock(sinks).get(session_id).cloned();
     if let Some(tx) = tx {
-        if tx.send(event).is_err() {
-            remove_sink_if_same(sinks, session_id, &tx);
+        send_or_prune(sinks, session_id, &tx, event);
+    }
+}
+
+fn dispatch_to_both_sinks(
+    session_sinks: &SessionSinkMap,
+    persistent_sinks: &SessionSinkMap,
+    session_id: &str,
+    event: DriverEvent,
+) {
+    let persistent_tx = lock(persistent_sinks).get(session_id).cloned();
+    let session_tx = lock(session_sinks).get(session_id).cloned();
+    match (persistent_tx, session_tx) {
+        (Some(ptx), Some(stx)) => {
+            send_or_prune(persistent_sinks, session_id, &ptx, event.clone());
+            send_or_prune(session_sinks, session_id, &stx, event);
         }
+        (Some(ptx), None) => send_or_prune(persistent_sinks, session_id, &ptx, event),
+        (None, Some(stx)) => send_or_prune(session_sinks, session_id, &stx, event),
+        (None, None) => {}
     }
 }
 
@@ -1108,37 +1221,43 @@ async fn pump(
     sender: Arc<Mutex<Option<mpsc::Sender<JsonRpcMessage>>>>,
     pending_rpc: PendingRpcMap,
     session_sinks: SessionSinkMap,
+    persistent_sinks: SessionSinkMap,
 ) {
     while let Some(msg) = messages.recv().await {
         match msg {
             JsonRpcMessage::Notification(n) => {
                 if let Some((session_id, event)) = translate_session_update(&n) {
-                    dispatch_to_session(&session_sinks, &session_id, event);
+                    dispatch_to_both_sinks(&session_sinks, &persistent_sinks, &session_id, event);
                 }
             }
             JsonRpcMessage::Request(req) => {
                 if let Some((session_id, event)) = parse_permission_request(&req) {
-                    dispatch_to_session(&session_sinks, &session_id, event);
+                    dispatch_to_both_sinks(&session_sinks, &persistent_sinks, &session_id, event);
                 } else {
                     tracing::debug!("ignoring server-initiated request: {}", req.method);
                 }
             }
             JsonRpcMessage::Response(resp) => {
                 if let Some(id) = resp.id.as_u64() {
-                    if let Some(tx) = lock(&pending_rpc).remove(&id) {
-                        let _ = tx.send(Ok(resp.result));
+                    if let Some(pending) = lock(&pending_rpc).remove(&id) {
+                        if let Some(session_id) = pending.persistent_prompt_session {
+                            let completed = build_prompt_completed(&session_id, &resp.result);
+                            dispatch_to_session(&persistent_sinks, &session_id, completed);
+                        }
+                        let _ = pending.tx.send(Ok(resp.result));
                     }
                 }
             }
             JsonRpcMessage::Error(err) => {
                 let message = format_rpc_error(&err.error);
                 if let Some(id) = err.id.as_ref().and_then(|v| v.as_u64()) {
-                    if let Some(tx) = lock(&pending_rpc).remove(&id) {
-                        let _ = tx.send(Err(message));
+                    if let Some(pending) = lock(&pending_rpc).remove(&id) {
+                        let _ = pending.tx.send(Err(message));
                         continue;
                     }
                 }
-                let sinks: Vec<_> = lock(&session_sinks).values().cloned().collect();
+                let mut sinks: Vec<_> = lock(&persistent_sinks).values().cloned().collect();
+                sinks.extend(lock(&session_sinks).values().cloned());
                 for tx in sinks {
                     let _ = tx.send(DriverEvent::Error {
                         session_id: None,
@@ -1149,7 +1268,11 @@ async fn pump(
         }
     }
 
-    lock(&sender).take();
+    {
+        let mut sender_guard = lock(&sender);
+        sender_guard.take();
+        lock(&persistent_sinks).clear();
+    }
     fail_pending_rpcs(&pending_rpc, "agent process closed its output");
 }
 
