@@ -1084,6 +1084,8 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "b1".to_string(),
@@ -1092,6 +1094,8 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "r2".to_string(),
@@ -1100,6 +1104,8 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
             ],
         },

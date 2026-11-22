@@ -27,7 +27,7 @@ pub struct HydratedSession {
 }
 
 /// Structural parent/child metadata for a conversation or terminal thread.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ThreadMeta {
     pub thread_id: String,
     pub parent_thread_id: Option<String>,
@@ -38,6 +38,10 @@ pub struct ThreadMeta {
     pub kind: grein_core::ThreadKind,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_dirty: usize,
 }
 
 /// Terminal foreground/background color captured from VT100 emulation.
@@ -76,6 +80,10 @@ pub struct PtyScreenSnapshot {
     pub alternate_screen: bool,
     pub exited: bool,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub scrollback_offset: usize,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 impl PtyScreenSnapshot {
@@ -397,6 +405,25 @@ pub trait TuiEnginePort: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ensure_thread_worktree not supported",
+        ))
+    }
+
+    async fn pty_scroll(&self, _thread_id: &str, _delta: isize) -> io::Result<PtyScreenSnapshot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pty_scroll not supported",
+        ))
+    }
+
+    async fn pty_restart(
+        &self,
+        _thread_id: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> io::Result<PtyScreenSnapshot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pty_restart not supported",
         ))
     }
 }

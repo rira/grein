@@ -84,6 +84,8 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -92,6 +94,8 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "t-grandchild".to_string(),
@@ -100,6 +104,8 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "t-sibling".to_string(),
@@ -108,6 +114,8 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
             ],
         },
@@ -364,6 +372,8 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "t-2".to_string(),
@@ -372,6 +382,8 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
             ])
         }
@@ -457,6 +469,8 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -465,6 +479,8 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
             ],
         },
@@ -887,6 +903,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "b1".to_string(),
@@ -895,6 +913,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: true,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "b2".to_string(),
@@ -903,6 +923,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "g1".to_string(),
@@ -911,6 +933,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "gg1".to_string(),
@@ -919,6 +943,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: true,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "r2".to_string(),
@@ -927,6 +953,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "r2c".to_string(),
@@ -935,6 +963,8 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
             ],
         },
@@ -1149,6 +1179,8 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -1157,6 +1189,8 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     merged: false,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 },
             ],
         },

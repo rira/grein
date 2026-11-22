@@ -2227,6 +2227,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.thread_meta.insert(
@@ -2238,6 +2240,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.thread_meta.insert(
@@ -2249,6 +2253,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.thread_meta.insert(
@@ -2260,6 +2266,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.thread_meta.insert(
@@ -2271,6 +2279,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.thread_meta.insert(
@@ -2282,6 +2292,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.thread_meta.insert(
@@ -2293,6 +2305,8 @@ mod tests {
                 merged: false,
                 kind: grein_core::ThreadKind::Agent,
                 cwd: None,
+                git_branch: None,
+                git_dirty: 0,
             },
         );
         app.sync_anchors();

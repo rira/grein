@@ -546,6 +546,8 @@ fn pty_snapshot_to_tui(snap: WsPtyScreenSnapshot) -> TuiPtyScreenSnapshot {
         alternate_screen: snap.alternate_screen,
         exited: snap.exited,
         exit_code: snap.exit_code,
+        scrollback_offset: snap.scrollback_offset,
+        cwd: snap.cwd,
     }
 }
 
@@ -1318,6 +1320,8 @@ impl EngineRuntime {
                 merged: thread.merged,
                 kind: thread.kind,
                 cwd: thread.cwd.clone(),
+                git_branch: None,
+                git_dirty: 0,
             });
         }
 

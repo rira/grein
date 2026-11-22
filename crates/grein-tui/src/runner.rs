@@ -1337,6 +1337,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                     merged: true,
                     kind: grein_core::ThreadKind::Agent,
                     cwd: None,
+                    git_branch: None,
+                    git_dirty: 0,
                 });
             let source_title = app
                 .threads
@@ -1709,6 +1711,8 @@ fn dispatch_action(
                             merged: false,
                             kind: grein_core::ThreadKind::Agent,
                             cwd: None,
+                            git_branch: None,
+                            git_dirty: 0,
                         };
                         let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
                             TuiEngineEvent::ThreadCreated { thread },
@@ -1929,6 +1933,8 @@ fn dispatch_action(
                             merged: false,
                             kind: grein_core::ThreadKind::Terminal,
                             cwd,
+                            git_branch: None,
+                            git_dirty: 0,
                         };
                         let _ =
                             local_ev_tx.send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));

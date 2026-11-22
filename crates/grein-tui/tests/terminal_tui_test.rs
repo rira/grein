@@ -127,6 +127,7 @@ fn test_dual_mode_layout_hides_composer_for_terminal_and_preserves_agent() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term".to_string(),
@@ -135,6 +136,7 @@ fn test_dual_mode_layout_hides_composer_for_terminal_and_preserves_agent() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: Some("/tmp/repo".to_string()),
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -220,6 +222,7 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-sub-agent".to_string(),
@@ -228,6 +231,7 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term-live".to_string(),
@@ -236,6 +240,7 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term-exit-ok".to_string(),
@@ -244,6 +249,7 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term-root-fail".to_string(),
@@ -252,6 +258,7 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -310,6 +317,7 @@ fn test_live_terminal_rendering_colors_attributes_wide_utf8_and_cursor() {
                 merged: false,
                 kind: ThreadKind::Terminal,
                 cwd: Some("/work".to_string()),
+                ..ThreadMeta::default()
             }],
         },
     );
@@ -364,6 +372,7 @@ fn test_live_terminal_rendering_colors_attributes_wide_utf8_and_cursor() {
                 alternate_screen: false,
                 exited: false,
                 exit_code: None,
+                ..PtyScreenSnapshot::default()
             },
         },
     );
@@ -449,6 +458,7 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term".to_string(),
@@ -457,6 +467,7 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: Some("/tmp".to_string()),
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -706,6 +717,7 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term".to_string(),
@@ -714,6 +726,7 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -862,6 +875,7 @@ impl TuiEnginePort for MockTerminalEngine {
             merged: false,
             kind: ThreadKind::Terminal,
             cwd: cwd.map(str::to_string),
+            ..ThreadMeta::default()
         });
         g.snapshots_by_thread.insert(
             id,
@@ -948,6 +962,7 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
             merged: false,
             kind: ThreadKind::Agent,
             cwd: None,
+            ..ThreadMeta::default()
         },
         ThreadMeta {
             thread_id: "t-persisted-term".to_string(),
@@ -956,6 +971,7 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
             merged: false,
             kind: ThreadKind::Terminal,
             cwd: Some("/tmp/persisted".to_string()),
+            ..ThreadMeta::default()
         },
     ];
     let mut snaps = HashMap::new();
@@ -1066,6 +1082,7 @@ async fn test_e2e_startup_on_persisted_terminal_loads_snapshot_and_focuses_termi
         merged: false,
         kind: ThreadKind::Terminal,
         cwd: Some("/tmp/boot".to_string()),
+        ..ThreadMeta::default()
     }];
     let mut snaps = HashMap::new();
     snaps.insert(
@@ -1246,6 +1263,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-agent-2".to_string(),
@@ -1254,6 +1272,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -1322,6 +1341,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term-1".to_string(),
@@ -1330,6 +1350,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: Some("/tmp".to_string()),
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-agent-2".to_string(),
@@ -1338,6 +1359,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -1415,6 +1437,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-term".to_string(),
@@ -1423,6 +1446,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
                     merged: false,
                     kind: ThreadKind::Terminal,
                     cwd: Some("/tmp".to_string()),
+                    ..ThreadMeta::default()
                 },
                 ThreadMeta {
                     thread_id: "t-agent-2".to_string(),
@@ -1431,6 +1455,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
                     merged: false,
                     kind: ThreadKind::Agent,
                     cwd: None,
+                    ..ThreadMeta::default()
                 },
             ],
         },
@@ -1640,6 +1665,7 @@ async fn test_pty_write_serialization_fifo_order() {
                 merged: false,
                 kind: ThreadKind::Terminal,
                 cwd: None,
+                ..ThreadMeta::default()
             }])
         }
         async fn pty_snapshot(
