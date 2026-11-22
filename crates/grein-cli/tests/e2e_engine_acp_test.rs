@@ -756,3 +756,432 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         "Legacy SQLite blackboard_entries rows must NEVER leak into fresh root: {fresh_sys}"
     );
 }
+
+fn fake_acp_config_with_flags(
+    cwd: &Path,
+    log_path: Option<&Path>,
+    extra_flags: &[&str],
+) -> AcpBackendConfig {
+    let mut args = vec![fake_acp_script_path().to_string_lossy().into_owned()];
+    if let Some(log) = log_path {
+        args.push("--log-file".to_string());
+        args.push(log.to_string_lossy().into_owned());
+    }
+    for flag in extra_flags {
+        args.push((*flag).to_string());
+    }
+    AcpBackendConfig {
+        command: "python3".to_string(),
+        args,
+        auth_method: Some("oauth-personal".to_string()),
+        cwd: cwd.to_path_buf(),
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_agent_options_before_turn1_config_set_and_default_propagation() {
+    use grein_cli::engine::{dispatch_json_rpc, UnixSocketEngineClient};
+    use grein_cli::run_daemon_with_socket_and_db;
+    use tokio::net::UnixStream;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("cfg.db");
+    let log_path = temp.path().join("cfg_wire.jsonl");
+    let cfg = fake_acp_config_with_flags(temp.path(), Some(&log_path), &["--emit-commands"]);
+
+    let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+        .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("ensure main");
+    let mut rx = engine.subscribe_tui_events();
+
+    // Calling agent_options before Turn 1 lazily initializes the ACP session and returns config options.
+    let opts = engine
+        .agent_options(&main.thread_id)
+        .await
+        .expect("agent_options before Turn 1");
+    assert_eq!(opts.thread_id, main.thread_id);
+    let model_opt = opts
+        .config_options
+        .iter()
+        .find(|o| o.id == "model")
+        .expect("model config option");
+    assert_eq!(model_opt.current_value, "fake-model");
+    assert_eq!(model_opt.options.len(), 2);
+    assert!(opts.config_options.iter().any(|o| o.id == "mode"));
+    assert!(opts.config_options.iter().any(|o| o.id == "thought_level"));
+
+    // Wait briefly for --emit-commands available_commands_update from the new session.
+    let mut saw_cmds = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(400), rx.recv()).await {
+        if let TuiEngineEvent::AgentCommandsUpdated {
+            ref thread_id,
+            ref commands,
+        } = ev
+        {
+            if thread_id == &main.thread_id && commands.iter().any(|c| c.name == "compact") {
+                saw_cmds = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_cmds, "expected AgentCommandsUpdated from ACP session");
+    let opts_cached = engine
+        .agent_options(&main.thread_id)
+        .await
+        .expect("cached agent_options");
+    assert!(opts_cached
+        .available_commands
+        .iter()
+        .any(|c| c.name == "compact"));
+
+    // Invalid option value returns Err cleanly without corrupting defaults.
+    let bad_err = engine
+        .set_agent_config(&main.thread_id, "thought_level", "bogus", true)
+        .await
+        .expect_err("invalid value must error");
+    assert!(bad_err.to_string().contains("invalid option"));
+
+    // Set per-thread only (set_default = false) -> does NOT propagate to newly forked branch.
+    let updated_local = engine
+        .set_agent_config(&main.thread_id, "thought_level", "low", false)
+        .await
+        .expect("set per-thread thought_level");
+    assert_eq!(
+        updated_local
+            .config_options
+            .iter()
+            .find(|o| o.id == "thought_level")
+            .unwrap()
+            .current_value,
+        "low"
+    );
+
+    let mut saw_cfg_ev = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(200), rx.recv()).await {
+        if let TuiEngineEvent::AgentConfigUpdated {
+            ref thread_id,
+            ref config_options,
+        } = ev
+        {
+            if thread_id == &main.thread_id
+                && config_options
+                    .iter()
+                    .any(|o| o.id == "thought_level" && o.current_value == "low")
+            {
+                saw_cfg_ev = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_cfg_ev, "expected AgentConfigUpdated after set_agent_config");
+
+    let branch_local = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("per-thread-isolation"))
+        .await
+        .expect("fork branch_local");
+    engine
+        .send_turn_for_thread(&branch_local.thread_id, "DUMP_CONFIG")
+        .await
+        .expect("branch_local DUMP_CONFIG");
+    let branch_local_reply = engine
+        .get_thread_transcript(&branch_local.thread_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .content;
+    assert_eq!(
+        branch_local_reply,
+        "CONFIG:model=fake-model,mode=default,thought_level=medium"
+    );
+
+    // Set default (set_default = true) -> updates Main AND propagates to newly forked branches!
+    engine
+        .set_agent_config(&main.thread_id, "model", "fake-model-fast", true)
+        .await
+        .expect("set default model");
+    engine
+        .set_agent_config(&main.thread_id, "thought_level", "high", true)
+        .await
+        .expect("set default thought_level");
+
+    engine
+        .send_turn_for_thread(&main.thread_id, "DUMP_CONFIG")
+        .await
+        .expect("main DUMP_CONFIG");
+    let main_cfg_reply = engine
+        .get_thread_transcript(&main.thread_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .content;
+    assert_eq!(
+        main_cfg_reply,
+        "CONFIG:model=fake-model-fast,mode=default,thought_level=high"
+    );
+
+    let branch_default = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("inherits-defaults"))
+        .await
+        .expect("fork branch_default");
+    let branch_opts = engine
+        .agent_options(&branch_default.thread_id)
+        .await
+        .expect("agent_options on forked branch");
+    assert_eq!(
+        branch_opts
+            .config_options
+            .iter()
+            .find(|o| o.id == "model")
+            .unwrap()
+            .current_value,
+        "fake-model-fast"
+    );
+    assert_eq!(
+        branch_opts
+            .config_options
+            .iter()
+            .find(|o| o.id == "thought_level")
+            .unwrap()
+            .current_value,
+        "high"
+    );
+    engine
+        .send_turn_for_thread(&branch_default.thread_id, "DUMP_CONFIG")
+        .await
+        .expect("branch_default DUMP_CONFIG");
+    let branch_default_reply = engine
+        .get_thread_transcript(&branch_default.thread_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .content;
+    assert_eq!(
+        branch_default_reply,
+        "CONFIG:model=fake-model-fast,mode=default,thought_level=high"
+    );
+
+    // JSON-RPC dispatch test for session.agent_options & session.set_agent_config
+    let rpc_opts_raw = dispatch_json_rpc(
+        &engine,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "session.agent_options",
+            "params": {"thread_id": branch_default.thread_id}
+        })
+        .to_string(),
+    )
+    .await;
+    let rpc_opts: Value = serde_json::from_str(&rpc_opts_raw).expect("rpc json");
+    assert_eq!(rpc_opts["result"]["thread_id"], branch_default.thread_id);
+
+    let rpc_set_raw = dispatch_json_rpc(
+        &engine,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "session.set_agent_config",
+            "params": {
+                "thread_id": branch_default.thread_id,
+                "config_id": "mode",
+                "value": "architect",
+                "set_default": false
+            }
+        })
+        .to_string(),
+    )
+    .await;
+    let rpc_set: Value = serde_json::from_str(&rpc_set_raw).expect("rpc set json");
+    assert!(rpc_set["error"].is_null());
+
+    // Verify UnixSocketEngineClient round-trip for session.agent_options & session.set_agent_config
+    let sock_path = temp.path().join("cfg_daemon.sock");
+    let sock_db = temp.path().join("cfg_daemon.db");
+    let sock_clone = sock_path.clone();
+    let daemon_task = tokio::spawn(async move {
+        let _ = run_daemon_with_socket_and_db(sock_clone, sock_db).await;
+    });
+    for _ in 0..40 {
+        if sock_path.exists() && UnixStream::connect(&sock_path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let sock_client = UnixSocketEngineClient::connect(&sock_path)
+        .await
+        .expect("connect sock");
+    let sock_main = sock_client.ensure_main_thread().await.expect("sock main");
+    let sock_opts = sock_client
+        .agent_options(&sock_main.thread_id)
+        .await
+        .expect("sock agent_options");
+    assert_eq!(sock_opts.thread_id, sock_main.thread_id);
+    daemon_task.abort();
+
+    // Legacy ACP server (--legacy-config: models + modes only, no configOptions, no set_config_option)
+    let legacy_db = temp.path().join("legacy_cfg.db");
+    let legacy_cfg = fake_acp_config_with_flags(temp.path(), None, &["--legacy-config"]);
+    let legacy_engine =
+        InProcessEngine::open_with_config(&legacy_db, temp.path().to_path_buf(), Some(legacy_cfg))
+            .expect("open legacy");
+    let legacy_main = legacy_engine.ensure_main_thread().await.expect("legacy main");
+    let legacy_opts = legacy_engine
+        .agent_options(&legacy_main.thread_id)
+        .await
+        .expect("legacy agent_options");
+    assert!(legacy_opts.config_options.iter().any(|o| o.id == "model" && o.current_value == "fake-model"));
+    assert!(legacy_opts.config_options.iter().any(|o| o.id == "mode" && o.current_value == "default"));
+
+    let legacy_model_res = legacy_engine
+        .set_agent_config(&legacy_main.thread_id, "model", "fake-model-fast", true)
+        .await
+        .expect("legacy fallback set_session_model");
+    assert_eq!(
+        legacy_model_res
+            .config_options
+            .iter()
+            .find(|o| o.id == "model")
+            .unwrap()
+            .current_value,
+        "fake-model-fast"
+    );
+    let legacy_mode_res = legacy_engine
+        .set_agent_config(&legacy_main.thread_id, "mode", "architect", false)
+        .await
+        .expect("legacy fallback set_session_mode");
+    assert_eq!(
+        legacy_mode_res
+            .config_options
+            .iter()
+            .find(|o| o.id == "mode")
+            .unwrap()
+            .current_value,
+        "architect"
+    );
+    legacy_engine
+        .send_turn_for_thread(&legacy_main.thread_id, "DUMP_CONFIG")
+        .await
+        .expect("legacy DUMP_CONFIG");
+    let legacy_reply = legacy_engine
+        .get_thread_transcript(&legacy_main.thread_id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .content;
+    assert_eq!(
+        legacy_reply,
+        "CONFIG:model=fake-model-fast,mode=architect,thought_level=medium"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_concurrent_turn_serialization_and_enriched_tool_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("serial_tools.db");
+    let cfg = fake_acp_config(temp.path());
+
+    let engine = Arc::new(
+        InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+            .expect("open engine"),
+    );
+    let main = engine.ensure_main_thread().await.expect("ensure main");
+
+    // 1. Concurrent overlapping turns on the same thread serialize cleanly and both succeed.
+    let e1 = Arc::clone(&engine);
+    let t1 = main.thread_id.clone();
+    let e2 = Arc::clone(&engine);
+    let t2 = main.thread_id.clone();
+    let (r1, r2) = tokio::join!(
+        async move { e1.send_turn_for_thread(&t1, "STREAM_SLOW").await },
+        async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            e2.send_turn_for_thread(&t2, "ECHO_LAST_PROMPT after slow").await
+        }
+    );
+    r1.expect("first overlapping turn must succeed");
+    r2.expect("second overlapping turn must succeed");
+
+    let transcript = engine
+        .get_thread_transcript(&main.thread_id)
+        .await
+        .expect("transcript");
+    let contents: Vec<(&str, &str)> = transcript
+        .iter()
+        .map(|t| (t.role.as_str(), t.content.as_str()))
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            ("user", "STREAM_SLOW"),
+            ("assistant", "PART1 PART2"),
+            ("user", "ECHO_LAST_PROMPT after slow"),
+            ("assistant", "ECHO_LAST_PROMPT after slow"),
+        ]
+    );
+
+    // 2. Enriched ToolInvoked (tool_call_id, summary) and ToolResult (tool_call_id, is_error).
+    let mut rx = engine.subscribe_tui_events();
+    engine
+        .send_turn_for_thread(&main.thread_id, "TOOL_SUMMARY_AND_ERROR")
+        .await
+        .expect("tool summary turn");
+
+    let mut evs = Vec::new();
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(300), rx.recv()).await {
+        let done = matches!(
+            ev,
+            TuiEngineEvent::ThreadStatusChanged { ref status, .. } if status == "idle"
+        );
+        evs.push(ev);
+        if done {
+            break;
+        }
+    }
+
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        TuiEngineEvent::ToolInvoked {
+            tool_name,
+            tool_call_id: Some(tc_id),
+            summary: Some(summary),
+            ..
+        } if tool_name == "run_command"
+            && tc_id == "tc-cmd-1"
+            && summary == "cargo test --locked"
+    )));
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        TuiEngineEvent::ToolResult {
+            tool_name,
+            tool_call_id: Some(tc_id),
+            is_error: true,
+            output,
+            ..
+        } if tool_name == "run_command" && tc_id == "tc-cmd-1" && output == "exit code 101"
+    )));
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        TuiEngineEvent::ToolInvoked {
+            tool_name,
+            tool_call_id: Some(tc_id),
+            summary: Some(summary),
+            ..
+        } if tool_name == "read_file"
+            && tc_id == "tc-read-2"
+            && summary == "Read Cargo manifest"
+    )));
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        TuiEngineEvent::ToolResult {
+            tool_name,
+            tool_call_id: Some(tc_id),
+            is_error: false,
+            output,
+            ..
+        } if tool_name == "read_file" && tc_id == "tc-read-2" && output == "[workspace]"
+    )));
+}

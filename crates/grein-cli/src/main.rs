@@ -11,7 +11,8 @@ use grein_cli::engine::{
     UnixSocketEngineClient,
 };
 use grein_tui::engine_port::{
-    HydratedSession, HydratedThread, HydratedTurn, ThreadMeta, TuiEngineEvent, TuiEnginePort,
+    AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, ThreadMeta,
+    TuiEngineEvent, TuiEnginePort,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -133,9 +134,21 @@ where
             for entry in agent_metas {
                 if entry.model.is_some() || entry.mode.is_some() {
                     self.emit(TuiEngineEvent::AgentMetaUpdated {
-                        thread_id: entry.thread_id,
+                        thread_id: entry.thread_id.clone(),
                         model: entry.model,
                         mode: entry.mode,
+                    });
+                }
+                if !entry.config_options.is_empty() {
+                    self.emit(TuiEngineEvent::AgentConfigUpdated {
+                        thread_id: entry.thread_id.clone(),
+                        config_options: entry.config_options,
+                    });
+                }
+                if !entry.available_commands.is_empty() {
+                    self.emit(TuiEngineEvent::AgentCommandsUpdated {
+                        thread_id: entry.thread_id,
+                        commands: entry.available_commands,
                     });
                 }
             }
@@ -407,6 +420,31 @@ where
             });
             msg
         })
+    }
+
+    async fn agent_options(&self, thread_id: &str) -> io::Result<AgentOptionsSnapshot> {
+        self.client.agent_options(thread_id).await.map_err(to_io)
+    }
+
+    async fn set_agent_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+        set_default: bool,
+    ) -> io::Result<AgentOptionsSnapshot> {
+        let snapshot = self
+            .client
+            .set_agent_config(thread_id, config_id, value, set_default)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::AgentConfigUpdated {
+                thread_id: snapshot.thread_id.clone(),
+                config_options: snapshot.config_options.clone(),
+            });
+        }
+        Ok(snapshot)
     }
 
     async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
@@ -935,5 +973,131 @@ done
                 >= 2,
             "thread_metadata Err must emit TuiEngineEvent::Error instead of ignoring: {err_evs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_hydrates_cached_options_commands_and_config_rpcs() {
+        use grein_cli::engine::{
+            AgentMetaEntry, EngineError, EngineEvent, SessionSnapshot, ShellCommandResult,
+            ThreadSummary, TranscriptEntry, TurnDispatchResult,
+        };
+        use grein_tui::engine_port::{AgentConfigChoice, AgentConfigOption, AgentSlashCommand};
+
+        struct CachedMetaEngine;
+
+        #[async_trait::async_trait]
+        impl DaemonEngine for CachedMetaEngine {
+            async fn ping(&self) -> Result<(), EngineError> { Ok(()) }
+            async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
+                Ok(ThreadSummary {
+                    thread_id: "t-cached".into(),
+                    title: "Main".into(),
+                    parent_node_id: "n-1".into(),
+                    active_leaf_id: "n-1".into(),
+                    merged: false,
+                    status: Default::default(),
+                })
+            }
+            async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+            async fn send_turn_for_thread(&self, _: &str, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+            async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn fork_thread_with_title(&self, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn create_root_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn rename_thread(&self, _: &str, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
+                Ok(vec![self.ensure_main_thread().await?])
+            }
+            async fn get_transcript(&self) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
+            async fn get_thread_transcript(&self, _: &str) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
+            async fn merge_thread(&self, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn merge_thread_with_summary(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+            async fn resolve_permission(&self, _: PermissionDecisionPayload) -> Result<EngineEvent, EngineError> { unreachable!() }
+            async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> { Ok(()) }
+            async fn run_shell_command(&self, _: &str, _: &str) -> Result<ShellCommandResult, EngineError> { unreachable!() }
+            async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> { unreachable!() }
+            async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
+                Ok(vec![AgentMetaEntry {
+                    thread_id: "t-cached".into(),
+                    model: Some("fake-model".into()),
+                    mode: Some("default".into()),
+                    config_options: vec![AgentConfigOption {
+                        id: "model".into(),
+                        name: "Model".into(),
+                        category: Some("model".into()),
+                        current_value: "fake-model".into(),
+                        options: vec![AgentConfigChoice {
+                            value: "fake-model".into(),
+                            name: "Fake Model".into(),
+                            description: None,
+                        }],
+                    }],
+                    available_commands: vec![AgentSlashCommand {
+                        name: "compact".into(),
+                        description: "Compact context".into(),
+                    }],
+                }])
+            }
+            async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+                Ok(AgentOptionsSnapshot {
+                    thread_id: thread_id.to_string(),
+                    config_options: self.agent_metadata().await?.remove(0).config_options,
+                    available_commands: self.agent_metadata().await?.remove(0).available_commands,
+                })
+            }
+            async fn set_agent_config(
+                &self,
+                thread_id: &str,
+                config_id: &str,
+                value: &str,
+                _set_default: bool,
+            ) -> Result<AgentOptionsSnapshot, EngineError> {
+                Ok(AgentOptionsSnapshot {
+                    thread_id: thread_id.to_string(),
+                    config_options: vec![AgentConfigOption {
+                        id: config_id.to_string(),
+                        name: "Model".into(),
+                        category: Some("model".into()),
+                        current_value: value.to_string(),
+                        options: Vec::new(),
+                    }],
+                    available_commands: Vec::new(),
+                })
+            }
+        }
+
+        let port = EngineClientPort::new(CachedMetaEngine);
+        let session = port.hydrate_session().await.expect("hydrate");
+        assert_eq!(session.active_thread_id, "t-cached");
+        let mut rx = port.subscribe_events().await.expect("subscribe");
+
+        let opts = port.agent_options("t-cached").await.expect("agent_options");
+        assert_eq!(opts.config_options.len(), 1);
+        assert_eq!(opts.available_commands.len(), 1);
+
+        let updated = port
+            .set_agent_config("t-cached", "model", "fake-model-fast", true)
+            .await
+            .expect("set_agent_config");
+        assert_eq!(updated.config_options[0].current_value, "fake-model-fast");
+
+        let mut evs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            evs.push(ev);
+        }
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::AgentMetaUpdated { thread_id, model, .. }
+                if thread_id == "t-cached" && model.as_deref() == Some("fake-model")
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::AgentConfigUpdated { thread_id, config_options }
+                if thread_id == "t-cached" && config_options.len() == 1
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::AgentCommandsUpdated { thread_id, commands }
+                if thread_id == "t-cached" && commands.len() == 1 && commands[0].name == "compact"
+        )));
     }
 }

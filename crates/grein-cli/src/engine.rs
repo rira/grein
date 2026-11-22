@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use grein_acp::{
-    AcpPermissionOption, AcpStdioDriver, DriverEvent, StdioProcessConfig, StdioProcessRunner,
+    AcpConfigOption, AcpPermissionOption, AcpSessionInfo, AcpStdioDriver, DriverEvent,
+    StdioProcessConfig, StdioProcessRunner, StdioRunnerError,
 };
 use grein_core::error::CoreError;
 use grein_core::model::{
@@ -15,6 +16,7 @@ use grein_core::model::{
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_core::sync::{synthesize_thread_merge, ContextCompiler};
 use grein_tui::engine_port::{
+    AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentSlashCommand,
     HydratedThread, HydratedTurn, SubagentSnapshot, SubagentStatus, ThreadMeta, TuiEngineEvent,
 };
 use serde::de::DeserializeOwned;
@@ -190,6 +192,10 @@ pub struct AgentMetaEntry {
     pub thread_id: String,
     pub model: Option<String>,
     pub mode: Option<String>,
+    #[serde(default)]
+    pub config_options: Vec<AgentConfigOption>,
+    #[serde(default)]
+    pub available_commands: Vec<AgentSlashCommand>,
 }
 
 #[async_trait]
@@ -255,6 +261,24 @@ pub trait DaemonEngine: Send + Sync {
     async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
         Ok(Vec::new())
     }
+    async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+        Ok(AgentOptionsSnapshot {
+            thread_id: thread_id.to_string(),
+            config_options: Vec::new(),
+            available_commands: Vec::new(),
+        })
+    }
+    async fn set_agent_config(
+        &self,
+        _thread_id: &str,
+        _config_id: &str,
+        _value: &str,
+        _set_default: bool,
+    ) -> Result<AgentOptionsSnapshot, EngineError> {
+        Err(EngineError::Protocol(
+            "set_agent_config not supported".to_string(),
+        ))
+    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -277,6 +301,10 @@ struct ActiveAcpSession {
     driver_gen: u64,
     model: Option<String>,
     mode: Option<String>,
+    config_options: Vec<AgentConfigOption>,
+    available_commands: Vec<AgentSlashCommand>,
+    has_legacy_model: bool,
+    has_legacy_mode: bool,
     pending_landmarks: Vec<String>,
     cmd_tx: mpsc::UnboundedSender<SessionListenerCmd>,
     listener_handle: tokio::task::JoinHandle<()>,
@@ -312,6 +340,9 @@ struct EngineState {
     decisions: Vec<PermissionDecisionPayload>,
     active_acp_sessions: HashMap<String, ActiveAcpSession>,
     pending_permissions: HashMap<String, PendingPermissionRecord>,
+    thread_turn_locks: HashMap<String, Arc<AsyncMutex<()>>>,
+    default_config: HashMap<String, String>,
+    pending_thread_config: HashMap<String, HashMap<String, String>>,
 }
 
 struct EngineRuntime {
@@ -497,6 +528,202 @@ fn extract_subagent_type(args: &Value) -> String {
         .to_string()
 }
 
+fn normalize_single_line(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_tool_call_summary(tool_name: &str, title: &str, args: &Value) -> Option<String> {
+    const PRIMARY_ARG_KEYS: &[&str] = &[
+        "CommandLine",
+        "command",
+        "cmd",
+        "Path",
+        "path",
+        "TargetFile",
+        "SearchPath",
+        "Query",
+        "query",
+    ];
+
+    let normalized_title = normalize_single_line(title);
+    if !normalized_title.is_empty() && normalized_title != tool_name.trim() {
+        return Some(truncate_chars_with_ellipsis(&normalized_title, 80));
+    }
+
+    for key in PRIMARY_ARG_KEYS {
+        if let Some(raw_val) = args.get(*key).and_then(Value::as_str) {
+            let normalized_val = normalize_single_line(raw_val);
+            if !normalized_val.is_empty() {
+                return Some(truncate_chars_with_ellipsis(&normalized_val, 80));
+            }
+        }
+    }
+
+    None
+}
+
+fn acp_config_option_to_tui(opt: &AcpConfigOption) -> AgentConfigOption {
+    AgentConfigOption {
+        id: opt.id.clone(),
+        name: opt.name.clone(),
+        category: opt.category.clone(),
+        current_value: opt.current_value.clone(),
+        options: opt
+            .options
+            .iter()
+            .map(|c| AgentConfigChoice {
+                value: c.value.clone(),
+                name: c.name.clone(),
+                description: c.description.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn normalize_session_config_options(info: &AcpSessionInfo) -> Vec<AgentConfigOption> {
+    let mut out: Vec<AgentConfigOption> = info
+        .config_options
+        .iter()
+        .map(acp_config_option_to_tui)
+        .collect();
+
+    let has_model = out
+        .iter()
+        .any(|o| o.id == "model" || o.category.as_deref() == Some("model"));
+    if !has_model && !info.available_models.is_empty() {
+        out.push(AgentConfigOption {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            category: Some("model".to_string()),
+            current_value: info
+                .current_model_id
+                .clone()
+                .unwrap_or_else(|| info.available_models[0].model_id.clone()),
+            options: info
+                .available_models
+                .iter()
+                .map(|m| AgentConfigChoice {
+                    value: m.model_id.clone(),
+                    name: m.name.clone(),
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    let has_mode = out
+        .iter()
+        .any(|o| o.id == "mode" || o.category.as_deref() == Some("mode"));
+    if !has_mode && !info.available_modes.is_empty() {
+        out.push(AgentConfigOption {
+            id: "mode".to_string(),
+            name: "Mode".to_string(),
+            category: Some("mode".to_string()),
+            current_value: info
+                .current_mode_id
+                .clone()
+                .unwrap_or_else(|| info.available_modes[0].id.clone()),
+            options: info
+                .available_modes
+                .iter()
+                .map(|m| AgentConfigChoice {
+                    value: m.id.clone(),
+                    name: m.name.clone(),
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    out
+}
+
+fn extract_model_and_mode_from_options(
+    options: &[AgentConfigOption],
+    fallback_model: Option<String>,
+    fallback_mode: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let opt_model = options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("model") || o.id == "model")
+        .map(|o| o.current_value.clone())
+        .filter(|v| !v.is_empty());
+    let opt_mode = options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("mode") || o.id == "mode")
+        .map(|o| o.current_value.clone())
+        .filter(|v| !v.is_empty());
+    (opt_model.or(fallback_model), opt_mode.or(fallback_mode))
+}
+
+fn merge_updated_config_options(
+    existing: &[AgentConfigOption],
+    mut incoming: Vec<AgentConfigOption>,
+    has_legacy_model: bool,
+    has_legacy_mode: bool,
+) -> (Vec<AgentConfigOption>, bool, bool) {
+    let incoming_has_model = incoming
+        .iter()
+        .any(|o| o.id == "model" || o.category.as_deref() == Some("model"));
+    let incoming_has_mode = incoming
+        .iter()
+        .any(|o| o.id == "mode" || o.category.as_deref() == Some("mode"));
+
+    if !incoming_has_model && has_legacy_model {
+        if let Some(model_opt) = existing
+            .iter()
+            .find(|o| o.id == "model" || o.category.as_deref() == Some("model"))
+        {
+            incoming.push(model_opt.clone());
+        }
+    }
+    if !incoming_has_mode && has_legacy_mode {
+        if let Some(mode_opt) = existing
+            .iter()
+            .find(|o| o.id == "mode" || o.category.as_deref() == Some("mode"))
+        {
+            incoming.push(mode_opt.clone());
+        }
+    }
+
+    (
+        incoming,
+        has_legacy_model && !incoming_has_model,
+        has_legacy_mode && !incoming_has_mode,
+    )
+}
+
+fn is_unsupported_method_error(err: &StdioRunnerError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("-32601")
+        || msg.contains("method not found")
+        || msg.contains("not supported")
+        || msg.contains("unsupported")
+        || msg.contains("unimplemented")
+        || msg.contains("unknown method")
+}
+
+fn stdio_err_to_engine(err: StdioRunnerError) -> EngineError {
+    match err {
+        StdioRunnerError::ProcessTerminated(msg) => EngineError::Transport(msg),
+        other => {
+            let msg = other.to_string();
+            if msg.contains("-32602") {
+                EngineError::InvalidParams(msg)
+            } else {
+                EngineError::Transport(msg)
+            }
+        }
+    }
+}
+
+struct ConfigTarget<'a> {
+    config_id: &'a str,
+    value: &'a str,
+    is_model_hint: bool,
+    is_mode_hint: bool,
+}
+
 #[derive(Clone)]
 struct TrackedLayer1Subagent {
     snapshot: SubagentSnapshot,
@@ -516,6 +743,341 @@ impl EngineRuntime {
         self.state
             .lock()
             .map_err(|_| EngineError::Storage("engine state poisoned".to_string()))
+    }
+
+    async fn acquire_thread_turn_lock(
+        &self,
+        thread_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, EngineError> {
+        let mutex = {
+            let mut state = self.lock()?;
+            Arc::clone(
+                state
+                    .thread_turn_locks
+                    .entry(thread_id.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+        Ok(mutex.lock_owned().await)
+    }
+
+    async fn current_driver_if_running(&self) -> Option<(Arc<AcpStdioDriver>, u64)> {
+        let mut guard = self.acp_driver.lock().await;
+        if let Some(slot) = guard.as_ref() {
+            if slot.driver.is_running() {
+                return Some((Arc::clone(&slot.driver), slot.generation));
+            }
+            let dead_gen = slot.generation;
+            *guard = None;
+            if let Ok(mut state) = self.state.lock() {
+                state
+                    .active_acp_sessions
+                    .retain(|_, s| s.driver_gen != dead_gen);
+            }
+        }
+        None
+    }
+
+    async fn apply_config_to_driver(
+        driver: &AcpStdioDriver,
+        session_id: &str,
+        target: &ConfigTarget<'_>,
+    ) -> Result<Option<Vec<AgentConfigOption>>, EngineError> {
+        match driver
+            .set_config_option(session_id, target.config_id, target.value)
+            .await
+        {
+            Ok(opts) => {
+                if opts.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(opts.iter().map(acp_config_option_to_tui).collect()))
+                }
+            }
+            Err(err) if is_unsupported_method_error(&err) => {
+                if target.config_id == "model" || target.is_model_hint {
+                    driver
+                        .set_session_model(session_id, target.value)
+                        .await
+                        .map_err(stdio_err_to_engine)?;
+                    Ok(None)
+                } else if target.config_id == "mode" || target.is_mode_hint {
+                    driver
+                        .set_session_mode(session_id, target.value)
+                        .await
+                        .map_err(stdio_err_to_engine)?;
+                    Ok(None)
+                } else {
+                    Err(EngineError::Protocol(format!(
+                        "ACP config option `{}` not supported: {err}",
+                        target.config_id
+                    )))
+                }
+            }
+            Err(err) => Err(stdio_err_to_engine(err)),
+        }
+    }
+
+    fn apply_config_update_to_state(
+        &self,
+        thread_id: &str,
+        session_id: &str,
+        target: &ConfigTarget<'_>,
+        updated_opts: Option<Vec<AgentConfigOption>>,
+    ) -> Result<(AgentOptionsSnapshot, Option<String>, Option<String>), EngineError> {
+        let mut state = self.lock()?;
+        let entry = state
+            .active_acp_sessions
+            .get_mut(thread_id)
+            .filter(|e| e.session_id == session_id)
+            .ok_or_else(|| EngineError::NotFound(format!("active ACP session for {thread_id}")))?;
+
+        match updated_opts {
+            Some(incoming) => {
+                let (mut merged, next_legacy_model, next_legacy_mode) = merge_updated_config_options(
+                    &entry.config_options,
+                    incoming,
+                    entry.has_legacy_model,
+                    entry.has_legacy_mode,
+                );
+                entry.has_legacy_model = next_legacy_model;
+                entry.has_legacy_mode = next_legacy_mode;
+                for opt in &mut merged {
+                    if opt.id == target.config_id && opt.current_value != target.value {
+                        opt.current_value = target.value.to_string();
+                    }
+                }
+                entry.config_options = merged;
+            }
+            None => {
+                for opt in &mut entry.config_options {
+                    if opt.id == target.config_id {
+                        opt.current_value = target.value.to_string();
+                    }
+                }
+            }
+        }
+
+        if target.config_id == "model" || target.is_model_hint {
+            entry.model = Some(target.value.to_string());
+        }
+        if target.config_id == "mode" || target.is_mode_hint {
+            entry.mode = Some(target.value.to_string());
+        }
+        let (model, mode) = extract_model_and_mode_from_options(
+            &entry.config_options,
+            entry.model.clone(),
+            entry.mode.clone(),
+        );
+        entry.model = model.clone();
+        entry.mode = mode.clone();
+
+        let snapshot = AgentOptionsSnapshot {
+            thread_id: thread_id.to_string(),
+            config_options: entry.config_options.clone(),
+            available_commands: entry.available_commands.clone(),
+        };
+        Ok((snapshot, model, mode))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_acp_session_for_thread(
+        self: &Arc<Self>,
+        cfg: &AcpBackendConfig,
+        tid: ThreadId,
+        thread_id: &str,
+        initial_leaf_id: NodeId,
+        exclude_node_id: Option<NodeId>,
+        emit_initial_meta: bool,
+    ) -> Result<(Arc<AcpStdioDriver>, ActiveSessionHandle), EngineError> {
+        let (driver, driver_gen) = self.ensure_driver(cfg).await?;
+
+        {
+            let mut state = self.lock()?;
+            let stale = state
+                .active_acp_sessions
+                .get(thread_id)
+                .is_some_and(|s| s.driver_gen != driver_gen || s.cmd_tx.is_closed());
+            if stale {
+                state.active_acp_sessions.remove(thread_id);
+            }
+            if let Some(existing) = state.active_acp_sessions.get(thread_id) {
+                return Ok((
+                    driver,
+                    ActiveSessionHandle {
+                        session_id: existing.session_id.clone(),
+                        driver_gen: existing.driver_gen,
+                        cmd_tx: existing.cmd_tx.clone(),
+                    },
+                ));
+            }
+        }
+
+        let mut payload = ContextCompiler::new("")
+            .compile_thread_context(&self.storage, tid)
+            .map_err(storage_err)?;
+        payload.trunk_path.retain(|n| !is_internal_root_node(n));
+        if let Some(ex_id) = exclude_node_id {
+            payload.branch_turns.retain(|n| n.id != ex_id);
+        }
+        let include_branch_turns = !payload.branch_turns.is_empty();
+        let append =
+            payload.build_acp_system_prompt_append(include_branch_turns, ACP_SYSTEM_PROMPT_MAX_CHARS);
+        let append_opt = (!append.trim().is_empty()).then_some(append.as_str());
+
+        let info = match driver.new_session(&cfg.cwd, append_opt).await {
+            Ok(info) => info,
+            Err(err) => {
+                self.invalidate_driver_if_dead(&driver, driver_gen).await;
+                return Err(EngineError::Transport(format!("ACP new_session failed: {err}")));
+            }
+        };
+
+        self.storage
+            .update_thread_acp_session_id(&tid, Some(&info.session_id))
+            .map_err(storage_err)?;
+
+        let config_options = normalize_session_config_options(&info);
+        let has_legacy_model = !info
+            .config_options
+            .iter()
+            .any(|o| o.id == "model" || o.category.as_deref() == Some("model"))
+            && !info.available_models.is_empty();
+        let has_legacy_mode = !info
+            .config_options
+            .iter()
+            .any(|o| o.id == "mode" || o.category.as_deref() == Some("mode"))
+            && !info.available_modes.is_empty();
+        let (model, mode) = extract_model_and_mode_from_options(
+            &config_options,
+            info.current_model_id.clone(),
+            info.current_mode_id.clone(),
+        );
+
+        let events_rx = driver.subscribe_session(&info.session_id);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let listener_handle = spawn_session_listener(
+            Arc::clone(self),
+            tid,
+            thread_id.to_string(),
+            info.session_id.clone(),
+            Arc::clone(&driver),
+            initial_leaf_id,
+            events_rx,
+            cmd_rx,
+        );
+
+        let handle = ActiveSessionHandle {
+            session_id: info.session_id.clone(),
+            driver_gen,
+            cmd_tx: cmd_tx.clone(),
+        };
+
+        let mut desired_config: Vec<(String, String)> = {
+            let mut state = self.lock()?;
+            let mut merged = state.default_config.clone();
+            if let Some(pending) = state.pending_thread_config.get(thread_id) {
+                for (k, v) in pending {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            state.active_acp_sessions.insert(
+                thread_id.to_string(),
+                ActiveAcpSession {
+                    session_id: info.session_id.clone(),
+                    driver_gen,
+                    model: model.clone(),
+                    mode: mode.clone(),
+                    config_options: config_options.clone(),
+                    available_commands: Vec::new(),
+                    has_legacy_model,
+                    has_legacy_mode,
+                    pending_landmarks: Vec::new(),
+                    cmd_tx,
+                    listener_handle,
+                },
+            );
+            merged.into_iter().collect()
+        };
+
+        desired_config.sort_by(|(a, _), (b, _)| {
+            let rank = |k: &str| match k {
+                "model" => 0,
+                "mode" => 1,
+                _ => 2,
+            };
+            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        });
+
+        for (cfg_id, cfg_val) in desired_config {
+            let (already_matches, is_model_hint, is_mode_hint) = {
+                let state = self.lock()?;
+                if let Some(entry) = state.active_acp_sessions.get(thread_id) {
+                    let matching_opt = entry.config_options.iter().find(|o| o.id == cfg_id);
+                    let current = matching_opt.map(|o| o.current_value.as_str()).or_else(|| {
+                        if cfg_id == "model" {
+                            entry.model.as_deref()
+                        } else if cfg_id == "mode" {
+                            entry.mode.as_deref()
+                        } else {
+                            None
+                        }
+                    });
+                    let is_model = matching_opt
+                        .is_some_and(|o| o.category.as_deref() == Some("model"));
+                    let is_mode = matching_opt
+                        .is_some_and(|o| o.category.as_deref() == Some("mode"));
+                    (current == Some(cfg_val.as_str()), is_model, is_mode)
+                } else {
+                    (false, false, false)
+                }
+            };
+            if already_matches {
+                continue;
+            }
+            let target = ConfigTarget {
+                config_id: &cfg_id,
+                value: &cfg_val,
+                is_model_hint,
+                is_mode_hint,
+            };
+            if let Ok(updated_opts) =
+                Self::apply_config_to_driver(&driver, &info.session_id, &target).await
+            {
+                let _ = self.apply_config_update_to_state(
+                    thread_id,
+                    &info.session_id,
+                    &target,
+                    updated_opts,
+                );
+            }
+        }
+
+        if emit_initial_meta {
+            let (final_model, final_mode, final_opts) = {
+                let state = self.lock()?;
+                state
+                    .active_acp_sessions
+                    .get(thread_id)
+                    .map(|e| (e.model.clone(), e.mode.clone(), e.config_options.clone()))
+                    .unwrap_or((model, mode, config_options))
+            };
+            if final_model.is_some() || final_mode.is_some() {
+                self.emit_tui(TuiEngineEvent::AgentMetaUpdated {
+                    thread_id: thread_id.to_string(),
+                    model: final_model,
+                    mode: final_mode,
+                });
+            }
+            if !final_opts.is_empty() {
+                self.emit_tui(TuiEngineEvent::AgentConfigUpdated {
+                    thread_id: thread_id.to_string(),
+                    config_options: final_opts,
+                });
+            }
+        }
+
+        Ok((driver, handle))
     }
 
     fn subagent_watch(&self) -> Arc<SubagentWatcher> {
@@ -975,12 +1537,13 @@ fn spawn_session_listener(
                                 "tool".to_string()
                             };
                             active_tool_names.insert(tool_call_id.clone(), tool_name.clone());
+                            let summary = extract_tool_call_summary(&tool_name, &title, &args);
                             runtime.emit_tui(TuiEngineEvent::ToolInvoked {
                                 thread_id: thread_id.clone(),
                                 tool_name: tool_name.clone(),
                                 tool_call_id: (!tool_call_id.is_empty())
                                     .then(|| tool_call_id.clone()),
-                                summary: None,
+                                summary,
                             });
                             runtime.emit_tui(TuiEngineEvent::ToolActivityUpdated {
                                 thread_id: thread_id.clone(),
@@ -1208,9 +1771,124 @@ fn spawn_session_listener(
                                 }
                             }
                         }
-                        DriverEvent::CurrentModeUpdate { .. }
-                        | DriverEvent::ConfigOptionUpdate { .. }
-                        | DriverEvent::AvailableCommandsUpdate { .. } => {}
+                        DriverEvent::CurrentModeUpdate {
+                            current_mode_id, ..
+                        } => {
+                            let mut updated_meta = None;
+                            let mut updated_opts = None;
+                            if let Ok(mut state) = runtime.lock() {
+                                if let Some(entry) = state.active_acp_sessions.get_mut(&thread_id) {
+                                    if entry.session_id == session_id
+                                        && !current_mode_id.trim().is_empty()
+                                    {
+                                        entry.mode = Some(current_mode_id.clone());
+                                        let mut changed_opt = false;
+                                        for opt in &mut entry.config_options {
+                                            if (opt.id == "mode"
+                                                || opt.category.as_deref() == Some("mode"))
+                                                && opt.current_value != current_mode_id
+                                            {
+                                                opt.current_value = current_mode_id.clone();
+                                                changed_opt = true;
+                                            }
+                                        }
+                                        updated_meta = Some((entry.model.clone(), entry.mode.clone()));
+                                        if changed_opt {
+                                            updated_opts = Some(entry.config_options.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some((model, mode)) = updated_meta {
+                                runtime.emit_tui(TuiEngineEvent::AgentMetaUpdated {
+                                    thread_id: thread_id.clone(),
+                                    model,
+                                    mode,
+                                });
+                            }
+                            if let Some(config_options) = updated_opts {
+                                runtime.emit_tui(TuiEngineEvent::AgentConfigUpdated {
+                                    thread_id: thread_id.to_string(),
+                                    config_options,
+                                });
+                            }
+                        }
+                        DriverEvent::ConfigOptionUpdate { config_options, .. } => {
+                            let incoming: Vec<AgentConfigOption> = config_options
+                                .iter()
+                                .map(acp_config_option_to_tui)
+                                .collect();
+                            let mut emit_opts = None;
+                            let mut emit_meta = None;
+                            if let Ok(mut state) = runtime.lock() {
+                                if let Some(entry) = state.active_acp_sessions.get_mut(&thread_id) {
+                                    if entry.session_id == session_id {
+                                        let (merged, next_legacy_model, next_legacy_mode) =
+                                            merge_updated_config_options(
+                                                &entry.config_options,
+                                                incoming,
+                                                entry.has_legacy_model,
+                                                entry.has_legacy_mode,
+                                            );
+                                        entry.has_legacy_model = next_legacy_model;
+                                        entry.has_legacy_mode = next_legacy_mode;
+                                        let (new_model, new_mode) =
+                                            extract_model_and_mode_from_options(
+                                                &merged,
+                                                entry.model.clone(),
+                                                entry.mode.clone(),
+                                            );
+                                        let meta_changed =
+                                            new_model != entry.model || new_mode != entry.mode;
+                                        entry.config_options = merged.clone();
+                                        entry.model = new_model.clone();
+                                        entry.mode = new_mode.clone();
+                                        emit_opts = Some(merged);
+                                        if meta_changed || new_model.is_some() || new_mode.is_some()
+                                        {
+                                            emit_meta = Some((new_model, new_mode));
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(config_options) = emit_opts {
+                                runtime.emit_tui(TuiEngineEvent::AgentConfigUpdated {
+                                    thread_id: thread_id.clone(),
+                                    config_options,
+                                });
+                            }
+                            if let Some((model, mode)) = emit_meta {
+                                runtime.emit_tui(TuiEngineEvent::AgentMetaUpdated {
+                                    thread_id: thread_id.clone(),
+                                    model,
+                                    mode,
+                                });
+                            }
+                        }
+                        DriverEvent::AvailableCommandsUpdate { commands, .. } => {
+                            let converted: Vec<AgentSlashCommand> = commands
+                                .into_iter()
+                                .map(|c| AgentSlashCommand {
+                                    name: c.name,
+                                    description: c.description,
+                                })
+                                .collect();
+                            let mut updated = false;
+                            if let Ok(mut state) = runtime.lock() {
+                                if let Some(entry) = state.active_acp_sessions.get_mut(&thread_id) {
+                                    if entry.session_id == session_id {
+                                        entry.available_commands = converted.clone();
+                                        updated = true;
+                                    }
+                                }
+                            }
+                            if updated {
+                                runtime.emit_tui(TuiEngineEvent::AgentCommandsUpdated {
+                                    thread_id: thread_id.clone(),
+                                    commands: converted,
+                                });
+                            }
+                        }
                     }
                 }
                 _ = sleep_fut, if quiet_deadline.is_some() => {
@@ -1421,6 +2099,20 @@ impl InProcessEngine {
     pub async fn delete_thread(&self, thread_id: &str) -> Result<String, EngineError> {
         DaemonEngine::delete_thread(self, thread_id).await
     }
+
+    pub async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+        DaemonEngine::agent_options(self, thread_id).await
+    }
+
+    pub async fn set_agent_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+        set_default: bool,
+    ) -> Result<AgentOptionsSnapshot, EngineError> {
+        DaemonEngine::set_agent_config(self, thread_id, config_id, value, set_default).await
+    }
 }
 
 #[async_trait]
@@ -1535,6 +2227,8 @@ impl DaemonEngine for InProcessEngine {
             return Err(EngineError::NotFound(format!("thread {thread_id}")));
         }
 
+        let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
+
         // Flush any buffered unsolicited wakeup on an existing active session before inserting user node.
         let existing_cmd_tx = {
             let state = self.runtime.lock()?;
@@ -1644,75 +2338,25 @@ impl DaemonEngine for InProcessEngine {
                 (handle, prompt_text)
             }
             None => {
-                let mut payload = ContextCompiler::new("")
-                    .compile_thread_context(&self.runtime.storage, tid)
-                    .map_err(storage_err)?;
-                payload.trunk_path.retain(|n| !is_internal_root_node(n));
-                payload.branch_turns.retain(|n| n.id != user_node_id);
-                let include_branch_turns = !payload.branch_turns.is_empty();
-                let append = payload
-                    .build_acp_system_prompt_append(include_branch_turns, ACP_SYSTEM_PROMPT_MAX_CHARS);
-                let append_opt = (!append.trim().is_empty()).then_some(append.as_str());
-
-                let info = match driver.new_session(&cfg.cwd, append_opt).await {
-                    Ok(info) => info,
+                match self
+                    .runtime
+                    .ensure_acp_session_for_thread(
+                        &cfg,
+                        tid,
+                        thread_id,
+                        user_node_id,
+                        Some(user_node_id),
+                        true,
+                    )
+                    .await
+                {
+                    Ok((_, handle)) => (handle, prompt.to_string()),
                     Err(err) => {
                         self.runtime
-                            .invalidate_driver_if_dead(&driver, driver_gen)
-                            .await;
-                        let msg = format!("ACP new_session failed: {err}");
-                        self.runtime.mark_thread_error(tid, thread_id, &msg);
-                        return Err(EngineError::Transport(msg));
+                            .mark_thread_error(tid, thread_id, &err.to_string());
+                        return Err(err);
                     }
-                };
-
-                self.runtime
-                    .storage
-                    .update_thread_acp_session_id(&tid, Some(&info.session_id))
-                    .map_err(storage_err)?;
-
-                if info.current_model_id.is_some() || info.current_mode_id.is_some() {
-                    self.runtime.emit_tui(TuiEngineEvent::AgentMetaUpdated {
-                        thread_id: thread_id.to_string(),
-                        model: info.current_model_id.clone(),
-                        mode: info.current_mode_id.clone(),
-                    });
                 }
-
-                let events_rx = driver.subscribe_session(&info.session_id);
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-                let listener_handle = spawn_session_listener(
-                    Arc::clone(&self.runtime),
-                    tid,
-                    thread_id.to_string(),
-                    info.session_id.clone(),
-                    Arc::clone(&driver),
-                    user_node_id,
-                    events_rx,
-                    cmd_rx,
-                );
-
-                let handle = ActiveSessionHandle {
-                    session_id: info.session_id.clone(),
-                    driver_gen,
-                    cmd_tx: cmd_tx.clone(),
-                };
-                {
-                    let mut state = self.runtime.lock()?;
-                    state.active_acp_sessions.insert(
-                        thread_id.to_string(),
-                        ActiveAcpSession {
-                            session_id: info.session_id,
-                            driver_gen,
-                            model: info.current_model_id,
-                            mode: info.current_mode_id,
-                            pending_landmarks: Vec::new(),
-                            cmd_tx,
-                            listener_handle,
-                        },
-                    );
-                }
-                (handle, prompt.to_string())
             }
         };
 
@@ -2324,6 +2968,8 @@ impl DaemonEngine for InProcessEngine {
 
         let removed_session = {
             let mut state = self.runtime.lock()?;
+            state.pending_thread_config.remove(thread_id);
+            state.thread_turn_locks.remove(thread_id);
             state
                 .active_acp_sessions
                 .remove(thread_id)
@@ -2389,8 +3035,216 @@ impl DaemonEngine for InProcessEngine {
                 thread_id: thread_id.clone(),
                 model: s.model.clone(),
                 mode: s.mode.clone(),
+                config_options: s.config_options.clone(),
+                available_commands: s.available_commands.clone(),
             })
             .collect())
+    }
+
+    async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+        let tid: ThreadId = parse_typed_id(thread_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .is_none()
+        {
+            return Err(EngineError::NotFound(format!("thread {thread_id}")));
+        }
+
+        let Some(cfg) = self.runtime.acp_config.clone() else {
+            let state = self.runtime.lock()?;
+            return Ok(match state.active_acp_sessions.get(thread_id) {
+                Some(s) => AgentOptionsSnapshot {
+                    thread_id: thread_id.to_string(),
+                    config_options: s.config_options.clone(),
+                    available_commands: s.available_commands.clone(),
+                },
+                None => AgentOptionsSnapshot {
+                    thread_id: thread_id.to_string(),
+                    config_options: Vec::new(),
+                    available_commands: Vec::new(),
+                },
+            });
+        };
+
+        if let Some((_, current_gen)) = self.runtime.current_driver_if_running().await {
+            let state = self.runtime.lock()?;
+            if let Some(s) = state.active_acp_sessions.get(thread_id) {
+                if s.driver_gen == current_gen && !s.cmd_tx.is_closed() {
+                    return Ok(AgentOptionsSnapshot {
+                        thread_id: thread_id.to_string(),
+                        config_options: s.config_options.clone(),
+                        available_commands: s.available_commands.clone(),
+                    });
+                }
+            }
+        }
+
+        let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
+        let fresh_thread = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+
+        self.runtime
+            .ensure_acp_session_for_thread(
+                &cfg,
+                tid,
+                thread_id,
+                fresh_thread.active_leaf_id,
+                None,
+                true,
+            )
+            .await?;
+
+        let state = self.runtime.lock()?;
+        Ok(match state.active_acp_sessions.get(thread_id) {
+            Some(s) => AgentOptionsSnapshot {
+                thread_id: thread_id.to_string(),
+                config_options: s.config_options.clone(),
+                available_commands: s.available_commands.clone(),
+            },
+            None => AgentOptionsSnapshot {
+                thread_id: thread_id.to_string(),
+                config_options: Vec::new(),
+                available_commands: Vec::new(),
+            },
+        })
+    }
+
+    async fn set_agent_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+        set_default: bool,
+    ) -> Result<AgentOptionsSnapshot, EngineError> {
+        if config_id.trim().is_empty() || value.trim().is_empty() {
+            return Err(EngineError::InvalidParams(
+                "config_id and value must not be empty".to_string(),
+            ));
+        }
+
+        let tid: ThreadId = parse_typed_id(thread_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .is_none()
+        {
+            return Err(EngineError::NotFound(format!("thread {thread_id}")));
+        }
+
+        let Some(cfg) = self.runtime.acp_config.clone() else {
+            return Err(EngineError::Transport(
+                "no ACP agent configured; install agy or set GREIN_ACP_BIN".to_string(),
+            ));
+        };
+
+        let existing = if let Some((driver, current_gen)) =
+            self.runtime.current_driver_if_running().await
+        {
+            let state = self.runtime.lock()?;
+            state
+                .active_acp_sessions
+                .get(thread_id)
+                .filter(|s| s.driver_gen == current_gen && !s.cmd_tx.is_closed())
+                .map(|s| {
+                    let opt = s.config_options.iter().find(|o| o.id == config_id);
+                    (
+                        driver,
+                        s.session_id.clone(),
+                        opt.is_some_and(|o| o.category.as_deref() == Some("model")),
+                        opt.is_some_and(|o| o.category.as_deref() == Some("mode")),
+                    )
+                })
+        } else {
+            None
+        };
+
+        let (driver, session_id, is_model_hint, is_mode_hint) = match existing {
+            Some(found) => found,
+            None => {
+                let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
+                let fresh_thread = self
+                    .runtime
+                    .storage
+                    .get_thread(tid)
+                    .map_err(storage_err)?
+                    .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+                let (driver, handle) = self
+                    .runtime
+                    .ensure_acp_session_for_thread(
+                        &cfg,
+                        tid,
+                        thread_id,
+                        fresh_thread.active_leaf_id,
+                        None,
+                        true,
+                    )
+                    .await?;
+                let state = self.runtime.lock()?;
+                let opt = state
+                    .active_acp_sessions
+                    .get(thread_id)
+                    .and_then(|s| s.config_options.iter().find(|o| o.id == config_id));
+                (
+                    driver,
+                    handle.session_id,
+                    opt.is_some_and(|o| o.category.as_deref() == Some("model")),
+                    opt.is_some_and(|o| o.category.as_deref() == Some("mode")),
+                )
+            }
+        };
+
+        let target = ConfigTarget {
+            config_id,
+            value,
+            is_model_hint,
+            is_mode_hint,
+        };
+        let updated_opts =
+            EngineRuntime::apply_config_to_driver(&driver, &session_id, &target).await?;
+
+        let (snapshot, model, mode) = self.runtime.apply_config_update_to_state(
+            thread_id,
+            &session_id,
+            &target,
+            updated_opts,
+        )?;
+
+        {
+            let mut state = self.runtime.lock()?;
+            state
+                .pending_thread_config
+                .entry(thread_id.to_string())
+                .or_default()
+                .insert(config_id.to_string(), value.to_string());
+            if set_default {
+                state
+                    .default_config
+                    .insert(config_id.to_string(), value.to_string());
+            }
+        }
+
+        self.runtime.emit_tui(TuiEngineEvent::AgentConfigUpdated {
+            thread_id: thread_id.to_string(),
+            config_options: snapshot.config_options.clone(),
+        });
+        self.runtime.emit_tui(TuiEngineEvent::AgentMetaUpdated {
+            thread_id: thread_id.to_string(),
+            model,
+            mode,
+        });
+
+        Ok(snapshot)
     }
 }
 
@@ -2478,6 +3332,24 @@ async fn route(
             json!({"next_active_thread_id": next_active_thread_id})
         }
         "session.agent_metadata" => to_json(&engine.agent_metadata().await?)?,
+        "session.agent_options" => {
+            let thread_id = required_str(params, "thread_id")?;
+            to_json(&engine.agent_options(thread_id).await?)?
+        }
+        "session.set_agent_config" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let config_id = required_str(params, "config_id")?;
+            let value = required_str(params, "value")?;
+            let set_default = params
+                .get("set_default")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            to_json(
+                &engine
+                    .set_agent_config(thread_id, config_id, value, set_default)
+                    .await?,
+            )?
+        }
         "permissions.resolve" => {
             let decision: PermissionDecisionPayload = serde_json::from_value(params.clone())
                 .map_err(|e| EngineError::InvalidParams(e.to_string()))?;
@@ -2597,6 +3469,20 @@ impl UnixSocketEngineClient {
 
     pub async fn delete_thread(&self, thread_id: &str) -> Result<String, EngineError> {
         DaemonEngine::delete_thread(self, thread_id).await
+    }
+
+    pub async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+        DaemonEngine::agent_options(self, thread_id).await
+    }
+
+    pub async fn set_agent_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+        set_default: bool,
+    ) -> Result<AgentOptionsSnapshot, EngineError> {
+        DaemonEngine::set_agent_config(self, thread_id, config_id, value, set_default).await
     }
 }
 
@@ -2823,6 +3709,30 @@ impl DaemonEngine for UnixSocketEngineClient {
     async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
         self.call_typed("session.agent_metadata", json!({})).await
     }
+
+    async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+        self.call_typed("session.agent_options", json!({"thread_id": thread_id}))
+            .await
+    }
+
+    async fn set_agent_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+        set_default: bool,
+    ) -> Result<AgentOptionsSnapshot, EngineError> {
+        self.call_typed(
+            "session.set_agent_config",
+            json!({
+                "thread_id": thread_id,
+                "config_id": config_id,
+                "value": value,
+                "set_default": set_default,
+            }),
+        )
+        .await
+    }
 }
 
 /// Unified engine: standalone in-process or remote daemon.
@@ -3015,6 +3925,31 @@ impl DaemonEngine for EngineClient {
         match self {
             Self::InProcess(e) => DaemonEngine::agent_metadata(e.as_ref()).await,
             Self::Socket(e) => DaemonEngine::agent_metadata(e).await,
+        }
+    }
+
+    async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::agent_options(e.as_ref(), thread_id).await,
+            Self::Socket(e) => DaemonEngine::agent_options(e, thread_id).await,
+        }
+    }
+
+    async fn set_agent_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+        set_default: bool,
+    ) -> Result<AgentOptionsSnapshot, EngineError> {
+        match self {
+            Self::InProcess(e) => {
+                DaemonEngine::set_agent_config(e.as_ref(), thread_id, config_id, value, set_default)
+                    .await
+            }
+            Self::Socket(e) => {
+                DaemonEngine::set_agent_config(e, thread_id, config_id, value, set_default).await
+            }
         }
     }
 }
@@ -4616,5 +5551,320 @@ done
             .map(|(_, text)| *text)
             .collect();
         assert_eq!(blank_prompts, vec!["blank root prompt"]);
+    }
+
+    #[test]
+    fn test_extract_tool_call_summary_variants() {
+        assert_eq!(
+            extract_tool_call_summary("run_command", "Run   tests\nnow", &json!({"cmd": "cargo test"})),
+            Some("Run tests now".to_string())
+        );
+        assert_eq!(
+            extract_tool_call_summary(
+                "run_command",
+                "run_command",
+                &json!({"CommandLine": "cargo test --locked"})
+            ),
+            Some("cargo test --locked".to_string())
+        );
+        assert_eq!(
+            extract_tool_call_summary("read_file", "", &json!({"TargetFile": "src/main.rs"})),
+            Some("src/main.rs".to_string())
+        );
+        assert_eq!(
+            extract_tool_call_summary("search", "", &json!({"Query": "fn route"})),
+            Some("fn route".to_string())
+        );
+        assert_eq!(extract_tool_call_summary("noop", "", &json!({})), None);
+
+        let long_cmd = "x".repeat(120);
+        let truncated = extract_tool_call_summary("run_command", "", &json!({"command": long_cmd}))
+            .expect("truncated");
+        assert_eq!(truncated.chars().count(), 80);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_normalize_session_config_options_precedence_and_fallback() {
+        use grein_acp::{AcpConfigChoice, AcpModeOption, AcpModelOption};
+
+        // 1. Prefer config_options when non-empty with model/mode
+        let full = AcpSessionInfo {
+            session_id: "s1".into(),
+            current_model_id: Some("legacy-model".into()),
+            current_mode_id: Some("legacy-mode".into()),
+            available_models: vec![AcpModelOption {
+                model_id: "legacy-model".into(),
+                name: "Legacy".into(),
+                description: None,
+            }],
+            available_modes: vec![AcpModeOption {
+                id: "legacy-mode".into(),
+                name: "Legacy Mode".into(),
+                description: None,
+            }],
+            config_options: vec![
+                AcpConfigOption {
+                    id: "model".into(),
+                    name: "Model".into(),
+                    category: Some("model".into()),
+                    current_value: "modern-model".into(),
+                    options: vec![AcpConfigChoice {
+                        value: "modern-model".into(),
+                        name: "Modern".into(),
+                        description: None,
+                    }],
+                },
+                AcpConfigOption {
+                    id: "mode".into(),
+                    name: "Mode".into(),
+                    category: Some("mode".into()),
+                    current_value: "modern-mode".into(),
+                    options: vec![AcpConfigChoice {
+                        value: "modern-mode".into(),
+                        name: "Modern Mode".into(),
+                        description: None,
+                    }],
+                },
+            ],
+        };
+        let norm_full = normalize_session_config_options(&full);
+        assert_eq!(norm_full.len(), 2);
+        assert_eq!(norm_full[0].current_value, "modern-model");
+        assert_eq!(norm_full[1].current_value, "modern-mode");
+
+        // 2. Fallback synthesis from available_models / available_modes when config_options empty
+        let legacy = AcpSessionInfo {
+            session_id: "s2".into(),
+            current_model_id: Some("m2".into()),
+            current_mode_id: Some("code".into()),
+            available_models: vec![
+                AcpModelOption {
+                    model_id: "m1".into(),
+                    name: "M1".into(),
+                    description: None,
+                },
+                AcpModelOption {
+                    model_id: "m2".into(),
+                    name: "M2".into(),
+                    description: Some("Fast".into()),
+                },
+            ],
+            available_modes: vec![AcpModeOption {
+                id: "code".into(),
+                name: "Code".into(),
+                description: None,
+            }],
+            config_options: Vec::new(),
+        };
+        let norm_legacy = normalize_session_config_options(&legacy);
+        assert_eq!(norm_legacy.len(), 2);
+        assert_eq!(norm_legacy[0].id, "model");
+        assert_eq!(norm_legacy[0].current_value, "m2");
+        assert_eq!(norm_legacy[0].options.len(), 2);
+        assert_eq!(norm_legacy[1].id, "mode");
+        assert_eq!(norm_legacy[1].current_value, "code");
+
+        // 3. Hybrid: non-empty config_options without model/mode still synthesizes missing model/mode
+        let hybrid = AcpSessionInfo {
+            session_id: "s3".into(),
+            current_model_id: Some("m1".into()),
+            current_mode_id: None,
+            available_models: vec![AcpModelOption {
+                model_id: "m1".into(),
+                name: "M1".into(),
+                description: None,
+            }],
+            available_modes: Vec::new(),
+            config_options: vec![AcpConfigOption {
+                id: "thought_level".into(),
+                name: "Thinking".into(),
+                category: Some("thought_level".into()),
+                current_value: "high".into(),
+                options: Vec::new(),
+            }],
+        };
+        let norm_hybrid = normalize_session_config_options(&hybrid);
+        assert_eq!(norm_hybrid.len(), 2);
+        assert!(norm_hybrid.iter().any(|o| o.id == "thought_level"));
+        assert!(norm_hybrid.iter().any(|o| o.id == "model" && o.current_value == "m1"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_send_turn_for_thread_serializes_without_listener_close() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("concurrent_turns.db");
+        let capture_path = temp.path().join("concurrent_capture.jsonl");
+
+        let mock_script = r#"
+sess_counter=0
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$GREIN_CAPTURE"
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"mock","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-%s"}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/prompt"'*)
+            if printf '%s' "$line" | grep -q "turn-one"; then
+                sleep 0.12
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply-one"}}}}\n'
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            else
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply-two"}}}}\n'
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            fi
+            ;;
+    esac
+done
+"#;
+        let wrapper = format!(
+            "#!/bin/sh\nexport GREIN_CAPTURE={:?}\n{}\n",
+            capture_path.to_string_lossy(),
+            mock_script
+        );
+        let script_path = write_executable_script(temp.path(), "mock_serial.sh", &wrapper);
+        let cfg = AcpBackendConfig {
+            command: script_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        };
+
+        let engine = Arc::new(
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+                .expect("open"),
+        );
+        let main = engine.ensure_main_thread().await.expect("main");
+
+        let e1 = Arc::clone(&engine);
+        let t1 = main.thread_id.clone();
+        let e2 = Arc::clone(&engine);
+        let t2 = main.thread_id.clone();
+
+        let (res1, res2) = tokio::join!(
+            async move { e1.send_turn_for_thread(&t1, "turn-one").await },
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                e2.send_turn_for_thread(&t2, "turn-two").await
+            }
+        );
+
+        res1.expect("first turn must succeed");
+        res2.expect("second overlapping turn must serialize and succeed");
+
+        let transcript = engine
+            .get_thread_transcript(&main.thread_id)
+            .await
+            .expect("transcript");
+        let entries: Vec<(&str, &str)> = transcript
+            .iter()
+            .map(|t| (t.role.as_str(), t.content.as_str()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("user", "turn-one"),
+                ("assistant", "reply-one"),
+                ("user", "turn-two"),
+                ("assistant", "reply-two"),
+            ]
+        );
+
+        let frames: Vec<Value> = std::fs::read_to_string(&capture_path)
+            .expect("capture")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let session_new_count = frames
+            .iter()
+            .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
+            .count();
+        assert_eq!(session_new_count, 1, "must reuse single ACP session");
+    }
+
+    #[tokio::test]
+    async fn test_live_acp_config_updates_and_commands_via_session_listener() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("live_updates.db");
+
+        let mock_script = r#"#!/bin/sh
+while IFS= read -r line; do
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"mock","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-u","models":{"currentModelId":"m1","availableModels":[{"modelId":"m1","name":"M1"},{"modelId":"m2","name":"M2"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
+            ;;
+        *'"method":"session/prompt"'*)
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-u","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact context"}]}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-u","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-u","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"thought_level","name":"Thinking","category":"thought_level","currentValue":"high","options":[{"value":"high","name":"High"}]}]}}}\n'
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-u","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"updated"}}}}\n'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        let script_path = write_executable_script(temp.path(), "mock_updates.sh", mock_script);
+        let cfg = AcpBackendConfig {
+            command: script_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        };
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+                .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        let mut rx = engine.subscribe_tui_events();
+
+        engine
+            .send_turn_for_thread(&main.thread_id, "trigger updates")
+            .await
+            .expect("turn");
+
+        let mut evs = Vec::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(200), rx.recv()).await {
+            let done = matches!(ev, TuiEngineEvent::ThreadStatusChanged { ref status, .. } if status == "idle");
+            evs.push(ev);
+            if done {
+                break;
+            }
+        }
+
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::AgentCommandsUpdated { thread_id, commands }
+                if thread_id == &main.thread_id
+                    && commands.len() == 1
+                    && commands[0].name == "compact"
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::AgentMetaUpdated { thread_id, mode: Some(mode), .. }
+                if thread_id == &main.thread_id && mode == "plan"
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::AgentConfigUpdated { thread_id, config_options }
+                if thread_id == &main.thread_id
+                    && config_options.iter().any(|o| o.id == "thought_level" && o.current_value == "high")
+                    && config_options.iter().any(|o| o.id == "model" && o.current_value == "m1")
+                    && config_options.iter().any(|o| o.id == "mode" && o.current_value == "plan")
+        )));
+
+        let metas = engine.agent_metadata().await.expect("agent_metadata");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].mode.as_deref(), Some("plan"));
+        assert_eq!(metas[0].available_commands.len(), 1);
+        assert!(metas[0].config_options.iter().any(|o| o.id == "thought_level"));
     }
 }

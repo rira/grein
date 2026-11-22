@@ -13,8 +13,15 @@ from typing import Any
 
 
 class FakeAcpServer:
-    def __init__(self, log_path: str | None) -> None:
+    def __init__(
+        self,
+        log_path: str | None,
+        legacy_config: bool = False,
+        emit_commands: bool = False,
+    ) -> None:
         self._log_path = log_path
+        self._legacy_config = legacy_config
+        self._emit_commands = emit_commands
         self._stdout_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -71,6 +78,64 @@ class FakeAcpServer:
             },
         )
 
+    def _build_config_options(self, session: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": session["model"],
+                "options": [
+                    {
+                        "value": "fake-model",
+                        "name": "Fake Model",
+                        "description": "Default fake model",
+                    },
+                    {
+                        "value": "fake-model-fast",
+                        "name": "Fake Model Fast",
+                        "description": "Fast fake model",
+                    },
+                ],
+            },
+            {
+                "id": "mode",
+                "name": "Mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": session["mode"],
+                "options": [
+                    {
+                        "value": "default",
+                        "name": "Default",
+                        "description": "Default mode",
+                    },
+                    {
+                        "value": "architect",
+                        "name": "Architect",
+                        "description": "Planning mode",
+                    },
+                ],
+            },
+            {
+                "id": "thought_level",
+                "name": "Thinking Level",
+                "category": "thought_level",
+                "type": "select",
+                "currentValue": session["thought_level"],
+                "options": [
+                    {"value": "low", "name": "Low", "description": "Fast thinking"},
+                    {
+                        "value": "medium",
+                        "name": "Medium",
+                        "description": "Balanced thinking",
+                    },
+                    {"value": "high", "name": "High", "description": "Deep thinking"},
+                ],
+            },
+        ]
+
     def _ensure_session(self, session_id: str) -> dict[str, Any]:
         with self._state_lock:
             session = self._sessions.get(session_id)
@@ -79,6 +144,9 @@ class FakeAcpServer:
                     "system_prompt": "",
                     "first_turn": True,
                     "cancel_event": threading.Event(),
+                    "model": "fake-model",
+                    "mode": "default",
+                    "thought_level": "medium",
                 }
                 self._sessions[session_id] = session
             return session
@@ -111,20 +179,80 @@ class FakeAcpServer:
         with self._state_lock:
             self._session_counter += 1
             session_id = f"sess-{self._session_counter}"
-            self._sessions[session_id] = {
+            session = {
                 "system_prompt": append_text,
                 "first_turn": True,
                 "cancel_event": threading.Event(),
+                "model": "fake-model",
+                "mode": "default",
+                "thought_level": "medium",
             }
+            self._sessions[session_id] = session
+            config_options = self._build_config_options(session)
 
-        self._send_response(
-            req_id,
-            {
-                "sessionId": session_id,
-                "models": {"currentModelId": "fake-model", "availableModels": []},
-                "modes": {"currentModeId": "default", "availableModes": []},
+        result: dict[str, Any] = {
+            "sessionId": session_id,
+            "models": {
+                "currentModelId": "fake-model",
+                "availableModels": [
+                    {
+                        "modelId": "fake-model",
+                        "name": "Fake Model",
+                        "description": "Default fake model",
+                    },
+                    {
+                        "modelId": "fake-model-fast",
+                        "name": "Fake Model Fast",
+                        "description": "Fast fake model",
+                    },
+                ],
             },
-        )
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [
+                    {
+                        "id": "default",
+                        "name": "Default",
+                        "description": "Default mode",
+                    },
+                    {
+                        "id": "architect",
+                        "name": "Architect",
+                        "description": "Planning mode",
+                    },
+                ],
+            },
+        }
+        if not self._legacy_config:
+            result["configOptions"] = config_options
+
+        self._send_response(req_id, result)
+
+        if self._emit_commands:
+            def _emit_initial_cmds() -> None:
+                if self._shutdown_event.wait(timeout=0.03):
+                    return
+                with self._state_lock:
+                    if session_id not in self._sessions:
+                        return
+                self._send_update(
+                    session_id,
+                    {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [
+                            {
+                                "name": "compact",
+                                "description": "Compact conversation history",
+                            },
+                            {
+                                "name": "plan",
+                                "description": "Switch to architectural planning",
+                            },
+                        ],
+                    },
+                )
+
+            threading.Thread(target=_emit_initial_cmds, daemon=True).start()
 
     def _extract_prompt_text(self, params: dict[str, Any]) -> str:
         prompt_items = params.get("prompt") or []
@@ -216,6 +344,86 @@ class FakeAcpServer:
 
         if "ECHO_LAST_PROMPT" in prompt_text:
             self._send_text_chunk(session_id, prompt_text)
+            self._send_response(req_id, {"stopReason": "end_turn"})
+            return
+
+        if "DUMP_CONFIG" in prompt_text:
+            with self._state_lock:
+                model = session["model"]
+                mode = session["mode"]
+                thought_level = session["thought_level"]
+            self._send_text_chunk(
+                session_id,
+                f"CONFIG:model={model},mode={mode},thought_level={thought_level}",
+            )
+            self._send_response(req_id, {"stopReason": "end_turn"})
+            return
+
+        if "TOOL_SUMMARY_AND_ERROR" in prompt_text:
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-cmd-1",
+                    "name": "run_command",
+                    "title": "run_command",
+                    "args": {"CommandLine": "cargo test --locked"},
+                    "status": "pending",
+                },
+            )
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-cmd-1",
+                    "name": "run_command",
+                    "status": "failed",
+                    "rawOutput": {"output": "exit code 101"},
+                },
+            )
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-read-2",
+                    "name": "read_file",
+                    "title": "Read Cargo manifest",
+                    "args": {"Path": "Cargo.toml"},
+                    "status": "pending",
+                },
+            )
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-read-2",
+                    "name": "read_file",
+                    "status": "completed",
+                    "rawOutput": {"output": "[workspace]"},
+                },
+            )
+            self._send_text_chunk(session_id, "TOOL_TEST_DONE")
+            self._send_response(req_id, {"stopReason": "end_turn"})
+            return
+
+        if "EMIT_COMMANDS" in prompt_text:
+            self._send_update(
+                session_id,
+                {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {
+                            "name": "compact",
+                            "description": "Compact conversation history",
+                        },
+                        {
+                            "name": "review",
+                            "description": "Review code changes",
+                        },
+                    ],
+                },
+            )
+            self._send_text_chunk(session_id, "COMMANDS_EMITTED")
             self._send_response(req_id, {"stopReason": "end_turn"})
             return
 
@@ -372,6 +580,70 @@ class FakeAcpServer:
         if cancel_event is not None:
             cancel_event.set()
 
+    def _handle_set_config_option(self, req_id: Any, params: dict[str, Any]) -> None:
+        if self._legacy_config:
+            self._send_error(req_id, -32601, "Method not found: session/set_config_option")
+            return
+        session_id = params.get("sessionId")
+        config_id = params.get("configId")
+        value = params.get("value")
+        if not isinstance(session_id, str) or not isinstance(config_id, str) or not isinstance(value, str):
+            self._send_error(req_id, -32602, "invalid set_config_option params")
+            return
+
+        valid_values = {
+            "model": {"fake-model", "fake-model-fast"},
+            "mode": {"default", "architect"},
+            "thought_level": {"low", "medium", "high"},
+        }
+        allowed = valid_values.get(config_id)
+        if allowed is None or value not in allowed:
+            self._send_error(req_id, -32602, f"invalid option {config_id}={value}")
+            return
+
+        session = self._ensure_session(session_id)
+        with self._state_lock:
+            session[config_id] = value
+            config_options = self._build_config_options(session)
+
+        self._send_update(
+            session_id,
+            {
+                "sessionUpdate": "config_option_update",
+                "configOptions": config_options,
+            },
+        )
+        self._send_response(req_id, {"configOptions": config_options})
+
+    def _handle_set_model(self, req_id: Any, params: dict[str, Any]) -> None:
+        session_id = params.get("sessionId")
+        model_id = params.get("modelId")
+        if not isinstance(session_id, str) or model_id not in {"fake-model", "fake-model-fast"}:
+            self._send_error(req_id, -32602, f"invalid modelId: {model_id}")
+            return
+        session = self._ensure_session(session_id)
+        with self._state_lock:
+            session["model"] = model_id
+        self._send_response(req_id, {})
+
+    def _handle_set_mode(self, req_id: Any, params: dict[str, Any]) -> None:
+        session_id = params.get("sessionId")
+        mode_id = params.get("modeId")
+        if not isinstance(session_id, str) or mode_id not in {"default", "architect"}:
+            self._send_error(req_id, -32602, f"invalid modeId: {mode_id}")
+            return
+        session = self._ensure_session(session_id)
+        with self._state_lock:
+            session["mode"] = mode_id
+        self._send_update(
+            session_id,
+            {
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": mode_id,
+            },
+        )
+        self._send_response(req_id, {})
+
     def _handle_session_close(self, req_id: Any, params: dict[str, Any]) -> None:
         session_id = params.get("sessionId")
         if isinstance(session_id, str):
@@ -436,6 +708,12 @@ class FakeAcpServer:
                 workers.append(worker)
             elif method == "session/cancel":
                 self._handle_cancel(params)
+            elif method == "session/set_config_option":
+                self._handle_set_config_option(req_id, params)
+            elif method == "session/set_model":
+                self._handle_set_model(req_id, params)
+            elif method == "session/set_mode":
+                self._handle_set_mode(req_id, params)
             elif method == "session/close":
                 self._handle_session_close(req_id, params)
             elif req_id is not None:
@@ -450,6 +728,8 @@ class FakeAcpServer:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fake ACP v1 NDJSON server")
     parser.add_argument("--log-file", dest="log_file", default=None)
+    parser.add_argument("--legacy-config", action="store_true", default=False)
+    parser.add_argument("--emit-commands", action="store_true", default=False)
     args, _ = parser.parse_known_args(argv)
     return args
 
@@ -457,7 +737,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main() -> int:
     args = parse_args(sys.argv[1:])
     log_path = args.log_file or os.environ.get("FAKE_ACP_LOG")
-    server = FakeAcpServer(log_path)
+    legacy_config = args.legacy_config or os.environ.get("FAKE_ACP_LEGACY_CONFIG") == "1"
+    emit_commands = args.emit_commands or os.environ.get("FAKE_ACP_EMIT_COMMANDS") == "1"
+    server = FakeAcpServer(log_path, legacy_config=legacy_config, emit_commands=emit_commands)
     return server.run()
 
 
