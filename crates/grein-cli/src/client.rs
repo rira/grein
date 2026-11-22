@@ -187,6 +187,79 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn session_create_terminal(
+        &mut self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(pid) = parent_thread_id {
+            params.insert("parent_thread_id".to_string(), json!(pid));
+        }
+        if let Some(t) = title {
+            params.insert("title".to_string(), json!(t));
+        }
+        if let Some(dir) = cwd {
+            params.insert("cwd".to_string(), json!(dir));
+        }
+        params.insert("rows".to_string(), json!(rows));
+        params.insert("cols".to_string(), json!(cols));
+        self.json_rpc("session.create_terminal", Value::Object(params))
+            .await
+    }
+
+    pub async fn session_pty_write(
+        &mut self,
+        thread_id: &str,
+        bytes: &[u8],
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.pty_write",
+            json!({"thread_id": thread_id, "bytes": bytes}),
+        )
+        .await
+    }
+
+    pub async fn session_pty_resize(
+        &mut self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.pty_resize",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+    }
+
+    pub async fn session_pty_snapshot(
+        &mut self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.pty_snapshot",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+    }
+
+    pub async fn session_ensure_thread_worktree(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.ensure_thread_worktree",
+            json!({"thread_id": thread_id}),
+        )
+        .await
+    }
+
     async fn send_command(&mut self, cmd: &str) -> Result<String, std::io::Error> {
         self.stream.write_all(format!("{cmd}\n").as_bytes()).await?;
         self.stream.flush().await?;

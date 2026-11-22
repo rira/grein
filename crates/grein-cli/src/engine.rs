@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -11,13 +11,22 @@ use grein_acp::{
 };
 use grein_core::error::CoreError;
 use grein_core::model::{
-    Anchor, AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadStatus,
+    Anchor, AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadKind,
+    ThreadStatus,
 };
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_core::sync::{synthesize_thread_merge, ContextCompiler};
 use grein_tui::engine_port::{
     AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentSlashCommand,
-    HydratedThread, HydratedTurn, SubagentSnapshot, SubagentStatus, ThreadMeta, TuiEngineEvent,
+    HydratedThread, HydratedTurn, PtyCell as TuiPtyCell, PtyColor as TuiPtyColor,
+    PtyScreenSnapshot as TuiPtyScreenSnapshot, SubagentSnapshot, SubagentStatus, ThreadMeta,
+    TuiEngineEvent,
+};
+use grein_workspace::allocator::{ThreadId as WorkspaceThreadId, WorktreeAllocator};
+use grein_workspace::git::{GitError, GitRepository};
+use grein_workspace::pty_session::{
+    InteractivePtySession, PtyCell as WsPtyCell, PtyColor as WsPtyColor,
+    PtyScreenSnapshot as WsPtyScreenSnapshot,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -36,6 +45,7 @@ const SHELL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const SHELL_MAX_OUTPUT_BYTES: usize = 65_536;
 const UNSOLICITED_QUIET_TIMEOUT: Duration = Duration::from_millis(1500);
 const CLOSE_SESSION_TIMEOUT: Duration = Duration::from_millis(250);
+const PTY_COALESCE_WINDOW: Duration = Duration::from_millis(16);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -279,6 +289,41 @@ pub trait DaemonEngine: Send + Sync {
             "set_agent_config not supported".to_string(),
         ))
     }
+    async fn create_terminal(
+        &self,
+        _parent_thread_id: Option<&str>,
+        _title: Option<&str>,
+        _cwd: Option<&str>,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<ThreadSummary, EngineError> {
+        Err(EngineError::Protocol(
+            "create_terminal not supported".to_string(),
+        ))
+    }
+    async fn pty_write(&self, _thread_id: &str, _bytes: Vec<u8>) -> Result<(), EngineError> {
+        Err(EngineError::Protocol(
+            "pty_write not supported".to_string(),
+        ))
+    }
+    async fn pty_resize(&self, _thread_id: &str, _rows: u16, _cols: u16) -> Result<(), EngineError> {
+        Ok(())
+    }
+    async fn pty_snapshot(
+        &self,
+        _thread_id: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        Err(EngineError::Protocol(
+            "pty_snapshot not supported".to_string(),
+        ))
+    }
+    async fn ensure_thread_worktree(&self, _thread_id: &str) -> Result<String, EngineError> {
+        Err(EngineError::Protocol(
+            "ensure_thread_worktree not supported".to_string(),
+        ))
+    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -356,6 +401,11 @@ struct EngineRuntime {
     next_perm_seq: AtomicU64,
     subagent_watch: Mutex<Arc<SubagentWatcher>>,
     unsolicited_quiet_timeout: Mutex<Duration>,
+    active_pty_sessions: Arc<Mutex<HashMap<String, Arc<InteractivePtySession>>>>,
+    pty_exited_threads: Mutex<HashSet<String>>,
+    pty_notify_tx: mpsc::UnboundedSender<String>,
+    pty_notify_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    pty_notifier_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Engine backed directly by `SqliteStorage` and live ACP v1 stdio drivers.
@@ -368,6 +418,18 @@ impl Drop for InProcessEngine {
         if let Ok(mut state) = self.runtime.state.lock() {
             state.active_acp_sessions.clear();
         }
+        if let Ok(mut handle) = self.runtime.pty_notifier_handle.lock() {
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+        }
+        let sessions: Vec<Arc<InteractivePtySession>> = self
+            .runtime
+            .active_pty_sessions
+            .lock()
+            .map(|mut map| map.drain().map(|(_, s)| s).collect())
+            .unwrap_or_default();
+        drop(sessions);
         if let Ok(watch) = self.runtime.subagent_watch.lock() {
             watch.shutdown();
         }
@@ -428,6 +490,8 @@ fn is_internal_root_node(node: &ConversationNode) -> bool {
 fn thread_to_summary(thread: &Thread, is_first: bool) -> ThreadSummary {
     let title = if !thread.title.trim().is_empty() {
         thread.title.clone()
+    } else if thread.kind == ThreadKind::Terminal {
+        "Terminal".to_string()
     } else if is_first {
         "Main".to_string()
     } else {
@@ -440,6 +504,47 @@ fn thread_to_summary(thread: &Thread, is_first: bool) -> ThreadSummary {
         active_leaf_id: thread.active_leaf_id.0.to_string(),
         merged: thread.merged,
         status: thread.status,
+    }
+}
+
+fn pty_color_to_tui(color: WsPtyColor) -> TuiPtyColor {
+    match color {
+        WsPtyColor::Default => TuiPtyColor::Default,
+        WsPtyColor::Indexed(idx) => TuiPtyColor::Indexed(idx),
+        WsPtyColor::Rgb(r, g, b) => TuiPtyColor::Rgb(r, g, b),
+    }
+}
+
+fn pty_cell_to_tui(cell: WsPtyCell) -> TuiPtyCell {
+    TuiPtyCell {
+        contents: cell.contents,
+        fg: pty_color_to_tui(cell.fg),
+        bg: pty_color_to_tui(cell.bg),
+        bold: cell.bold,
+        italic: cell.italic,
+        underline: cell.underline,
+        inverse: cell.inverse,
+        is_wide_continuation: cell.is_wide_continuation,
+    }
+}
+
+fn pty_snapshot_to_tui(snap: WsPtyScreenSnapshot) -> TuiPtyScreenSnapshot {
+    TuiPtyScreenSnapshot {
+        rows: snap.rows,
+        cols: snap.cols,
+        cells: snap
+            .cells
+            .into_iter()
+            .map(|row| row.into_iter().map(pty_cell_to_tui).collect())
+            .collect(),
+        cursor_row: snap.cursor_row,
+        cursor_col: snap.cursor_col,
+        hide_cursor: snap.hide_cursor,
+        application_cursor: snap.application_cursor,
+        bracketed_paste: snap.bracketed_paste,
+        alternate_screen: snap.alternate_screen,
+        exited: snap.exited,
+        exit_code: snap.exit_code,
     }
 }
 
@@ -925,7 +1030,17 @@ impl EngineRuntime {
             payload.build_acp_system_prompt_append(include_branch_turns, ACP_SYSTEM_PROMPT_MAX_CHARS);
         let append_opt = (!append.trim().is_empty()).then_some(append.as_str());
 
-        let info = match driver.new_session(&cfg.cwd, append_opt).await {
+        let session_cwd = self
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .and_then(|t| t.cwd)
+            .filter(|c| !c.trim().is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| cfg.cwd.clone());
+
+        let info = match driver.new_session(&session_cwd, append_opt).await {
             Ok(info) => info,
             Err(err) => {
                 self.invalidate_driver_if_dead(&driver, driver_gen).await;
@@ -1298,6 +1413,217 @@ impl EngineRuntime {
                 .active_acp_sessions
                 .retain(|_, s| s.driver_gen != generation);
         }
+    }
+
+    fn ensure_pty_notifier_started(self: &Arc<Self>) {
+        let maybe_rx = self
+            .pty_notify_rx
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(mut rx) = maybe_rx else {
+            return;
+        };
+        let weak_rt: Weak<EngineRuntime> = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            while let Some(first_tid) = rx.recv().await {
+                let mut dirty = HashSet::new();
+                dirty.insert(first_tid);
+                let deadline = tokio::time::Instant::now() + PTY_COALESCE_WINDOW;
+                loop {
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(Some(tid)) => {
+                            dirty.insert(tid);
+                        }
+                        Ok(None) => return,
+                        Err(_) => break,
+                    }
+                }
+                let Some(rt) = weak_rt.upgrade() else {
+                    break;
+                };
+                rt.flush_dirty_pty_threads(dirty);
+            }
+        });
+        if let Ok(mut guard) = self.pty_notifier_handle.lock() {
+            *guard = Some(handle);
+        }
+    }
+
+    fn flush_dirty_pty_threads(&self, dirty: HashSet<String>) {
+        for thread_id in dirty {
+            let session = self
+                .active_pty_sessions
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&thread_id).cloned());
+            let Some(session) = session else {
+                continue;
+            };
+            let snap = pty_snapshot_to_tui(session.snapshot());
+            let exited = snap.exited;
+            let exit_code = snap.exit_code;
+            self.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+                thread_id: thread_id.clone(),
+                snapshot: snap,
+            });
+            if exited {
+                let newly_exited = self
+                    .pty_exited_threads
+                    .lock()
+                    .map(|mut seen| seen.insert(thread_id.clone()))
+                    .unwrap_or(false);
+                if newly_exited {
+                    if let Some(tid) = parse_typed_id::<ThreadId>(&thread_id) {
+                        if self.storage.get_thread(tid).ok().flatten().is_some() {
+                            let _ = self.storage.update_thread_status(tid, ThreadStatus::Idle);
+                        }
+                    }
+                    self.emit_tui(TuiEngineEvent::PtyExited {
+                        thread_id: thread_id.clone(),
+                        exit_code,
+                    });
+                    self.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+                        thread_id,
+                        status: "idle".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn resolve_thread_cwd(&self, thread: &Thread) -> PathBuf {
+        thread
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    fn resolve_terminal_cwd(
+        &self,
+        explicit_cwd: Option<&str>,
+        parent_thread: Option<&Thread>,
+    ) -> Result<String, EngineError> {
+        let base_dir = parent_thread
+            .map(|p| self.resolve_thread_cwd(p))
+            .unwrap_or_else(|| self.cwd.clone());
+        let candidate = match explicit_cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let raw_path = Path::new(raw);
+                if raw_path.is_absolute() {
+                    raw_path.to_path_buf()
+                } else {
+                    base_dir.join(raw_path)
+                }
+            }
+            None => base_dir,
+        };
+        if !candidate.is_dir() {
+            return Err(EngineError::InvalidParams(format!(
+                "terminal cwd does not exist or is not a directory: {}",
+                candidate.display()
+            )));
+        }
+        let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
+            EngineError::InvalidParams(format!(
+                "failed to resolve terminal cwd {}: {e}",
+                candidate.display()
+            ))
+        })?;
+        canonical
+            .to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| EngineError::InvalidParams("terminal cwd is not valid UTF-8".to_string()))
+    }
+
+    async fn spawn_pty_for_thread(
+        self: &Arc<Self>,
+        thread_id: &str,
+        cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Arc<InteractivePtySession>, EngineError> {
+        self.ensure_pty_notifier_started();
+        let notify_tx = self.pty_notify_tx.clone();
+        let tid_for_cb = thread_id.to_string();
+        let on_update: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = notify_tx.send(tid_for_cb.clone());
+        });
+        let clamped_rows = rows.max(4);
+        let clamped_cols = cols.max(10);
+        let spawned = tokio::task::spawn_blocking(move || {
+            InteractivePtySession::spawn(&cwd, clamped_rows, clamped_cols, None, on_update)
+        })
+        .await
+        .map_err(|e| EngineError::Transport(format!("PTY spawn task panicked: {e}")))?
+        .map_err(|e| EngineError::Transport(format!("failed to spawn PTY session: {e}")))?;
+
+        let session = Arc::new(spawned);
+        if let Ok(mut exited) = self.pty_exited_threads.lock() {
+            exited.remove(thread_id);
+        }
+        if let Ok(mut map) = self.active_pty_sessions.lock() {
+            map.insert(thread_id.to_string(), Arc::clone(&session));
+        }
+        let _ = self.pty_notify_tx.send(thread_id.to_string());
+        Ok(session)
+    }
+
+    async fn ensure_pty_session(
+        self: &Arc<Self>,
+        thread_id: &str,
+        thread: &Thread,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Arc<InteractivePtySession>, EngineError> {
+        if let Some(existing) = self
+            .active_pty_sessions
+            .lock()
+            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
+            .get(thread_id)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+
+        let _guard = self.acquire_thread_turn_lock(thread_id).await?;
+        if let Some(existing) = self
+            .active_pty_sessions
+            .lock()
+            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
+            .get(thread_id)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+
+        let cwd = self.resolve_thread_cwd(thread);
+        self.spawn_pty_for_thread(thread_id, cwd, rows, cols).await
+    }
+
+    fn require_terminal_thread(&self, thread_id: &str) -> Result<(ThreadId, Thread), EngineError> {
+        let tid: ThreadId = parse_typed_id(thread_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        let thread = self
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if thread.kind != ThreadKind::Terminal {
+            return Err(EngineError::InvalidParams(format!(
+                "thread {thread_id} is not a terminal thread"
+            )));
+        }
+        Ok((tid, thread))
     }
 }
 
@@ -1973,6 +2299,8 @@ impl InProcessEngine {
             }),
         );
 
+        let (pty_notify_tx, pty_notify_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             runtime: Arc::new(EngineRuntime {
                 storage,
@@ -1988,6 +2316,11 @@ impl InProcessEngine {
                 next_perm_seq: AtomicU64::new(1),
                 subagent_watch: Mutex::new(watcher),
                 unsolicited_quiet_timeout: Mutex::new(UNSOLICITED_QUIET_TIMEOUT),
+                active_pty_sessions: Arc::new(Mutex::new(HashMap::new())),
+                pty_exited_threads: Mutex::new(HashSet::new()),
+                pty_notify_tx,
+                pty_notify_rx: Mutex::new(Some(pty_notify_rx)),
+                pty_notifier_handle: Mutex::new(None),
             }),
         })
     }
@@ -2115,6 +2448,38 @@ impl InProcessEngine {
     ) -> Result<AgentOptionsSnapshot, EngineError> {
         DaemonEngine::set_agent_config(self, thread_id, config_id, value, set_default).await
     }
+
+    pub async fn create_terminal(
+        &self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::create_terminal(self, parent_thread_id, title, cwd, rows, cols).await
+    }
+
+    pub async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
+        DaemonEngine::pty_write(self, thread_id, bytes).await
+    }
+
+    pub async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> Result<(), EngineError> {
+        DaemonEngine::pty_resize(self, thread_id, rows, cols).await
+    }
+
+    pub async fn pty_snapshot(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        DaemonEngine::pty_snapshot(self, thread_id, rows, cols).await
+    }
+
+    pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
+        DaemonEngine::ensure_thread_worktree(self, thread_id).await
+    }
 }
 
 #[async_trait]
@@ -2126,8 +2491,9 @@ impl DaemonEngine for InProcessEngine {
     async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
         let mut state = self.runtime.lock()?;
         let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-        if let Some(first) = threads.first() {
-            return Ok(thread_to_summary(first, true));
+        if let Some(first_agent) = threads.iter().find(|t| t.kind == ThreadKind::Agent) {
+            let is_first = threads.first().is_some_and(|t| t.id == first_agent.id);
+            return Ok(thread_to_summary(first_agent, is_first));
         }
 
         let nodes = self.runtime.storage.list_nodes().map_err(storage_err)?;
@@ -2183,17 +2549,23 @@ impl DaemonEngine for InProcessEngine {
         if self.runtime.acp_config.is_none() {
             let mut state = self.runtime.lock()?;
             let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-            let parent = threads.first().map(|t| t.active_leaf_id).or(state.last_node);
+            let target_agent = threads.iter().find(|t| t.kind == ThreadKind::Agent);
+            if target_agent.is_none() && !threads.is_empty() {
+                return Err(EngineError::InvalidParams(
+                    "cannot send agent prompt to a terminal thread".to_string(),
+                ));
+            }
+            let parent = target_agent.map(|t| t.active_leaf_id).or(state.last_node);
             let node_id = NodeId::new();
             let node = ConversationNode::new(node_id, parent, AuthorRole::User, prompt.to_string());
             self.runtime
                 .storage
                 .insert_node(&node)
                 .map_err(storage_err)?;
-            if let Some(first) = threads.first() {
+            if let Some(agent_thread) = target_agent {
                 self.runtime
                     .storage
-                    .update_thread_leaf(first.id, node_id)
+                    .update_thread_leaf(agent_thread.id, node_id)
                     .map_err(storage_err)?;
             }
             state.last_node = Some(node_id);
@@ -2219,14 +2591,16 @@ impl DaemonEngine for InProcessEngine {
 
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        if self
+        let existing_thread = self
             .runtime
             .storage
             .get_thread(tid)
             .map_err(storage_err)?
-            .is_none()
-        {
-            return Err(EngineError::NotFound(format!("thread {thread_id}")));
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if existing_thread.kind == ThreadKind::Terminal {
+            return Err(EngineError::InvalidParams(
+                "cannot send agent prompt to a terminal thread".to_string(),
+            ));
         }
 
         let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
@@ -2450,21 +2824,27 @@ impl DaemonEngine for InProcessEngine {
         title: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
         let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-        let (parent_node_id, parent_thread_id) =
+        let (parent_node_id, parent_thread_id, parent_cwd) =
             match source_thread_or_node.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(raw) => {
                     if let Some(tid) = parse_typed_id::<ThreadId>(raw) {
                         if let Some(thread) =
                             self.runtime.storage.get_thread(tid).map_err(storage_err)?
                         {
-                            (thread.active_leaf_id, Some(thread.id))
+                            if thread.kind == ThreadKind::Terminal {
+                                return Err(EngineError::InvalidParams(
+                                    "cannot fork an agent branch from a terminal thread"
+                                        .to_string(),
+                                ));
+                            }
+                            (thread.active_leaf_id, Some(thread.id), thread.cwd)
                         } else if let Some(node) = self
                             .runtime
                             .storage
                             .get_node(NodeId(tid.0))
                             .map_err(storage_err)?
                         {
-                            (node.id, None)
+                            (node.id, None, None)
                         } else {
                             return Err(EngineError::NotFound(format!("thread or node {raw}")));
                         }
@@ -2474,9 +2854,14 @@ impl DaemonEngine for InProcessEngine {
                 }
                 None => {
                     if let Some(first) = existing_threads.first() {
-                        (first.active_leaf_id, Some(first.id))
+                        if first.kind == ThreadKind::Terminal {
+                            return Err(EngineError::InvalidParams(
+                                "cannot fork an agent branch from a terminal thread".to_string(),
+                            ));
+                        }
+                        (first.active_leaf_id, Some(first.id), first.cwd.clone())
                     } else if let Some(last_node) = self.runtime.lock()?.last_node {
-                        (last_node, None)
+                        (last_node, None, None)
                     } else {
                         return Err(EngineError::NotFound("no turns recorded".to_string()));
                     }
@@ -2508,11 +2893,13 @@ impl DaemonEngine for InProcessEngine {
         let tid = self
             .runtime
             .storage
-            .create_thread_with_parent(
+            .create_thread_with_kind(
                 parent_node_id,
                 anchor_id,
                 Some(&resolved_title),
                 parent_thread_id,
+                ThreadKind::Agent,
+                parent_cwd.as_deref(),
             )
             .map_err(storage_err)?;
         let created = self
@@ -2711,6 +3098,11 @@ impl DaemonEngine for InProcessEngine {
             .get_thread(source_tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {source_id}")))?;
+        if source.kind == ThreadKind::Terminal {
+            return Err(EngineError::InvalidParams(
+                "cannot merge a terminal thread into an agent context".to_string(),
+            ));
+        }
 
         let explicit_target = match target_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => match parse_typed_id::<ThreadId>(raw) {
@@ -2744,6 +3136,11 @@ impl DaemonEngine for InProcessEngine {
                 "cannot join a root context without a parent branch".to_string(),
             ));
         };
+        if target.kind == ThreadKind::Terminal {
+            return Err(EngineError::InvalidParams(
+                "cannot merge into a terminal thread".to_string(),
+            ));
+        }
 
         let source_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
         let source_is_first = source_threads.first().is_some_and(|t| t.id == source.id);
@@ -2896,7 +3293,10 @@ impl DaemonEngine for InProcessEngine {
                 "command must not be empty".to_string(),
             ));
         }
-        let cwd = self.runtime.cwd.clone();
+        let cwd = parse_typed_id::<ThreadId>(thread_id)
+            .and_then(|tid| self.runtime.storage.get_thread(tid).ok().flatten())
+            .map(|t| self.runtime.resolve_thread_cwd(&t))
+            .unwrap_or_else(|| self.runtime.cwd.clone());
         let cmd = command.to_string();
         let output = tokio::task::spawn_blocking(move || {
             grein_workspace::shell::run_shell_command_with_pty_blocking(
@@ -2967,6 +3367,19 @@ impl DaemonEngine for InProcessEngine {
             .into_iter()
             .find(|m| m.thread_id == thread_id)
             .and_then(|m| m.parent_thread_id);
+
+        let removed_pty = self
+            .runtime
+            .active_pty_sessions
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(thread_id));
+        if let Ok(mut exited) = self.runtime.pty_exited_threads.lock() {
+            exited.remove(thread_id);
+        }
+        if let Some(pty_session) = removed_pty {
+            let _ = tokio::task::spawn_blocking(move || drop(pty_session)).await;
+        }
 
         let removed_session = {
             let mut state = self.runtime.lock()?;
@@ -3046,14 +3459,18 @@ impl DaemonEngine for InProcessEngine {
     async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        if self
+        let thread = self
             .runtime
             .storage
             .get_thread(tid)
             .map_err(storage_err)?
-            .is_none()
-        {
-            return Err(EngineError::NotFound(format!("thread {thread_id}")));
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if thread.kind == ThreadKind::Terminal {
+            return Ok(AgentOptionsSnapshot {
+                thread_id: thread_id.to_string(),
+                config_options: Vec::new(),
+                available_commands: Vec::new(),
+            });
         }
 
         let Some(cfg) = self.runtime.acp_config.clone() else {
@@ -3134,14 +3551,16 @@ impl DaemonEngine for InProcessEngine {
 
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        if self
+        let thread = self
             .runtime
             .storage
             .get_thread(tid)
             .map_err(storage_err)?
-            .is_none()
-        {
-            return Err(EngineError::NotFound(format!("thread {thread_id}")));
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if thread.kind == ThreadKind::Terminal {
+            return Err(EngineError::InvalidParams(
+                "cannot set agent config on a terminal thread".to_string(),
+            ));
         }
 
         let Some(cfg) = self.runtime.acp_config.clone() else {
@@ -3247,6 +3666,268 @@ impl DaemonEngine for InProcessEngine {
         });
 
         Ok(snapshot)
+    }
+
+    async fn create_terminal(
+        &self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ThreadSummary, EngineError> {
+        let parent_thread = match parent_thread_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let parent_tid: ThreadId = parse_typed_id(raw)
+                    .ok_or_else(|| EngineError::NotFound(format!("thread {raw}")))?;
+                let thread = self
+                    .runtime
+                    .storage
+                    .get_thread(parent_tid)
+                    .map_err(storage_err)?
+                    .ok_or_else(|| EngineError::NotFound(format!("thread {raw}")))?;
+                Some(thread)
+            }
+            None => None,
+        };
+
+        let resolved_cwd = self
+            .runtime
+            .resolve_terminal_cwd(cwd, parent_thread.as_ref())?;
+        let resolved_title = title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Terminal")
+            .to_string();
+
+        let (parent_node_id, parent_tid_opt) = match parent_thread.as_ref() {
+            Some(parent) => (parent.active_leaf_id, Some(parent.id)),
+            None => {
+                let root_node = ConversationNode::new_root(AuthorRole::System, "");
+                self.runtime
+                    .storage
+                    .insert_node(&root_node)
+                    .map_err(storage_err)?;
+                (root_node.id, None)
+            }
+        };
+
+        let anchor_id = AnchorId::new();
+        let anchor = Anchor {
+            level: 1,
+            title: resolved_title.clone(),
+            slug: slugify_anchor(&resolved_title),
+            line_number: 1,
+        };
+        self.runtime
+            .storage
+            .insert_anchor(&anchor_id.0, &anchor)
+            .map_err(storage_err)?;
+
+        let tid = self
+            .runtime
+            .storage
+            .create_thread_with_kind(
+                parent_node_id,
+                anchor_id,
+                Some(&resolved_title),
+                parent_tid_opt,
+                ThreadKind::Terminal,
+                Some(&resolved_cwd),
+            )
+            .map_err(storage_err)?;
+        let tid_str = tid.0.to_string();
+
+        if let Err(err) = self
+            .runtime
+            .spawn_pty_for_thread(&tid_str, PathBuf::from(&resolved_cwd), rows, cols)
+            .await
+        {
+            let _ = self.runtime.storage.delete_thread(tid);
+            return Err(err);
+        }
+
+        let created = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::Storage("created terminal thread missing".to_string()))?;
+        let summary = thread_to_summary(&created, false);
+        self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
+            thread: HydratedThread {
+                id: summary.thread_id.clone(),
+                title: summary.title.clone(),
+                turns: Vec::new(),
+            },
+        });
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        Ok(summary)
+    }
+
+    async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
+        let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
+        let session = self
+            .runtime
+            .ensure_pty_session(thread_id, &thread, 24, 80)
+            .await?;
+        tokio::task::spawn_blocking(move || session.write_bytes(&bytes))
+            .await
+            .map_err(|e| EngineError::Transport(format!("PTY write task panicked: {e}")))?
+            .map_err(|e| EngineError::Transport(format!("PTY write failed: {e}")))
+    }
+
+    async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> Result<(), EngineError> {
+        let _ = self.runtime.require_terminal_thread(thread_id)?;
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let session = self
+            .runtime
+            .active_pty_sessions
+            .lock()
+            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
+            .get(thread_id)
+            .cloned();
+        let Some(session) = session else {
+            return Ok(());
+        };
+        let target_rows = rows.max(4);
+        let target_cols = cols.max(10);
+        tokio::task::spawn_blocking(move || session.resize(target_rows, target_cols))
+            .await
+            .map_err(|e| EngineError::Transport(format!("PTY resize task panicked: {e}")))?
+            .map_err(|e| EngineError::Transport(format!("PTY resize failed: {e}")))
+    }
+
+    async fn pty_snapshot(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
+        let session = self
+            .runtime
+            .ensure_pty_session(thread_id, &thread, rows, cols)
+            .await?;
+        let snap = session.snapshot();
+        if rows > 0 && cols > 0 {
+            let target_rows = rows.max(4);
+            let target_cols = cols.max(10);
+            if snap.rows != target_rows || snap.cols != target_cols {
+                let s_clone = Arc::clone(&session);
+                tokio::task::spawn_blocking(move || s_clone.resize(target_rows, target_cols))
+                    .await
+                    .map_err(|e| EngineError::Transport(format!("PTY resize task panicked: {e}")))?
+                    .map_err(|e| EngineError::Transport(format!("PTY resize failed: {e}")))?;
+                return Ok(pty_snapshot_to_tui(session.snapshot()));
+            }
+        }
+        Ok(pty_snapshot_to_tui(snap))
+    }
+
+    async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
+        let tid: ThreadId = parse_typed_id(thread_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        let initial = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        if initial.kind == ThreadKind::Terminal {
+            return Err(EngineError::InvalidParams(
+                "cannot allocate a git worktree for a terminal thread".to_string(),
+            ));
+        }
+
+        let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
+        let thread = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+
+        let repo = GitRepository::discover(&self.runtime.cwd).map_err(|err| match err {
+            GitError::NotFound => EngineError::InvalidParams(format!(
+                "workspace {} is not inside a git repository",
+                self.runtime.cwd.display()
+            )),
+            GitError::CommandFailed(msg) => EngineError::Transport(msg),
+        })?;
+        let expected_dir = repo.root().join(".grein").join("worktrees").join(thread_id);
+
+        let worktree_path = if expected_dir.is_dir() && expected_dir.join(".git").exists() {
+            expected_dir
+        } else {
+            let tid_owned = thread_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                let allocator = WorktreeAllocator::new(repo);
+                let mut session = allocator.open_session(WorkspaceThreadId::from(tid_owned))?;
+                session.transition_to_isolated_worktree()?;
+                Ok::<PathBuf, grein_workspace::allocator::WorkspaceError>(
+                    session.working_directory().to_path_buf(),
+                )
+            })
+            .await
+            .map_err(|e| EngineError::Transport(format!("worktree task panicked: {e}")))?
+            .map_err(|e| EngineError::Transport(format!("failed to create worktree: {e}")))?
+        };
+
+        let canonical = std::fs::canonicalize(&worktree_path).map_err(|e| {
+            EngineError::Transport(format!(
+                "failed to canonicalize worktree {}: {e}",
+                worktree_path.display()
+            ))
+        })?;
+        let path_str = canonical
+            .to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| EngineError::InvalidParams("worktree path is not valid UTF-8".to_string()))?;
+
+        let cwd_changed = thread.cwd.as_deref() != Some(path_str.as_str());
+        if cwd_changed {
+            self.runtime
+                .storage
+                .update_thread_cwd(&tid, Some(&path_str))
+                .map_err(storage_err)?;
+            self.runtime
+                .storage
+                .update_thread_acp_session_id(&tid, None)
+                .map_err(storage_err)?;
+            let old_session = {
+                let mut state = self.runtime.lock()?;
+                state
+                    .active_acp_sessions
+                    .remove(thread_id)
+                    .map(|s| (s.session_id.clone(), s.driver_gen))
+            };
+            if let Some((session_id, driver_gen)) = old_session {
+                let driver_opt = {
+                    let guard = self.runtime.acp_driver.lock().await;
+                    guard
+                        .as_ref()
+                        .filter(|s| s.generation == driver_gen && s.driver.is_running())
+                        .map(|s| Arc::clone(&s.driver))
+                };
+                if let Some(driver) = driver_opt {
+                    let _ = tokio::time::timeout(
+                        CLOSE_SESSION_TIMEOUT,
+                        driver.close_session(&session_id),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        Ok(path_str)
     }
 }
 
@@ -3367,9 +4048,68 @@ async fn route(
             let command = required_str(params, "command")?;
             to_json(&engine.run_shell_command(thread_id, command).await?)?
         }
+        "session.create_terminal" | "create_terminal" => {
+            let parent_thread_id = params.get("parent_thread_id").and_then(Value::as_str);
+            let title = params.get("title").and_then(Value::as_str);
+            let cwd = params.get("cwd").and_then(Value::as_str);
+            let rows = parse_opt_u16(params, "rows", 24)?;
+            let cols = parse_opt_u16(params, "cols", 80)?;
+            to_json(
+                &engine
+                    .create_terminal(parent_thread_id, title, cwd, rows, cols)
+                    .await?,
+            )?
+        }
+        "session.pty_write" | "pty_write" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let bytes_val = params
+                .get("bytes")
+                .cloned()
+                .ok_or_else(|| EngineError::InvalidParams("missing `bytes` param".to_string()))?;
+            let bytes: Vec<u8> = serde_json::from_value(bytes_val)
+                .map_err(|e| EngineError::InvalidParams(format!("invalid `bytes`: {e}")))?;
+            engine.pty_write(thread_id, bytes).await?;
+            json!({"ok": true})
+        }
+        "session.pty_resize" | "pty_resize" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let rows = parse_req_u16(params, "rows")?;
+            let cols = parse_req_u16(params, "cols")?;
+            engine.pty_resize(thread_id, rows, cols).await?;
+            json!({"ok": true})
+        }
+        "session.pty_snapshot" | "pty_snapshot" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let rows = parse_opt_u16(params, "rows", 0)?;
+            let cols = parse_opt_u16(params, "cols", 0)?;
+            to_json(&engine.pty_snapshot(thread_id, rows, cols).await?)?
+        }
+        "session.ensure_thread_worktree" | "ensure_thread_worktree" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let cwd = engine.ensure_thread_worktree(thread_id).await?;
+            json!({"cwd": cwd})
+        }
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+fn parse_opt_u16(params: &Value, key: &str, default: u16) -> Result<u16, EngineError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| EngineError::InvalidParams(format!("invalid u16 param `{key}`"))),
+    }
+}
+
+fn parse_req_u16(params: &Value, key: &str) -> Result<u16, EngineError> {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or_else(|| EngineError::InvalidParams(format!("missing u16 param `{key}`")))
 }
 
 /// Handles one JSON-RPC 2.0 request line and returns the serialized response.
@@ -3420,6 +4160,22 @@ impl UnixSocketEngineClient {
         })
     }
 
+    fn parse_rpc_response(line: &str) -> Result<Value, EngineError> {
+        let response: Value =
+            serde_json::from_str(line.trim()).map_err(|e| EngineError::Protocol(e.to_string()))?;
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown rpc error");
+            return Err(EngineError::Protocol(message.to_string()));
+        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| EngineError::Protocol("response missing result".into()))
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value, EngineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
@@ -3441,19 +4197,34 @@ impl UnixSocketEngineClient {
         if read == 0 {
             return Err(EngineError::Transport("daemon closed connection".into()));
         }
-        let response: Value =
-            serde_json::from_str(line.trim()).map_err(|e| EngineError::Protocol(e.to_string()))?;
-        if let Some(error) = response.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown rpc error");
-            return Err(EngineError::Protocol(message.to_string()));
+        Self::parse_rpc_response(&line)
+    }
+
+    async fn call_dedicated(&self, method: &str, params: Value) -> Result<Value, EngineError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        let (read, mut writer) = stream.into_split();
+        writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        let read_bytes = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        if read_bytes == 0 {
+            return Err(EngineError::Transport("daemon closed connection".into()));
         }
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| EngineError::Protocol("response missing result".into()))
+        Self::parse_rpc_response(&line)
     }
 
     async fn call_typed<T: DeserializeOwned>(
@@ -3462,6 +4233,15 @@ impl UnixSocketEngineClient {
         params: Value,
     ) -> Result<T, EngineError> {
         let value = self.call(method, params).await?;
+        serde_json::from_value(value).map_err(|e| EngineError::Protocol(e.to_string()))
+    }
+
+    async fn call_dedicated_typed<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, EngineError> {
+        let value = self.call_dedicated(method, params).await?;
         serde_json::from_value(value).map_err(|e| EngineError::Protocol(e.to_string()))
     }
 
@@ -3485,6 +4265,38 @@ impl UnixSocketEngineClient {
         set_default: bool,
     ) -> Result<AgentOptionsSnapshot, EngineError> {
         DaemonEngine::set_agent_config(self, thread_id, config_id, value, set_default).await
+    }
+
+    pub async fn create_terminal(
+        &self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::create_terminal(self, parent_thread_id, title, cwd, rows, cols).await
+    }
+
+    pub async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
+        DaemonEngine::pty_write(self, thread_id, bytes).await
+    }
+
+    pub async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> Result<(), EngineError> {
+        DaemonEngine::pty_resize(self, thread_id, rows, cols).await
+    }
+
+    pub async fn pty_snapshot(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        DaemonEngine::pty_snapshot(self, thread_id, rows, cols).await
+    }
+
+    pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
+        DaemonEngine::ensure_thread_worktree(self, thread_id).await
     }
 }
 
@@ -3735,6 +4547,74 @@ impl DaemonEngine for UnixSocketEngineClient {
         )
         .await
     }
+
+    async fn create_terminal(
+        &self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ThreadSummary, EngineError> {
+        let mut params = serde_json::Map::new();
+        if let Some(pid) = parent_thread_id {
+            params.insert("parent_thread_id".to_string(), json!(pid));
+        }
+        if let Some(t) = title {
+            params.insert("title".to_string(), json!(t));
+        }
+        if let Some(dir) = cwd {
+            params.insert("cwd".to_string(), json!(dir));
+        }
+        params.insert("rows".to_string(), json!(rows));
+        params.insert("cols".to_string(), json!(cols));
+        self.call_dedicated_typed("session.create_terminal", Value::Object(params))
+            .await
+    }
+
+    async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
+        self.call_dedicated(
+            "session.pty_write",
+            json!({"thread_id": thread_id, "bytes": bytes}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> Result<(), EngineError> {
+        self.call_dedicated(
+            "session.pty_resize",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn pty_snapshot(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        self.call_dedicated_typed(
+            "session.pty_snapshot",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+    }
+
+    async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
+        let val = self
+            .call(
+                "session.ensure_thread_worktree",
+                json!({"thread_id": thread_id}),
+            )
+            .await?;
+        val.get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| EngineError::Protocol("response missing cwd".into()))
+    }
 }
 
 /// Unified engine: standalone in-process or remote daemon.
@@ -3952,6 +4832,60 @@ impl DaemonEngine for EngineClient {
             Self::Socket(e) => {
                 DaemonEngine::set_agent_config(e, thread_id, config_id, value, set_default).await
             }
+        }
+    }
+
+    async fn create_terminal(
+        &self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<ThreadSummary, EngineError> {
+        match self {
+            Self::InProcess(e) => {
+                DaemonEngine::create_terminal(e.as_ref(), parent_thread_id, title, cwd, rows, cols)
+                    .await
+            }
+            Self::Socket(e) => {
+                DaemonEngine::create_terminal(e, parent_thread_id, title, cwd, rows, cols).await
+            }
+        }
+    }
+
+    async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::pty_write(e.as_ref(), thread_id, bytes).await,
+            Self::Socket(e) => DaemonEngine::pty_write(e, thread_id, bytes).await,
+        }
+    }
+
+    async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> Result<(), EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::pty_resize(e.as_ref(), thread_id, rows, cols).await,
+            Self::Socket(e) => DaemonEngine::pty_resize(e, thread_id, rows, cols).await,
+        }
+    }
+
+    async fn pty_snapshot(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::pty_snapshot(e.as_ref(), thread_id, rows, cols).await,
+            Self::Socket(e) => DaemonEngine::pty_snapshot(e, thread_id, rows, cols).await,
+        }
+    }
+
+    async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
+        match self {
+            Self::InProcess(e) => {
+                DaemonEngine::ensure_thread_worktree(e.as_ref(), thread_id).await
+            }
+            Self::Socket(e) => DaemonEngine::ensure_thread_worktree(e, thread_id).await,
         }
     }
 }

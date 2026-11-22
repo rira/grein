@@ -11,8 +11,8 @@ use grein_cli::engine::{
     UnixSocketEngineClient,
 };
 use grein_tui::engine_port::{
-    AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, ThreadMeta,
-    TuiEngineEvent, TuiEnginePort,
+    AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, PtyScreenSnapshot,
+    ThreadMeta, TuiEngineEvent, TuiEnginePort,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -445,6 +445,68 @@ where
             });
         }
         Ok(snapshot)
+    }
+
+    async fn create_terminal(
+        &self,
+        parent_thread_id: Option<&str>,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        rows: u16,
+        cols: u16,
+    ) -> io::Result<HydratedThread> {
+        let created = self
+            .client
+            .create_terminal(parent_thread_id, title, cwd, rows, cols)
+            .await
+            .map_err(to_io)?;
+        let hydrated = HydratedThread {
+            id: created.thread_id,
+            title: created.title,
+            turns: Vec::new(),
+        };
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::ThreadCreated {
+                thread: hydrated.clone(),
+            });
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(hydrated)
+    }
+
+    async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> io::Result<()> {
+        self.client.pty_write(thread_id, bytes).await.map_err(to_io)
+    }
+
+    async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> io::Result<()> {
+        self.client
+            .pty_resize(thread_id, rows, cols)
+            .await
+            .map_err(to_io)
+    }
+
+    async fn pty_snapshot(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> io::Result<PtyScreenSnapshot> {
+        self.client
+            .pty_snapshot(thread_id, rows, cols)
+            .await
+            .map_err(to_io)
+    }
+
+    async fn ensure_thread_worktree(&self, thread_id: &str) -> io::Result<String> {
+        let cwd = self
+            .client
+            .ensure_thread_worktree(thread_id)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(cwd)
     }
 
     async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
@@ -1099,5 +1161,76 @@ done
             TuiEngineEvent::AgentCommandsUpdated { thread_id, commands }
                 if thread_id == "t-cached" && commands.len() == 1 && commands[0].name == "compact"
         )));
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_terminal_and_worktree_methods() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git failed: {:?}", args);
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Grein Test"]);
+        run_git(&["config", "user.email", "test@grein.dev"]);
+        std::fs::write(repo_root.join("file.txt"), "hello\n").expect("write");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        let db_path = temp.path().join("session.db");
+        let engine = InProcessEngine::open_with_config(&db_path, repo_root.clone(), None)
+            .expect("open");
+        let port = EngineClientPort::new(engine);
+
+        let session = port.hydrate_session().await.expect("hydrate");
+        let main_id = session.active_thread_id.clone();
+
+        let branch = port
+            .fork_branch(&main_id, Some("wt-port"))
+            .await
+            .expect("fork");
+        let wt_path = port
+            .ensure_thread_worktree(&branch.id)
+            .await
+            .expect("ensure_thread_worktree");
+        assert!(std::path::Path::new(&wt_path).join(".git").exists());
+
+        let term = port
+            .create_terminal(Some(&branch.id), None, None, 24, 100)
+            .await
+            .expect("create_terminal");
+        assert_eq!(term.title, "Terminal");
+
+        port.pty_resize(&term.id, 30, 110)
+            .await
+            .expect("pty_resize");
+        port.pty_write(&term.id, b"printf 'PORT_%s\\n' \"$(pwd)\"\n".to_vec())
+            .await
+            .expect("pty_write");
+
+        let expected = format!("PORT_{wt_path}");
+        let mut saw_output = false;
+        for _ in 0..50 {
+            let snap = port
+                .pty_snapshot(&term.id, 30, 110)
+                .await
+                .expect("pty_snapshot");
+            assert_eq!(snap.rows, 30);
+            assert_eq!(snap.cols, 110);
+            if snap.plain_text().lines().any(|l| l.trim() == expected) {
+                saw_output = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(saw_output, "EngineClientPort must drive PTY in worktree cwd");
     }
 }

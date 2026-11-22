@@ -74,6 +74,14 @@ pub async fn run_daemon_with_socket_and_db(
     socket_path: PathBuf,
     db_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let engine = Arc::new(InProcessEngine::open(&db_path)?);
+    run_daemon_with_engine(socket_path, engine).await
+}
+
+pub async fn run_daemon_with_engine(
+    socket_path: PathBuf,
+    engine: Arc<InProcessEngine>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
@@ -83,7 +91,6 @@ pub async fn run_daemon_with_socket_and_db(
         }
     }
 
-    let engine = Arc::new(InProcessEngine::open(&db_path)?);
     let listener = UnixListener::bind(&socket_path)?;
 
     loop {
@@ -331,6 +338,52 @@ mod tests {
                     && target_thread_id == &main.thread_id
                     && summary == "Decided over JSON-RPC"
         )));
+
+        let term_rpc = raw_client
+            .session_create_terminal(Some(&main.thread_id), Some("Daemon Term"), None, 24, 90)
+            .await
+            .expect("session_create_terminal");
+        let term_id = term_rpc["result"]["thread_id"]
+            .as_str()
+            .expect("term_id")
+            .to_string();
+        assert_eq!(term_rpc["result"]["title"], "Daemon Term");
+
+        let resize_rpc = raw_client
+            .session_pty_resize(&term_id, 26, 96)
+            .await
+            .expect("session_pty_resize");
+        assert_eq!(resize_rpc["result"]["ok"], true);
+
+        let write_rpc = raw_client
+            .session_pty_write(&term_id, b"printf 'RPC_%s\\n' 'TERM_OK'\n")
+            .await
+            .expect("session_pty_write");
+        assert_eq!(write_rpc["result"]["ok"], true);
+
+        let mut saw_rpc_term_ok = false;
+        for _ in 0..50 {
+            let snap_rpc = raw_client
+                .session_pty_snapshot(&term_id, 26, 96)
+                .await
+                .expect("session_pty_snapshot");
+            let snap: grein_tui::engine_port::PtyScreenSnapshot =
+                serde_json::from_value(snap_rpc["result"].clone()).expect("decode PtyScreenSnapshot");
+            assert_eq!(snap.rows, 26);
+            assert_eq!(snap.cols, 96);
+            if snap.plain_text().lines().any(|l| l.trim() == "RPC_TERM_OK") {
+                saw_rpc_term_ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(saw_rpc_term_ok, "DaemonClient PTY RPCs must drive live PTY");
+
+        let wt_err_rpc = raw_client
+            .session_ensure_thread_worktree(&term_id)
+            .await
+            .expect("session_ensure_thread_worktree on terminal");
+        assert_eq!(wt_err_rpc["error"]["code"], -32602);
 
         server.abort();
     }
