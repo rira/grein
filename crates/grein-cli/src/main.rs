@@ -143,7 +143,6 @@ where
         Ok(HydratedSession {
             active_thread_id,
             threads,
-            blackboard: Vec::new(),
         })
     }
 
@@ -514,13 +513,9 @@ mod tests {
         assert_eq!(session.active_thread_id, session.threads[0].id);
         assert_eq!(session.threads[0].title, "Main");
         assert!(session.threads[0].turns.is_empty());
-        assert!(session.blackboard.is_empty());
 
         let mut rx = port.subscribe_events().await.expect("subscribe");
 
-        port.upsert_blackboard("arch", "two-tier")
-            .await
-            .expect("default upsert is no-op");
         let forked = port
             .fork_branch(&session.active_thread_id, Some("auth"))
             .await
@@ -561,9 +556,6 @@ mod tests {
             TuiEngineEvent::ShellOutput { stdout, exit_code, .. } if stdout == "hi" && *exit_code == 0
         )));
 
-        port.delete_blackboard("arch")
-            .await
-            .expect("default delete is no-op");
         drop(port);
 
         let reopened =
@@ -575,7 +567,6 @@ mod tests {
         assert_eq!(session2.threads[0].turns.len(), 1);
         assert_eq!(session2.threads[0].turns[0].role, "user");
         assert_eq!(session2.threads[0].turns[0].content, "hello");
-        assert!(session2.blackboard.is_empty());
     }
 
     #[tokio::test]
@@ -890,9 +881,6 @@ done
                     && target_thread_id == &main_id
                     && summary == "Offline decision"
         )));
-        assert!(!offline_evs
-            .iter()
-            .any(|e| matches!(e, TuiEngineEvent::BlackboardUpdated { .. })));
 
         struct FailingMetaEngine;
         #[async_trait::async_trait]

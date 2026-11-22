@@ -71,7 +71,6 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                 turns: Vec::new(),
             },
         ],
-        blackboard: Vec::new(),
     };
     apply_hydrated_session(&mut app, &session);
     apply_engine_event(
@@ -175,7 +174,6 @@ fn test_tree_vertical_scrolling_keeps_selected_context_visible() {
         &HydratedSession {
             active_thread_id: "t-0".to_string(),
             threads,
-            blackboard: Vec::new(),
         },
     );
 
@@ -224,7 +222,6 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
             }],
-            blackboard: Vec::new(),
         },
     );
 
@@ -332,7 +329,6 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                         turns: Vec::new(),
                     },
                 ],
-                blackboard: Vec::new(),
             })
         }
         async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
@@ -436,7 +432,6 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     }],
                 },
             ],
-            blackboard: Vec::new(),
         },
     );
     apply_engine_event(
@@ -512,7 +507,6 @@ fn test_layout_with_chrome_and_subagent_strip_auto_hide_and_overflow() {
                     turns: Vec::new(),
                 },
             ],
-            blackboard: Vec::new(),
         },
     );
 
@@ -591,7 +585,6 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
             }],
-            blackboard: Vec::new(),
         },
     );
     apply_engine_event(
@@ -773,7 +766,6 @@ fn test_live_branch_preview_and_rune_lore() {
                     }],
                 },
             ],
-            blackboard: Vec::new(),
         },
     );
     app.input_buffer = "keep-my-draft".to_string();
@@ -862,7 +854,6 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     turns: Vec::new(),
                 },
             ],
-            blackboard: Vec::new(),
         },
     );
     apply_engine_event(
@@ -988,7 +979,6 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
                     turns: Vec::new(),
                 },
             ],
-            blackboard: Vec::new(),
         },
     );
 
@@ -1112,7 +1102,6 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     turns: Vec::new(),
                 },
             ],
-            blackboard: Vec::new(),
         },
     );
     apply_engine_event(

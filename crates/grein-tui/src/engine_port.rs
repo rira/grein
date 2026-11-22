@@ -19,19 +19,11 @@ pub struct HydratedThread {
     pub turns: Vec<HydratedTurn>,
 }
 
-/// A hydrated blackboard entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HydratedBlackboardEntry {
-    pub key: String,
-    pub value: String,
-}
-
 /// Full session snapshot used to seed the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HydratedSession {
     pub active_thread_id: String,
     pub threads: Vec<HydratedThread>,
-    pub blackboard: Vec<HydratedBlackboardEntry>,
 }
 
 /// Structural parent/child metadata for a conversation thread.
@@ -90,13 +82,6 @@ pub enum TuiEngineEvent {
     ThreadStatusChanged {
         thread_id: String,
         status: String,
-    },
-    BlackboardUpdated {
-        key: String,
-        value: String,
-    },
-    BlackboardDeleted {
-        key: String,
     },
     ThoughtChunk {
         thread_id: String,
@@ -179,14 +164,6 @@ pub trait TuiEnginePort: Send + Sync {
     }
 
     async fn cancel_turn(&self, _thread_id: &str) -> io::Result<()> {
-        Ok(())
-    }
-
-    async fn upsert_blackboard(&self, _key: &str, _value: &str) -> io::Result<()> {
-        Ok(())
-    }
-
-    async fn delete_blackboard(&self, _key: &str) -> io::Result<()> {
         Ok(())
     }
 

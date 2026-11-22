@@ -3177,10 +3177,6 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
-        assert!(!events.iter().any(|e| matches!(
-            e,
-            TuiEngineEvent::BlackboardUpdated { .. } | TuiEngineEvent::BlackboardDeleted { .. }
-        )));
         assert!(events.iter().any(|e| matches!(
             e,
             TuiEngineEvent::ThreadCreated { thread } if thread.id == forked.thread_id && thread.title == "feat-auth"
@@ -4479,9 +4475,6 @@ done
         while let Ok(ev) = rx.try_recv() {
             evs.push(ev);
         }
-        assert!(!evs
-            .iter()
-            .any(|e| matches!(e, TuiEngineEvent::BlackboardUpdated { .. })));
         assert!(evs.iter().any(|e| matches!(
             e,
             TuiEngineEvent::ThreadMerged { thread_id, target_thread_id, summary }

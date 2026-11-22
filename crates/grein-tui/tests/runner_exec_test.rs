@@ -6,8 +6,7 @@ use grein_core::model::{AuthorRole, ThreadId};
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_tui::app::App;
 use grein_tui::engine_port::{
-    HydratedBlackboardEntry, HydratedSession, HydratedThread, HydratedTurn, TuiEngineEvent,
-    TuiEnginePort,
+    HydratedSession, HydratedThread, HydratedTurn, TuiEngineEvent, TuiEnginePort,
 };
 use tokio::sync::mpsc;
 
@@ -118,7 +117,6 @@ impl TuiEnginePort for SqliteBackedEngine {
                 title: "persisted".to_string(),
                 turns,
             }],
-            blackboard: Vec::new(),
         })
     }
 
@@ -163,10 +161,6 @@ fn sample_session() -> HydratedSession {
                 },
             ],
         }],
-        blackboard: vec![HydratedBlackboardEntry {
-            key: "goal".to_string(),
-            value: "ship".to_string(),
-        }],
     }
 }
 
@@ -181,8 +175,6 @@ async fn test_engine_port_prompt_dispatch_records_thread_and_prompt() {
     assert_eq!(session.threads[0].title, "Main");
     assert_eq!(session.threads[0].turns[1].role, "Assistant");
     assert_eq!(session.threads[0].turns[1].content, "world");
-    assert_eq!(session.blackboard[0].key, "goal");
-    assert_eq!(session.blackboard[0].value, "ship");
 
     port.send_turn(&session.active_thread_id, "echo first")
         .await
@@ -350,17 +342,6 @@ async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
             let (tx, rx) = mpsc::unbounded_channel();
             *self.tx.lock().unwrap() = Some(tx);
             Ok(rx)
-        }
-        async fn upsert_blackboard(&self, key: &str, value: &str) -> io::Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("wb_set:{key}:{value}"));
-            Ok(())
-        }
-        async fn delete_blackboard(&self, key: &str) -> io::Result<()> {
-            self.calls.lock().unwrap().push(format!("wb_del:{key}"));
-            Ok(())
         }
         async fn run_shell_command(&self, thread_id: &str, command: &str) -> io::Result<()> {
             self.calls
@@ -579,20 +560,6 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_ignores_bla
         },
     );
     assert_eq!(app.threads[1].title, "Renamed Branch");
-
-    apply_engine_event(
-        &mut app,
-        TuiEngineEvent::BlackboardUpdated {
-            key: "goal".to_string(),
-            value: "ship".to_string(),
-        },
-    );
-    apply_engine_event(
-        &mut app,
-        TuiEngineEvent::BlackboardDeleted {
-            key: "goal".to_string(),
-        },
-    );
 
     apply_engine_event(
         &mut app,

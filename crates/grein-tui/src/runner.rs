@@ -1141,7 +1141,6 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             app.thread_statuses.insert(thread_id, status);
         }
-        TuiEngineEvent::BlackboardUpdated { .. } | TuiEngineEvent::BlackboardDeleted { .. } => {}
         TuiEngineEvent::Error { message } => {
             let active = app.active_thread_id.clone();
             app.streaming_assistant_threads.remove(&active);

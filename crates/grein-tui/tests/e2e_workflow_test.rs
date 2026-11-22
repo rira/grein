@@ -121,7 +121,6 @@ impl TuiEnginePort for MockLiveEngine {
         Ok(HydratedSession {
             active_thread_id: guard.active_thread_id.clone(),
             threads: guard.threads.clone(),
-            blackboard: Vec::new(),
         })
     }
 
@@ -1146,7 +1145,6 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
         &HydratedSession {
             active_thread_id: "t-0".to_string(),
             threads: threads_c,
-            blackboard: Vec::new(),
         },
     );
     let mut terminal_c = Terminal::new(TestBackend::new(100, 10)).unwrap();
@@ -1498,7 +1496,6 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
             }],
-            blackboard: Vec::new(),
         },
     );
     let mut stepped_terminal = Terminal::new(TestBackend::new(120, 26)).unwrap();
@@ -1723,7 +1720,6 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
                     title: "Main".to_string(),
                     turns: Vec::new(),
                 }],
-                blackboard: Vec::new(),
             })
         }
         async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
