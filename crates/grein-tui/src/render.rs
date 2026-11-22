@@ -30,7 +30,26 @@ fn thread_status_glyph(status: Option<&str>) -> (&'static str, Color) {
     match status.unwrap_or("idle") {
         "streaming" | "executing" | "thinking" => ("●", Color::Yellow),
         "permission" | "permission_required" | "error" => ("⚠", Color::Red),
-        _ => ("✓", Color::Green),
+        _ => ("ᛉ", Color::Green),
+    }
+}
+
+fn selected_tree_thread<'a>(state: &'a AppState) -> Option<(&'a str, &'a str)> {
+    let idx = state.tree.selected_index()?;
+    if !state.tree.nodes.is_empty() {
+        match state.tree.nodes.get(idx)? {
+            TreeNode::Thread(t) => Some((t.id.as_str(), t.title.as_str())),
+            TreeNode::Anchor(a) => state
+                .threads
+                .iter()
+                .find(|t| t.id == a.thread_id)
+                .map(|t| (t.id.as_str(), t.title.as_str())),
+        }
+    } else {
+        let ordered = compute_ordered_thread_indices(&state.threads, &state.thread_meta);
+        let &(thread_idx, _) = ordered.get(idx)?;
+        let t = state.threads.get(thread_idx)?;
+        Some((t.id.as_str(), t.title.as_str()))
     }
 }
 
@@ -139,7 +158,7 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style(tree_focused))
-        .title(" Tree ");
+        .title(" ᛇ Grein ");
     let paragraph = Paragraph::new(lines)
         .block(block)
         .scroll((scroll_offset, 0));
@@ -469,6 +488,9 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
     }
 
     let focused_debug = format!("{:?}", state.focused_pane());
+    let tree_focused = state.active_focus == PaneFocus::Tree
+        || state.focused_pane == PaneFocus::Tree
+        || state.focus == PaneFocus::Tree;
     let transcript_focused = focused_debug.contains("Transcript");
     let blackboard_focused = focused_debug.contains("Blackboard");
     let composer_focused = focused_debug.contains("Composer")
@@ -479,8 +501,24 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
 
     let tree_scroll = render_tree_view_inner(f, layout.tree_area, state);
 
+    let preview = if tree_focused {
+        selected_tree_thread(state).filter(|(sel_id, _)| *sel_id != active_id)
+    } else {
+        None
+    };
+    let display_thread_id = preview.map(|(id, _)| id).unwrap_or(active_id);
+    let display_md: &str = if display_thread_id == active_id {
+        &state.active_transcript_md
+    } else {
+        state
+            .thread_transcripts
+            .get(display_thread_id)
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+
     let mut transcript_lines = Vec::new();
-    if let Some(meta) = state.thread_meta.get(active_id) {
+    if let Some(meta) = state.thread_meta.get(display_thread_id) {
         if let Some(ref parent_id) = meta.parent_thread_id {
             let parent_title = state
                 .threads
@@ -496,14 +534,14 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
                 banner,
                 Style::default().fg(Color::DarkGray),
             )));
-            if !state.active_transcript_md.trim().is_empty() {
+            if !display_md.trim().is_empty() {
                 transcript_lines.push(Line::raw(""));
             }
         }
     }
     let transcript_inner_width = layout.transcript_area.width.saturating_sub(2);
     transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
-        &state.active_transcript_md,
+        display_md,
         transcript_inner_width as usize,
     ));
     let transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
@@ -511,14 +549,18 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
     let max_scroll_u16 = visual_lines
         .saturating_sub(transcript_inner_height as usize)
         .min(u16::MAX as usize) as u16;
-    let vp = state.transcript_viewport(active_id);
+    let vp = state.transcript_viewport(display_thread_id);
     let transcript_scroll_y = if vp.auto_scroll() {
         max_scroll_u16
     } else {
         (vp.scroll_offset() as u16).min(max_scroll_u16)
     };
+    let transcript_title = match preview {
+        Some((_, title)) => format!(" Transcript (Preview: {title}) "),
+        None => " Transcript ".to_string(),
+    };
     let transcript_block = Block::default()
-        .title(" Transcript ")
+        .title(transcript_title)
         .borders(Borders::ALL)
         .border_style(border_style(transcript_focused));
     let transcript_widget = Paragraph::new(transcript_lines)
@@ -638,7 +680,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         render_help_modal(f, f.area());
     }
 
-    (active_id.to_string(), max_scroll_u16, tree_scroll)
+    (display_thread_id.to_string(), max_scroll_u16, tree_scroll)
 }
 
 #[cfg(test)]

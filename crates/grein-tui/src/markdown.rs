@@ -70,7 +70,7 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
         {
             in_user_block = true;
             let user_style = Style::default().fg(Color::Green);
-            let mut spans = vec![Span::styled("ᛉ ", user_style.add_modifier(Modifier::BOLD))];
+            let mut spans = vec![Span::styled("❯ ", user_style.add_modifier(Modifier::BOLD))];
             if !user_prompt.is_empty() {
                 spans.extend(parse_inline_spans_with_base(user_prompt, user_style));
             }

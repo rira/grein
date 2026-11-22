@@ -440,12 +440,12 @@ fn test_ratatui_test_backend_transcript_renders_aligned_box_table_without_pipe_w
 }
 
 #[test]
-fn test_user_prompts_render_with_algiz_rune_in_leaf_green() {
+fn test_user_prompts_render_with_chevron_in_leaf_green() {
     let md = "# User: hello world\nsecond line\n\n## Agent (agy)\nreply";
     let rendered = render_markdown_lines(md);
     let texts = lines_text(&rendered);
 
-    assert_eq!(texts[0], "ᛉ hello world");
+    assert_eq!(texts[0], "❯ hello world");
     assert_eq!(texts[1], "  second line");
     assert!(
         !texts.join("\n").contains("User:"),

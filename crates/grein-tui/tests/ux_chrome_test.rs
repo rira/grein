@@ -132,17 +132,17 @@ fn test_tree_is_context_only_nested_and_scrollable() {
         !screen.contains("↳ How does auth work?"),
         "Tree must not render user question previews:\n{screen}"
     );
-    assert!(screen.contains("✓ Main"), "Expected root context:\n{screen}");
+    assert!(screen.contains("ᛉ Main"), "Expected root context:\n{screen}");
     assert!(
         screen.contains("  ● Child Context"),
         "Expected depth-1 indented child context:\n{screen}"
     );
     assert!(
-        screen.contains("    ✓ Grandchild"),
+        screen.contains("    ᛉ Grandchild"),
         "Expected depth-2 indented grandchild context:\n{screen}"
     );
     assert!(
-        screen.contains("  ✓ Second Child"),
+        screen.contains("  ᛉ Second Child"),
         "Expected depth-1 sibling context:\n{screen}"
     );
 
@@ -736,4 +736,76 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
         assert!(!app.show_help_modal);
         assert_eq!(app.focused_pane(), pane);
     }
+}
+
+#[test]
+fn test_live_branch_preview_and_rune_lore() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-main".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-main".to_string(),
+                    title: "Main".to_string(),
+                    turns: vec![HydratedTurn {
+                        id: "u1".to_string(),
+                        role: "User".to_string(),
+                        content: "main branch prompt".to_string(),
+                    }],
+                },
+                HydratedThread {
+                    id: "t-alt".to_string(),
+                    title: "Feature Alt".to_string(),
+                    turns: vec![HydratedTurn {
+                        id: "u2".to_string(),
+                        role: "User".to_string(),
+                        content: "feature preview prompt".to_string(),
+                    }],
+                },
+            ],
+            blackboard: Vec::new(),
+        },
+    );
+    app.input_buffer = "keep-my-draft".to_string();
+    app.cursor_position = app.input_buffer.len();
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 26)).unwrap();
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let initial_screen = render_screen(&terminal);
+    assert!(
+        initial_screen.contains("ᛇ Grein"),
+        "Expected 'ᛇ Grein' left panel title:\n{initial_screen}"
+    );
+    assert!(initial_screen.contains("ᛉ Main"));
+    assert!(initial_screen.contains("❯ main branch prompt"));
+    assert!(!initial_screen.contains("Transcript (Preview:"));
+
+    // Focus left panel and move selection to Feature Alt -> live preview without switching
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Down));
+    assert_eq!(app.active_thread_id(), "t-main");
+    assert_eq!(app.composer_input(), "keep-my-draft");
+
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let preview_screen = render_screen(&terminal);
+    assert!(
+        preview_screen.contains("Transcript (Preview: Feature Alt)"),
+        "Expected preview title in Transcript:\n{preview_screen}"
+    );
+    assert!(
+        preview_screen.contains("❯ feature preview prompt"),
+        "Expected previewed branch prompt in Transcript:\n{preview_screen}"
+    );
+
+    // Enter commits the branch swap, restores non-preview Transcript title, and focuses Composer
+    app.handle_key_event(key(KeyCode::Enter));
+    assert_eq!(app.active_thread_id(), "t-alt");
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let swapped_screen = render_screen(&terminal);
+    assert!(!swapped_screen.contains("Transcript (Preview:"));
+    assert!(swapped_screen.contains("❯ feature preview prompt"));
 }

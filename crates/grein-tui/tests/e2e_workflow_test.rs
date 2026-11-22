@@ -1079,16 +1079,16 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
 
     assert!(
-        tree_text.contains("✓ Main"),
-        "expected root context in Tree:\n{tree_text}"
+        tree_text.contains("ᛉ Main"),
+        "expected root context in Grein panel:\n{tree_text}"
     );
     assert!(
-        tree_text.contains("  ✓ Auth Child"),
-        "expected depth-1 child context in Tree:\n{tree_text}"
+        tree_text.contains("  ᛉ Auth Child"),
+        "expected depth-1 child context in Grein panel:\n{tree_text}"
     );
     assert!(
-        tree_text.contains("    ✓ JWT Grandchild"),
-        "expected depth-2 grandchild context in Tree:\n{tree_text}"
+        tree_text.contains("    ᛉ JWT Grandchild"),
+        "expected depth-2 grandchild context in Grein panel:\n{tree_text}"
     );
     assert!(!tree_text.contains('⚓'), "Tree must not contain ⚓:\n{tree_text}");
     assert!(
@@ -1105,7 +1105,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
     );
 
     assert!(
-        transcript_text.contains("ᛉ GFM_TABLE"),
+        transcript_text.contains("❯ GFM_TABLE"),
         "expected user prompt in Transcript:\n{transcript_text}"
     );
     assert!(
