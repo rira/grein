@@ -317,26 +317,26 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 ├───────────────────────────────────────────────────────────────────────────────┤
 │ Subagents (auto-hides when empty; up to 5 active rows + overflow)             │
 ├───────────────────────────────────────────────────────────────────────────────┤
-│ ? for help                                agent · default · ✓ idle · 0 subagents │
+│ Ctrl+G tree · Alt+T zsh · ? help           agent · default · ✓ idle · 0 subagents │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### Left Column (`34%` width): `ᛇ Grein` Context Tree Sidebar
 * Displays the full multi-root mixed Agent + Terminal forest: top-level Agent roots marked with `ᛉ`, Terminal nodes marked with `>_` (plus `[exit N]` / `[exited]` badge when terminated), and child branches nested depth-first via `parent_thread_id` with Unicode box-drawing connectors (`├─`, `└─`, `│`).
 * Real-time status glyphs (`●` streaming/executing/thinking, `⚠` permission required or error) and `[joined]` suffix on merged branches.
-* **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript (`Transcript (Preview: <title>)`) or live VT100 terminal screen (`Terminal (Preview: <title>)`) while keeping focus in `ᛇ Grein` until confirmed with `Enter`, `l`, or `Tab` (on a terminal node).
+* **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript (`Transcript (Preview: <title>)`) or live VT100 terminal screen (`Terminal (Preview: <title>)`, fetching `pty_snapshot` if missing and hiding the Agent `Composer`) while keeping focus in `ᛇ Grein` until confirmed with `Enter`, `l`, `→` (`Right`), `Esc`, `Ctrl+G`, or `Tab` (on a terminal node).
 
 #### Right Column (`66%` width, or `100%` Borderless Copy Zoom): Dual-Mode `Transcript` / Live `Terminal` Pane
 * **Agent Mode (`ThreadKind::Agent`):** Full-width Markdown rendering including headings, inline formatting, syntax-highlighted code fences, GFM tables, horizontal rules, leaf-green `❯ ` user prompt prefix, lineage banners (`> ↳ Forked from <parent> (<N> ancestor turns in LLM context)`), join markers (`↳ Joined from <branch>`), collapsible tool/shell cards (`Ctrl+O` toggles all), and ANSI-colored PTY shell blocks (`$ cmd (exit N)`).
-* **Terminal Mode (`ThreadKind::Terminal`):** Hides `Composer` completely and expands the right pane to full height above the status bar (or `100%` full-screen width when zoomed via `Ctrl+T`), rendering `PtyScreenSnapshot` cell-by-cell (`Default`/`Indexed`/`Rgb` colors, bold/italic/underline/inverse, wide UTF-8 cells skipping `is_wide_continuation`, and clamped cursor positioning when `FocusedPane::Terminal` is active). Cold reopens fetch `pty_snapshot` automatically and pane dimension changes emit `pty_resize`.
-* **Borderless-Sides Copy Zoom (`Ctrl+T`, `z` in Tree, `/zoom`):** Collapses `ᛇ Grein` and expands the right pane to `100%` width with `Borders::TOP | Borders::BOTTOM` only (zero left/right `│` borders) for clean terminal mouse drag-select copying, complemented by `y` / `Alt+Y` / `/copy [code|all]` (copying `PtyScreenSnapshot::plain_text()` on terminal threads via native + OSC 52 clipboard).
+* **Terminal Mode (`ThreadKind::Terminal`):** Hides `Composer` completely and expands the right pane to full height above the status bar (or `100%` full-screen width when zoomed via `Ctrl+T`), rendering `PtyScreenSnapshot` cell-by-cell (`Default`/`Indexed`/`Rgb` colors, bold/italic/underline/inverse, wide UTF-8 cells skipping `is_wide_continuation`, and clamped cursor positioning when `FocusedPane::Terminal` is active). Cold reopens fetch `pty_snapshot` automatically, pane dimension changes emit `pty_resize`, and PTY keystrokes are serialized over a single FIFO writer channel. Once a PTY exits, `Esc` (as well as `Ctrl+G`) returns to `ᛇ Grein` without forwarding further keys to `pty.write`.
+* **Borderless-Sides Copy Zoom (`Ctrl+T`, `z` in Tree, `/zoom`):** Collapses `ᛇ Grein` and expands the right pane to `100%` width with `Borders::TOP | Borders::BOTTOM` only (zero left/right `│` borders) for clean terminal mouse drag-select copying, complemented by `y` / `Alt+Y` / `/copy [code|all]` (copying `PtyScreenSnapshot::plain_text()` on terminal threads via native + OSC 52 clipboard). Entering `ᛇ Grein` (`Ctrl+G`, `Esc`) automatically unhides the sidebar.
 * **Global Transcript Scrolling:** Independent scrollback buffer per context (`TranscriptViewport`) using exact pre-wrapped styled lines (zero bottom clipping), controllable globally from anywhere in the UI via `Alt+↑` / `Alt+↓`, `PgUp` / `PgDn`, and `Alt+Home` / `Alt+End`, or zero-modifier Tree keys (`Ctrl+U` / `Ctrl+D`, `g` / `G`)—including while live-previewing another branch in `ᛇ Grein`.
 * **External `$PAGER` Diff Integration:** Pressing `o` when inspecting a diff card suspends Ratatui and opens the colorized diff in `$PAGER` (e.g. `delta`, `git diff`, `less`), cleanly restoring the TUI on exit.
 
 #### Bottom Area: `Composer`, Optional `Subagents` Strip & Status Bar
-* **`Composer`:** Soft-wraps single and multi-line drafts to inner cell width, auto-grows from 3 to 10 lines following the active cursor row, preserves an independent input draft per context, supports full Readline editing/kill-ring shortcuts (`Ctrl+A`/`E`, `Ctrl+F`/`B`, `Alt+B`/`F`), `!cmd` PTY shell execution, and slash commands including interactive `/model`, `/mode`, `/thinking` (`/effort`), and `/commands`.
+* **`Composer`:** Soft-wraps single and multi-line drafts to inner cell width, auto-grows from 3 to 10 lines following the active cursor row, preserves an independent input draft per context, supports full Readline editing/kill-ring shortcuts (`Ctrl+A`/`E`, `Ctrl+F`/`B`, `Alt+B`/`F`), `!cmd` PTY shell execution, and slash commands including interactive `/model`, `/mode`, `/thinking` (`/effort`), `/commands`, and terminal aliases (`/term`, `/terminal`, `/zsh`, `/sh`, `/shell`, `/bash`).
 * **`Subagents` Strip:** Auto-hiding panel below `Composer` (renders only when subagents are active on the focused context, up to 5 rows + `+N more` overflow) showing live subagent type, role, model, activity, and elapsed time.
-* **1-Line Status Bar:** Left side displays `? for help` (or `esc to cancel` while streaming/executing) plus status notices; right side displays `<mode> · <model> · <live_status> · <N subagents>`.
+* **1-Line Status Bar:** Left side displays `Ctrl+G tree · Alt+T zsh · ? help` (or `Esc cancel · Ctrl+G tree · Alt+T zsh` while streaming/executing, `Ctrl+G for tree` in live `Terminal`, and `exited · Esc/Ctrl+G tree` in an exited `Terminal`) plus status notices; right side displays `<mode> · <model> · <live_status> · <N subagents>`.
 
 ---
 
@@ -346,8 +346,9 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 
 | Keybinding | Scope | Action |
 | :--- | :--- | :--- |
-| `Esc` | Global (outside `Terminal`) | Cancel active streaming/executing turn; otherwise toggle focus between `Composer`/`Terminal` and `ᛇ Grein` sidebar (inside `Terminal`, `Esc` passes `\x1b` to PTY) |
-| `Ctrl+G` | Global (incl. `Terminal`) | Toggle focus between `Composer`/`Terminal` and `ᛇ Grein` sidebar without cancelling turns or forwarding `\x07` to PTY |
+| `Esc` | Global (outside live `Terminal`) | Cancel active streaming/executing turn; otherwise toggle focus between `Composer`/`ᛇ Grein` (auto-unhides sidebar; in `ᛇ Grein`, activates the selected node into `Composer` or `Terminal`). Inside a live `Terminal`, `Esc` passes `\x1b` to PTY; on an **exited** `Terminal`, `Esc` returns to `ᛇ Grein` |
+| `Ctrl+G` | Global (incl. `Terminal`) | Toggle focus between `Composer`/`Terminal` and `ᛇ Grein` sidebar (auto-unhiding sidebar when zoomed; activating the selected node when in `ᛇ Grein`) without cancelling turns or forwarding `\x07` to PTY |
+| `Alt+T` | Global (outside `Terminal`) | Open or jump straight to the active/selected thread's `>_` terminal (switches to an existing child/selected Terminal or spawns a new one; passes through to PTY inside `FocusedPane::Terminal`) |
 | `Tab` / `Shift+Tab` | Global (outside `Terminal`) | Cycle branches within the active root's subtree (`Tab` in `ᛇ Grein` on a terminal node enters `Terminal`; inside `Terminal`, `Tab` sends `\t` to PTY) |
 | `Alt+Shift+↑` / `Alt+Shift+↓` | Global | Switch to previous / next top-level root |
 | `Alt+J` / `Alt+K` | Global | Switch to next / previous top-level root |
@@ -372,8 +373,8 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | `J` / `K` | Switch to next / previous top-level root |
 | `Ctrl+U` / `Ctrl+D` | Scroll active/previewed `Transcript` half-page up / down |
 | `g` / `G` | Jump active/previewed `Transcript` to top / bottom |
-| `Enter` / `l` | Activate selected branch/root (or anchor) and focus `Composer` (or `Terminal` for `>_` nodes) |
-| `t` / `T` | Open a child terminal under the active context (`t`, inherits `cwd`) or a blank root terminal (`T`) |
+| `Enter` / `l` / `→` (`Right`) | Activate selected branch/root (or anchor) and focus `Composer` (or `Terminal` for `>_` nodes) |
+| `t` / `T` | Open a child terminal under the selected context (`t`, inherits `cwd`) or a blank root terminal (`T`) |
 | `f` | Fork a new child branch off the selected context |
 | `n` | Create a new blank independent root context |
 | `r` | Prefill `/rename <title>` for the selected context and focus `Composer` |
@@ -405,7 +406,7 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | Command | Action |
 | :--- | :--- |
 | `!cmd` | Execute shell command in a PTY under the active context (`$ cmd (exit N)` with ANSI rendering) |
-| `/term [path]` | Spawn an interactive child PTY terminal (inheriting active context's `cwd` or overriding with `[path]`) and focus `Terminal` |
+| `/term [path]` (`/terminal`, `/zsh`, `/sh`, `/shell`, `/bash`) | Spawn an interactive child PTY terminal (inheriting active context's `cwd` or overriding with `[path]`, case-insensitive) and focus `Terminal` |
 | `/worktree` | Opt-in allocate/attach an isolated git worktree `cwd` for the active thread (inherited by child terminals) |
 | `/fork [title]`, `/branch [title]`, `/grein [title]` | Fork a new child branch off the active context (`parent_thread_id`) |
 | `/root [title]`, `/new [title]` | Create a new blank independent root context |

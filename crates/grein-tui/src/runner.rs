@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -95,6 +96,7 @@ pub fn draw_frame_mut<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> 
 
 pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
     match event {
+        Event::Key(key) if key.kind == KeyEventKind::Release => {}
         Event::Key(key) => {
             let _ = handle_key_event(app, key);
         }
@@ -535,13 +537,14 @@ impl App {
 
         let mut parts = trimmed.splitn(2, char::is_whitespace);
         let head = parts.next().unwrap_or("");
+        let head_lower = head.to_ascii_lowercase();
         let rest = parts.next().unwrap_or("").trim();
 
-        if head != "/rename" && !matches!(head, "/?" | "/help") {
+        if head_lower != "/rename" && !matches!(head_lower.as_str(), "/?" | "/help") {
             self.pending_rename_thread_id = None;
         }
 
-        match head {
+        match head_lower.as_str() {
             "/?" | "/help" => {
                 self.help_scroll_offset = 0;
                 self.show_help_modal = true;
@@ -578,7 +581,7 @@ impl App {
                 return;
             }
             "/model" | "/mode" | "/thinking" | "/effort" => {
-                let target_config_id = match head {
+                let target_config_id = match head_lower.as_str() {
                     "/model" => "model",
                     "/mode" => "mode",
                     _ => "thought_level",
@@ -686,7 +689,7 @@ impl App {
                 self.request_join_thread(source_thread_id, summary);
                 return;
             }
-            "/term" => {
+            "/term" | "/terminal" | "/zsh" | "/sh" | "/shell" | "/bash" => {
                 let cwd = parse_term_cwd(rest);
                 let active_id = self.active_thread_id.clone();
                 self.dispatch_create_terminal(Some(active_id), cwd);
@@ -1000,6 +1003,9 @@ impl App {
 }
 
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<TreeAction>, TuiError> {
+    if key.kind == KeyEventKind::Release {
+        return Ok(None);
+    }
     let was_composer = app.focused_pane() == FocusedPane::Composer
         || app.focus() == FocusedPane::Composer
         || app.active_focus() == FocusedPane::Composer;
@@ -1672,6 +1678,7 @@ fn dispatch_action(
     action: AppAction,
     local_ev_tx: mpsc::UnboundedSender<RunnerLocalEvent>,
     err_tx: mpsc::UnboundedSender<(Option<String>, String)>,
+    pty_write_tx: &mpsc::UnboundedSender<(String, Vec<u8>)>,
 ) {
     match action {
         AppAction::SendPrompt { thread_id, prompt } => {
@@ -1939,13 +1946,7 @@ fn dispatch_action(
             });
         }
         AppAction::PtyWrite { thread_id, bytes } => {
-            tokio::spawn(async move {
-                if let Err(err) = engine.pty_write(&thread_id, bytes).await {
-                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
-                        "Terminal input failed: {err}"
-                    )));
-                }
-            });
+            let _ = pty_write_tx.send((thread_id, bytes));
         }
         AppAction::PtyResize {
             thread_id,
@@ -2006,6 +2007,7 @@ fn drain_pending_actions(
     engine: &Arc<dyn TuiEnginePort>,
     local_ev_tx: &mpsc::UnboundedSender<RunnerLocalEvent>,
     err_tx: &mpsc::UnboundedSender<(Option<String>, String)>,
+    pty_write_tx: &mpsc::UnboundedSender<(String, Vec<u8>)>,
     pending_local_merges: &mut HashMap<String, usize>,
 ) {
     while let Some(action) = app.pending_actions.pop_front() {
@@ -2023,6 +2025,7 @@ fn drain_pending_actions(
             action,
             local_ev_tx.clone(),
             err_tx.clone(),
+            pty_write_tx,
         );
     }
 }
@@ -2121,6 +2124,18 @@ pub async fn run_with_engine_events<B: Backend>(
 
     let (local_ev_tx, mut local_ev_rx) = mpsc::unbounded_channel::<RunnerLocalEvent>();
     let (err_tx, mut err_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
+    let (pty_write_tx, mut pty_write_rx) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let pty_engine = Arc::clone(&engine);
+    let pty_local_ev_tx = local_ev_tx.clone();
+    let pty_writer_handle = tokio::spawn(async move {
+        while let Some((thread_id, bytes)) = pty_write_rx.recv().await {
+            if let Err(err) = pty_engine.pty_write(&thread_id, bytes).await {
+                let _ = pty_local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                    "Terminal input failed: {err}"
+                )));
+            }
+        }
+    });
     let mut pending_local_merges: HashMap<String, usize> = HashMap::new();
     while let Ok(event) = engine_events.try_recv() {
         handle_streamed_engine_event(&mut app, event, &mut pending_local_merges);
@@ -2131,6 +2146,7 @@ pub async fn run_with_engine_events<B: Backend>(
         &engine,
         &local_ev_tx,
         &err_tx,
+        &pty_write_tx,
         &mut pending_local_merges,
     );
 
@@ -2141,6 +2157,7 @@ pub async fn run_with_engine_events<B: Backend>(
             &engine,
             &local_ev_tx,
             &err_tx,
+            &pty_write_tx,
             &mut pending_local_merges,
         );
         if app.should_quit() {
@@ -2158,6 +2175,7 @@ pub async fn run_with_engine_events<B: Backend>(
                     &engine,
                     &local_ev_tx,
                     &err_tx,
+                    &pty_write_tx,
                     &mut pending_local_merges,
                 );
             }
@@ -2299,6 +2317,7 @@ pub async fn run_with_engine_events<B: Backend>(
                     &engine,
                     &local_ev_tx,
                     &err_tx,
+                    &pty_write_tx,
                     &mut pending_local_merges,
                 );
             }
@@ -2328,6 +2347,9 @@ pub async fn run_with_engine_events<B: Backend>(
             }
         }
     }
+
+    drop(pty_write_tx);
+    let _ = pty_writer_handle.await;
 
     Ok(())
 }

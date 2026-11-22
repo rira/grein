@@ -617,11 +617,11 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     let idle_screen = render_screen(&terminal);
     assert!(!idle_screen.contains("Enter: Send"));
     assert!(!idle_screen.contains("!cmd: Shell"));
-    assert!(idle_screen.contains("? for help"));
+    assert!(idle_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"));
     assert!(idle_screen.contains("code · claude-sonnet"));
     assert!(idle_screen.contains("0 subagents"));
 
-    // ThoughtChunk shows thinking and esc to cancel
+    // ThoughtChunk shows thinking and Esc cancel
     apply_engine_event(
         &mut app,
         TuiEngineEvent::ThoughtChunk {
@@ -633,7 +633,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     assert_eq!(app.tick_count, 1);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let thinking_screen = render_screen(&terminal);
-    assert!(thinking_screen.contains("esc to cancel"));
+    assert!(thinking_screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"));
     assert!(thinking_screen.contains("thinking"));
 
     // ToolActivityUpdated sets tool name, clearing restores streaming
@@ -693,7 +693,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     );
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let done_screen = render_screen(&terminal);
-    assert!(done_screen.contains("? for help"));
+    assert!(done_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"));
     assert!(done_screen.contains("idle"));
 }
 

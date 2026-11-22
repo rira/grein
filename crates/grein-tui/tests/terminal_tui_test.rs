@@ -3,7 +3,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use grein_core::ThreadKind;
 use grein_tui::app::{App, AppAction, FocusedPane, PendingPermission};
 use grein_tui::engine_port::{
@@ -1111,4 +1111,650 @@ async fn test_e2e_startup_on_persisted_terminal_loads_snapshot_and_focuses_termi
     assert!(g.pty_writes.contains(&("t-term-boot".to_string(), b"l".to_vec())));
     assert!(g.pty_writes.contains(&("t-term-boot".to_string(), b"s".to_vec())));
     assert!(g.pty_writes.contains(&("t-term-boot".to_string(), b"\r".to_vec())));
+}
+
+fn key_with_kind(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers,
+        kind,
+        state: KeyEventState::NONE,
+    }
+}
+
+#[test]
+fn test_key_release_events_are_ignored_while_press_and_repeat_are_handled() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-1".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-1".to_string(),
+                    title: "One".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-2".to_string(),
+                    title: "Two".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+        },
+    );
+
+    // Esc Press then Esc Release must stay in Tree (not double-toggle back to Composer)
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    app.handle_key_event(key_with_kind(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    ));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert!(!app.handle_key_event(key_with_kind(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    )));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+
+    // Ctrl+G Press then Ctrl+G Release via runner::handle_event must stay in Composer
+    handle_event(
+        &mut app,
+        Event::Key(key_with_kind(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )),
+    )
+    .unwrap();
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    handle_event(
+        &mut app,
+        Event::Key(key_with_kind(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        )),
+    )
+    .unwrap();
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+    // Repeat events must still work in Composer and Tree, while Release is ignored
+    app.handle_key_event(key_with_kind(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+        KeyEventKind::Repeat,
+    ));
+    app.handle_key_event(key_with_kind(
+        KeyCode::Char('b'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    ));
+    assert_eq!(app.composer_input(), "a");
+
+    // Enter Release via runner::handle_key_event must not clear last_submitted_prompt
+    app.last_submitted_prompt = Some("keep-me".to_string());
+    grein_tui::runner::handle_key_event(
+        &mut app,
+        key_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release),
+    )
+    .unwrap();
+    assert_eq!(app.last_submitted_prompt().as_deref(), Some("keep-me"));
+
+    // Repeat Down in Tree advances selection
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(0);
+    app.handle_key_event(key_with_kind(
+        KeyCode::Down,
+        KeyModifiers::NONE,
+        KeyEventKind::Repeat,
+    ));
+    assert_eq!(app.tree.selected_index(), Some(1));
+}
+
+#[test]
+fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-agent-1".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-agent-1".to_string(),
+                    title: "Agent 1".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-agent-2".to_string(),
+                    title: "Agent 2".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMetadataUpdated {
+            meta: vec![
+                ThreadMeta {
+                    thread_id: "t-agent-1".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Agent,
+                    cwd: None,
+                },
+                ThreadMeta {
+                    thread_id: "t-agent-2".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Agent,
+                    cwd: None,
+                },
+            ],
+        },
+    );
+
+    // 1. In Composer with no child terminal -> Alt+T dispatches CreateTerminal under active thread
+    app.set_focus(FocusedPane::Composer);
+    assert!(app.handle_key_event(alt('t')));
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateTerminal {
+            parent_thread_id: Some(ref pid),
+            title: None,
+            cwd: None,
+            ..
+        }) if pid == "t-agent-1"
+    ));
+
+    // 2. In Tree with t-agent-2 selected and no child terminal -> Alt+T targets selected t-agent-2
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1);
+    assert!(app.handle_key_event(alt('t')));
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateTerminal {
+            parent_thread_id: Some(ref pid),
+            title: None,
+            cwd: None,
+            ..
+        }) if pid == "t-agent-2"
+    ));
+
+    // 3. With child terminal t-term-1 under t-agent-1 (no snapshot yet):
+    //    Alt+T from Transcript jumps directly to t-term-1, focuses Terminal, and requests PtySnapshot.
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-agent-1".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-agent-1".to_string(),
+                    title: "Agent 1".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-term-1".to_string(),
+                    title: "Shell".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-agent-2".to_string(),
+                    title: "Agent 2".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMetadataUpdated {
+            meta: vec![
+                ThreadMeta {
+                    thread_id: "t-agent-1".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Agent,
+                    cwd: None,
+                },
+                ThreadMeta {
+                    thread_id: "t-term-1".to_string(),
+                    parent_thread_id: Some("t-agent-1".to_string()),
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Terminal,
+                    cwd: Some("/tmp".to_string()),
+                },
+                ThreadMeta {
+                    thread_id: "t-agent-2".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Agent,
+                    cwd: None,
+                },
+            ],
+        },
+    );
+    app.pending_actions.clear();
+    app.set_focus(FocusedPane::Transcript);
+    assert!(app.handle_key_event(alt('t')));
+    assert_eq!(app.active_thread_id(), "t-term-1");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::PtySnapshot { ref thread_id, .. }) if thread_id == "t-term-1"
+    ));
+
+    // 4. Inside FocusedPane::Terminal, Alt+T MUST NOT be intercepted — passes through to PTY
+    app.pending_actions.clear();
+    assert!(app.handle_key_event(alt('t')));
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::PtyWrite {
+            thread_id: "t-term-1".to_string(),
+            bytes: b"\x1bt".to_vec(),
+        })
+    );
+
+    // 5. From Tree hovering on t-term-1 while t-agent-1 is active -> Alt+T switches to t-term-1 & focuses Terminal
+    app.switch_thread("t-agent-1");
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1);
+    app.pending_actions.clear();
+    assert!(app.handle_key_event(alt('t')));
+    assert_eq!(app.active_thread_id(), "t-term-1");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+    assert!(!app
+        .pending_actions
+        .iter()
+        .any(|a| matches!(a, AppAction::CreateTerminal { .. })));
+}
+
+#[test]
+fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-agent-1".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-agent-1".to_string(),
+                    title: "Agent 1".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-term".to_string(),
+                    title: "Shell".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-agent-2".to_string(),
+                    title: "Agent 2".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMetadataUpdated {
+            meta: vec![
+                ThreadMeta {
+                    thread_id: "t-agent-1".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Agent,
+                    cwd: None,
+                },
+                ThreadMeta {
+                    thread_id: "t-term".to_string(),
+                    parent_thread_id: Some("t-agent-1".to_string()),
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Terminal,
+                    cwd: Some("/tmp".to_string()),
+                },
+                ThreadMeta {
+                    thread_id: "t-agent-2".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                    kind: ThreadKind::Agent,
+                    cwd: None,
+                },
+            ],
+        },
+    );
+
+    // 1. Zoomed in Composer -> Esc and Ctrl+G both auto-unhide sidebar when focusing Tree
+    app.set_focus(FocusedPane::Composer);
+    app.sidebar_hidden = true;
+    app.handle_key_event(key(KeyCode::Esc));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert!(!app.sidebar_hidden, "Esc into Tree must unhide sidebar");
+
+    app.set_focus(FocusedPane::Composer);
+    app.sidebar_hidden = true;
+    app.handle_key_event(ctrl('g'));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert!(!app.sidebar_hidden, "Ctrl+G into Tree must unhide sidebar");
+
+    // 2. Moving Tree selection onto Terminal with missing pty_screens requests PtySnapshot,
+    //    and Terminal preview hides the Agent Composer completely.
+    app.pending_actions.clear();
+    app.handle_key_event(key(KeyCode::Down)); // lands on t-term
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::PtySnapshot { ref thread_id, .. }) if thread_id == "t-term"
+    ));
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let preview_screen = render_screen(&terminal);
+    assert!(
+        preview_screen.contains("Terminal (Preview: Shell)"),
+        "{preview_screen}"
+    );
+    assert!(
+        !preview_screen.contains("Composer"),
+        "Terminal preview in Tree must hide Agent Composer:\n{preview_screen}"
+    );
+
+    // 3. 't' in Tree attaches child terminal to selected_tree_thread_info().0 (t-agent-2), not active_thread_id
+    app.handle_key_event(key(KeyCode::Char('j'))); // lands on t-agent-2
+    app.pending_actions.clear();
+    app.handle_key_event(key(KeyCode::Char('t')));
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateTerminal {
+            parent_thread_id: Some(ref pid),
+            cwd: None,
+            ..
+        }) if pid == "t-agent-2"
+    ));
+
+    // 4. In Tree, Esc, Ctrl+G, and Right activate the currently selected node (entering Terminal when Terminal is selected)
+    app.handle_key_event(key(KeyCode::Char('k'))); // back on t-term
+    app.handle_key_event(key(KeyCode::Esc));
+    assert_eq!(app.active_thread_id(), "t-term");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+
+    app.switch_thread("t-agent-1");
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1); // t-term
+    app.handle_key_event(ctrl('g'));
+    assert_eq!(app.active_thread_id(), "t-term");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+
+    app.switch_thread("t-agent-1");
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1); // t-term
+    app.handle_key_event(key(KeyCode::Right));
+    assert_eq!(app.active_thread_id(), "t-term");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+
+    // 5. Exited PTY in FocusedPane::Terminal:
+    //    - Status bar shows "exited · Esc/Ctrl+G tree"
+    //    - Further keys / paste do NOT emit PtyWrite
+    //    - Esc escapes back to FocusedPane::Tree and unhides sidebar if zoomed
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::PtyScreenUpdated {
+            thread_id: "t-term".to_string(),
+            snapshot: make_snapshot_from_lines(&["process finished"], 10, 40),
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::PtyExited {
+            thread_id: "t-term".to_string(),
+            exit_code: Some(0),
+        },
+    );
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let exited_screen = render_screen(&terminal);
+    assert!(
+        exited_screen.contains("exited · Esc/Ctrl+G tree"),
+        "Exited terminal status bar must guide user back to Tree:\n{exited_screen}"
+    );
+
+    app.pending_actions.clear();
+    app.handle_key_event(key(KeyCode::Char('a')));
+    app.handle_key_event(key(KeyCode::Enter));
+    app.handle_key_event(ctrl('c'));
+    handle_event(&mut app, Event::Paste("echo no".to_string())).unwrap();
+    assert!(
+        !app.pending_actions
+            .iter()
+            .any(|a| matches!(a, AppAction::PtyWrite { .. })),
+        "Exited PTY must not forward keys or paste to PtyWrite: {:?}",
+        app.pending_actions
+    );
+
+    app.sidebar_hidden = true;
+    app.handle_key_event(key(KeyCode::Esc));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert!(!app.sidebar_hidden, "Esc from exited terminal into Tree must unhide sidebar");
+}
+
+#[test]
+fn test_terminal_slash_command_aliases_case_insensitive() {
+    let mut app = App::new();
+    app.active_thread_id = "t-main".to_string();
+
+    for cmd in [
+        "/term",
+        "/TERM",
+        "/terminal",
+        "/Terminal",
+        "/zsh",
+        "/ZSH",
+        "/sh",
+        "/SH",
+        "/shell",
+        "/Shell",
+        "/bash",
+        "/Bash",
+    ] {
+        app.pending_actions.clear();
+        app.submit_composer_prompt(cmd);
+        assert!(
+            matches!(
+                app.pending_actions.pop_front(),
+                Some(AppAction::CreateTerminal {
+                    parent_thread_id: Some(ref pid),
+                    cwd: None,
+                    ..
+                }) if pid == "t-main"
+            ),
+            "Command {cmd} should dispatch CreateTerminal"
+        );
+
+        app.pending_actions.clear();
+        app.submit_composer_prompt(format!("{cmd} \"/tmp/work dir\""));
+        assert!(
+            matches!(
+                app.pending_actions.pop_front(),
+                Some(AppAction::CreateTerminal {
+                    parent_thread_id: Some(ref pid),
+                    cwd: Some(ref path),
+                    ..
+                }) if pid == "t-main" && path == "/tmp/work dir"
+            ),
+            "Command {cmd} with path should dispatch CreateTerminal with parsed cwd"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_pty_write_serialization_fifo_order() {
+    struct DelayedPtyEngine {
+        writes: Mutex<Vec<Vec<u8>>>,
+        event_tx: Mutex<Option<mpsc::UnboundedSender<TuiEngineEvent>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TuiEnginePort for DelayedPtyEngine {
+        async fn hydrate_session(&self) -> io::Result<HydratedSession> {
+            Ok(HydratedSession {
+                active_thread_id: "t-term".to_string(),
+                threads: vec![HydratedThread {
+                    id: "t-term".to_string(),
+                    title: "Shell".to_string(),
+                    turns: Vec::new(),
+                }],
+            })
+        }
+        async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
+            Ok(())
+        }
+        async fn fork_thread(&self, thread_id: &str, _anchor_id: &str) -> io::Result<String> {
+            Ok(format!("{thread_id}-fork"))
+        }
+        async fn merge_thread(&self, _source_id: &str, _target_id: &str) -> io::Result<()> {
+            Ok(())
+        }
+        async fn resolve_permission(&self, _request_id: &str, _approved: bool) -> io::Result<()> {
+            Ok(())
+        }
+        async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.event_tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        }
+        async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
+            Ok(vec![ThreadMeta {
+                thread_id: "t-term".to_string(),
+                parent_thread_id: None,
+                inherited_turn_count: 0,
+                merged: false,
+                kind: ThreadKind::Terminal,
+                cwd: None,
+            }])
+        }
+        async fn pty_snapshot(
+            &self,
+            _thread_id: &str,
+            rows: u16,
+            cols: u16,
+        ) -> io::Result<PtyScreenSnapshot> {
+            Ok(make_snapshot_from_lines(&["ready"], rows.max(1), cols.max(1)))
+        }
+        async fn pty_write(&self, _thread_id: &str, bytes: Vec<u8>) -> io::Result<()> {
+            // Invert timing: earlier bytes sleep longer; unordered tokio::spawn would scramble them!
+            let delay_ms = match bytes.first().copied() {
+                Some(b'0') => 25,
+                Some(b'1') => 15,
+                Some(b'2') => 8,
+                _ => 1,
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            self.writes.lock().unwrap().push(bytes);
+            Ok(())
+        }
+    }
+
+    let engine = Arc::new(DelayedPtyEngine {
+        writes: Mutex::new(Vec::new()),
+        event_tx: Mutex::new(None),
+    });
+    let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    let (key_tx, key_rx) = mpsc::unbounded_channel();
+
+    let runner = tokio::spawn(async move {
+        run_with_engine_events(&mut terminal, App::new(), engine_dyn, key_rx).await?;
+        Ok::<_, io::Error>(terminal)
+    });
+
+    wait_for("subscribed", || {
+        engine.event_tx.lock().unwrap().is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let expected: Vec<Vec<u8>> = "0123456789abcdef"
+        .bytes()
+        .map(|b| vec![b])
+        .collect();
+    for b in "0123456789abcdef".chars() {
+        key_tx.send(Event::Key(key(KeyCode::Char(b)))).unwrap();
+    }
+
+    wait_for("all 16 pty_writes delivered", || {
+        engine.writes.lock().unwrap().len() == expected.len()
+    })
+    .await;
+
+    key_tx.send(Event::Key(ctrl('q'))).unwrap();
+    let _terminal = timeout(Duration::from_secs(3), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(engine.writes.lock().unwrap().as_slice(), expected.as_slice());
+}
+
+#[test]
+fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-main".to_string(),
+            threads: vec![HydratedThread {
+                id: "t-main".to_string(),
+                title: "Main".to_string(),
+                turns: Vec::new(),
+            }],
+        },
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let idle_screen = render_screen(&terminal);
+    assert!(
+        idle_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"),
+        "Idle Composer status bar missing expected hint:\n{idle_screen}"
+    );
+
+    app.thread_statuses
+        .insert("t-main".to_string(), "streaming".to_string());
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let busy_screen = render_screen(&terminal);
+    assert!(
+        busy_screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"),
+        "Busy Composer status bar missing expected hint:\n{busy_screen}"
+    );
+
+    app.show_help_modal = true;
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let help_screen = render_screen(&terminal);
+    for expected in [
+        "Alt+T",
+        "Ctrl+G",
+        "t / T",
+        "/term [path]",
+        "/zsh",
+        "/terminal",
+        "Right",
+        "exited",
+        "Press Esc, q, ?, or Enter to close",
+    ] {
+        assert!(
+            help_screen.contains(expected),
+            "Help modal missing {expected:?}:\n{help_screen}"
+        );
+    }
 }

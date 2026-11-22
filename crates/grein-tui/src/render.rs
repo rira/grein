@@ -527,12 +527,19 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
             || active_tool.is_some()
             || thought.is_some());
 
-    let left_hint = if active_is_terminal && state.focused_pane == PaneFocus::Terminal {
-        "Ctrl+G for tree"
+    let terminal_focused = state.active_focus == PaneFocus::Terminal
+        || state.focused_pane == PaneFocus::Terminal
+        || state.focus == PaneFocus::Terminal;
+    let left_hint = if active_is_terminal && terminal_focused {
+        if state.terminal_exit_code(active_id).is_some() {
+            "exited · Esc/Ctrl+G tree"
+        } else {
+            "Ctrl+G for tree"
+        }
     } else if is_busy {
-        "esc to cancel"
+        "Esc cancel · Ctrl+G tree · Alt+T zsh"
     } else {
-        "? for help"
+        "Ctrl+G tree · Alt+T zsh · ? help"
     };
 
     let (mode, model, live_status, status_color) = if active_is_terminal {
@@ -821,10 +828,10 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                     "Alt+↑/↓, PgUp/PgDn",
                     "Scroll Transcript (Alt+Home/End top/btm)",
                 ),
-                ("Esc / Ctrl+G", "Toggle Composer/Term & Tree (Esc cancels)"),
+                ("Esc / Ctrl+G", "Tree/pane; Esc cancels or leaves exited >_"),
                 (
                     "Ctrl+N / Alt+N, Alt+R / F2",
-                    "Fork branch / new root / rename context",
+                    "Fork / new root / rename; Alt+T >_ zsh",
                 ),
                 (
                     "Ctrl+T / Ctrl+O / Alt+Y",
@@ -836,8 +843,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
             "── ᛇ Grein Navigation ──",
             &[
                 (
-                    "j/k/↑/↓, Enter/l, J / K",
-                    "Browse (preview) / enter / switch root",
+                    "j/k/↑/↓, Enter/l/Right",
+                    "Browse (preview) / enter / J/K switch root",
                 ),
                 (
                     "Ctrl+U / Ctrl+D, g / G",
@@ -849,7 +856,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                 ),
                 (
                     "t / T, z / y / q (ᛇ Grein)",
-                    "Child/root terminal, zoom / copy / quit",
+                    "Child/root >_ term, zoom / copy / quit",
                 ),
             ],
         ),
@@ -865,10 +872,13 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                     "Alt+←/→, Ctrl+←/→, Alt+B/F",
                     "Word move, Ctrl+K/U/W, Ctrl+Y/Ctrl+D/Alt+D",
                 ),
-                ("!cmd, /term [path]", "Shell cmd / open terminal (/worktree)"),
+                (
+                    "!cmd, /term [path]",
+                    "Cmd / >_ (/terminal /zsh /sh /shell /bash)",
+                ),
                 (
                     "/fork, /grein, /root, /new",
-                    "Fork (/branch) / create blank root",
+                    "Fork (/branch) / blank root (/worktree)",
                 ),
                 (
                     "/rename, /join, /merge",
@@ -1097,7 +1107,18 @@ fn render_terminal_pane(
 fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let active_id = state.active_thread_id();
     let active_is_terminal = state.is_terminal_thread(active_id);
-    let show_composer = !active_is_terminal || state.pending_rename_thread_id.is_some();
+    let tree_focused = state.active_focus == PaneFocus::Tree
+        || state.focused_pane == PaneFocus::Tree
+        || state.focus == PaneFocus::Tree;
+    let preview = if tree_focused && !state.sidebar_hidden {
+        selected_tree_thread(state).filter(|(sel_id, _)| *sel_id != active_id)
+    } else {
+        None
+    };
+    let display_thread_id = preview.map(|(id, _)| id).unwrap_or(active_id);
+    let display_is_terminal = state.is_terminal_thread(display_thread_id);
+    let show_composer =
+        (!active_is_terminal && !display_is_terminal) || state.pending_rename_thread_id.is_some();
     let active_subagents: &[SubagentSnapshot] = state
         .thread_subagents
         .get(active_id)
@@ -1140,9 +1161,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     };
 
     let focused_debug = format!("{:?}", state.focused_pane());
-    let tree_focused = state.active_focus == PaneFocus::Tree
-        || state.focused_pane == PaneFocus::Tree
-        || state.focus == PaneFocus::Tree;
     let transcript_focused = focused_debug.contains("Transcript");
     let terminal_focused = state.active_focus == PaneFocus::Terminal
         || state.focused_pane == PaneFocus::Terminal
@@ -1159,14 +1177,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     } else {
         render_tree_view_inner(f, layout.tree_area, state)
     };
-
-    let preview = if tree_focused && !state.sidebar_hidden {
-        selected_tree_thread(state).filter(|(sel_id, _)| *sel_id != active_id)
-    } else {
-        None
-    };
-    let display_thread_id = preview.map(|(id, _)| id).unwrap_or(active_id);
-    let display_is_terminal = state.is_terminal_thread(display_thread_id);
 
     let mut max_scroll_u16 = 0u16;
     let mut transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
@@ -1462,7 +1472,7 @@ mod tests {
         assert!(!screen.contains("Blackboard"));
         assert!(screen.contains("●"));
         assert!(screen.contains("⚠"));
-        assert!(screen.contains("esc to cancel"));
+        assert!(screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"));
         assert!(!screen.contains("Enter: Send"));
     }
 }

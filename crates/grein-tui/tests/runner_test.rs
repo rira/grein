@@ -218,7 +218,8 @@ fn test_golden_e2e_two_column_integration_and_multiline_sqlite() {
         screen.contains("Composer")
             && screen.contains("Draft line 1")
             && screen.contains("Draft line 2")
-            && (screen.contains("? for help") || screen.contains("esc to cancel")),
+            && (screen.contains("Ctrl+G tree · Alt+T zsh · ? help")
+                || screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh")),
         "Composer pane must auto-grow for multi-line draft and render bottom status bar"
     );
 }

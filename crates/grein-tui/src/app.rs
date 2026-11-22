@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::IsTerminal;
 use thiserror::Error;
@@ -591,6 +591,75 @@ impl App {
         }
     }
 
+    pub fn is_terminal_exited(&self, thread_id: &str) -> bool {
+        self.terminal_exit_code(thread_id).is_some()
+    }
+
+    fn find_existing_terminal_for(&self, target_id: &str) -> Option<String> {
+        if self.is_terminal_thread(target_id) {
+            return Some(target_id.to_string());
+        }
+        let mut candidates: Vec<&str> = self
+            .threads
+            .iter()
+            .filter_map(|t| {
+                let meta = self.thread_meta.get(&t.id)?;
+                (meta.kind == grein_core::ThreadKind::Terminal
+                    && meta.parent_thread_id.as_deref() == Some(target_id))
+                .then_some(t.id.as_str())
+            })
+            .collect();
+        if candidates.is_empty() {
+            let mut meta_ids: Vec<&str> = self
+                .thread_meta
+                .values()
+                .filter(|m| {
+                    m.kind == grein_core::ThreadKind::Terminal
+                        && m.parent_thread_id.as_deref() == Some(target_id)
+                })
+                .map(|m| m.thread_id.as_str())
+                .collect();
+            meta_ids.sort_unstable();
+            candidates = meta_ids;
+        }
+        candidates
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| !self.is_terminal_exited(id))
+            .or_else(|| candidates.last().copied())
+            .map(str::to_string)
+    }
+
+    fn focus_tree(&mut self) {
+        self.pending_rename_thread_id = None;
+        self.focused_pane = FocusedPane::Tree;
+        self.sidebar_hidden = false;
+        self.sync_focus_out();
+    }
+
+    fn open_or_jump_to_terminal(&mut self) {
+        self.pending_rename_thread_id = None;
+        let target_id = if self.focused_pane == FocusedPane::Tree {
+            self.selected_tree_thread_info().0
+        } else {
+            self.active_thread_id.clone()
+        };
+        if let Some(term_id) = self.find_existing_terminal_for(&target_id) {
+            if term_id != self.active_thread_id {
+                self.switch_thread(&term_id);
+            } else {
+                self.maybe_request_pty_snapshot(&term_id);
+                self.maybe_queue_terminal_resize();
+            }
+            self.focused_pane = FocusedPane::Terminal;
+            self.sync_focus_out();
+        } else {
+            self.dispatch_create_terminal(Some(target_id), None);
+            self.sync_focus_out();
+        }
+    }
+
     pub fn current_terminal_dims_or_default(&self) -> (u16, u16) {
         if self.terminal_pane_size.0 >= 1 && self.terminal_pane_size.1 >= 1 {
             return self.terminal_pane_size;
@@ -676,6 +745,7 @@ impl App {
         parent_thread_id: Option<String>,
         cwd: Option<String>,
     ) {
+        self.pending_rename_thread_id = None;
         let (rows, cols) = self.current_terminal_dims_or_default();
         self.status_notice = None;
         self.pending_actions.push_back(AppAction::CreateTerminal {
@@ -697,6 +767,9 @@ impl App {
             return false;
         }
         if self.focused_pane == FocusedPane::Terminal {
+            if self.is_terminal_exited(&self.active_thread_id) {
+                return false;
+            }
             let bracketed = self
                 .pty_screens
                 .get(&self.active_thread_id)
@@ -841,6 +914,7 @@ impl App {
     }
 
     fn sync_focus_in(&mut self) {
+        let prev = self.focused_pane;
         if self.focus != self.focused_pane {
             if self.focus != FocusedPane::Composer {
                 self.focused_pane = self.focus;
@@ -854,6 +928,9 @@ impl App {
             } else {
                 self.active_focus = self.focused_pane;
             }
+        }
+        if prev != FocusedPane::Tree && self.focused_pane == FocusedPane::Tree {
+            self.sidebar_hidden = false;
         }
     }
 
@@ -875,8 +952,13 @@ impl App {
     }
 
     pub fn set_focus(&mut self, pane: impl Into<FocusedPane>) {
-        self.focused_pane = pane.into();
-        self.sync_focus_out();
+        let pane = pane.into();
+        if pane == FocusedPane::Tree {
+            self.focus_tree();
+        } else {
+            self.focused_pane = pane;
+            self.sync_focus_out();
+        }
     }
 
     pub fn set_focused_pane(&mut self, pane: impl Into<FocusedPane>) {
@@ -934,19 +1016,68 @@ impl App {
         Ok(())
     }
 
+    fn activate_selected_tree_node(&mut self) -> Option<TreeAction> {
+        self.pending_rename_thread_id = None;
+        let Some(idx) = self.tree.selected_index() else {
+            self.focused_pane = if self.active_is_terminal() {
+                FocusedPane::Terminal
+            } else {
+                FocusedPane::Composer
+            };
+            self.sync_focus_out();
+            return None;
+        };
+        match self.tree.nodes.get(idx).cloned() {
+            Some(crate::ui::tree::TreeNode::Anchor(anchor)) => {
+                let id = anchor.id;
+                let thread_id = anchor.thread_id;
+                if thread_id != self.active_thread_id
+                    && self.threads.iter().any(|t| t.id == thread_id)
+                {
+                    self.switch_thread(&thread_id);
+                }
+                self.tree.set_active_anchor_id(Some(id.clone()));
+                Some(TreeAction::ActivateAnchor(id))
+            }
+            Some(crate::ui::tree::TreeNode::Thread(thread)) => {
+                if thread.id != self.active_thread_id {
+                    self.switch_thread(&thread.id);
+                }
+                self.focused_pane = if self.is_terminal_thread(&thread.id) {
+                    FocusedPane::Terminal
+                } else {
+                    FocusedPane::Composer
+                };
+                self.sync_focus_out();
+                None
+            }
+            None => {
+                self.focused_pane = if self.active_is_terminal() {
+                    FocusedPane::Terminal
+                } else {
+                    FocusedPane::Composer
+                };
+                self.sync_focus_out();
+                None
+            }
+        }
+    }
+
     fn toggle_composer_tree_focus(&mut self) {
         if matches!(
             self.focused_pane,
             FocusedPane::Composer | FocusedPane::Terminal
         ) {
-            self.pending_rename_thread_id = None;
-            self.focused_pane = FocusedPane::Tree;
+            self.focus_tree();
+        } else if self.focused_pane == FocusedPane::Tree {
+            let _ = self.activate_selected_tree_node();
         } else if self.active_is_terminal() {
             self.focused_pane = FocusedPane::Terminal;
+            self.sync_focus_out();
         } else {
             self.focused_pane = FocusedPane::Composer;
+            self.sync_focus_out();
         }
-        self.sync_focus_out();
     }
 
     pub fn cycle_focus(&mut self) {
@@ -1402,6 +1533,8 @@ impl App {
                     let curr = self.tree.selected_index().unwrap_or(0);
                     if curr + 1 < self.tree.nodes.len() {
                         self.tree.select_index(curr + 1);
+                        let (sel_id, _) = self.selected_tree_thread_info();
+                        self.maybe_request_pty_snapshot(&sel_id);
                     }
                 }
                 None
@@ -1411,6 +1544,8 @@ impl App {
                     let curr = self.tree.selected_index().unwrap_or(0);
                     if curr > 0 {
                         self.tree.select_index(curr - 1);
+                        let (sel_id, _) = self.selected_tree_thread_info();
+                        self.maybe_request_pty_snapshot(&sel_id);
                     }
                 }
                 None
@@ -1471,7 +1606,8 @@ impl App {
                 None
             }
             KeyCode::Char('t') if no_ctrl_alt => {
-                self.dispatch_create_terminal(Some(self.active_thread_id.clone()), None);
+                let (parent_thread_id, _) = self.selected_tree_thread_info();
+                self.dispatch_create_terminal(Some(parent_thread_id), None);
                 None
             }
             KeyCode::Char('T') if no_ctrl_alt => {
@@ -1492,34 +1628,10 @@ impl App {
                 self.request_delete_thread(target_id);
                 None
             }
-            KeyCode::Enter | KeyCode::Char('l') if no_ctrl_alt || key.code == KeyCode::Enter => {
-                if let Some(idx) = self.tree.selected_index() {
-                    match self.tree.nodes.get(idx).cloned() {
-                        Some(crate::ui::tree::TreeNode::Anchor(anchor)) => {
-                            let id = anchor.id;
-                            let thread_id = anchor.thread_id;
-                            if thread_id != self.active_thread_id
-                                && self.threads.iter().any(|t| t.id == thread_id)
-                            {
-                                self.switch_thread(&thread_id);
-                            }
-                            self.tree.set_active_anchor_id(Some(id.clone()));
-                            return Some(TreeAction::ActivateAnchor(id));
-                        }
-                        Some(crate::ui::tree::TreeNode::Thread(thread)) => {
-                            self.switch_thread(&thread.id);
-                            self.focused_pane = if self.is_terminal_thread(&thread.id) {
-                                FocusedPane::Terminal
-                            } else {
-                                FocusedPane::Composer
-                            };
-                            self.sync_focus_out();
-                            return None;
-                        }
-                        None => {}
-                    }
-                }
-                None
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
+                if no_ctrl_alt || key.code == KeyCode::Enter =>
+            {
+                self.activate_selected_tree_node()
             }
             _ => None,
         }
@@ -1686,6 +1798,9 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
         self.sync_focus_in();
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1713,8 +1828,7 @@ impl App {
             && !alt
             && matches!(key.code, KeyCode::Char('g' | 'G'))
         {
-            self.focused_pane = FocusedPane::Tree;
-            self.sync_focus_out();
+            self.focus_tree();
             return true;
         }
 
@@ -1776,6 +1890,14 @@ impl App {
                 self.toggle_sidebar_zoom();
                 self.sync_focus_out();
                 return true;
+            }
+            if self.is_terminal_exited(&self.active_thread_id) {
+                if key.code == KeyCode::Esc && !ctrl && !alt {
+                    self.focus_tree();
+                    return true;
+                }
+                self.sync_focus_out();
+                return false;
             }
             let app_cursor = self
                 .pty_screens
@@ -1925,6 +2047,10 @@ impl App {
                     self.begin_rename_prefill();
                     return true;
                 }
+                KeyCode::Char('t' | 'T') => {
+                    self.open_or_jump_to_terminal();
+                    return true;
+                }
                 KeyCode::Char('y' | 'Y') => {
                     self.copy_transcript_content(CopyMode::LastReply);
                     self.sync_focus_out();
@@ -1953,18 +2079,11 @@ impl App {
                 return true;
             }
             if self.focused_pane == FocusedPane::Composer {
-                self.pending_rename_thread_id = None;
-                self.focused_pane = FocusedPane::Tree;
-                self.sync_focus_out();
+                self.focus_tree();
                 return true;
             }
             if self.focused_pane == FocusedPane::Tree {
-                self.focused_pane = if self.active_is_terminal() {
-                    FocusedPane::Terminal
-                } else {
-                    FocusedPane::Composer
-                };
-                self.sync_focus_out();
+                let _ = self.activate_selected_tree_node();
                 return true;
             }
         }
