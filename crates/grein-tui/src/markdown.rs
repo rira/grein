@@ -37,6 +37,7 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
     let raw_lines: Vec<&str> = markdown.lines().collect();
     let mut out = Vec::new();
     let mut in_code_block = false;
+    let mut in_user_block = false;
     let mut idx = 0usize;
 
     while idx < raw_lines.len() {
@@ -45,6 +46,7 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
 
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
+            in_user_block = false;
             out.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().fg(Color::DarkGray),
@@ -60,6 +62,38 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
             )));
             idx += 1;
             continue;
+        }
+
+        if let Some(user_prompt) = trimmed
+            .strip_prefix("# User: ")
+            .or_else(|| (trimmed == "# User:").then_some(""))
+        {
+            in_user_block = true;
+            let user_style = Style::default().fg(Color::Green);
+            let mut spans = vec![Span::styled("ᛉ ", user_style.add_modifier(Modifier::BOLD))];
+            if !user_prompt.is_empty() {
+                spans.extend(parse_inline_spans_with_base(user_prompt, user_style));
+            }
+            out.push(Line::from(spans));
+            idx += 1;
+            continue;
+        }
+
+        if in_user_block {
+            if trimmed.is_empty()
+                || trimmed == "## Agent (agy)"
+                || trimmed == "## Assistant"
+                || trimmed.starts_with('#')
+            {
+                in_user_block = false;
+            } else {
+                let user_style = Style::default().fg(Color::Green);
+                let mut spans = vec![Span::styled("  ", user_style)];
+                spans.extend(parse_inline_spans_with_base(line, user_style));
+                out.push(Line::from(spans));
+                idx += 1;
+                continue;
+            }
         }
 
         if idx + 1 < raw_lines.len() {

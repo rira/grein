@@ -1105,7 +1105,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
     );
 
     assert!(
-        transcript_text.contains("User: GFM_TABLE"),
+        transcript_text.contains("ᛉ GFM_TABLE"),
         "expected user prompt in Transcript:\n{transcript_text}"
     );
     assert!(

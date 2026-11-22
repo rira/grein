@@ -438,3 +438,42 @@ fn test_ratatui_test_backend_transcript_renders_aligned_box_table_without_pipe_w
         }
     }
 }
+
+#[test]
+fn test_user_prompts_render_with_algiz_rune_in_leaf_green() {
+    let md = "# User: hello world\nsecond line\n\n## Agent (agy)\nreply";
+    let rendered = render_markdown_lines(md);
+    let texts = lines_text(&rendered);
+
+    assert_eq!(texts[0], "ᛉ hello world");
+    assert_eq!(texts[1], "  second line");
+    assert!(
+        !texts.join("\n").contains("User:"),
+        "User: literal prefix must not appear in rendered lines: {texts:?}"
+    );
+
+    assert_eq!(rendered[0].spans[0].style.fg, Some(Color::Green));
+    assert!(rendered[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert!(rendered[0]
+        .spans
+        .iter()
+        .all(|s| s.style.fg == Some(Color::Green)));
+    assert!(rendered[1]
+        .spans
+        .iter()
+        .all(|s| s.style.fg == Some(Color::Green)));
+
+    assert_eq!(texts[3], "Agent (agy)");
+    assert!(rendered[3]
+        .spans
+        .iter()
+        .all(|s| s.style.fg != Some(Color::Green)));
+    assert_eq!(texts[4], "reply");
+    assert!(rendered[4]
+        .spans
+        .iter()
+        .all(|s| s.style.fg != Some(Color::Green)));
+}
