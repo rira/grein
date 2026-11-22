@@ -56,7 +56,7 @@ impl Fixture {
 }
 
 fn kinds(agents: &[AcpAgent]) -> Vec<AcpAgentKind> {
-    agents.iter().map(|a| a.kind.clone()).collect()
+    agents.iter().map(|a| a.kind).collect()
 }
 
 #[test]

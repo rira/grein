@@ -681,15 +681,15 @@ impl App {
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         self.sync_focus_in();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if matches!(
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
                 key.code,
                 KeyCode::Char('c') | KeyCode::Char('q') | KeyCode::Char('Q')
-            ) {
-                self.should_quit = true;
-                self.sync_focus_out();
-                return true;
-            }
+            )
+        {
+            self.should_quit = true;
+            self.sync_focus_out();
+            return true;
         }
 
         if self.pending_permission.is_some() {
@@ -1217,25 +1217,27 @@ mod tests {
 
     #[test]
     fn test_ctrl_n_forks_and_tree_enter_switches_thread_to_composer() {
-        let mut app = App::default();
-        app.active_thread_id = "t-1".to_string();
+        let mut app = App {
+            active_thread_id: "t-1".to_string(),
+            active_transcript_md: "# User: root\n\n".to_string(),
+            threads: vec![
+                ThreadItem {
+                    id: "t-1".to_string(),
+                    title: "Root".to_string(),
+                    anchors: Vec::new(),
+                },
+                ThreadItem {
+                    id: "t-2".to_string(),
+                    title: "Branch".to_string(),
+                    anchors: Vec::new(),
+                },
+            ],
+            ..App::default()
+        };
         app.thread_transcripts
             .insert("t-1".to_string(), "# User: root\n\n".to_string());
         app.thread_transcripts
             .insert("t-2".to_string(), "# User: branch\n\n".to_string());
-        app.active_transcript_md = "# User: root\n\n".to_string();
-        app.threads = vec![
-            ThreadItem {
-                id: "t-1".to_string(),
-                title: "Root".to_string(),
-                anchors: Vec::new(),
-            },
-            ThreadItem {
-                id: "t-2".to_string(),
-                title: "Branch".to_string(),
-                anchors: Vec::new(),
-            },
-        ];
         app.sync_anchors_and_blackboard();
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));

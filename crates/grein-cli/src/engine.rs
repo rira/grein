@@ -1633,7 +1633,7 @@ impl DaemonEngine for UnixSocketEngineClient {
 
 /// Unified engine: standalone in-process or remote daemon.
 pub enum EngineClient {
-    InProcess(InProcessEngine),
+    InProcess(Box<InProcessEngine>),
     Socket(UnixSocketEngineClient),
 }
 
@@ -1787,7 +1787,7 @@ impl DaemonEngine for EngineClient {
         &self,
     ) -> Result<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>, EngineError> {
         match self {
-            Self::InProcess(e) => DaemonEngine::subscribe_events(e).await,
+            Self::InProcess(e) => DaemonEngine::subscribe_events(e.as_ref()).await,
             Self::Socket(e) => e.subscribe_events().await,
         }
     }
