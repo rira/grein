@@ -375,8 +375,8 @@ fn test_nested_lists_blockquotes_and_fenced_code_blocks_with_pipes() {
         .spans
         .iter()
         .all(|s| s.style.fg == Some(Color::DarkGray)));
-    for idx in 5..=9 {
-        assert!(lines[idx]
+    for line in &lines[5..=9] {
+        assert!(line
             .spans
             .iter()
             .all(|s| s.style.fg == Some(Color::Yellow)));

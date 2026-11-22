@@ -260,6 +260,7 @@ pub trait DaemonEngine: Send + Sync {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 enum SessionListenerCmd {
     PrepareSolicited {
         reply_tx: oneshot::Sender<NodeId>,
@@ -453,10 +454,10 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn path_from_node_map<'a>(
+fn path_from_node_map(
     leaf_id: NodeId,
-    nodes_by_id: &'a HashMap<NodeId, ConversationNode>,
-) -> Vec<&'a ConversationNode> {
+    nodes_by_id: &HashMap<NodeId, ConversationNode>,
+) -> Vec<&ConversationNode> {
     let mut path = Vec::new();
     let mut cur = Some(leaf_id);
     let mut visited = HashSet::new();
@@ -957,7 +958,7 @@ fn spawn_session_listener(
                                 content: text,
                             });
                         }
-                        DriverEvent::ToolCall { tool_call_id, name, title, args, status: _, .. } => {
+                        DriverEvent::ToolCall { tool_call_id, name, title, args, .. } => {
                             if !solicited_in_flight {
                                 if !wakeup_active {
                                     wakeup_active = true;
@@ -1083,13 +1084,14 @@ fn spawn_session_listener(
                             let trimmed = title.trim();
                             if !trimmed.is_empty() {
                                 if let Ok(Some(current)) = runtime.storage.get_thread(tid) {
-                                    if current.title.trim().is_empty() || current.title.starts_with("Branch") {
-                                        if runtime.storage.update_thread_title(&tid, trimmed).is_ok() {
-                                            runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
-                                                thread_id: thread_id.clone(),
-                                                title: trimmed.to_string(),
-                                            });
-                                        }
+                                    if (current.title.trim().is_empty()
+                                        || current.title.starts_with("Branch"))
+                                        && runtime.storage.update_thread_title(&tid, trimmed).is_ok()
+                                    {
+                                        runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
+                                            thread_id: thread_id.clone(),
+                                            title: trimmed.to_string(),
+                                        });
                                     }
                                 }
                             }

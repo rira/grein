@@ -640,9 +640,9 @@ impl App {
                     .tree
                     .selected_index()
                     .and_then(|idx| self.tree.nodes.get(idx))
-                    .and_then(|node| match node {
-                        crate::ui::tree::TreeNode::Thread(t) => Some(t.id.clone()),
-                        crate::ui::tree::TreeNode::Anchor(a) => Some(a.thread_id.clone()),
+                    .map(|node| match node {
+                        crate::ui::tree::TreeNode::Thread(t) => t.id.clone(),
+                        crate::ui::tree::TreeNode::Anchor(a) => a.thread_id.clone(),
                     })
                     .unwrap_or_else(|| self.active_thread_id.clone());
                 self.request_delete_thread(target_id);

@@ -235,9 +235,9 @@ fn rebuild_tree_nodes(app: &mut App) {
         .tree
         .selected_index()
         .and_then(|idx| app.tree.nodes.get(idx))
-        .and_then(|node| match node {
-            crate::ui::tree::TreeNode::Thread(t) => Some(t.id.clone()),
-            crate::ui::tree::TreeNode::Anchor(a) => Some(a.thread_id.clone()),
+        .map(|node| match node {
+            crate::ui::tree::TreeNode::Thread(t) => t.id.clone(),
+            crate::ui::tree::TreeNode::Anchor(a) => a.thread_id.clone(),
         });
     let prev_selected = app.tree.selected_index();
     let prev_scroll = app.tree.scroll_offset;

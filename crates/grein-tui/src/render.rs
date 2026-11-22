@@ -34,7 +34,7 @@ fn thread_status_glyph(status: Option<&str>) -> (&'static str, Color) {
     }
 }
 
-fn selected_tree_thread<'a>(state: &'a AppState) -> Option<(&'a str, &'a str)> {
+fn selected_tree_thread(state: &AppState) -> Option<(&str, &str)> {
     let idx = state.tree.selected_index()?;
     if !state.tree.nodes.is_empty() {
         match state.tree.nodes.get(idx)? {
