@@ -22,144 +22,8 @@ pub fn border_style(is_focused: bool) -> Style {
     }
 }
 
-fn parse_inline_spans(mut text: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    while !text.is_empty() {
-        let bold_pos = text.find("**");
-        let code_pos = text.find('`');
-
-        match (bold_pos, code_pos) {
-            (Some(b), Some(c)) if b < c => {
-                if b > 0 {
-                    spans.push(Span::raw(text[..b].to_string()));
-                }
-                let rest = &text[b + 2..];
-                if let Some(end) = rest.find("**") {
-                    spans.push(Span::styled(
-                        rest[..end].to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
-                    text = &rest[end + 2..];
-                } else {
-                    spans.push(Span::raw(text[b..].to_string()));
-                    break;
-                }
-            }
-            (Some(b), Some(c)) if c < b => {
-                if c > 0 {
-                    spans.push(Span::raw(text[..c].to_string()));
-                }
-                let rest = &text[c + 1..];
-                if let Some(end) = rest.find('`') {
-                    spans.push(Span::styled(
-                        rest[..end].to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                    text = &rest[end + 1..];
-                } else {
-                    spans.push(Span::raw(text[c..].to_string()));
-                    break;
-                }
-            }
-            (Some(b), None) => {
-                if b > 0 {
-                    spans.push(Span::raw(text[..b].to_string()));
-                }
-                let rest = &text[b + 2..];
-                if let Some(end) = rest.find("**") {
-                    spans.push(Span::styled(
-                        rest[..end].to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
-                    text = &rest[end + 2..];
-                } else {
-                    spans.push(Span::raw(text[b..].to_string()));
-                    break;
-                }
-            }
-            (None, Some(c)) => {
-                if c > 0 {
-                    spans.push(Span::raw(text[..c].to_string()));
-                }
-                let rest = &text[c + 1..];
-                if let Some(end) = rest.find('`') {
-                    spans.push(Span::styled(
-                        rest[..end].to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                    text = &rest[end + 1..];
-                } else {
-                    spans.push(Span::raw(text[c..].to_string()));
-                    break;
-                }
-            }
-            (None, None) => {
-                spans.push(Span::raw(text.to_string()));
-                break;
-            }
-            (Some(_), Some(_)) => unreachable!(),
-        }
-    }
-    spans
-}
-
 pub fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code_block = false;
-    for line in markdown.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-            continue;
-        }
-        if in_code_block {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::Yellow),
-            )));
-            continue;
-        }
-        if let Some(h1) = trimmed.strip_prefix("# ") {
-            lines.push(Line::from(vec![Span::styled(
-                h1.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
-        } else if let Some(h2) = trimmed.strip_prefix("## ") {
-            lines.push(Line::from(vec![Span::styled(
-                h2.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
-        } else if let Some(h3) = trimmed.strip_prefix("### ") {
-            lines.push(Line::from(vec![Span::styled(
-                h3.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )]));
-        } else if let Some(quote) = trimmed.strip_prefix("> ") {
-            lines.push(Line::from(vec![Span::styled(
-                quote.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )]));
-        } else if let Some(bullet) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            let mut spans = vec![Span::raw("• ")];
-            spans.extend(parse_inline_spans(bullet));
-            lines.push(Line::from(spans));
-        } else if trimmed.is_empty() {
-            lines.push(Line::raw(""));
-        } else {
-            lines.push(Line::from(parse_inline_spans(line)));
-        }
-    }
-    if lines.is_empty() && !markdown.is_empty() {
-        lines.push(Line::raw(markdown.to_string()));
-    }
-    lines
+    crate::markdown::render_markdown_lines(markdown)
 }
 
 fn thread_status_glyph(status: Option<&str>) -> (&'static str, Color) {
@@ -637,9 +501,11 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
             }
         }
     }
-    transcript_lines.extend(render_markdown_lines(&state.active_transcript_md));
-
     let transcript_inner_width = layout.transcript_area.width.saturating_sub(2);
+    transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
+        &state.active_transcript_md,
+        transcript_inner_width as usize,
+    ));
     let transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
     let visual_lines = wrapped_line_count(&transcript_lines, transcript_inner_width);
     let max_scroll_u16 = visual_lines

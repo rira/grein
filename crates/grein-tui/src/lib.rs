@@ -8,6 +8,7 @@ pub mod engine_port;
 pub mod events;
 pub mod focus;
 pub mod layout;
+pub mod markdown;
 pub mod pager;
 pub mod pane;
 pub mod panes;
