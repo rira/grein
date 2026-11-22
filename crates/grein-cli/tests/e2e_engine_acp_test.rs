@@ -5,7 +5,7 @@ use std::time::Duration;
 use grein_cli::engine::{
     AcpBackendConfig, DaemonEngine, InProcessEngine, PermissionDecisionPayload,
 };
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_tui::engine_port::{SubagentStatus, TuiEngineEvent};
 use tokio::time::timeout;
 
 fn fake_acp_script_path() -> PathBuf {
@@ -279,6 +279,167 @@ async fn test_e2e_permissions_approve_deny_cancel_and_shell_command() {
         TuiEngineEvent::ShellOutput { ref stdout, exit_code, .. }
             if stdout.trim() == "hello-shell" && exit_code == 0
     ));
+}
+
+#[tokio::test]
+async fn test_e2e_unsolicited_subagent_wakeup_persistence_branch_local_and_delete_thread() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("wakeup.db");
+    let cfg = fake_acp_config(temp.path());
+
+    let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg.clone()))
+        .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("ensure main");
+
+    // Seed Main with a trunk turn before spawning background subagent wakeup.
+    engine
+        .send_turn_for_thread(&main.thread_id, "trunk-seed-question")
+        .await
+        .expect("seed turn");
+
+    let mut rx = engine.subscribe_tui_events();
+    let main_id = main.thread_id.clone();
+    let collector = tokio::spawn(async move {
+        let mut saw_subagent = false;
+        let mut completed_count = 0usize;
+        let mut streamed = String::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_secs(5), rx.recv()).await {
+            match ev {
+                TuiEngineEvent::SubagentUpdated {
+                    ref thread_id,
+                    ref subagent,
+                } if thread_id == &main_id => {
+                    if subagent.role == "Background Code Checker"
+                        && subagent.agent_type == "research"
+                        && matches!(
+                            subagent.status,
+                            SubagentStatus::Running | SubagentStatus::Completed
+                        )
+                    {
+                        saw_subagent = true;
+                    }
+                }
+                TuiEngineEvent::StreamChunk {
+                    ref thread_id,
+                    ref content,
+                } if thread_id == &main_id => {
+                    streamed.push_str(content);
+                }
+                TuiEngineEvent::TurnCompleted { ref thread_id } if thread_id == &main_id => {
+                    completed_count += 1;
+                    if completed_count >= 2 && streamed.contains("WAKEUP_OK") {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (saw_subagent, completed_count, streamed)
+    });
+
+    engine
+        .send_turn_for_thread(&main.thread_id, "SPAWN_SUBAGENT_WAKEUP")
+        .await
+        .expect("spawn wakeup turn");
+
+    let (saw_subagent, completed_count, streamed) = timeout(Duration::from_secs(6), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+    assert!(saw_subagent, "expected SubagentUpdated event from invoke_subagent");
+    assert!(completed_count >= 2, "expected solicited + wakeup TurnCompleted, got {completed_count}");
+    assert!(streamed.contains("Spawned background subagent."));
+    assert!(streamed.contains("WAKEUP_OK: background subagent finished"));
+
+    // Verify SQLite persistence across full engine reopen.
+    drop(engine);
+    let reopened =
+        InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg.clone()))
+            .expect("reopen engine");
+    let persisted_main = reopened
+        .get_thread_transcript(&main.thread_id)
+        .await
+        .expect("persisted main transcript");
+    assert!(
+        persisted_main
+            .iter()
+            .any(|t| t.role == "assistant" && t.content.contains("WAKEUP_OK: background subagent finished")),
+        "unsolicited wakeup output must persist in SQLite across reopen: {persisted_main:?}"
+    );
+
+    // Fork a branch and verify branch-local turns + ThreadMeta parent/inherited count.
+    let fork = reopened
+        .fork_thread_with_title(Some(&main.thread_id), Some("side-fork"))
+        .await
+        .expect("fork branch");
+    let fork_initial = reopened
+        .get_thread_transcript(&fork.thread_id)
+        .await
+        .expect("fork initial transcript");
+    assert!(
+        fork_initial.is_empty(),
+        "forked branch must load only branch-local turns initially, got: {fork_initial:?}"
+    );
+
+    let meta = reopened.thread_metadata().await.expect("thread metadata");
+    let fork_meta = meta
+        .iter()
+        .find(|m| m.thread_id == fork.thread_id)
+        .expect("fork metadata");
+    assert_eq!(fork_meta.parent_thread_id.as_deref(), Some(main.thread_id.as_str()));
+    assert!(
+        fork_meta.inherited_turn_count >= 4,
+        "expected >= 4 inherited trunk turns above fork point, got {}",
+        fork_meta.inherited_turn_count
+    );
+
+    reopened
+        .send_turn_for_thread(&fork.thread_id, "branch-only-question")
+        .await
+        .expect("fork turn");
+    let fork_after = reopened
+        .get_thread_transcript(&fork.thread_id)
+        .await
+        .expect("fork branch-local transcript");
+    assert!(fork_after.iter().any(|t| t.content == "branch-only-question"));
+    assert!(
+        !fork_after.iter().any(|t| t.content == "trunk-seed-question"),
+        "ancestor trunk turns must not duplicate inside forked transcript: {fork_after:?}"
+    );
+
+    // Delete forked branch (verify ThreadDeleted event), then verify sole-thread guard on Main.
+    let mut del_rx = reopened.subscribe_tui_events();
+    let next_active = reopened
+        .delete_thread(&fork.thread_id)
+        .await
+        .expect("delete forked branch");
+    assert_eq!(next_active, main.thread_id);
+
+    let mut saw_deleted = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(500), del_rx.recv()).await {
+        if let TuiEngineEvent::ThreadDeleted {
+            ref thread_id,
+            ref next_active_thread_id,
+        } = ev
+        {
+            if thread_id == &fork.thread_id && next_active_thread_id == &main.thread_id {
+                saw_deleted = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_deleted, "expected ThreadDeleted event");
+    assert_eq!(reopened.list_threads().await.expect("threads").len(), 1);
+    assert!(
+        reopened.delete_thread(&main.thread_id).await.is_err(),
+        "deleting sole remaining thread must be refused"
+    );
+
+    drop(reopened);
+    let reopened_again =
+        InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+            .expect("reopen after delete");
+    assert_eq!(reopened_again.list_threads().await.expect("threads").len(), 1);
 }
 
 #[tokio::test]
