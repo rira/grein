@@ -190,6 +190,7 @@ pub struct App {
     pub blackboard_selected: usize,
     pub input_buffer: String,
     pub cursor_position: usize,
+    pub kill_ring: String,
     pub should_quit: bool,
     pub active_transcript_md: String,
     pub threads: Vec<ThreadItem>,
@@ -231,6 +232,7 @@ impl Default for App {
             blackboard_selected: 0,
             input_buffer: String::new(),
             cursor_position: 0,
+            kill_ring: String::new(),
             should_quit: false,
             active_transcript_md: String::new(),
             threads: Vec::new(),
@@ -258,6 +260,71 @@ impl Default for App {
             status_notice: None,
         }
     }
+}
+
+fn clamp_char_boundary(buf: &str, pos: usize) -> usize {
+    let mut idx = pos.min(buf.len());
+    while idx > 0 && !buf.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+pub fn line_start(buf: &str, pos: usize) -> usize {
+    let pos = clamp_char_boundary(buf, pos);
+    match buf[..pos].rfind('\n') {
+        Some(nl) => nl + 1,
+        None => 0,
+    }
+}
+
+pub fn line_end(buf: &str, pos: usize) -> usize {
+    let pos = clamp_char_boundary(buf, pos);
+    match buf[pos..].find('\n') {
+        Some(rel) => pos + rel,
+        None => buf.len(),
+    }
+}
+
+pub fn prev_word_boundary(buf: &str, pos: usize) -> usize {
+    let mut idx = clamp_char_boundary(buf, pos);
+    let mut iter = buf[..idx].char_indices().rev().peekable();
+    while let Some(&(byte_idx, ch)) = iter.peek() {
+        if is_word_char(ch) {
+            break;
+        }
+        idx = byte_idx;
+        iter.next();
+    }
+    while let Some(&(byte_idx, ch)) = iter.peek() {
+        if !is_word_char(ch) {
+            break;
+        }
+        idx = byte_idx;
+        iter.next();
+    }
+    idx
+}
+
+pub fn next_word_boundary(buf: &str, pos: usize) -> usize {
+    let mut idx = clamp_char_boundary(buf, pos);
+    for ch in buf[idx..].chars() {
+        if is_word_char(ch) {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    for ch in buf[idx..].chars() {
+        if !is_word_char(ch) {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
 }
 
 impl App {
@@ -471,7 +538,7 @@ impl App {
     }
 
     pub fn composer_cursor_2d(&self) -> (u16, u16) {
-        let clamped_pos = self.cursor_position.min(self.input_buffer.len());
+        let clamped_pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
         let prefix = &self.input_buffer[..clamped_pos];
         let row = prefix.bytes().filter(|&b| b == b'\n').count() as u16;
         let col = match prefix.rfind('\n') {
@@ -730,6 +797,158 @@ impl App {
         }
     }
 
+    fn kill_range(&mut self, start: usize, end: usize) {
+        let start = clamp_char_boundary(&self.input_buffer, start);
+        let end = clamp_char_boundary(&self.input_buffer, end);
+        if end > start {
+            self.kill_ring = self.input_buffer.drain(start..end).collect();
+        }
+        self.cursor_position = start;
+    }
+
+    fn handle_key_composer(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
+
+        match (key.code, ctrl, alt) {
+            (KeyCode::Enter, _, _) => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.input_buffer.insert(pos, '\n');
+                    self.cursor_position = pos + 1;
+                } else {
+                    let prompt = std::mem::take(&mut self.input_buffer);
+                    self.cursor_position = 0;
+                    self.submit_composer_prompt(prompt);
+                }
+                true
+            }
+            (KeyCode::Char('j' | 'J'), true, false) => {
+                self.input_buffer.insert(pos, '\n');
+                self.cursor_position = pos + 1;
+                true
+            }
+            (KeyCode::Char('a' | 'A'), true, false) | (KeyCode::Home, false, false) => {
+                self.cursor_position = line_start(&self.input_buffer, pos);
+                true
+            }
+            (KeyCode::Char('e' | 'E'), true, false) | (KeyCode::End, false, false) => {
+                self.cursor_position = line_end(&self.input_buffer, pos);
+                true
+            }
+            (KeyCode::Char('f' | 'F'), true, false) => {
+                self.cursor_position = match self.input_buffer[pos..].chars().next() {
+                    Some(ch) => pos + ch.len_utf8(),
+                    None => pos,
+                };
+                true
+            }
+            (KeyCode::Char('d' | 'D'), true, false) => {
+                self.cursor_position = pos;
+                if pos < self.input_buffer.len() {
+                    self.input_buffer.remove(pos);
+                }
+                true
+            }
+            (KeyCode::Char('k' | 'K'), true, false) => {
+                let end = line_end(&self.input_buffer, pos);
+                let kill_end = if pos < end {
+                    end
+                } else if pos < self.input_buffer.len() {
+                    pos + 1
+                } else {
+                    pos
+                };
+                self.kill_range(pos, kill_end);
+                true
+            }
+            (KeyCode::Char('u' | 'U'), true, false) => {
+                let start = line_start(&self.input_buffer, pos);
+                let kill_start = if pos > start {
+                    start
+                } else if pos > 0 {
+                    pos - 1
+                } else {
+                    pos
+                };
+                self.kill_range(kill_start, pos);
+                true
+            }
+            (KeyCode::Char('w' | 'W'), true, false) | (KeyCode::Backspace, false, true) => {
+                let start = prev_word_boundary(&self.input_buffer, pos);
+                self.kill_range(start, pos);
+                true
+            }
+            (KeyCode::Char('d' | 'D'), false, true)
+            | (KeyCode::Delete, true, false)
+            | (KeyCode::Delete, false, true) => {
+                let end = next_word_boundary(&self.input_buffer, pos);
+                self.kill_range(pos, end);
+                true
+            }
+            (KeyCode::Left, true, false)
+            | (KeyCode::Left, false, true)
+            | (KeyCode::Char('b' | 'B'), false, true) => {
+                self.cursor_position = prev_word_boundary(&self.input_buffer, pos);
+                true
+            }
+            (KeyCode::Right, true, false)
+            | (KeyCode::Right, false, true)
+            | (KeyCode::Char('f' | 'F'), false, true) => {
+                self.cursor_position = next_word_boundary(&self.input_buffer, pos);
+                true
+            }
+            (KeyCode::Char('y' | 'Y'), true, false) => {
+                if !self.kill_ring.is_empty() {
+                    self.input_buffer.insert_str(pos, &self.kill_ring);
+                    self.cursor_position = pos + self.kill_ring.len();
+                } else {
+                    self.cursor_position = pos;
+                }
+                true
+            }
+            (KeyCode::Char(c), false, false) => {
+                self.input_buffer.insert(pos, c);
+                self.cursor_position = pos + c.len_utf8();
+                true
+            }
+            (KeyCode::Backspace, false, false) if pos > 0 => {
+                if let Some((idx, _)) = self.input_buffer[..pos].char_indices().next_back() {
+                    self.input_buffer.remove(idx);
+                    self.cursor_position = idx;
+                    true
+                } else {
+                    false
+                }
+            }
+            (KeyCode::Delete, false, false) if pos < self.input_buffer.len() => {
+                self.input_buffer.remove(pos);
+                self.cursor_position = pos;
+                true
+            }
+            (KeyCode::Left, false, false) if pos > 0 => {
+                if let Some((idx, _)) = self.input_buffer[..pos].char_indices().next_back() {
+                    self.cursor_position = idx;
+                    true
+                } else {
+                    false
+                }
+            }
+            (KeyCode::Right, false, false) if pos < self.input_buffer.len() => {
+                if let Some(ch) = self.input_buffer[pos..].chars().next() {
+                    self.cursor_position = pos + ch.len_utf8();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         self.sync_focus_in();
 
@@ -820,14 +1039,6 @@ impl App {
                 self.focus_prev();
                 return true;
             }
-            KeyCode::Char('[') if self.focused_pane != FocusedPane::Composer => {
-                self.set_blackboard_collapsed(true);
-                return true;
-            }
-            KeyCode::Char(']') if self.focused_pane != FocusedPane::Composer => {
-                self.set_blackboard_collapsed(false);
-                return true;
-            }
             KeyCode::Esc => {
                 let status = self
                     .thread_statuses
@@ -847,32 +1058,20 @@ impl App {
                     return true;
                 }
             }
-            KeyCode::Enter if self.focused_pane == FocusedPane::Composer => {
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
-                {
-                    self.input_buffer.insert(self.cursor_position, '\n');
-                    self.cursor_position += 1;
-                    self.sync_focus_out();
-                    return true;
-                }
-                let prompt = std::mem::take(&mut self.input_buffer);
-                self.cursor_position = 0;
-                self.submit_composer_prompt(prompt);
+            _ if self.focused_pane == FocusedPane::Composer => {
+                let handled = self.handle_key_composer(key);
                 self.sync_focus_out();
+                return handled;
+            }
+            KeyCode::Char('[') => {
+                self.set_blackboard_collapsed(true);
                 return true;
             }
-            KeyCode::Char('j') | KeyCode::Char('J')
-                if self.focused_pane == FocusedPane::Composer
-                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.input_buffer.insert(self.cursor_position, '\n');
-                self.cursor_position += 1;
-                self.sync_focus_out();
+            KeyCode::Char(']') => {
+                self.set_blackboard_collapsed(false);
                 return true;
             }
-            KeyCode::Char('q') if self.focused_pane != FocusedPane::Composer => {
+            KeyCode::Char('q') => {
                 self.should_quit = true;
                 self.sync_focus_out();
                 return true;
@@ -911,66 +1110,6 @@ impl App {
                 let active = self.active_thread_id.clone();
                 self.transcript_viewport_mut(&active).scroll_to_bottom();
                 self.sync_focus_out();
-                return true;
-            }
-            KeyCode::Char(c) if self.focused_pane == FocusedPane::Composer => {
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                {
-                    self.input_buffer.insert(self.cursor_position, c);
-                    self.cursor_position += c.len_utf8();
-                    self.sync_focus_out();
-                    return true;
-                }
-            }
-            KeyCode::Backspace
-                if self.focused_pane == FocusedPane::Composer && self.cursor_position > 0 =>
-            {
-                if let Some((idx, _)) = self.input_buffer[..self.cursor_position]
-                    .char_indices()
-                    .next_back()
-                {
-                    self.input_buffer.remove(idx);
-                    self.cursor_position = idx;
-                    self.sync_focus_out();
-                    return true;
-                }
-            }
-            KeyCode::Delete
-                if self.focused_pane == FocusedPane::Composer
-                    && self.cursor_position < self.input_buffer.len() =>
-            {
-                self.input_buffer.remove(self.cursor_position);
-                self.sync_focus_out();
-                return true;
-            }
-            KeyCode::Left
-                if self.focused_pane == FocusedPane::Composer && self.cursor_position > 0 =>
-            {
-                if let Some((idx, _)) = self.input_buffer[..self.cursor_position]
-                    .char_indices()
-                    .next_back()
-                {
-                    self.cursor_position = idx;
-                    return true;
-                }
-            }
-            KeyCode::Right
-                if self.focused_pane == FocusedPane::Composer
-                    && self.cursor_position < self.input_buffer.len() =>
-            {
-                if let Some(ch) = self.input_buffer[self.cursor_position..].chars().next() {
-                    self.cursor_position += ch.len_utf8();
-                    return true;
-                }
-            }
-            KeyCode::Home if self.focused_pane == FocusedPane::Composer => {
-                self.cursor_position = 0;
-                return true;
-            }
-            KeyCode::End if self.focused_pane == FocusedPane::Composer => {
-                self.cursor_position = self.input_buffer.len();
                 return true;
             }
             _ => {

@@ -399,41 +399,25 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
 }
 
 fn render_help_modal(f: &mut Frame, area: Rect) {
-    let popup_width = area.width.saturating_sub(6).clamp(30, 74).min(area.width);
-    let popup_height = 20u16.min(area.height.max(1));
-    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
-    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
-
-    f.render_widget(Clear, popup_area);
-    let block = Block::default()
-        .title(" Keybindings & Commands ")
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-
     let key_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let rows = [
         ("Tab/Shift+Tab", "Cycle focus across panes"),
         ("Esc", "Cancel streaming turn, or focus Tree"),
-        ("Enter", "Send prompt / activate Tree item"),
-        ("Shift+Enter", "Insert newline in Composer"),
+        ("Shift+Enter", "Newline in Composer (Enter sends/activates)"),
+        ("Ctrl+A / Ctrl+E", "Move to line start / end (Home / End)"),
+        ("Alt+← / Alt+→", "Move by word (Ctrl+←/→, Alt+B / Alt+F)"),
+        ("Ctrl+K / U / W", "Kill to end / start / prev word (Alt+D next)"),
+        ("Ctrl+Y / Ctrl+D", "Yank kill ring / delete char (Ctrl+F next)"),
         ("!cmd", "Run shell command in active context"),
         ("/fork, /grein", "Fork new child context (/branch)"),
         ("/merge", "Merge active branch into parent"),
         ("/close, /delete", "Close active fork (>1 context)"),
         ("/wb set|del", "Upsert or delete Blackboard entry"),
         ("/?, /help, ?", "Open this keybindings help modal"),
-        ("x / d (Tree)", "Close selected fork (>1 context)"),
-        ("f / m (Tree)", "Fork / Merge selected context"),
-        ("j / k / ↑ / ↓", "Navigate Tree / Blackboard / Transcript"),
-        ("Ctrl+B / [ / ]", "Toggle / collapse / expand Blackboard"),
-        ("Ctrl+N", "Quick-fork new child context"),
+        ("x/d, f/m, ↑/↓", "Tree close/fork/merge; j/k/↑/↓ navigate"),
+        ("Ctrl+N / Ctrl+B", "Quick-fork / toggle Blackboard ([ / ])"),
         ("Ctrl+C / Ctrl+Q", "Quit application"),
     ];
     let mut lines: Vec<Line<'static>> = rows
@@ -450,6 +434,22 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         " Press Esc, q, ?, or Enter to close",
         Style::default().fg(Color::DarkGray),
     )));
+
+    let popup_width = area.width.saturating_sub(6).clamp(30, 74).min(area.width);
+    let popup_height = (lines.len() as u16 + 2).min(area.height.max(1));
+    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(" Keybindings & Commands ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
     let widget = Paragraph::new(lines)
         .block(block)
