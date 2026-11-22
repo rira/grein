@@ -1212,25 +1212,30 @@ done
         port.pty_resize(&term.id, 30, 110)
             .await
             .expect("pty_resize");
-        port.pty_write(&term.id, b"printf 'PORT_%s\\n' \"$(pwd)\"\n".to_vec())
+        port.pty_write(&term.id, b"printf '\\nPORT_%s\\n' \"$(pwd)\"\n".to_vec())
             .await
             .expect("pty_write");
 
         let expected = format!("PORT_{wt_path}");
         let mut saw_output = false;
-        for _ in 0..50 {
+        let mut last_screen = String::new();
+        for _ in 0..150 {
             let snap = port
                 .pty_snapshot(&term.id, 30, 110)
                 .await
                 .expect("pty_snapshot");
             assert_eq!(snap.rows, 30);
             assert_eq!(snap.cols, 110);
-            if snap.plain_text().lines().any(|l| l.trim() == expected) {
+            last_screen = snap.plain_text();
+            if last_screen.lines().any(|l| l.trim() == expected) {
                 saw_output = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        assert!(saw_output, "EngineClientPort must drive PTY in worktree cwd");
+        assert!(
+            saw_output,
+            "EngineClientPort must drive PTY in worktree cwd; last screen:\n{last_screen}"
+        );
     }
 }

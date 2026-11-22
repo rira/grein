@@ -257,7 +257,7 @@ done
     engine
         .pty_write(
             &child_term.thread_id,
-            b"printf 'TERM_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+            b"printf '\\nTERM_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
         )
         .await
         .expect("pty_write");
@@ -392,7 +392,7 @@ async fn test_create_terminal_coalesced_events_exit_and_guardrails_without_acp()
     engine
         .pty_write(
             &term.thread_id,
-            b"i=1; while [ \"$i\" -le 40 ]; do printf \"BURST_%s\\n\" \"$i\"; i=$((i+1)); done; exit 9\n".to_vec(),
+            b"printf '\\n'; i=1; while [ \"$i\" -le 40 ]; do printf \"BURST_%s\\n\" \"$i\"; i=$((i+1)); done; exit 9\n".to_vec(),
         )
         .await
         .expect("pty_write burst and exit");
@@ -499,7 +499,7 @@ async fn test_cold_reopen_lazy_respawn_and_delete_kills_pty_child() {
     reopened
         .pty_write(
             &term_id,
-            b"printf 'LAZY_PWD=%s PID=%s\\n' \"$(pwd)\" \"$$\" && sleep 60\n".to_vec(),
+            b"printf '\\nLAZY_PWD=%s PID=%s\\n' \"$(pwd)\" \"$$\" && sleep 60\n".to_vec(),
         )
         .await
         .expect("pty_write");
@@ -631,7 +631,7 @@ done
 
     timeout(
         Duration::from_millis(400),
-        client.pty_write(&term.thread_id, b"printf 'FAST_%s\\n' 'NONBLOCK'\n".to_vec()),
+        client.pty_write(&term.thread_id, b"printf '\\nFAST_%s\\n' 'NONBLOCK'\n".to_vec()),
     )
     .await
     .expect("pty_write must not stall behind send_turn")

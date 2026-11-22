@@ -356,13 +356,14 @@ mod tests {
         assert_eq!(resize_rpc["result"]["ok"], true);
 
         let write_rpc = raw_client
-            .session_pty_write(&term_id, b"printf 'RPC_%s\\n' 'TERM_OK'\n")
+            .session_pty_write(&term_id, b"printf '\\nRPC_%s\\n' 'TERM_OK'\n")
             .await
             .expect("session_pty_write");
         assert_eq!(write_rpc["result"]["ok"], true);
 
         let mut saw_rpc_term_ok = false;
-        for _ in 0..50 {
+        let mut last_screen = String::new();
+        for _ in 0..150 {
             let snap_rpc = raw_client
                 .session_pty_snapshot(&term_id, 26, 96)
                 .await
@@ -371,13 +372,17 @@ mod tests {
                 serde_json::from_value(snap_rpc["result"].clone()).expect("decode PtyScreenSnapshot");
             assert_eq!(snap.rows, 26);
             assert_eq!(snap.cols, 96);
-            if snap.plain_text().lines().any(|l| l.trim() == "RPC_TERM_OK") {
+            last_screen = snap.plain_text();
+            if last_screen.lines().any(|l| l.trim() == "RPC_TERM_OK") {
                 saw_rpc_term_ok = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        assert!(saw_rpc_term_ok, "DaemonClient PTY RPCs must drive live PTY");
+        assert!(
+            saw_rpc_term_ok,
+            "DaemonClient PTY RPCs must drive live PTY; last screen:\n{last_screen}"
+        );
 
         let wt_err_rpc = raw_client
             .session_ensure_thread_worktree(&term_id)

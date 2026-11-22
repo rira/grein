@@ -66,7 +66,7 @@ fn test_spawn_in_temp_dir_renders_pwd() {
             .expect("spawn pty session");
 
     assert!(session.child_pid() > 0);
-    session.write_bytes(b"pwd\n").expect("write pwd");
+    session.write_bytes(b"printf '\\n'; pwd\n").expect("write pwd");
 
     let snap = signal.wait_for(&session, Duration::from_secs(5), |s| {
         s.plain_text()
@@ -89,7 +89,7 @@ fn test_stateful_shell_persists_env_and_cwd() {
         .write_bytes(b"export GREIN_PTY_TEST=ok123\n")
         .expect("export env var");
     session
-        .write_bytes(b"echo ENV_VAL=$GREIN_PTY_TEST\n")
+        .write_bytes(b"printf '\\nENV_VAL=%s\\n' \"$GREIN_PTY_TEST\"\n")
         .expect("echo env var");
 
     signal.wait_for(&session, Duration::from_secs(5), |s| {
@@ -98,7 +98,7 @@ fn test_stateful_shell_persists_env_and_cwd() {
             .any(|line| line.trim() == "ENV_VAL=ok123")
     });
 
-    session.write_bytes(b"cd / && pwd\n").expect("cd root");
+    session.write_bytes(b"cd / && printf '\\n' && pwd\n").expect("cd root");
     signal.wait_for(&session, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|line| line.trim() == "/")
     });
@@ -113,7 +113,7 @@ fn test_ctrl_c_interrupts_sleep_and_keeps_shell_alive() {
             .expect("spawn pty session");
 
     session
-        .write_bytes(b"echo SLEEP_READY && sleep 30\n")
+        .write_bytes(b"printf '\\nSLEEP_%s\\n' READY && sleep 30\n")
         .expect("start sleep");
     signal.wait_for(&session, Duration::from_secs(5), |s| {
         s.plain_text()
@@ -126,7 +126,7 @@ fn test_ctrl_c_interrupts_sleep_and_keeps_shell_alive() {
     session.write_bytes(b"\x03").expect("send ctrl-c");
     std::thread::sleep(Duration::from_millis(120));
     session
-        .write_bytes(b"echo AFTER_CTRL_C\n")
+        .write_bytes(b"printf '\\nAFTER_%s\\n' CTRL_C\n")
         .expect("echo marker after ctrl-c");
 
     signal.wait_for(&session, Duration::from_secs(5), |s| {
@@ -161,7 +161,7 @@ fn test_dynamic_resize_updates_snapshot_and_tty_winsize() {
     assert_eq!(resized.cells[0].len(), 110);
 
     session
-        .write_bytes(b"stty size\n")
+        .write_bytes(b"printf '\\n'; stty size\n")
         .expect("query stty size");
     signal.wait_for(&session, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|line| line.trim() == "42 110")
@@ -220,7 +220,7 @@ fn test_drop_kills_process_group_and_reaps_cleanly() {
 
     let pid = session.child_pid();
     session
-        .write_bytes(b"echo SLEEP_GROUP_ACTIVE && sleep 60\n")
+        .write_bytes(b"printf '\\nSLEEP_GROUP_%s\\n' ACTIVE && sleep 60\n")
         .expect("start long sleep");
     signal.wait_for(&session, Duration::from_secs(5), |s| {
         s.plain_text()
