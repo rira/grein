@@ -977,6 +977,8 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
             "Borderless zoomed Transcript row {idx} must not have right │ border: {row:?}"
         );
     }
+    assert!(zoomed_transcript.contains("✦ Explanation:"));
+    assert!(!zoomed_transcript.contains("Assistant"));
     assert!(zoomed_transcript.contains("fn demo() {}"));
 
     app.submit_composer_prompt("/zoom");
@@ -1008,6 +1010,8 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
     app.submit_composer_prompt("/copy all");
     let copied_all = app.last_copied_text.as_deref().unwrap_or("");
     assert!(copied_all.contains("Show snippet"));
+    assert!(copied_all.contains("✦ Explanation:"));
+    assert!(!copied_all.contains("Assistant"));
     assert!(copied_all.contains("fn demo() {}"));
 }
 

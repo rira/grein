@@ -273,12 +273,16 @@ fn test_latest_assistant_text_latest_code_block_and_plain_text() {
 
     let plain = t.full_plain_text();
     assert!(plain.contains("Show examples"));
-    assert!(plain.contains("And nested markdown:"));
+    assert!(plain.contains("✦ Here is Python:\n~~~python\nprint('hi')\n~~~"));
+    assert!(plain.contains("✦ And nested markdown:\n````markdown\n```rust\nfn main() {}\n```\n````\nDone."));
+    assert!(!plain.contains("Assistant"));
     assert!(plain.contains("green_out"));
     assert!(!plain.contains("\x1b[32m"));
     assert!(plain.contains("err_line"));
     assert!(plain.contains("Joined branch alpha"));
     assert!(plain.contains("Something failed"));
+    assert!(!t.latest_assistant_text().unwrap().contains('✦'));
+    assert!(!t.latest_code_block().unwrap().contains('✦'));
 }
 
 #[test]
@@ -321,16 +325,22 @@ fn test_render_lines_user_assistant_join_error_and_tool_cards() {
     assert_eq!(user_line1.spans[0].style.fg, Some(Color::Green));
     assert_eq!(user_line1.spans[1].style.fg, Some(Color::Green));
 
-    // AssistantMarkdown: bold Assistant heading + rendered markdown
-    let asst_heading = rendered
+    // AssistantMarkdown: inline cyan bold ✦ accent on prose, zero "Assistant" header
+    assert!(
+        texts.iter().all(|l| !l.contains("Assistant")),
+        "Transcript must not render Assistant header: {texts:?}"
+    );
+    let asst_line = rendered
         .iter()
-        .find(|l| line_text(l) == "Assistant")
-        .expect("Assistant heading missing");
-    assert!(asst_heading
-        .spans
-        .iter()
-        .all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
-    assert!(texts.iter().any(|l| l == "Hello world"));
+        .find(|l| line_text(l) == "✦ Hello world")
+        .expect("Inline ✦ Assistant prose line missing");
+    assert_eq!(asst_line.spans[0].content, "✦ ");
+    assert_eq!(asst_line.spans[0].style.fg, Some(Color::Cyan));
+    assert!(asst_line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(asst_line.spans[1].content, "Hello ");
+    assert_eq!(asst_line.spans[1].style.fg, None);
+    assert_eq!(asst_line.spans[2].content, "world");
+    assert!(asst_line.spans[2].style.add_modifier.contains(Modifier::BOLD));
 
     // Running ToolCall: yellow ⚙ grep + DarkGray (pattern)
     let running_line = rendered
@@ -512,4 +522,162 @@ fn test_clipboard_osc52_and_tmux_passthrough_and_headless_safety() {
 
     // Must not panic in headless test environments
     let _ = copy_to_clipboard("hello clipboard");
+}
+
+#[test]
+fn test_assistant_markdown_inline_accent_and_exact_width_wrapping() {
+    // 18-char prose fits with 2-col "✦ " at width 20 on one line
+    let mut fits = ThreadTranscript::new();
+    fits.append_assistant_chunk("Alpha beta gamma12");
+    let fits_lines = fits.render_lines(20);
+    assert_eq!(lines_text(&fits_lines), vec!["✦ Alpha beta gamma12"]);
+    assert_eq!(fits_lines[0].spans[0].content, "✦ ");
+    assert_eq!(fits_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(fits_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+
+    // 19-char prose overflows width 20 once "✦ " is prepended; wraps without clipping last 2 chars
+    let mut wraps = ThreadTranscript::new();
+    wraps.append_assistant_chunk("Alpha beta gamma123\nSecond line");
+    let wrapped_lines = wraps.render_lines(20);
+    let wrapped_texts = lines_text(&wrapped_lines);
+    assert_eq!(
+        wrapped_texts,
+        vec!["✦ Alpha beta", "gamma123", "Second line"]
+    );
+    for line in &wrapped_lines {
+        assert!(
+            line.width() <= 20,
+            "line exceeded width 20: {:?}",
+            line_text(line)
+        );
+    }
+    assert_eq!(wrapped_lines[0].spans[0].content, "✦ ");
+    assert_eq!(wrapped_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(wrapped_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+
+    // Single 19-char token wraps cleanly without clipping trailing characters
+    let mut long_word = ThreadTranscript::new();
+    long_word.append_assistant_chunk("1234567890123456789");
+    let long_word_lines = long_word.render_lines(20);
+    assert_eq!(
+        lines_text(&long_word_lines),
+        vec!["✦", "1234567890123456789"]
+    );
+    for line in &long_word_lines {
+        assert!(line.width() <= 20);
+    }
+
+    // Heading on first line keeps heading bold styling alongside cyan bold ✦
+    let mut heading = ThreadTranscript::new();
+    heading.append_assistant_chunk("# Auth Overview");
+    let heading_lines = heading.render_lines(40);
+    assert_eq!(lines_text(&heading_lines), vec!["✦ Auth Overview"]);
+    assert_eq!(heading_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(heading_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert!(heading_lines[0].spans[1]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+
+    // Width 0 renders without wrapping or panic
+    let zero_w = fits.render_lines(0);
+    assert_eq!(lines_text(&zero_w), vec!["✦ Alpha beta gamma12"]);
+}
+
+#[test]
+fn test_assistant_markdown_code_fence_empty_and_plain_text_contracts() {
+    // Code block starting with ```rust puts standalone ✦ above flush column-0 code block
+    let mut backtick = ThreadTranscript::new();
+    backtick.append_assistant_chunk("```rust\nfn main() {}\n```");
+    let bt_lines = backtick.render_lines(80);
+    let bt_texts = lines_text(&bt_lines);
+    assert_eq!(bt_texts[0], "✦");
+    assert_eq!(bt_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(bt_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(bt_texts[1], "╭─ rust ─");
+    assert_eq!(bt_texts[2], "fn main() {}");
+    assert_eq!(bt_texts[3], "╰───");
+    assert_eq!(
+        backtick.full_plain_text(),
+        "✦\n```rust\nfn main() {}\n```"
+    );
+    assert_eq!(
+        backtick.latest_assistant_text().as_deref(),
+        Some("```rust\nfn main() {}\n```")
+    );
+    assert_eq!(
+        backtick.latest_code_block().as_deref(),
+        Some("fn main() {}")
+    );
+
+    // Code block starting at byte 0 with ~~~ puts standalone ✦ directly above flush code block
+    let mut tilde_byte0 = ThreadTranscript::new();
+    tilde_byte0.append_assistant_chunk("~~~sh\necho hi\n~~~");
+    let tb0_lines = tilde_byte0.render_lines(80);
+    let tb0_texts = lines_text(&tb0_lines);
+    assert_eq!(tb0_texts, vec!["✦", "╭─ sh ─", "echo hi", "╰───"]);
+    assert_eq!(tb0_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(tb0_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(tilde_byte0.full_plain_text(), "✦\n~~~sh\necho hi\n~~~");
+    assert_eq!(tilde_byte0.latest_code_block().as_deref(), Some("echo hi"));
+
+    // Code block starting after leading whitespace with ~~~ puts standalone ✦ above block
+    let mut tilde = ThreadTranscript::new();
+    tilde.append_assistant_chunk("  \n~~~python\nprint('ok')\n~~~");
+    let tilde_lines = tilde.render_lines(80);
+    let tilde_texts = lines_text(&tilde_lines);
+    assert_eq!(tilde_texts[0], "✦");
+    assert_eq!(tilde_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(tilde_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert!(tilde_texts.iter().any(|l| l == "╭─ python ─"));
+    assert!(tilde_texts.iter().any(|l| l == "print('ok')"));
+    assert_eq!(
+        tilde.full_plain_text(),
+        "✦\n  \n~~~python\nprint('ok')\n~~~"
+    );
+    assert_eq!(tilde.latest_code_block().as_deref(), Some("print('ok')"));
+
+    // Empty and whitespace-only AssistantMarkdown blocks render standalone ✦
+    let mut empty_block = ThreadTranscript::new();
+    empty_block.blocks.push(TranscriptBlock::AssistantMarkdown {
+        content: String::new(),
+    });
+    let empty_lines = empty_block.render_lines(80);
+    assert_eq!(lines_text(&empty_lines), vec!["✦"]);
+    assert_eq!(empty_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(empty_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(empty_block.full_plain_text(), "✦");
+    assert_eq!(empty_block.latest_assistant_text(), None);
+
+    let mut ws_block = ThreadTranscript::new();
+    ws_block.append_assistant_chunk("   \n  ");
+    let ws_lines = ws_block.render_lines(80);
+    assert_eq!(lines_text(&ws_lines), vec!["✦"]);
+    assert_eq!(ws_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(ws_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(ws_block.full_plain_text(), "✦");
 }

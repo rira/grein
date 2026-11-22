@@ -358,10 +358,12 @@ impl ThreadTranscript {
                 }
                 TranscriptBlock::AssistantMarkdown { content } => {
                     let clean = trim_trailing_newlines(content);
-                    if clean.is_empty() {
-                        parts.push("Assistant".to_string());
+                    if clean.trim().is_empty() {
+                        parts.push("✦".to_string());
+                    } else if starts_with_code_fence(clean) {
+                        parts.push(format!("✦\n{clean}"));
                     } else {
-                        parts.push(format!("Assistant\n{clean}"));
+                        parts.push(format!("✦ {clean}"));
                     }
                 }
                 TranscriptBlock::ToolCall {
@@ -449,6 +451,11 @@ fn trim_trailing_newlines(text: &str) -> &str {
     text.trim_end_matches(['\r', '\n'])
 }
 
+fn starts_with_code_fence(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
 fn trimmed_line_count(text: &str) -> usize {
     let clean = trim_trailing_newlines(text);
     if clean.is_empty() {
@@ -497,13 +504,32 @@ fn render_block(block: &TranscriptBlock, width: usize, out: &mut Vec<Line<'stati
             }
         }
         TranscriptBlock::AssistantMarkdown { content } => {
-            out.push(Line::from(Span::styled(
-                "Assistant",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            out.extend(crate::markdown::render_markdown_lines_with_width(
-                content, width,
-            ));
+            let accent_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            let body = crate::markdown::render_markdown_lines_with_width(content, width);
+            if content.trim().is_empty() || body.is_empty() {
+                out.push(Line::from(Span::styled("✦", accent_style)));
+                return;
+            }
+            if starts_with_code_fence(content) {
+                out.push(Line::from(Span::styled("✦", accent_style)));
+                out.extend(body);
+            } else {
+                let mut iter = body.into_iter();
+                if let Some(mut first) = iter.next() {
+                    let mut spans = Vec::with_capacity(first.spans.len() + 1);
+                    spans.push(Span::styled("✦ ", accent_style));
+                    spans.extend(first.spans);
+                    first.spans = spans;
+                    if width > 0 {
+                        out.extend(crate::markdown::wrap_styled_lines(vec![first], width));
+                    } else {
+                        out.push(first);
+                    }
+                }
+                out.extend(iter);
+            }
         }
         TranscriptBlock::ToolCall {
             tool_name,

@@ -612,12 +612,16 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     // Token-by-token reply on bugfix concatenated cleanly without newline splits,
     // and trunk turn "back on trunk" stays isolated from active bugfix transcript.
     assert!(
-        screen.contains("Reply(t-branch-2): fix bug"),
-        "expected streamed bugfix reply on screen:\n{screen}"
+        screen.contains("✦ Reply(t-branch-2): fix bug"),
+        "expected streamed bugfix reply with ✦ accent on screen:\n{screen}"
     );
     assert!(
-        screen.contains("Reply(t-branch-2): back on bugfix"),
-        "expected switched bugfix reply on screen:\n{screen}"
+        screen.contains("✦ Reply(t-branch-2): back on bugfix"),
+        "expected switched bugfix reply with ✦ accent on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Assistant"),
+        "Transcript must not render Assistant header:\n{screen}"
     );
     assert!(
         !screen.contains("Reply(t-trunk): back on trunk"),
@@ -692,7 +696,9 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_per
     assert!(app.active_transcript_md.contains("Tokens concatenate smoothly"));
     assert_eq!(app.active_transcript_md.matches("## Assistant").count(), 1);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
-    assert!(render_to_string(&terminal).contains("Tokens concatenate smoothly"));
+    let streamed_screen = render_to_string(&terminal);
+    assert!(streamed_screen.contains("✦ Tokens concatenate smoothly"));
+    assert!(!streamed_screen.contains("Assistant"));
 
     // 3. Shell escape !echo hi emits ShellOutput block into transcript
     app.input_buffer = "!echo hi".to_string();
@@ -1036,8 +1042,12 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
         "expected user prompt in Transcript:\n{transcript_text}"
     );
     assert!(
-        transcript_text.contains("Auth Matrix"),
-        "expected markdown heading in Transcript:\n{transcript_text}"
+        transcript_text.contains("✦ Auth Matrix"),
+        "expected markdown heading with ✦ accent in Transcript:\n{transcript_text}"
+    );
+    assert!(
+        !transcript_text.contains("Assistant"),
+        "Transcript must not render Assistant header:\n{transcript_text}"
     );
     for box_ch in ['┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘', '│'] {
         assert!(
@@ -1696,8 +1706,9 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
     let final_screen = render_to_string(&terminal);
     assert!(!final_screen.contains("Keybindings & Commands"));
     assert!(!final_screen.contains("Enter: Send"));
-    assert!(final_screen.contains("Reply(t-trunk): why?"));
-    assert!(final_screen.contains("Reply(t-trunk): still interactive"));
+    assert!(final_screen.contains("✦ Reply(t-trunk): why?"));
+    assert!(final_screen.contains("✦ Reply(t-trunk): still interactive"));
+    assert!(!final_screen.contains("Assistant"));
 }
 
 #[tokio::test]
