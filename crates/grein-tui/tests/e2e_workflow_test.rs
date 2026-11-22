@@ -1428,11 +1428,12 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
         .unwrap()
         .unwrap();
 
+    let shell = grein_tui::app::active_shell_label();
     let idle_layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 32), 0);
     let idle_full = render_to_string(&terminal_idle);
     let idle_status = render_rect_to_string(&terminal_idle, idle_layout.status_bar_area);
     assert!(!idle_full.contains("Subagents"));
-    assert!(idle_status.contains("Ctrl+G tree · Alt+T zsh · ? help"));
+    assert!(idle_status.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
     assert!(idle_status.contains("code · claude-sonnet"));
     assert!(idle_status.contains("✓ idle"));
     assert!(idle_status.contains("0 subagents"));
@@ -1519,7 +1520,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     assert!(strip_text.contains("Agent(research: Worker 1)"));
     assert!(strip_text.contains("gemini-2.5-pro"));
     assert!(strip_text.contains("+2 more"));
-    assert!(busy_status.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"));
+    assert!(busy_status.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")));
     assert!(busy_status.contains("tool: read_file"));
     assert!(busy_status.contains("7 subagents"));
 
@@ -1547,7 +1548,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     draw_frame_mut(&mut stepped_terminal, &mut app).unwrap();
     let thought_screen = render_to_string(&stepped_terminal);
     assert!(thought_screen.contains("thinking: inspecting logs"));
-    assert!(thought_screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"));
+    assert!(thought_screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")));
 
     apply_engine_event(
         &mut app,
@@ -1583,7 +1584,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     draw_frame_mut(&mut stepped_terminal, &mut app).unwrap();
     let cleared_screen = render_to_string(&stepped_terminal);
     assert!(!cleared_screen.contains("Subagents"));
-    assert!(cleared_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"));
+    assert!(cleared_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
     assert!(cleared_screen.contains("0 subagents"));
 }
 

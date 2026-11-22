@@ -214,12 +214,13 @@ fn test_golden_e2e_two_column_integration_and_multiline_sqlite() {
         "Blackboard pane must not render in 2-column layout"
     );
     // Composer pane & status bar assertions
+    let shell = grein_tui::app::active_shell_label();
     assert!(
         screen.contains("Composer")
             && screen.contains("Draft line 1")
             && screen.contains("Draft line 2")
-            && (screen.contains("Ctrl+G tree · Alt+T zsh · ? help")
-                || screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh")),
+            && (screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help"))
+                || screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}"))),
         "Composer pane must auto-grow for multi-line draft and render bottom status bar"
     );
 }

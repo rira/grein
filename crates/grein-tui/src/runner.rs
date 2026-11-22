@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +103,9 @@ pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
         Event::Paste(text) => {
             let _ = app.handle_paste_event(&text);
         }
+        Event::Mouse(mouse) => {
+            let _ = app.handle_mouse_event(mouse);
+        }
         Event::Resize(w, h) => {
             app.last_frame_area = Some(ratatui::layout::Rect::new(0, 0, w, h));
             app.maybe_queue_terminal_resize();
@@ -200,6 +203,127 @@ pub struct OrderedThreadEntry {
     pub index: usize,
     pub depth: usize,
     pub prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedThreadEntry {
+    pub index: usize,
+    pub depth: usize,
+    pub prefix: String,
+    pub has_children: bool,
+    pub hidden_descendants: usize,
+}
+
+struct FoldedTreeOrderCtx<'a> {
+    threads: &'a [ThreadItem],
+    children: HashMap<&'a str, Vec<usize>>,
+    collapsed: &'a BTreeSet<String>,
+    visited: Vec<bool>,
+    ordered: Vec<FoldedThreadEntry>,
+}
+
+impl<'a> FoldedTreeOrderCtx<'a> {
+    fn count_hidden_descendants(&mut self, idx: usize) -> usize {
+        let mut count = 0usize;
+        let Some(child_indices) = self.children.get(self.threads[idx].id.as_str()).cloned() else {
+            return 0;
+        };
+        for child_idx in child_indices {
+            if !self.visited[child_idx] {
+                self.visited[child_idx] = true;
+                count += 1;
+                count += self.count_hidden_descendants(child_idx);
+            }
+        }
+        count
+    }
+
+    fn visit(
+        &mut self,
+        idx: usize,
+        depth: usize,
+        prefix: String,
+        ancestor_continuations: &[bool],
+    ) {
+        if self.visited[idx] {
+            return;
+        }
+        self.visited[idx] = true;
+        let pending_children: Vec<usize> = self
+            .children
+            .get(self.threads[idx].id.as_str())
+            .map(|kids| kids.iter().copied().filter(|&c| !self.visited[c]).collect())
+            .unwrap_or_default();
+        let has_children = !pending_children.is_empty();
+        let is_collapsed = has_children && self.collapsed.contains(&self.threads[idx].id);
+        let entry_pos = self.ordered.len();
+        self.ordered.push(FoldedThreadEntry {
+            index: idx,
+            depth,
+            prefix,
+            has_children,
+            hidden_descendants: 0,
+        });
+        if is_collapsed {
+            let hidden = self.count_hidden_descendants(idx);
+            self.ordered[entry_pos].hidden_descendants = hidden;
+            return;
+        }
+        let total = pending_children.len();
+        for (pos, child_idx) in pending_children.into_iter().enumerate() {
+            let is_last = pos + 1 == total;
+            let mut child_prefix = String::new();
+            for &has_more in ancestor_continuations {
+                child_prefix.push_str(if has_more { "│  " } else { "   " });
+            }
+            child_prefix.push_str(if is_last { "└─ " } else { "├─ " });
+
+            let mut next_continuations = ancestor_continuations.to_vec();
+            next_continuations.push(!is_last);
+            self.visit(child_idx, depth + 1, child_prefix, &next_continuations);
+        }
+    }
+}
+
+/// Orders threads in parent-child depth-first order while hiding descendants of folded threads.
+pub fn compute_ordered_thread_entries_with_folds(
+    threads: &[ThreadItem],
+    thread_meta: &HashMap<String, ThreadMeta>,
+    collapsed: &BTreeSet<String>,
+) -> Vec<FoldedThreadEntry> {
+    let known_ids: HashSet<&str> = threads.iter().map(|t| t.id.as_str()).collect();
+    let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+
+    for (idx, thread) in threads.iter().enumerate() {
+        let parent = thread_meta
+            .get(&thread.id)
+            .and_then(|m| m.parent_thread_id.as_deref());
+        if let Some(pid) = parent {
+            if pid != thread.id && known_ids.contains(pid) {
+                children.entry(pid).or_default().push(idx);
+                continue;
+            }
+        }
+        roots.push(idx);
+    }
+
+    let mut ctx = FoldedTreeOrderCtx {
+        threads,
+        children,
+        collapsed,
+        visited: vec![false; threads.len()],
+        ordered: Vec::with_capacity(threads.len()),
+    };
+    for root_idx in roots {
+        ctx.visit(root_idx, 0, String::new(), &[]);
+    }
+    for idx in 0..threads.len() {
+        if !ctx.visited[idx] {
+            ctx.visit(idx, 0, String::new(), &[]);
+        }
+    }
+    ctx.ordered
 }
 
 struct TreeOrderCtx<'a> {
@@ -300,16 +424,28 @@ pub fn compute_ordered_thread_indices(
         .collect()
 }
 
-fn rebuild_tree_nodes(app: &mut App) {
-    let ordered = compute_ordered_thread_entries(&app.threads, &app.thread_meta);
+pub fn rebuild_tree_nodes(app: &mut App) {
+    let ordered = compute_ordered_thread_entries_with_folds(
+        &app.threads,
+        &app.thread_meta,
+        &app.collapsed_threads,
+    );
     let mut nodes = Vec::with_capacity(ordered.len());
     let mut depths = BTreeMap::new();
     let mut prefixes = BTreeMap::new();
+    let mut has_children_set = BTreeSet::new();
+    let mut hidden_counts = BTreeMap::new();
 
     for entry in ordered {
         let thread = &app.threads[entry.index];
         depths.insert(thread.id.clone(), entry.depth);
         prefixes.insert(thread.id.clone(), entry.prefix);
+        if entry.has_children {
+            has_children_set.insert(thread.id.clone());
+        }
+        if entry.hidden_descendants > 0 {
+            hidden_counts.insert(thread.id.clone(), entry.hidden_descendants);
+        }
         nodes.push(crate::ui::tree::TreeNode::Thread(
             crate::ui::tree::ThreadNode {
                 id: thread.id.clone(),
@@ -317,6 +453,8 @@ fn rebuild_tree_nodes(app: &mut App) {
             },
         ));
     }
+    app.tree_has_children = has_children_set;
+    app.tree_hidden_counts = hidden_counts;
 
     let prev_selected_id = app
         .tree
@@ -1063,6 +1201,11 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.help_scroll_offset = 0;
     app.status_notice = None;
     app.pending_rename_thread_id = None;
+    app.transcript_search.clear();
+    app.pending_g_prefix = false;
+    app.collapsed_threads.clear();
+    app.tree_has_children.clear();
+    app.tree_hidden_counts.clear();
 
     for t in &session.threads {
         let transcript = render_turns_md(&t.turns);
@@ -1383,9 +1526,10 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             for m in meta {
                 app.thread_meta.insert(m.thread_id.clone(), m);
             }
+            let active = app.active_thread_id.clone();
+            app.unfold_ancestors_for(&active);
             rebuild_tree_nodes(app);
             app.sync_focus_for_active_thread();
-            let active = app.active_thread_id.clone();
             app.maybe_request_pty_snapshot(&active);
             app.maybe_queue_terminal_resize();
         }
@@ -1412,6 +1556,9 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.pty_screens.remove(&thread_id);
             app.pty_exit_codes.remove(&thread_id);
             app.last_pty_sizes.remove(&thread_id);
+            app.collapsed_threads.remove(&thread_id);
+            app.tree_has_children.remove(&thread_id);
+            app.tree_hidden_counts.remove(&thread_id);
             if app
                 .config_picker
                 .as_ref()
@@ -1452,6 +1599,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                     .or_default();
             }
 
+            let active_for_unfold = app.active_thread_id.clone();
+            app.unfold_ancestors_for(&active_for_unfold);
             rebuild_tree_nodes(app);
             app.select_active_thread_in_tree();
             app.sync_focus_for_active_thread();
@@ -1574,7 +1723,12 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 app.thread_statuses
                     .insert(thread_id.clone(), status.to_string());
             } else {
-                app.pty_exit_codes.remove(&thread_id);
+                let was_exited = app.pty_exit_codes.remove(&thread_id).is_some()
+                    || app.pty_screens.get(&thread_id).is_some_and(|s| s.exited);
+                if was_exited {
+                    app.thread_statuses
+                        .insert(thread_id.clone(), "idle".to_string());
+                }
             }
             app.pty_screens.insert(thread_id, snapshot);
         }
@@ -1988,6 +2142,44 @@ fn dispatch_action(
                 }
             });
         }
+        AppAction::PtyScroll { thread_id, delta } => {
+            tokio::spawn(async move {
+                match engine.pty_scroll(&thread_id, delta).await {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::PtySnapshotLoaded {
+                            thread_id,
+                            snapshot,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Terminal scroll failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::PtyRestart {
+            thread_id,
+            rows,
+            cols,
+        } => {
+            tokio::spawn(async move {
+                match engine.pty_restart(&thread_id, rows, cols).await {
+                    Ok(snapshot) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::PtySnapshotLoaded {
+                            thread_id,
+                            snapshot,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Terminal restart failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
         AppAction::EnsureThreadWorktree { thread_id } => {
             tokio::spawn(async move {
                 match engine.ensure_thread_worktree(&thread_id).await {
@@ -2194,9 +2386,10 @@ pub async fn run_with_engine_events<B: Backend>(
                     RunnerLocalEvent::OptimisticThreadMeta(meta) => {
                         if !app.thread_meta.contains_key(&meta.thread_id) {
                             app.thread_meta.insert(meta.thread_id.clone(), meta);
+                            let active = app.active_thread_id.clone();
+                            app.unfold_ancestors_for(&active);
                             rebuild_tree_nodes(&mut app);
                             app.sync_focus_for_active_thread();
-                            let active = app.active_thread_id.clone();
                             app.maybe_request_pty_snapshot(&active);
                         }
                     }

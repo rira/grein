@@ -1529,7 +1529,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
     // 5. Exited PTY in FocusedPane::Terminal:
-    //    - Status bar shows "exited · Esc/Ctrl+G tree"
+    //    - Status bar shows "exited · Enter restart · Esc/Ctrl+G tree"
     //    - Further keys / paste do NOT emit PtyWrite
     //    - Esc escapes back to FocusedPane::Tree and unhides sidebar if zoomed
     apply_engine_event(
@@ -1549,7 +1549,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let exited_screen = render_screen(&terminal);
     assert!(
-        exited_screen.contains("exited · Esc/Ctrl+G tree"),
+        exited_screen.contains("exited · Enter restart · Esc/Ctrl+G tree"),
         "Exited terminal status bar must guide user back to Tree:\n{exited_screen}"
     );
 
@@ -1747,11 +1747,12 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
         },
     );
 
+    let shell = grein_tui::app::active_shell_label();
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let idle_screen = render_screen(&terminal);
     assert!(
-        idle_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"),
+        idle_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")),
         "Idle Composer status bar missing expected hint:\n{idle_screen}"
     );
 
@@ -1760,7 +1761,7 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let busy_screen = render_screen(&terminal);
     assert!(
-        busy_screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"),
+        busy_screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")),
         "Busy Composer status bar missing expected hint:\n{busy_screen}"
     );
 

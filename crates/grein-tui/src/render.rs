@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::app::{AppState, ConfigPickerModal, PaneFocus};
 use crate::engine_port::{PtyCell, PtyColor, SubagentSnapshot, SubagentStatus};
 use crate::layout::{compute_layout_with_options, subagent_strip_height};
-use crate::runner::{compute_ordered_thread_entries, compute_ordered_thread_indices};
+use crate::runner::{compute_ordered_thread_entries_with_folds, compute_ordered_thread_indices};
+use crate::search::{highlight_lines_with_matches, SearchDirection, TranscriptSearchState};
 use crate::ui::tree::{compute_tree_scroll_offset, TreeNode};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -186,6 +187,7 @@ fn render_thread_row(
     title: &str,
     depth: usize,
     prefix: &str,
+    hidden_descendants: usize,
     is_selected: bool,
     state: &AppState,
 ) -> Line<'static> {
@@ -215,16 +217,26 @@ fn render_thread_row(
         };
         (label, color)
     });
+    let fold_prefix = if hidden_descendants > 0 { "▸ " } else { "" };
+    let fold_badge = (hidden_descendants > 0).then(|| format!(" (+{hidden_descendants})"));
 
     if is_selected {
         let style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED);
         let label = match glyph_opt {
-            Some((glyph, _)) => format!("{prefix}{glyph} {title}"),
-            None => format!("{prefix}{title}"),
+            Some((glyph, _)) => format!("{prefix}{fold_prefix}{glyph} {title}"),
+            None => format!("{prefix}{fold_prefix}{title}"),
         };
         let mut spans = vec![Span::styled(label, style)];
+        if let Some(badge) = fold_badge {
+            spans.push(Span::styled(
+                badge,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::REVERSED),
+            ));
+        }
         if let Some((badge, color)) = exit_badge {
             spans.push(Span::styled(
                 badge,
@@ -252,6 +264,14 @@ fn render_thread_row(
             prefix.to_string(),
             Style::default().fg(Color::DarkGray),
         )];
+        if !fold_prefix.is_empty() {
+            spans.push(Span::styled(
+                fold_prefix,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some((glyph, glyph_color)) = glyph_opt {
             spans.push(Span::styled(
                 format!("{glyph} "),
@@ -259,6 +279,9 @@ fn render_thread_row(
             ));
         }
         spans.push(Span::styled(title.to_string(), title_style));
+        if let Some(badge) = fold_badge {
+            spans.push(Span::styled(badge, Style::default().fg(Color::DarkGray)));
+        }
         if let Some((badge, color)) = exit_badge {
             spans.push(Span::styled(badge, Style::default().fg(color)));
         }
@@ -282,13 +305,22 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
     let mut selected_line_idx: Option<usize> = None;
 
     if !state.tree.nodes.is_empty() {
-        let fallback_layout: Option<HashMap<&str, (usize, String)>> =
+        let fallback_layout: Option<HashMap<&str, (usize, String, usize)>> =
             if state.tree.prefixes.is_empty() && !state.threads.is_empty() {
                 Some(
-                    compute_ordered_thread_entries(&state.threads, &state.thread_meta)
-                        .into_iter()
-                        .map(|e| (state.threads[e.index].id.as_str(), (e.depth, e.prefix)))
-                        .collect(),
+                    compute_ordered_thread_entries_with_folds(
+                        &state.threads,
+                        &state.thread_meta,
+                        &state.collapsed_threads,
+                    )
+                    .into_iter()
+                    .map(|e| {
+                        (
+                            state.threads[e.index].id.as_str(),
+                            (e.depth, e.prefix, e.hidden_descendants),
+                        )
+                    })
+                    .collect(),
                 )
             } else {
                 None
@@ -300,25 +332,38 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
                 if is_selected {
                     selected_line_idx = Some(lines.len());
                 }
-                let (depth, prefix) = if let Some(ref map) = fallback_layout {
+                let (depth, prefix, hidden_descendants) = if let Some(ref map) = fallback_layout {
                     map.get(t.id.as_str())
-                        .map(|(d, p)| (*d, p.as_str()))
-                        .unwrap_or((state.tree.depth_for(&t.id), state.tree.prefix_for(&t.id)))
+                        .map(|(d, p, h)| (*d, p.as_str(), *h))
+                        .unwrap_or((
+                            state.tree.depth_for(&t.id),
+                            state.tree.prefix_for(&t.id),
+                            state.tree_hidden_counts.get(&t.id).copied().unwrap_or(0),
+                        ))
                 } else {
-                    (state.tree.depth_for(&t.id), state.tree.prefix_for(&t.id))
+                    (
+                        state.tree.depth_for(&t.id),
+                        state.tree.prefix_for(&t.id),
+                        state.tree_hidden_counts.get(&t.id).copied().unwrap_or(0),
+                    )
                 };
                 lines.push(render_thread_row(
                     &t.id,
                     &t.title,
                     depth,
                     prefix,
+                    hidden_descendants,
                     is_selected,
                     state,
                 ));
             }
         }
     } else if !state.threads.is_empty() {
-        let ordered = compute_ordered_thread_entries(&state.threads, &state.thread_meta);
+        let ordered = compute_ordered_thread_entries_with_folds(
+            &state.threads,
+            &state.thread_meta,
+            &state.collapsed_threads,
+        );
         for (row_idx, entry) in ordered.into_iter().enumerate() {
             let thread = &state.threads[entry.index];
             let is_selected = selected == Some(row_idx);
@@ -330,6 +375,7 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
                 &thread.title,
                 entry.depth,
                 &entry.prefix,
+                entry.hidden_descendants,
                 is_selected,
                 state,
             ));
@@ -383,6 +429,7 @@ struct RenderMetrics {
     frame_area: Rect,
     terminal_inner_size: Option<(u16, u16)>,
     display_is_preview: bool,
+    updated_search: Option<TranscriptSearchState>,
 }
 
 pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
@@ -394,6 +441,9 @@ pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
     state.transcript_viewport_height = metrics.transcript_inner_height;
     state.composer_scroll_y = metrics.composer_scroll_y;
     state.last_frame_area = Some(metrics.frame_area);
+    if let Some(updated_search) = metrics.updated_search {
+        state.transcript_search = updated_search;
+    }
     if let Some((rows, cols)) = metrics.terminal_inner_size {
         if rows >= 1 && cols >= 1 {
             state.terminal_pane_size = (rows, cols);
@@ -499,7 +549,26 @@ fn render_subagent_strip(f: &mut Frame, area: Rect, subagents: &[SubagentSnapsho
     f.render_widget(widget, area);
 }
 
-fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count: usize) {
+fn short_cwd_label(cwd: &str) -> String {
+    let trimmed = cwd.trim();
+    if trimmed == "/" {
+        return "/".to_string();
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_single_line(s, 28))
+        .unwrap_or_else(|| truncate_single_line(trimmed, 28))
+}
+
+fn render_status_bar(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    subagent_count: usize,
+    search: &TranscriptSearchState,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -530,25 +599,22 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
     let terminal_focused = state.active_focus == PaneFocus::Terminal
         || state.focused_pane == PaneFocus::Terminal
         || state.focus == PaneFocus::Terminal;
-    let left_hint = if active_is_terminal && terminal_focused {
-        if state.terminal_exit_code(active_id).is_some() {
-            "exited · Esc/Ctrl+G tree"
-        } else {
-            "Ctrl+G for tree"
-        }
-    } else if is_busy {
-        "Esc cancel · Ctrl+G tree · Alt+T zsh"
-    } else {
-        "Ctrl+G tree · Alt+T zsh · ? help"
-    };
 
     let (mode, model, live_status, status_color) = if active_is_terminal {
-        let cwd_label = state
-            .thread_meta
+        let raw_cwd = state
+            .pty_screens
             .get(active_id)
-            .and_then(|m| m.cwd.as_deref())
+            .and_then(|s| s.cwd.as_deref())
             .filter(|s| !s.trim().is_empty())
-            .map(|c| truncate_single_line(c, 28))
+            .or_else(|| {
+                state
+                    .thread_meta
+                    .get(active_id)
+                    .and_then(|m| m.cwd.as_deref())
+                    .filter(|s| !s.trim().is_empty())
+            });
+        let cwd_label = raw_cwd
+            .map(short_cwd_label)
             .unwrap_or_else(|| "pty".to_string());
         let (st, col) = match state.terminal_exit_code(active_id) {
             Some(Some(0)) => ("✓ exit 0".to_string(), Color::DarkGray),
@@ -597,35 +663,156 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
         format!("{subagent_count} subagents")
     };
 
+    let git_meta = state
+        .thread_meta
+        .get(active_id)
+        .and_then(|m| {
+            m.git_branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(|b| (b, m.git_dirty))
+        });
+    let git_badge = git_meta.map(|(branch, dirty)| {
+        let text = if dirty > 0 {
+            format!("⎇ {branch}*")
+        } else {
+            format!("⎇ {branch}")
+        };
+        let color = if dirty > 0 {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        (text, color)
+    });
+
     let right_prefix = format!("{mode} · {model} · ");
     let right_suffix = format!(" · {sa_label}");
-    let total_right_chars =
-        right_prefix.chars().count() + live_status.chars().count() + right_suffix.chars().count();
+    let git_prefix_chars = git_badge
+        .as_ref()
+        .map_or(0, |(badge, _)| badge.chars().count() + 3);
+    let total_right_chars = git_prefix_chars
+        + right_prefix.chars().count()
+        + live_status.chars().count()
+        + right_suffix.chars().count();
+
+    let scrollback_badge = if active_is_terminal {
+        state
+            .pty_screens
+            .get(active_id)
+            .filter(|s| s.scrollback_offset > 0)
+            .map(|s| format!(" · [scroll -{}]", s.scrollback_offset))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let notice_suffix = state
         .status_notice
         .as_deref()
         .map(|n| format!(" · {n}"))
         .unwrap_or_default();
-    let total_left_chars = left_hint.chars().count() + notice_suffix.chars().count();
+
+    let mut spans = Vec::new();
+    let total_left_chars = if search.is_visible() {
+        let prefix = match search.direction {
+            SearchDirection::Forward => '/',
+            SearchDirection::Reverse => '?',
+        };
+        let query_part = format!("{prefix}{}", search.query);
+        let counter_part = format!(" {}", search.counter_label());
+        let search_hint = if search.editing {
+            " · Enter/Esc"
+        } else {
+            " · n/N · Esc"
+        };
+        let counter_color = if search.matches.is_empty() && !search.query.is_empty() {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        spans.push(Span::styled(
+            query_part.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            counter_part.clone(),
+            Style::default().fg(counter_color),
+        ));
+        let mut left_len = query_part.chars().count() + counter_part.chars().count();
+        if left_len + search_hint.chars().count() + 1 + total_right_chars <= area.width as usize {
+            spans.push(Span::styled(
+                search_hint,
+                Style::default().fg(Color::DarkGray),
+            ));
+            left_len += search_hint.chars().count();
+        }
+        if !scrollback_badge.is_empty() {
+            spans.push(Span::styled(
+                scrollback_badge.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            left_len += scrollback_badge.chars().count();
+        }
+        left_len
+    } else {
+        let left_hint = if active_is_terminal && terminal_focused {
+            if state.terminal_exit_code(active_id).is_some() {
+                "exited · Enter restart · Esc/Ctrl+G tree".to_string()
+            } else {
+                "Ctrl+G for tree".to_string()
+            }
+        } else if is_busy {
+            format!(
+                "Esc cancel · Ctrl+G tree · Alt+T {}",
+                crate::app::active_shell_label()
+            )
+        } else {
+            format!(
+                "Ctrl+G tree · Alt+T {} · F1 help",
+                crate::app::active_shell_label()
+            )
+        };
+        let len = left_hint.chars().count()
+            + scrollback_badge.chars().count()
+            + notice_suffix.chars().count();
+        spans.push(Span::styled(
+            left_hint,
+            Style::default().fg(Color::DarkGray),
+        ));
+        if !scrollback_badge.is_empty() {
+            spans.push(Span::styled(
+                scrollback_badge,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if !notice_suffix.is_empty() {
+            spans.push(Span::styled(
+                notice_suffix,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        len
+    };
 
     let width = area.width as usize;
     let gap = width.saturating_sub(total_left_chars + total_right_chars);
 
-    let mut spans = vec![Span::styled(
-        left_hint.to_string(),
-        Style::default().fg(Color::DarkGray),
-    )];
-    if !notice_suffix.is_empty() {
-        spans.push(Span::styled(
-            notice_suffix,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
     if total_left_chars + 1 + total_right_chars <= width {
         spans.push(Span::raw(" ".repeat(gap.max(1))));
+        if let Some((badge, badge_color)) = git_badge {
+            spans.push(Span::styled(badge, Style::default().fg(badge_color)));
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
         spans.push(Span::styled(
             right_prefix,
             Style::default().fg(Color::DarkGray),
@@ -642,8 +829,12 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState, subagent_count
         let remaining = width - total_left_chars;
         if remaining >= 2 {
             spans.push(Span::raw(" "));
+            let compact_git = git_badge
+                .as_ref()
+                .map(|(badge, _)| format!("{badge} · "))
+                .unwrap_or_default();
             let compact_right = truncate_single_line(
-                &format!("{right_prefix}{live_status}{right_suffix}"),
+                &format!("{compact_git}{right_prefix}{live_status}{right_suffix}"),
                 remaining - 1,
             );
             spans.push(Span::styled(
@@ -817,80 +1008,93 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
     let key_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
+    let shell_desc = format!(
+        "Fork/root/rename; Alt+T >_ {}",
+        crate::app::active_shell_label()
+    );
 
-    let sections: [(&str, &[(&str, &str)]); 3] = [
+    let sections: [(&str, Vec<(&str, String)>); 3] = [
         (
             "── Global ──",
-            &[
-                ("Tab / Shift+Tab", "Cycle branches in active root"),
-                ("Alt+Shift+↑/↓, Alt+J/K", "Switch between top-level roots"),
+            vec![
+                (
+                    "Tab / Shift+Tab",
+                    "Cycle branches; Alt+Shift+↑/↓, Alt+J/K root".to_string(),
+                ),
                 (
                     "Alt+↑/↓, PgUp/PgDn",
-                    "Scroll Transcript (Alt+Home/End top/btm)",
+                    "Scroll Transcript; Shift+PgUp/PgDn >_".to_string(),
                 ),
-                ("Esc / Ctrl+G", "Tree/pane; Esc cancels or leaves exited >_"),
                 (
-                    "Ctrl+N / Alt+N, Alt+R / F2",
-                    "Fork / new root / rename; Alt+T >_ zsh",
+                    "/, ?, Ctrl+F, n / N",
+                    "Search Transcript (Esc clear; F1/g? help)".to_string(),
                 ),
+                (
+                    "Esc / Ctrl+G",
+                    "Tree/pane; Enter restarts exited >_".to_string(),
+                ),
+                ("Ctrl+N / Alt+N, Alt+R / F2", shell_desc),
                 (
                     "Ctrl+T / Ctrl+O / Alt+Y",
-                    "Zoom / tool cards / copy (Ctrl+C/Ctrl+Q)",
+                    "Zoom / tool cards / copy (Ctrl+C/Ctrl+Q)".to_string(),
                 ),
             ],
         ),
         (
             "── ᛇ Grein Navigation ──",
-            &[
+            vec![
                 (
                     "j/k/↑/↓, Enter/l/Right",
-                    "Browse (preview) / enter / J/K switch root",
+                    "Browse/enter; Space/h/l fold (J/K root)".to_string(),
                 ),
                 (
                     "Ctrl+U / Ctrl+D, g / G",
-                    "Half-page scroll / Transcript top/bottom",
+                    "Half-page scroll / top/btm; g? opens help".to_string(),
                 ),
                 (
                     "n / r / m (ᛇ Grein)",
-                    "New root/rename/join (f fork, d/x close)",
+                    "New root/rename/join (f fork, d/x close)".to_string(),
                 ),
                 (
                     "t / T, z / y / q (ᛇ Grein)",
-                    "Child/root >_ term, zoom / copy / quit",
+                    "Child/root >_ term, zoom / copy / quit".to_string(),
                 ),
             ],
         ),
         (
             "── Composer & Slash Commands ──",
-            &[
-                ("Shift+Enter / Ctrl+J", "Newline in Composer (Enter sends)"),
+            vec![
+                (
+                    "Shift+Enter / Ctrl+J",
+                    "Newline in Composer (Enter sends)".to_string(),
+                ),
                 (
                     "Ctrl+A / Ctrl+E",
-                    "Line start/end (Home/End, Ctrl+F / Ctrl+B)",
+                    "Line start/end (Home/End, Ctrl+B / ← / →)".to_string(),
                 ),
                 (
                     "Alt+←/→, Ctrl+←/→, Alt+B/F",
-                    "Word move, Ctrl+K/U/W, Ctrl+Y/Ctrl+D/Alt+D",
+                    "Word move, Ctrl+K/U/W, Ctrl+Y/Ctrl+D/Alt+D".to_string(),
                 ),
                 (
                     "!cmd, /term [path]",
-                    "Cmd / >_ (/terminal /zsh /sh /shell /bash)",
+                    "Cmd / >_ (/terminal /zsh /sh /shell /bash)".to_string(),
                 ),
                 (
                     "/fork, /grein, /root, /new",
-                    "Fork (/branch) / blank root (/worktree)",
+                    "Fork (/branch) / root (/worktree ⎇ branch*)".to_string(),
                 ),
                 (
                     "/rename, /join, /merge",
-                    "Rename / join (/close, /delete, /quit)",
+                    "Rename / join (/close, /delete, /quit)".to_string(),
                 ),
                 (
                     "/model, /mode, /thinking",
-                    "Pick model/mode/thinking (/effort)",
+                    "Pick model/mode/thinking (/effort)".to_string(),
                 ),
                 (
                     "/commands, /copy, /zoom",
-                    "Cmds, /copy [code|all], zoom, /?, /help, ?",
+                    "Cmds, /copy [code|all], zoom, /?, /help, ?".to_string(),
                 ),
             ],
         ),
@@ -899,7 +1103,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
     let mut raw_body: Vec<Line<'static>> = Vec::new();
     for (title, rows) in sections {
         raw_body.push(Line::from(Span::styled(format!(" {title}"), section_style)));
-        for &(k, desc) in rows {
+        for (k, desc) in rows {
             raw_body.push(Line::from(vec![
                 Span::styled(format!(" {k:<27}"), key_style),
                 Span::raw(desc),
@@ -1020,10 +1224,17 @@ fn render_terminal_pane(
         Some(t) => format!(" Terminal (Preview: {t}){exit_suffix} "),
         None => {
             if let Some(cwd) = state
-                .thread_meta
+                .pty_screens
                 .get(display_thread_id)
-                .and_then(|m| m.cwd.as_deref())
+                .and_then(|s| s.cwd.as_deref())
                 .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    state
+                        .thread_meta
+                        .get(display_thread_id)
+                        .and_then(|m| m.cwd.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                })
             {
                 format!(" Terminal: {thread_title} ({cwd}){exit_suffix} ")
             } else {
@@ -1081,6 +1292,7 @@ fn render_terminal_pane(
             && state.pending_permission.is_none()
             && state.config_picker.is_none()
             && !state.show_help_modal
+            && !state.transcript_search.editing
         {
             let cursor_x = inner.x + snap.cursor_col.min(inner.width.saturating_sub(1));
             let cursor_y = inner.y + snap.cursor_row.min(inner.height.saturating_sub(1));
@@ -1102,6 +1314,112 @@ fn render_terminal_pane(
     }
 
     Some((inner.height, inner.width))
+}
+
+/// Builds the pre-wrapped styled transcript lines for `display_thread_id` at `inner_width`.
+pub fn build_transcript_wrapped_lines(
+    state: &AppState,
+    display_thread_id: &str,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
+    let active_id = state.active_thread_id();
+    let display_md: &str = if display_thread_id == active_id {
+        &state.active_transcript_md
+    } else {
+        state
+            .thread_transcripts
+            .get(display_thread_id)
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    let use_blocks = state.has_synchronized_blocks(display_thread_id, display_md);
+
+    let mut transcript_lines = Vec::new();
+    if let Some(meta) = state.thread_meta.get(display_thread_id) {
+        if let Some(ref parent_id) = meta.parent_thread_id {
+            let parent_title = state
+                .threads
+                .iter()
+                .find(|t| t.id == *parent_id)
+                .map(|t| t.title.as_str())
+                .unwrap_or(parent_id.as_str());
+            let banner = format!(
+                "> ↳ Forked from {parent_title} ({} ancestor turns in LLM context)",
+                meta.inherited_turn_count
+            );
+            transcript_lines.push(Line::from(Span::styled(
+                banner,
+                Style::default().fg(Color::DarkGray),
+            )));
+            let has_body = if use_blocks {
+                state
+                    .thread_blocks
+                    .get(display_thread_id)
+                    .is_some_and(|b| !b.is_empty())
+            } else {
+                !display_md.trim().is_empty()
+            };
+            if has_body {
+                transcript_lines.push(Line::raw(""));
+            }
+        }
+    }
+
+    if use_blocks {
+        if let Some(blocks) = state.thread_blocks.get(display_thread_id) {
+            transcript_lines.extend(blocks.render_lines(inner_width));
+        }
+    } else {
+        transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
+            display_md,
+            inner_width,
+        ));
+    }
+
+    crate::markdown::wrap_styled_lines(transcript_lines, inner_width)
+}
+
+fn recompute_search_for_render(
+    state: &AppState,
+    display_thread_id: &str,
+    lines: &[Line<'static>],
+    inner_height: u16,
+) -> Option<TranscriptSearchState> {
+    if !state.transcript_search.is_visible() || state.transcript_search.query.is_empty() {
+        return None;
+    }
+    let mut fresh = state.transcript_search.clone();
+    let prev_active = state
+        .transcript_search
+        .current_index
+        .and_then(|i| state.transcript_search.matches.get(i))
+        .cloned();
+    let vp = state.transcript_viewport(display_thread_id);
+    let anchor = match fresh.direction {
+        SearchDirection::Forward => Some(vp.scroll_offset()),
+        SearchDirection::Reverse => {
+            let vp_h = inner_height.max(1) as usize;
+            Some(
+                vp.scroll_offset()
+                    .saturating_add(vp_h.saturating_sub(1))
+                    .min(lines.len().saturating_sub(1)),
+            )
+        }
+    };
+    fresh.recompute_matches(lines, anchor);
+    if fresh.matches == state.transcript_search.matches {
+        fresh.current_index = state.transcript_search.current_index;
+    } else if let Some(prev_m) = prev_active {
+        if let Some(pos) = fresh.matches.iter().position(|m| *m == prev_m) {
+            fresh.current_index = Some(pos);
+        } else if let (Some(old_idx), false) = (
+            state.transcript_search.current_index,
+            fresh.matches.is_empty(),
+        ) {
+            fresh.current_index = Some(old_idx.min(fresh.matches.len() - 1));
+        }
+    }
+    Some(fresh)
 }
 
 fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
@@ -1181,6 +1499,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let mut max_scroll_u16 = 0u16;
     let mut transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
     let mut terminal_inner_size = None;
+    let mut updated_search: Option<TranscriptSearchState> = None;
 
     if display_is_terminal {
         terminal_inner_size = render_terminal_pane(
@@ -1192,16 +1511,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             terminal_focused,
         );
     } else {
-        let display_md: &str = if display_thread_id == active_id {
-            &state.active_transcript_md
-        } else {
-            state
-                .thread_transcripts
-                .get(display_thread_id)
-                .map(String::as_str)
-                .unwrap_or("")
-        };
-
         let transcript_borders = if state.sidebar_hidden {
             Borders::TOP | Borders::BOTTOM
         } else {
@@ -1213,52 +1522,30 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             layout.transcript_area.width.saturating_sub(2)
         };
         transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
-        let use_blocks = state.has_synchronized_blocks(display_thread_id, display_md);
 
-        let mut transcript_lines = Vec::new();
-        if let Some(meta) = state.thread_meta.get(display_thread_id) {
-            if let Some(ref parent_id) = meta.parent_thread_id {
-                let parent_title = state
-                    .threads
-                    .iter()
-                    .find(|t| t.id == *parent_id)
-                    .map(|t| t.title.as_str())
-                    .unwrap_or(parent_id.as_str());
-                let banner = format!(
-                    "> ↳ Forked from {parent_title} ({} ancestor turns in LLM context)",
-                    meta.inherited_turn_count
-                );
-                transcript_lines.push(Line::from(Span::styled(
-                    banner,
-                    Style::default().fg(Color::DarkGray),
-                )));
-                let has_body = if use_blocks {
-                    state
-                        .thread_blocks
-                        .get(display_thread_id)
-                        .is_some_and(|b| !b.is_empty())
-                } else {
-                    !display_md.trim().is_empty()
-                };
-                if has_body {
-                    transcript_lines.push(Line::raw(""));
-                }
-            }
-        }
-
-        if use_blocks {
-            if let Some(blocks) = state.thread_blocks.get(display_thread_id) {
-                transcript_lines.extend(blocks.render_lines(transcript_inner_width as usize));
-            }
+        let wrapped_lines = build_transcript_wrapped_lines(
+            state,
+            display_thread_id,
+            transcript_inner_width as usize,
+        );
+        updated_search = recompute_search_for_render(
+            state,
+            display_thread_id,
+            &wrapped_lines,
+            transcript_inner_height,
+        );
+        let wrapped_lines = if let Some(ref s) = updated_search {
+            highlight_lines_with_matches(wrapped_lines, &s.matches, s.current_index)
+        } else if state.transcript_search.is_visible() {
+            highlight_lines_with_matches(
+                wrapped_lines,
+                &state.transcript_search.matches,
+                state.transcript_search.current_index,
+            )
         } else {
-            transcript_lines.extend(crate::markdown::render_markdown_lines_with_width(
-                display_md,
-                transcript_inner_width as usize,
-            ));
-        }
+            wrapped_lines
+        };
 
-        let wrapped_lines =
-            crate::markdown::wrap_styled_lines(transcript_lines, transcript_inner_width as usize);
         let visual_lines = wrapped_lines.len();
         max_scroll_u16 = visual_lines
             .saturating_sub(transcript_inner_height as usize)
@@ -1309,6 +1596,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             && state.pending_permission.is_none()
             && state.config_picker.is_none()
             && !state.show_help_modal
+            && !state.transcript_search.editing
         {
             let visible_row = composer_layout.cursor_row.saturating_sub(composer_scroll_y);
             let cursor_x = layout.composer_area.x
@@ -1327,7 +1615,29 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         render_subagent_strip(f, strip_area, active_subagents);
     }
 
-    render_status_bar(f, layout.status_bar_area, state, active_subagents.len());
+    let effective_search = updated_search
+        .as_ref()
+        .unwrap_or(&state.transcript_search);
+    render_status_bar(
+        f,
+        layout.status_bar_area,
+        state,
+        active_subagents.len(),
+        effective_search,
+    );
+
+    if effective_search.editing
+        && state.pending_permission.is_none()
+        && state.config_picker.is_none()
+        && !state.show_help_modal
+        && layout.status_bar_area.width > 1
+        && layout.status_bar_area.height > 0
+    {
+        let query_w = Span::raw(&effective_search.query).width() as u16;
+        let cursor_x = layout.status_bar_area.x
+            + (1 + query_w).min(layout.status_bar_area.width.saturating_sub(1));
+        f.set_cursor_position(Position::new(cursor_x, layout.status_bar_area.y));
+    }
 
     let mut rendered_help_scroll = state.help_scroll_offset;
     if let Some(perm) = &state.pending_permission {
@@ -1378,6 +1688,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         frame_area: f.area(),
         terminal_inner_size,
         display_is_preview: preview.is_some(),
+        updated_search,
     }
 }
 
@@ -1472,7 +1783,10 @@ mod tests {
         assert!(!screen.contains("Blackboard"));
         assert!(screen.contains("●"));
         assert!(screen.contains("⚠"));
-        assert!(screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"));
+        assert!(screen.contains(&format!(
+            "Esc cancel · Ctrl+G tree · Alt+T {}",
+            crate::app::active_shell_label()
+        )));
         assert!(!screen.contains("Enter: Send"));
     }
 }

@@ -633,7 +633,8 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     let idle_screen = render_screen(&terminal);
     assert!(!idle_screen.contains("Enter: Send"));
     assert!(!idle_screen.contains("!cmd: Shell"));
-    assert!(idle_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"));
+    let shell = grein_tui::app::active_shell_label();
+    assert!(idle_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
     assert!(idle_screen.contains("code · claude-sonnet"));
     assert!(idle_screen.contains("0 subagents"));
 
@@ -649,7 +650,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     assert_eq!(app.tick_count, 1);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let thinking_screen = render_screen(&terminal);
-    assert!(thinking_screen.contains("Esc cancel · Ctrl+G tree · Alt+T zsh"));
+    assert!(thinking_screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")));
     assert!(thinking_screen.contains("thinking"));
 
     // ToolActivityUpdated sets tool name, clearing restores streaming
@@ -709,7 +710,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     );
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let done_screen = render_screen(&terminal);
-    assert!(done_screen.contains("Ctrl+G tree · Alt+T zsh · ? help"));
+    assert!(done_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
     assert!(done_screen.contains("idle"));
 }
 
@@ -764,12 +765,29 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert!(!app.show_help_modal);
     assert_eq!(app.composer_input(), "");
 
-    // Open from Tree and Transcript and dismiss with Enter
+    // In Tree and Transcript: '?' opens Reverse Search, while 'g?' and 'F1' open Help
     for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
         app.set_focus(pane);
         app.handle_key_event(key(KeyCode::Char('?')));
-        assert!(app.show_help_modal, "Expected '?' to open modal from {pane:?}");
+        assert!(!app.show_help_modal);
+        assert!(app.transcript_search.editing);
+        assert_eq!(
+            app.transcript_search.direction,
+            grein_tui::search::SearchDirection::Reverse
+        );
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.transcript_search.is_visible());
+
+        app.handle_key_event(key(KeyCode::Char('g')));
+        app.handle_key_event(key(KeyCode::Char('?')));
+        assert!(app.show_help_modal, "Expected 'g?' to open modal from {pane:?}");
         app.handle_key_event(key(KeyCode::Enter));
+        assert!(!app.show_help_modal);
+        assert_eq!(app.focused_pane(), pane);
+
+        app.handle_key_event(key(KeyCode::F(1)));
+        assert!(app.show_help_modal, "Expected 'F1' to open modal from {pane:?}");
+        app.handle_key_event(key(KeyCode::Esc));
         assert!(!app.show_help_modal);
         assert_eq!(app.focused_pane(), pane);
     }

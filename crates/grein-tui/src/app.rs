@@ -132,6 +132,15 @@ pub enum AppAction {
         rows: u16,
         cols: u16,
     },
+    PtyScroll {
+        thread_id: String,
+        delta: isize,
+    },
+    PtyRestart {
+        thread_id: String,
+        rows: u16,
+        cols: u16,
+    },
     EnsureThreadWorktree {
         thread_id: String,
     },
@@ -285,6 +294,11 @@ pub struct App {
     pub last_pty_sizes: HashMap<String, (u16, u16)>,
     pub terminal_pane_size: (u16, u16),
     pub last_frame_area: Option<ratatui::layout::Rect>,
+    pub transcript_search: crate::search::TranscriptSearchState,
+    pub pending_g_prefix: bool,
+    pub collapsed_threads: BTreeSet<String>,
+    pub tree_has_children: BTreeSet<String>,
+    pub tree_hidden_counts: BTreeMap<String, usize>,
 }
 
 pub type AppState = App;
@@ -338,8 +352,29 @@ impl Default for App {
             last_pty_sizes: HashMap::new(),
             terminal_pane_size: (0, 0),
             last_frame_area: None,
+            transcript_search: crate::search::TranscriptSearchState::default(),
+            pending_g_prefix: false,
+            collapsed_threads: BTreeSet::new(),
+            tree_has_children: BTreeSet::new(),
+            tree_hidden_counts: BTreeMap::new(),
         }
     }
+}
+
+pub fn shell_label_from_env(val: Option<&str>) -> String {
+    val.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| std::path::Path::new(s).file_name())
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("sh")
+        .to_string()
+}
+
+pub fn active_shell_label() -> String {
+    let val = std::env::var("SHELL").ok();
+    shell_label_from_env(val.as_deref())
 }
 
 fn clamp_char_boundary(buf: &str, pos: usize) -> usize {
@@ -633,6 +668,7 @@ impl App {
 
     fn focus_tree(&mut self) {
         self.pending_rename_thread_id = None;
+        self.pending_g_prefix = false;
         self.focused_pane = FocusedPane::Tree;
         self.sidebar_hidden = false;
         self.sync_focus_out();
@@ -794,9 +830,99 @@ impl App {
         false
     }
 
+    pub fn unfold_ancestors_for(&mut self, thread_id: &str) -> bool {
+        let mut changed = false;
+        let mut visited = std::collections::HashSet::new();
+        let mut cur = self
+            .thread_meta
+            .get(thread_id)
+            .and_then(|m| m.parent_thread_id.as_deref())
+            .map(str::to_string);
+        while let Some(pid) = cur {
+            if !visited.insert(pid.clone()) {
+                break;
+            }
+            if self.collapsed_threads.remove(&pid) {
+                changed = true;
+            }
+            cur = self
+                .thread_meta
+                .get(&pid)
+                .and_then(|m| m.parent_thread_id.as_deref())
+                .map(str::to_string);
+        }
+        changed
+    }
+
+    pub fn thread_has_children(&self, thread_id: &str) -> bool {
+        self.tree_has_children.contains(thread_id)
+            || self.thread_meta.values().any(|m| {
+                m.parent_thread_id.as_deref() == Some(thread_id)
+                    && self.threads.iter().any(|t| t.id == m.thread_id)
+            })
+    }
+
+    pub fn toggle_tree_fold(&mut self, thread_id: &str) -> bool {
+        if !self.thread_has_children(thread_id) {
+            return false;
+        }
+        if !self.collapsed_threads.insert(thread_id.to_string()) {
+            self.collapsed_threads.remove(thread_id);
+        }
+        crate::runner::rebuild_tree_nodes(self);
+        true
+    }
+
+    pub fn fold_or_jump_parent_in_tree(&mut self) -> bool {
+        let Some(idx) = self.tree.selected_index() else {
+            return false;
+        };
+        match self.tree.nodes.get(idx).cloned() {
+            Some(crate::ui::tree::TreeNode::Anchor(anchor)) => {
+                if let Some(parent_idx) = self.tree.nodes.iter().position(|n| {
+                    matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == anchor.thread_id)
+                }) {
+                    self.tree.select_index(parent_idx);
+                    self.maybe_request_pty_snapshot(&anchor.thread_id);
+                    return true;
+                }
+                false
+            }
+            Some(crate::ui::tree::TreeNode::Thread(thread)) => {
+                if self.thread_has_children(&thread.id)
+                    && !self.collapsed_threads.contains(&thread.id)
+                {
+                    self.collapsed_threads.insert(thread.id);
+                    crate::runner::rebuild_tree_nodes(self);
+                    return true;
+                }
+                if let Some(parent_id) = self
+                    .thread_meta
+                    .get(&thread.id)
+                    .and_then(|m| m.parent_thread_id.as_deref())
+                    .map(str::to_string)
+                {
+                    if let Some(parent_idx) = self.tree.nodes.iter().position(|n| {
+                        matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == parent_id)
+                    }) {
+                        self.tree.select_index(parent_idx);
+                        self.maybe_request_pty_snapshot(&parent_id);
+                        return true;
+                    }
+                }
+                false
+            }
+            None => false,
+        }
+    }
+
     pub fn switch_thread(&mut self, thread_id: impl Into<String>) {
         let target_thread = thread_id.into();
         self.pending_rename_thread_id = None;
+        self.pending_g_prefix = false;
+        if target_thread != self.active_thread_id {
+            self.transcript_search.clear();
+        }
         self.thread_drafts
             .insert(self.active_thread_id.clone(), self.input_buffer.clone());
         self.thread_transcripts.insert(
@@ -819,10 +945,11 @@ impl App {
         self.thread_viewports
             .entry(self.active_thread_id.clone())
             .or_default();
+        let active_id = self.active_thread_id.clone();
+        self.unfold_ancestors_for(&active_id);
         self.sync_anchors();
         self.select_active_thread_in_tree();
         self.sync_focus_for_active_thread();
-        let active_id = self.active_thread_id.clone();
         self.maybe_request_pty_snapshot(&active_id);
         self.maybe_queue_terminal_resize();
     }
@@ -952,6 +1079,7 @@ impl App {
     }
 
     pub fn set_focus(&mut self, pane: impl Into<FocusedPane>) {
+        self.pending_g_prefix = false;
         let pane = pane.into();
         if pane == FocusedPane::Tree {
             self.focus_tree();
@@ -1430,6 +1558,231 @@ impl App {
         }
     }
 
+    pub fn current_transcript_inner_width(&self) -> usize {
+        if let Some(area) = self.last_frame_area {
+            let sub_count = self
+                .thread_subagents
+                .get(&self.active_thread_id)
+                .map_or(0, Vec::len);
+            let strip_h = crate::layout::subagent_strip_height(sub_count);
+            let layout = crate::layout::compute_layout_with_options(
+                area,
+                strip_h,
+                self.sidebar_hidden,
+                false,
+            );
+            let w = if self.sidebar_hidden {
+                layout.transcript_area.width
+            } else {
+                layout.transcript_area.width.saturating_sub(2)
+            };
+            if w >= 1 {
+                return w as usize;
+            }
+        }
+        80
+    }
+
+    fn search_anchor_for(&self, target_id: &str, total_lines: usize) -> Option<usize> {
+        let vp = self.transcript_viewport(target_id);
+        match self.transcript_search.direction {
+            crate::search::SearchDirection::Forward => Some(vp.scroll_offset()),
+            crate::search::SearchDirection::Reverse => {
+                let vp_h = if self.transcript_viewport_height > 0 {
+                    self.transcript_viewport_height as usize
+                } else {
+                    total_lines.max(1)
+                };
+                Some(
+                    vp.scroll_offset()
+                        .saturating_add(vp_h.saturating_sub(1))
+                        .min(total_lines.saturating_sub(1)),
+                )
+            }
+        }
+    }
+
+    fn scroll_transcript_to_line(&mut self, target_id: &str, line_idx: usize, total_lines: usize) {
+        let vp_h = if self.transcript_viewport_height > 0 {
+            self.transcript_viewport_height as usize
+        } else {
+            20
+        };
+        let max_scroll = total_lines.saturating_sub(vp_h);
+        let has_vp_height = self.transcript_viewport_height > 0;
+        let vp = self.transcript_viewport_mut(target_id);
+        if has_vp_height || vp.max_scroll == 0 {
+            vp.max_scroll = max_scroll;
+        }
+        let eff_max = vp.max_scroll;
+        let cur = vp.scroll_offset.min(eff_max);
+        let new_offset = if line_idx < cur {
+            line_idx.saturating_sub(vp_h / 4).min(eff_max)
+        } else if line_idx >= cur + vp_h {
+            (line_idx + 1)
+                .saturating_sub(vp_h)
+                .saturating_add(vp_h / 4)
+                .min(eff_max)
+        } else {
+            cur
+        };
+        vp.scroll_offset = new_offset;
+        vp.auto_scroll = false;
+    }
+
+    fn recompute_transcript_search_and_scroll(&mut self) {
+        let target_id = self.transcript_scroll_target_id();
+        if self.is_terminal_thread(&target_id) {
+            self.transcript_search.recompute_matches(&[], None);
+            return;
+        }
+        let width = self.current_transcript_inner_width();
+        let lines = crate::render::build_transcript_wrapped_lines(self, &target_id, width);
+        let anchor = self.search_anchor_for(&target_id, lines.len());
+        self.transcript_search.recompute_matches(&lines, anchor);
+        if let Some(line_idx) = self.transcript_search.active_line_index() {
+            self.scroll_transcript_to_line(&target_id, line_idx, lines.len());
+        }
+    }
+
+    fn step_transcript_search(&mut self, next: bool) {
+        let target_id = self.transcript_scroll_target_id();
+        if self.is_terminal_thread(&target_id) {
+            return;
+        }
+        let width = self.current_transcript_inner_width();
+        let lines = crate::render::build_transcript_wrapped_lines(self, &target_id, width);
+        if !self.transcript_search.query.is_empty() {
+            let old_matches = std::mem::take(&mut self.transcript_search.matches);
+            let old_idx = self.transcript_search.current_index;
+            let prev_active = old_idx.and_then(|i| old_matches.get(i)).cloned();
+            let anchor = self.search_anchor_for(&target_id, lines.len());
+            self.transcript_search.recompute_matches(&lines, anchor);
+            if self.transcript_search.matches == old_matches {
+                self.transcript_search.current_index = old_idx;
+            } else if let Some(prev_m) = prev_active {
+                if let Some(pos) = self
+                    .transcript_search
+                    .matches
+                    .iter()
+                    .position(|m| *m == prev_m)
+                {
+                    self.transcript_search.current_index = Some(pos);
+                } else if let (Some(oi), false) = (old_idx, self.transcript_search.matches.is_empty())
+                {
+                    self.transcript_search.current_index =
+                        Some(oi.min(self.transcript_search.matches.len() - 1));
+                }
+            }
+        }
+        let moved = if next {
+            self.transcript_search.next_match().is_some()
+        } else {
+            self.transcript_search.prev_match().is_some()
+        };
+        if moved {
+            if let Some(line_idx) = self.transcript_search.active_line_index() {
+                self.scroll_transcript_to_line(&target_id, line_idx, lines.len());
+            }
+        }
+    }
+
+    fn open_transcript_search(&mut self, direction: crate::search::SearchDirection) {
+        self.transcript_search.open(direction);
+        self.pending_g_prefix = false;
+    }
+
+    pub fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::MouseEventKind;
+        let is_up = match mouse.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return false,
+        };
+        self.sync_focus_in();
+        if self.show_help_modal {
+            if is_up {
+                self.help_scroll_offset = self.help_scroll_offset.saturating_sub(3);
+            } else {
+                self.help_scroll_offset = self.help_scroll_offset.saturating_add(3);
+            }
+            self.sync_focus_out();
+            return true;
+        }
+        if self.has_active_modal() {
+            self.sync_focus_out();
+            return false;
+        }
+        let delta: isize = if is_up { 3 } else { -3 };
+        let over_tree_pane = self.focused_pane == FocusedPane::Tree
+            && self.last_frame_area.is_none_or(|area| {
+                if self.sidebar_hidden || area.width == 0 || area.height == 0 {
+                    false
+                } else {
+                    let sub_count = self
+                        .thread_subagents
+                        .get(&self.active_thread_id)
+                        .map_or(0, Vec::len);
+                    let strip_h = crate::layout::subagent_strip_height(sub_count);
+                    let layout = crate::layout::compute_layout_with_options(
+                        area,
+                        strip_h,
+                        self.sidebar_hidden,
+                        self.active_is_terminal() || self.pending_rename_thread_id.is_some(),
+                    );
+                    !layout
+                        .transcript_area
+                        .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                }
+            });
+
+        if self.active_is_terminal() && !over_tree_pane {
+            self.pending_actions.push_back(AppAction::PtyScroll {
+                thread_id: self.active_thread_id.clone(),
+                delta,
+            });
+            self.sync_focus_out();
+            return true;
+        }
+
+        if over_tree_pane {
+            let target_id = self.selected_tree_thread_info().0;
+            if self.is_terminal_thread(&target_id)
+                && self.last_frame_area.is_some()
+                && self.active_is_terminal()
+            {
+                self.pending_actions.push_back(AppAction::PtyScroll {
+                    thread_id: target_id,
+                    delta,
+                });
+            } else if is_up {
+                self.tree.select_previous();
+                let (sel_id, _) = self.selected_tree_thread_info();
+                self.maybe_request_pty_snapshot(&sel_id);
+            } else {
+                self.tree.select_next();
+                let (sel_id, _) = self.selected_tree_thread_info();
+                self.maybe_request_pty_snapshot(&sel_id);
+            }
+            self.sync_focus_out();
+            return true;
+        }
+
+        let target_id = self.transcript_scroll_target_id();
+        if self.is_terminal_thread(&target_id) {
+            self.pending_actions.push_back(AppAction::PtyScroll {
+                thread_id: target_id,
+                delta,
+            });
+        } else if is_up {
+            self.scroll_target_transcript(TranscriptScroll::Up(3));
+        } else {
+            self.scroll_target_transcript(TranscriptScroll::Down(3));
+        }
+        self.sync_focus_out();
+        true
+    }
+
     fn scroll_target_transcript(&mut self, action: TranscriptScroll) {
         let target_id = self.transcript_scroll_target_id();
         let vp = self.transcript_viewport_mut(&target_id);
@@ -1576,6 +1929,7 @@ impl App {
             }
             KeyCode::Char('g') if no_ctrl_alt => {
                 self.scroll_target_transcript(TranscriptScroll::Top);
+                self.pending_g_prefix = true;
                 None
             }
             KeyCode::Char('G') if no_ctrl_alt => {
@@ -1628,11 +1982,25 @@ impl App {
                 self.request_delete_thread(target_id);
                 None
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
-                if no_ctrl_alt || key.code == KeyCode::Enter =>
-            {
-                self.activate_selected_tree_node()
+            KeyCode::Char(' ') if no_ctrl_alt => {
+                let (sel_id, _) = self.selected_tree_thread_info();
+                self.toggle_tree_fold(&sel_id);
+                None
             }
+            KeyCode::Left | KeyCode::Char('h') if no_ctrl_alt => {
+                self.fold_or_jump_parent_in_tree();
+                None
+            }
+            KeyCode::Right | KeyCode::Char('l') if no_ctrl_alt => {
+                let (sel_id, _) = self.selected_tree_thread_info();
+                if self.collapsed_threads.remove(&sel_id) {
+                    crate::runner::rebuild_tree_nodes(self);
+                    None
+                } else {
+                    self.activate_selected_tree_node()
+                }
+            }
+            KeyCode::Enter => self.activate_selected_tree_node(),
             _ => None,
         }
     }
@@ -1677,13 +2045,6 @@ impl App {
             }
             (KeyCode::Char('e' | 'E'), true, false) | (KeyCode::End, false, false) => {
                 self.cursor_position = line_end(&self.input_buffer, pos);
-                true
-            }
-            (KeyCode::Char('f' | 'F'), true, false) => {
-                self.cursor_position = match self.input_buffer[pos..].chars().next() {
-                    Some(ch) => pos + ch.len_utf8(),
-                    None => pos,
-                };
                 true
             }
             (KeyCode::Char('b' | 'B'), true, false) => {
@@ -1808,6 +2169,7 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         if ctrl && !alt && matches!(key.code, KeyCode::Char('q' | 'Q')) {
+            self.pending_g_prefix = false;
             self.should_quit = true;
             self.sync_focus_out();
             return true;
@@ -1818,6 +2180,7 @@ impl App {
             && matches!(key.code, KeyCode::Char('c' | 'C'))
             && (self.focused_pane != FocusedPane::Terminal || self.has_active_modal())
         {
+            self.pending_g_prefix = false;
             self.should_quit = true;
             self.sync_focus_out();
             return true;
@@ -1833,6 +2196,7 @@ impl App {
         }
 
         if self.pending_permission.is_some() {
+            self.pending_g_prefix = false;
             let no_ctrl_alt = !ctrl && !alt;
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if no_ctrl_alt => {
@@ -1848,12 +2212,14 @@ impl App {
         }
 
         if self.config_picker.is_some() {
+            self.pending_g_prefix = false;
             self.handle_key_config_picker(key);
             self.sync_focus_out();
             return true;
         }
 
         if self.show_help_modal {
+            self.pending_g_prefix = false;
             let no_ctrl_alt = !ctrl && !alt;
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => {
@@ -1886,6 +2252,7 @@ impl App {
         }
 
         if self.focused_pane == FocusedPane::Terminal {
+            self.pending_g_prefix = false;
             if ctrl && !alt && matches!(key.code, KeyCode::Char('t' | 'T')) {
                 self.toggle_sidebar_zoom();
                 self.sync_focus_out();
@@ -1896,8 +2263,39 @@ impl App {
                     self.focus_tree();
                     return true;
                 }
+                if key.code == KeyCode::Enter && !ctrl && !alt {
+                    let (rows, cols) = self.current_terminal_dims_or_default();
+                    self.pending_actions.push_back(AppAction::PtyRestart {
+                        thread_id: self.active_thread_id.clone(),
+                        rows,
+                        cols,
+                    });
+                    self.sync_focus_out();
+                    return true;
+                }
                 self.sync_focus_out();
                 return false;
+            }
+            if (shift || alt) && !ctrl {
+                match key.code {
+                    KeyCode::PageUp => {
+                        self.pending_actions.push_back(AppAction::PtyScroll {
+                            thread_id: self.active_thread_id.clone(),
+                            delta: 5,
+                        });
+                        self.sync_focus_out();
+                        return true;
+                    }
+                    KeyCode::PageDown => {
+                        self.pending_actions.push_back(AppAction::PtyScroll {
+                            thread_id: self.active_thread_id.clone(),
+                            delta: -5,
+                        });
+                        self.sync_focus_out();
+                        return true;
+                    }
+                    _ => {}
+                }
             }
             let app_cursor = self
                 .pty_screens
@@ -1915,6 +2313,83 @@ impl App {
             }
             self.sync_focus_out();
             return false;
+        }
+
+        let had_g_prefix = std::mem::take(&mut self.pending_g_prefix);
+
+        if key.code == KeyCode::F(1) && !ctrl && !alt {
+            self.help_scroll_offset = 0;
+            self.show_help_modal = true;
+            self.sync_focus_out();
+            return true;
+        }
+
+        if ctrl && !alt && matches!(key.code, KeyCode::Char('f' | 'F')) {
+            self.open_transcript_search(crate::search::SearchDirection::Forward);
+            self.sync_focus_out();
+            return true;
+        }
+
+        if self.transcript_search.editing {
+            match key.code {
+                KeyCode::Esc if !ctrl && !alt => {
+                    self.transcript_search.clear();
+                }
+                KeyCode::Enter if !ctrl && !alt => {
+                    self.transcript_search.confirm();
+                    if !self.transcript_search.query.is_empty() {
+                        self.recompute_transcript_search_and_scroll();
+                    }
+                }
+                KeyCode::Backspace if !ctrl && !alt => {
+                    self.transcript_search.query.pop();
+                    self.recompute_transcript_search_and_scroll();
+                }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    self.transcript_search.query.push(c);
+                    self.recompute_transcript_search_and_scroll();
+                }
+                _ => {}
+            }
+            self.sync_focus_out();
+            return true;
+        }
+
+        if matches!(self.focused_pane, FocusedPane::Tree | FocusedPane::Transcript) && !ctrl && !alt
+        {
+            match key.code {
+                KeyCode::Char('?') => {
+                    if had_g_prefix {
+                        self.help_scroll_offset = 0;
+                        self.show_help_modal = true;
+                    } else {
+                        self.open_transcript_search(crate::search::SearchDirection::Reverse);
+                    }
+                    self.sync_focus_out();
+                    return true;
+                }
+                KeyCode::Char('/') => {
+                    self.open_transcript_search(crate::search::SearchDirection::Forward);
+                    self.sync_focus_out();
+                    return true;
+                }
+                KeyCode::Char('n') if !self.transcript_search.query.is_empty() => {
+                    self.step_transcript_search(true);
+                    self.sync_focus_out();
+                    return true;
+                }
+                KeyCode::Char('N') if !self.transcript_search.query.is_empty() => {
+                    self.step_transcript_search(false);
+                    self.sync_focus_out();
+                    return true;
+                }
+                KeyCode::Esc if !self.transcript_search.query.is_empty() => {
+                    self.transcript_search.clear();
+                    self.sync_focus_out();
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         // Global Transcript scrolling (active thread, or previewed thread when focused in Tree)
@@ -1998,7 +2473,8 @@ impl App {
         if key.code == KeyCode::Char('?')
             && !ctrl
             && !alt
-            && (self.focused_pane != FocusedPane::Composer || self.input_buffer.is_empty())
+            && self.focused_pane == FocusedPane::Composer
+            && self.input_buffer.is_empty()
         {
             self.help_scroll_offset = 0;
             self.show_help_modal = true;
@@ -2141,6 +2617,7 @@ impl App {
             }
             KeyCode::Char('g') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
                 self.scroll_target_transcript(TranscriptScroll::Top);
+                self.pending_g_prefix = !had_g_prefix;
                 return true;
             }
             KeyCode::Char('G') if !ctrl && !alt && self.focused_pane == FocusedPane::Transcript => {
@@ -2160,6 +2637,9 @@ impl App {
             _ => {
                 if self.focused_pane == FocusedPane::Tree {
                     let _ = self.handle_key_tree(key);
+                    if key.code == KeyCode::Char('g') && !ctrl && !alt && had_g_prefix {
+                        self.pending_g_prefix = false;
+                    }
                     self.sync_focus_out();
                     return true;
                 }

@@ -228,10 +228,10 @@ fn test_word_navigation_char_f_d_and_yank_roundtrip() {
     assert!(app.handle_key_event(alt('F')));
     assert_eq!(app.cursor_position, app.input_buffer.len());
 
-    // Ctrl+F and Ctrl+D on multi-byte text
+    // Right arrow and Ctrl+D on multi-byte text (Ctrl+F opens Forward Search)
     app.input_buffer = "héllo".to_string();
     app.cursor_position = 1; // right before 'é'
-    assert!(app.handle_key_event(ctrl('f')));
+    assert!(app.handle_key_event(key(KeyCode::Right, KeyModifiers::NONE)));
     assert_eq!(app.cursor_position, 3); // after 2-byte 'é'
     assert!(app.handle_key_event(ctrl('d')));
     assert_eq!(app.input_buffer, "hélo");
@@ -266,9 +266,9 @@ fn test_utf8_emoji_safety_no_panic() {
     app.cursor_position = 0;
 
     let keys = [
-        ctrl('f'),
-        ctrl('f'),
-        ctrl('f'),
+        key(KeyCode::Right, KeyModifiers::NONE),
+        key(KeyCode::Right, KeyModifiers::NONE),
+        key(KeyCode::Right, KeyModifiers::NONE),
         key(KeyCode::Right, KeyModifiers::ALT),
         key(KeyCode::Right, KeyModifiers::ALT),
         ctrl('d'),
@@ -299,7 +299,7 @@ fn test_utf8_emoji_safety_no_panic() {
     // Explicit multi-byte emoji kill/yank sanity
     app.input_buffer = "héllo 🦀 wörld".to_string();
     app.cursor_position = "héllo 🦀".len();
-    app.handle_key_event(ctrl('f')); // over ' '
+    app.handle_key_event(key(KeyCode::Right, KeyModifiers::NONE)); // over ' '
     app.handle_key_event(key(KeyCode::Left, KeyModifiers::ALT));
     assert_eq!(&app.input_buffer[..app.cursor_position], "");
     app.handle_key_event(key(KeyCode::Right, KeyModifiers::ALT));
@@ -359,7 +359,6 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
             ctrl('u'),
             ctrl('w'),
             ctrl('d'),
-            ctrl('f'),
             ctrl('y'),
             alt('b'),
             alt('f'),
@@ -375,6 +374,14 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
         assert_eq!(app.cursor_position, 5);
         assert_eq!(app.kill_ring, "preserved");
     }
+
+    // Ctrl+F opens Forward Search without mutating Composer draft/cursor; Esc clears it
+    assert!(app.handle_key_event(ctrl('f')));
+    assert!(app.transcript_search.editing);
+    assert_eq!(app.input_buffer, "keep\n this draft");
+    assert_eq!(app.cursor_position, 5);
+    app.handle_key_event(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.transcript_search.is_visible());
 
     // '?' Help Modal displays Readline shortcuts without clipping
     app.set_focus(FocusedPane::Composer);
