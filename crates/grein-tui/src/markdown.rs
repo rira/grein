@@ -42,11 +42,40 @@ struct ActiveFence {
     ansi_style: Style,
 }
 
+fn flush_pending_accent(
+    out: &mut Vec<Line<'static>>,
+    pending_assistant_accent: &mut bool,
+    accent_style: Style,
+) {
+    if std::mem::take(pending_assistant_accent) {
+        out.push(Line::from(Span::styled("✦", accent_style)));
+    }
+}
+
+fn push_with_pending_accent(
+    out: &mut Vec<Line<'static>>,
+    mut line: Line<'static>,
+    pending_assistant_accent: &mut bool,
+    accent_style: Style,
+) {
+    if std::mem::take(pending_assistant_accent) {
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        spans.push(Span::styled("✦ ", accent_style));
+        spans.extend(line.spans);
+        line.spans = spans;
+    }
+    out.push(line);
+}
+
 fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
     let raw_lines: Vec<&str> = markdown.lines().collect();
     let mut out = Vec::new();
     let mut active_fence: Option<ActiveFence> = None;
     let mut in_user_block = false;
+    let mut pending_assistant_accent = false;
+    let accent_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let mut idx = 0usize;
 
     while idx < raw_lines.len() {
@@ -77,6 +106,7 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
 
         if let Some((fence_char, fence_len, lang)) = parse_opening_fence(line) {
             in_user_block = false;
+            flush_pending_accent(&mut out, &mut pending_assistant_accent, accent_style);
             if !lang.eq_ignore_ascii_case("ansi") {
                 let header = if lang.is_empty() {
                     "╭───".to_string()
@@ -103,6 +133,7 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
             .strip_prefix("# User: ")
             .or_else(|| (trimmed == "# User:").then_some(""))
         {
+            flush_pending_accent(&mut out, &mut pending_assistant_accent, accent_style);
             in_user_block = true;
             let user_style = Style::default().fg(Color::Green);
             let mut spans = vec![Span::styled("❯ ", user_style.add_modifier(Modifier::BOLD))];
@@ -114,12 +145,16 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
             continue;
         }
 
+        if trimmed == "## Assistant" || trimmed == "## Agent (agy)" {
+            in_user_block = false;
+            flush_pending_accent(&mut out, &mut pending_assistant_accent, accent_style);
+            pending_assistant_accent = true;
+            idx += 1;
+            continue;
+        }
+
         if in_user_block {
-            if trimmed.is_empty()
-                || trimmed == "## Agent (agy)"
-                || trimmed == "## Assistant"
-                || trimmed.starts_with('#')
-            {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 in_user_block = false;
             } else {
                 let user_style = Style::default().fg(Color::Green);
@@ -131,8 +166,14 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
             }
         }
 
+        if pending_assistant_accent && trimmed.is_empty() {
+            idx += 1;
+            continue;
+        }
+
         if idx + 1 < raw_lines.len() {
             if let Some((table, next_idx)) = try_parse_table(&raw_lines, idx) {
+                flush_pending_accent(&mut out, &mut pending_assistant_accent, accent_style);
                 out.extend(render_table(&table, max_width));
                 idx = next_idx;
                 continue;
@@ -145,7 +186,7 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
             } else {
                 Color::Red
             };
-            out.push(Line::from(vec![
+            let rendered_line = Line::from(vec![
                 Span::styled(
                     format!("$ {cmd} "),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -154,16 +195,29 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
                     format!("(exit {exit_code})"),
                     Style::default().fg(exit_color),
                 ),
-            ]));
+            ]);
+            push_with_pending_accent(
+                &mut out,
+                rendered_line,
+                &mut pending_assistant_accent,
+                accent_style,
+            );
         } else if let Some(heading_text) = strip_heading_prefix(trimmed) {
             let heading_style = Style::default().add_modifier(Modifier::BOLD);
             let spans = parse_inline_spans_with_base(heading_text, heading_style);
-            out.push(Line::from(if spans.is_empty() {
+            let rendered_line = Line::from(if spans.is_empty() {
                 vec![Span::styled(String::new(), heading_style)]
             } else {
                 spans
-            }));
+            });
+            push_with_pending_accent(
+                &mut out,
+                rendered_line,
+                &mut pending_assistant_accent,
+                accent_style,
+            );
         } else if is_horizontal_rule(trimmed) {
+            flush_pending_accent(&mut out, &mut pending_assistant_accent, accent_style);
             let rule_len = match max_width {
                 Some(w) => w.clamp(3, 60),
                 None => 32,
@@ -178,19 +232,36 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
                 .add_modifier(Modifier::ITALIC);
             let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
             spans.extend(parse_inline_spans_with_base(quote, quote_base));
-            out.push(Line::from(spans));
+            push_with_pending_accent(
+                &mut out,
+                Line::from(spans),
+                &mut pending_assistant_accent,
+                accent_style,
+            );
         } else if let Some((indent, bullet)) = split_list_bullet(line) {
             let mut spans = vec![Span::raw(format!("{indent}• "))];
             spans.extend(parse_inline_spans(bullet));
-            out.push(Line::from(spans));
+            push_with_pending_accent(
+                &mut out,
+                Line::from(spans),
+                &mut pending_assistant_accent,
+                accent_style,
+            );
         } else if trimmed.is_empty() {
             out.push(Line::raw(""));
         } else {
-            out.push(Line::from(parse_inline_spans(line)));
+            push_with_pending_accent(
+                &mut out,
+                Line::from(parse_inline_spans(line)),
+                &mut pending_assistant_accent,
+                accent_style,
+            );
         }
 
         idx += 1;
     }
+
+    flush_pending_accent(&mut out, &mut pending_assistant_accent, accent_style);
 
     if out.is_empty() && !markdown.is_empty() {
         out.push(Line::raw(markdown.to_string()));

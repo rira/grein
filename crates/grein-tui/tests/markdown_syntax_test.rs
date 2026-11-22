@@ -461,3 +461,26 @@ fn test_wrap_styled_line_and_lines_unicode_and_styles() {
         vec!["one two", "three", "four", "five"]
     );
 }
+
+#[test]
+fn test_assistant_accent_wrapping_and_fenced_headers() {
+    let md = "## Assistant\nalpha beta gamma";
+    let wrapped_11 = wrap_styled_lines(render_markdown_lines(md), 11);
+    assert!(wrapped_11.iter().all(|l| l.width() <= 11));
+    assert_eq!(lines_text(&wrapped_11), vec!["✦ alpha", "beta gamma"]);
+    assert_eq!(wrapped_11[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(wrapped_11[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+
+    let exact_12 = wrap_styled_lines(render_markdown_lines("## Agent (agy)\nalpha beta"), 12);
+    assert_eq!(lines_text(&exact_12), vec!["✦ alpha beta"]);
+    assert_eq!(exact_12[0].width(), 12);
+
+    let fenced = "````markdown\n## Assistant\n## Agent (agy)\n````";
+    assert_eq!(
+        lines_text(&render_markdown_lines(fenced)),
+        vec!["╭─ markdown ─", "## Assistant", "## Agent (agy)", "╰───"]
+    );
+}

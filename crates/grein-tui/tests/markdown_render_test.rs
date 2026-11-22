@@ -1,7 +1,7 @@
 use grein_tui::app::App;
 use grein_tui::engine_port::TuiEngineEvent;
 use grein_tui::markdown::{
-    parse_inline_spans, render_markdown_lines, render_markdown_lines_with_width,
+    parse_inline_spans, render_markdown_lines, render_markdown_lines_with_width, wrap_styled_lines,
 };
 use grein_tui::render::{render_app, render_markdown_lines as render_mod_markdown_lines};
 use grein_tui::runner::apply_engine_event;
@@ -472,16 +472,186 @@ fn test_user_prompts_render_with_chevron_in_leaf_green() {
         .iter()
         .all(|s| s.style.fg == Some(Color::Green)));
 
-    assert_eq!(texts[3], "Agent (agy)");
+    assert_eq!(texts[3], "✦ reply");
+    assert_eq!(texts.len(), 4);
+    assert!(
+        !texts.join("\n").contains("Agent (agy)"),
+        "Agent (agy) literal header must not appear in rendered lines: {texts:?}"
+    );
+    assert_eq!(rendered[3].spans[0].content, "✦ ");
+    assert_eq!(rendered[3].spans[0].style.fg, Some(Color::Cyan));
+    assert!(rendered[3].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert_eq!(rendered[3].spans[1].content, "reply");
     assert!(rendered[3]
         .spans
         .iter()
         .all(|s| s.style.fg != Some(Color::Green)));
-    assert_eq!(texts[4], "reply");
-    assert!(rendered[4]
+}
+
+#[test]
+fn test_assistant_and_agent_headers_render_minimal_cyan_accent() {
+    for header in ["## Assistant", "## Agent (agy)", "  ## Assistant  "] {
+        let md = format!("{header}\nHello world");
+        let lines = render_markdown_lines(&md);
+        let texts = lines_text(&lines);
+        assert_eq!(texts, vec!["✦ Hello world"], "for header {header:?}");
+        assert!(!texts.join("\n").contains("Assistant"));
+        assert!(!texts.join("\n").contains("Agent (agy)"));
+        assert_eq!(lines[0].spans[0].content, "✦ ");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert!(lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(lines[0].spans[1].content, "Hello world");
+        assert_eq!(lines[0].spans[1].style.fg, None);
+    }
+
+    let spaced = render_markdown_lines("## Assistant\n\n\nHello\n\nWorld");
+    assert_eq!(lines_text(&spaced), vec!["✦ Hello", "", "World"]);
+
+    for eof_only in ["## Assistant\n", "## Assistant", "## Agent (agy)\n\n"] {
+        let lines = render_markdown_lines(eof_only);
+        assert_eq!(lines_text(&lines), vec!["✦"], "for {eof_only:?}");
+        assert_eq!(lines[0].spans[0].content, "✦");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert!(lines[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+    }
+
+    let user_to_asst = render_markdown_lines("# User: hi\n## Assistant\nhello");
+    assert_eq!(lines_text(&user_to_asst), vec!["❯ hi", "✦ hello"]);
+    assert!(user_to_asst[0]
+        .spans
+        .iter()
+        .all(|s| s.style.fg == Some(Color::Green)));
+    assert_eq!(user_to_asst[1].spans[0].style.fg, Some(Color::Cyan));
+    assert!(user_to_asst[1]
         .spans
         .iter()
         .all(|s| s.style.fg != Some(Color::Green)));
+
+    let asst_to_user = render_markdown_lines("## Assistant\n# User: next");
+    assert_eq!(lines_text(&asst_to_user), vec!["✦", "❯ next"]);
+    assert_eq!(asst_to_user[0].spans[0].style.fg, Some(Color::Cyan));
+
+    let back_to_back = render_markdown_lines("## Assistant\n## Agent (agy)\nhello");
+    assert_eq!(lines_text(&back_to_back), vec!["✦", "✦ hello"]);
+
+    let heading_first = render_markdown_lines("## Assistant\n### Summary");
+    assert_eq!(lines_text(&heading_first), vec!["✦ Summary"]);
+    assert_eq!(heading_first[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(heading_first[0].spans[1]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+
+    let list_first = render_markdown_lines("## Assistant\n- item one");
+    assert_eq!(lines_text(&list_first), vec!["✦ • item one"]);
+
+    let quote_first = render_markdown_lines("## Assistant\n> quoted line");
+    assert_eq!(lines_text(&quote_first), vec!["✦ │ quoted line"]);
+
+    let non_marker_h2 = render_markdown_lines("## Assistant Note\nbody");
+    assert_eq!(lines_text(&non_marker_h2), vec!["Assistant Note", "body"]);
+    let non_marker_h3 = render_markdown_lines("### Assistant\nbody");
+    assert_eq!(lines_text(&non_marker_h3), vec!["Assistant", "body"]);
+}
+
+#[test]
+fn test_assistant_accent_code_fence_table_and_literal_markdown_fence() {
+    let md_fence = "## Assistant\n\n```rust\nlet x = 1;\n```";
+    let fence_lines = render_markdown_lines(md_fence);
+    let fence_texts = lines_text(&fence_lines);
+    assert_eq!(
+        fence_texts,
+        vec!["✦", "╭─ rust ─", "let x = 1;", "╰───"]
+    );
+    assert_eq!(fence_lines[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(fence_lines[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert!(fence_texts[2].starts_with("let x = 1;"));
+
+    let tilde_fence = "## Agent (agy)\n~~~python\nprint(1)\n~~~";
+    assert_eq!(
+        lines_text(&render_markdown_lines(tilde_fence)),
+        vec!["✦", "╭─ python ─", "print(1)", "╰───"]
+    );
+
+    let table_first = "## Assistant\n| A | B |\n| --- | --- |\n| 1 | 2 |";
+    let table_lines = render_markdown_lines(table_first);
+    let table_texts = lines_text(&table_lines);
+    assert_eq!(table_texts[0], "✦");
+    assert!(table_texts[1].starts_with('┌'));
+
+    let literal_in_fence = "```markdown\n## Assistant\n## Agent (agy)\n```";
+    assert_eq!(
+        lines_text(&render_markdown_lines(literal_in_fence)),
+        vec!["╭─ markdown ─", "## Assistant", "## Agent (agy)", "╰───"]
+    );
+}
+
+#[test]
+fn test_assistant_accent_wrapping_and_ratatui_screen() {
+    let md = "## Assistant\nalpha beta gamma";
+    let wrapped_12 = wrap_styled_lines(render_markdown_lines_with_width(md, 12), 12);
+    assert_eq!(lines_text(&wrapped_12), vec!["✦ alpha beta", "gamma"]);
+    assert!(wrapped_12.iter().all(|l| l.width() <= 12));
+    assert_eq!(wrapped_12[0].spans[0].style.fg, Some(Color::Cyan));
+    assert!(wrapped_12[0].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+
+    let wrapped_11 = wrap_styled_lines(render_markdown_lines_with_width(md, 11), 11);
+    assert_eq!(lines_text(&wrapped_11), vec!["✦ alpha", "beta gamma"]);
+    assert!(wrapped_11.iter().all(|l| l.width() <= 11));
+
+    let backend = TestBackend::new(80, 18);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+    app.active_transcript_md =
+        "# User: hi\n\n## Assistant\nHello world\n\n## Agent (agy)\n\n```rust\nlet x = 1;\n```"
+            .to_string();
+
+    terminal.draw(|f| render_app(f, &app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let mut screen_rows = Vec::new();
+    for y in 0..buf.area.height {
+        let mut row = String::new();
+        for x in 0..buf.area.width {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        screen_rows.push(row);
+    }
+    let screen = screen_rows.join("\n");
+
+    assert!(screen.contains("❯ hi"), "{screen}");
+    assert!(screen.contains("✦ Hello world"), "{screen}");
+    assert!(screen.contains("let x = 1;"), "{screen}");
+    assert!(!screen.contains("## Assistant"), "{screen}");
+    assert!(!screen.contains("Agent (agy)"), "{screen}");
+
+    let mut found_cyan_bold_star = false;
+    for y in 0..buf.area.height {
+        let row = &screen_rows[y as usize];
+        if let Some(byte_idx) = row.find("✦ Hello world") {
+            let col = row[..byte_idx].chars().count() as u16;
+            let cell = &buf[(col, y)];
+            assert_eq!(cell.fg, Color::Cyan);
+            assert!(cell.modifier.contains(Modifier::BOLD));
+            found_cyan_bold_star = true;
+            break;
+        }
+    }
+    assert!(found_cyan_bold_star, "expected cyan bold ✦ on screen:\n{screen}");
 }
 
 #[test]
