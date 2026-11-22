@@ -433,11 +433,69 @@ pub struct AcpPermissionOption {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpModelOption {
+    pub model_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpModeOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConfigChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    pub current_value: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub options: Vec<AcpConfigChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSlashCommand {
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AcpSessionInfo {
     pub session_id: String,
     pub current_model_id: Option<String>,
     pub current_mode_id: Option<String>,
+    pub available_models: Vec<AcpModelOption>,
+    pub available_modes: Vec<AcpModeOption>,
+    pub config_options: Vec<AcpConfigOption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +536,18 @@ pub enum DriverEvent {
     SessionInfoUpdate {
         session_id: String,
         title: String,
+    },
+    CurrentModeUpdate {
+        session_id: String,
+        current_mode_id: String,
+    },
+    ConfigOptionUpdate {
+        session_id: String,
+        config_options: Vec<AcpConfigOption>,
+    },
+    AvailableCommandsUpdate {
+        session_id: String,
+        commands: Vec<AcpSlashCommand>,
     },
     UsageUpdate {
         session_id: String,
@@ -550,6 +620,31 @@ pub trait AgentDriver: Send + Sync {
         Err(StdioRunnerError::CommunicationError(
             "submit_prompt not supported by this driver".into(),
         ))
+    }
+
+    async fn set_session_model(
+        &self,
+        _session_id: &str,
+        _model_id: &str,
+    ) -> Result<(), StdioRunnerError> {
+        Err(StdioRunnerError::CommunicationError("not supported".into()))
+    }
+
+    async fn set_session_mode(
+        &self,
+        _session_id: &str,
+        _mode_id: &str,
+    ) -> Result<(), StdioRunnerError> {
+        Err(StdioRunnerError::CommunicationError("not supported".into()))
+    }
+
+    async fn set_config_option(
+        &self,
+        _session_id: &str,
+        _config_id: &str,
+        _value: &str,
+    ) -> Result<Vec<AcpConfigOption>, StdioRunnerError> {
+        Err(StdioRunnerError::CommunicationError("not supported".into()))
     }
 
     async fn shutdown(&self) -> Result<(), StdioRunnerError>;
@@ -852,6 +947,49 @@ impl AcpStdioDriver {
         Ok(())
     }
 
+    pub async fn set_session_model(
+        &self,
+        session_id: &str,
+        model_id: &str,
+    ) -> Result<(), StdioRunnerError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "modelId": model_id,
+        });
+        self.rpc_call("session/set_model", Some(params)).await?;
+        Ok(())
+    }
+
+    pub async fn set_session_mode(
+        &self,
+        session_id: &str,
+        mode_id: &str,
+    ) -> Result<(), StdioRunnerError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "modeId": mode_id,
+        });
+        self.rpc_call("session/set_mode", Some(params)).await?;
+        Ok(())
+    }
+
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<AcpConfigOption>, StdioRunnerError> {
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "configId": config_id,
+            "value": value,
+        });
+        let result = self
+            .rpc_call("session/set_config_option", Some(params))
+            .await?;
+        parse_config_options_result(&result)
+    }
+
     pub async fn shutdown(&self) -> Result<(), StdioRunnerError> {
         {
             let mut sender_guard = lock(&self.sender);
@@ -920,6 +1058,31 @@ impl AgentDriver for AcpStdioDriver {
 
     async fn submit_prompt(&self, session_id: &str, prompt: &str) -> Result<(), StdioRunnerError> {
         AcpStdioDriver::submit_prompt(self, session_id, prompt).await
+    }
+
+    async fn set_session_model(
+        &self,
+        session_id: &str,
+        model_id: &str,
+    ) -> Result<(), StdioRunnerError> {
+        AcpStdioDriver::set_session_model(self, session_id, model_id).await
+    }
+
+    async fn set_session_mode(
+        &self,
+        session_id: &str,
+        mode_id: &str,
+    ) -> Result<(), StdioRunnerError> {
+        AcpStdioDriver::set_session_mode(self, session_id, mode_id).await
+    }
+
+    async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<AcpConfigOption>, StdioRunnerError> {
+        AcpStdioDriver::set_config_option(self, session_id, config_id, value).await
     }
 
     async fn shutdown(&self) -> Result<(), StdioRunnerError> {
@@ -1000,6 +1163,29 @@ fn parse_initialize_result(
     })
 }
 
+fn parse_json_vec<T: serde::de::DeserializeOwned>(value: Option<&serde_json::Value>) -> Vec<T> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| serde_json::from_value::<T>(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_config_options_result(
+    result: &serde_json::Value,
+) -> Result<Vec<AcpConfigOption>, StdioRunnerError> {
+    match result.get("configOptions") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(v) if v.is_array() => Ok(parse_json_vec(Some(v))),
+        Some(_) => Err(StdioRunnerError::CommunicationError(
+            "session/set_config_option response configOptions must be an array".into(),
+        )),
+    }
+}
+
 fn parse_session_info(result: &serde_json::Value) -> Result<AcpSessionInfo, StdioRunnerError> {
     let session_id = result
         .get("sessionId")
@@ -1017,11 +1203,17 @@ fn parse_session_info(result: &serde_json::Value) -> Result<AcpSessionInfo, Stdi
         .pointer("/modes/currentModeId")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let available_models = parse_json_vec(result.pointer("/models/availableModels"));
+    let available_modes = parse_json_vec(result.pointer("/modes/availableModes"));
+    let config_options = parse_json_vec(result.get("configOptions"));
 
     Ok(AcpSessionInfo {
         session_id,
         current_model_id,
         current_mode_id,
+        available_models,
+        available_modes,
+        config_options,
     })
 }
 
@@ -1125,6 +1317,23 @@ fn translate_session_update(n: &JsonRpcNotification) -> Option<(String, DriverEv
         "session_info_update" => DriverEvent::SessionInfoUpdate {
             session_id: session_id.clone(),
             title: str_field(update, "title"),
+        },
+        "current_mode_update" => DriverEvent::CurrentModeUpdate {
+            session_id: session_id.clone(),
+            current_mode_id: update
+                .get("currentModeId")
+                .and_then(|v| v.as_str())
+                .or_else(|| update.get("modeId").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "config_option_update" => DriverEvent::ConfigOptionUpdate {
+            session_id: session_id.clone(),
+            config_options: parse_json_vec(update.get("configOptions")),
+        },
+        "available_commands_update" => DriverEvent::AvailableCommandsUpdate {
+            session_id: session_id.clone(),
+            commands: parse_json_vec(update.get("availableCommands")),
         },
         "usage_update" => DriverEvent::UsageUpdate {
             session_id: session_id.clone(),
@@ -1318,8 +1527,48 @@ mod tests {
     fn parses_session_info_with_and_without_models_modes() {
         let full = json!({
             "sessionId": "sid-123",
-            "models": { "currentModelId": "gemini-2.5-pro" },
-            "modes": { "currentModeId": "architect" }
+            "models": {
+                "currentModelId": "gemini-2.5-pro",
+                "availableModels": [
+                    {
+                        "modelId": "gemini-2.5-pro",
+                        "name": "Gemini 2.5 Pro",
+                        "description": "Deep reasoning"
+                    },
+                    {
+                        "modelId": "gemini-2.5-flash",
+                        "name": "Gemini 2.5 Flash"
+                    }
+                ]
+            },
+            "modes": {
+                "currentModeId": "architect",
+                "availableModes": [
+                    {
+                        "id": "architect",
+                        "name": "Architect",
+                        "description": "Plan only"
+                    },
+                    {
+                        "id": "code",
+                        "name": "Code",
+                        "description": null
+                    }
+                ]
+            },
+            "configOptions": [
+                {
+                    "id": "thought_level",
+                    "name": "Thinking",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "high",
+                    "options": [
+                        { "value": "low", "name": "Low", "description": "Fast" },
+                        { "value": "high", "name": "High" }
+                    ]
+                }
+            ]
         });
         assert_eq!(
             parse_session_info(&full).expect("full session info"),
@@ -1327,6 +1576,48 @@ mod tests {
                 session_id: "sid-123".into(),
                 current_model_id: Some("gemini-2.5-pro".into()),
                 current_mode_id: Some("architect".into()),
+                available_models: vec![
+                    AcpModelOption {
+                        model_id: "gemini-2.5-pro".into(),
+                        name: "Gemini 2.5 Pro".into(),
+                        description: Some("Deep reasoning".into()),
+                    },
+                    AcpModelOption {
+                        model_id: "gemini-2.5-flash".into(),
+                        name: "Gemini 2.5 Flash".into(),
+                        description: None,
+                    },
+                ],
+                available_modes: vec![
+                    AcpModeOption {
+                        id: "architect".into(),
+                        name: "Architect".into(),
+                        description: Some("Plan only".into()),
+                    },
+                    AcpModeOption {
+                        id: "code".into(),
+                        name: "Code".into(),
+                        description: None,
+                    },
+                ],
+                config_options: vec![AcpConfigOption {
+                    id: "thought_level".into(),
+                    name: "Thinking".into(),
+                    category: Some("thought_level".into()),
+                    current_value: "high".into(),
+                    options: vec![
+                        AcpConfigChoice {
+                            value: "low".into(),
+                            name: "Low".into(),
+                            description: Some("Fast".into()),
+                        },
+                        AcpConfigChoice {
+                            value: "high".into(),
+                            name: "High".into(),
+                            description: None,
+                        },
+                    ],
+                }],
             }
         );
 
@@ -1335,8 +1626,7 @@ mod tests {
             parse_session_info(&minimal).expect("minimal session info"),
             AcpSessionInfo {
                 session_id: "sid-456".into(),
-                current_model_id: None,
-                current_mode_id: None,
+                ..Default::default()
             }
         );
 
@@ -1473,18 +1763,208 @@ mod tests {
 
         assert_eq!(
             translate_session_update(&make_notif(json!({
-                "sessionUpdate": "available_commands_update",
-                "availableCommands": []
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": "architect"
             }))),
-            None
+            Some((
+                "s1".into(),
+                DriverEvent::CurrentModeUpdate {
+                    session_id: "s1".into(),
+                    current_mode_id: "architect".into(),
+                }
+            ))
         );
+
+        assert_eq!(
+            translate_session_update(&make_notif(json!({
+                "sessionUpdate": "current_mode_update",
+                "modeId": "code"
+            }))),
+            Some((
+                "s1".into(),
+                DriverEvent::CurrentModeUpdate {
+                    session_id: "s1".into(),
+                    current_mode_id: "code".into(),
+                }
+            ))
+        );
+
+        assert_eq!(
+            translate_session_update(&make_notif(json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    { "name": "compact", "description": "Compact context" },
+                    { "name": "help", "description": null },
+                    { "name": "clear" }
+                ]
+            }))),
+            Some((
+                "s1".into(),
+                DriverEvent::AvailableCommandsUpdate {
+                    session_id: "s1".into(),
+                    commands: vec![
+                        AcpSlashCommand {
+                            name: "compact".into(),
+                            description: "Compact context".into(),
+                        },
+                        AcpSlashCommand {
+                            name: "help".into(),
+                            description: String::new(),
+                        },
+                        AcpSlashCommand {
+                            name: "clear".into(),
+                            description: String::new(),
+                        },
+                    ],
+                }
+            ))
+        );
+
         assert_eq!(
             translate_session_update(&make_notif(json!({
                 "sessionUpdate": "config_option_update",
-                "options": []
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "category": "model",
+                        "currentValue": "gemini-2.5-flash",
+                        "options": [
+                            { "value": "gemini-2.5-flash", "name": "Flash" }
+                        ]
+                    }
+                ]
+            }))),
+            Some((
+                "s1".into(),
+                DriverEvent::ConfigOptionUpdate {
+                    session_id: "s1".into(),
+                    config_options: vec![AcpConfigOption {
+                        id: "model".into(),
+                        name: "Model".into(),
+                        category: Some("model".into()),
+                        current_value: "gemini-2.5-flash".into(),
+                        options: vec![AcpConfigChoice {
+                            value: "gemini-2.5-flash".into(),
+                            name: "Flash".into(),
+                            description: None,
+                        }],
+                    }],
+                }
+            ))
+        );
+
+        assert_eq!(
+            translate_session_update(&make_notif(json!({
+                "sessionUpdate": "unknown_future_update",
+                "payload": {}
             }))),
             None
         );
+    }
+
+    #[test]
+    fn parses_set_config_option_response() {
+        let valid = json!({
+            "configOptions": [
+                {
+                    "id": "mode",
+                    "name": "Mode",
+                    "category": "mode",
+                    "currentValue": "plan",
+                    "options": [
+                        { "value": "code", "name": "Code", "description": "Edit files" },
+                        { "value": "plan", "name": "Plan" }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            parse_config_options_result(&valid).expect("valid configOptions"),
+            vec![AcpConfigOption {
+                id: "mode".into(),
+                name: "Mode".into(),
+                category: Some("mode".into()),
+                current_value: "plan".into(),
+                options: vec![
+                    AcpConfigChoice {
+                        value: "code".into(),
+                        name: "Code".into(),
+                        description: Some("Edit files".into()),
+                    },
+                    AcpConfigChoice {
+                        value: "plan".into(),
+                        name: "Plan".into(),
+                        description: None,
+                    },
+                ],
+            }]
+        );
+        assert_eq!(parse_config_options_result(&json!({})).expect("empty"), vec![]);
+        assert_eq!(
+            parse_config_options_result(&json!({ "configOptions": null })).expect("null"),
+            vec![]
+        );
+        assert!(parse_config_options_result(&json!({ "configOptions": "bad" })).is_err());
+    }
+
+    struct StubAgentDriver;
+
+    #[async_trait]
+    impl AgentDriver for StubAgentDriver {
+        async fn initialize(&self) -> Result<AcpInitializeResult, StdioRunnerError> {
+            unreachable!()
+        }
+        async fn authenticate(&self, _method_id: &str) -> Result<(), StdioRunnerError> {
+            unreachable!()
+        }
+        async fn new_session(
+            &self,
+            _cwd: &Path,
+            _system_prompt_append: Option<&str>,
+        ) -> Result<AcpSessionInfo, StdioRunnerError> {
+            unreachable!()
+        }
+        async fn send_prompt(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+        ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, StdioRunnerError> {
+            unreachable!()
+        }
+        async fn respond_permission(
+            &self,
+            _request_id: serde_json::Value,
+            _option_id: Option<&str>,
+        ) -> Result<(), StdioRunnerError> {
+            unreachable!()
+        }
+        async fn cancel_session(&self, _session_id: &str) -> Result<(), StdioRunnerError> {
+            unreachable!()
+        }
+        async fn close_session(&self, _session_id: &str) -> Result<(), StdioRunnerError> {
+            unreachable!()
+        }
+        async fn shutdown(&self) -> Result<(), StdioRunnerError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_agent_driver_config_setters_return_not_supported() {
+        let driver = StubAgentDriver;
+        assert!(matches!(
+            driver.set_session_model("s1", "m1").await,
+            Err(StdioRunnerError::CommunicationError(msg)) if msg == "not supported"
+        ));
+        assert!(matches!(
+            driver.set_session_mode("s1", "mode1").await,
+            Err(StdioRunnerError::CommunicationError(msg)) if msg == "not supported"
+        ));
+        assert!(matches!(
+            driver.set_config_option("s1", "cfg", "val").await,
+            Err(StdioRunnerError::CommunicationError(msg)) if msg == "not supported"
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use grein_acp::{
-    AcpInitializeResult, AcpPermissionOption, AcpSessionInfo, AcpStdioDriver, AcpUsage,
-    AgentDriver, DriverEvent, JsonRpcMessage, JsonRpcRequest, StdioProcessConfig,
-    StdioProcessRunner,
+    AcpConfigChoice, AcpConfigOption, AcpInitializeResult, AcpModeOption, AcpModelOption,
+    AcpPermissionOption, AcpSessionInfo, AcpSlashCommand, AcpStdioDriver, AcpUsage, AgentDriver,
+    DriverEvent, JsonRpcMessage, JsonRpcRequest, StdioProcessConfig, StdioProcessRunner,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -355,9 +355,11 @@ while IFS= read -r line; do
     if [ "$seen" -eq 2 ]; then
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking-a"}}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello-b"}}}}\n'
-        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact context"},{"name":"help"}]}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","name":"read_file","title":"Read lib.rs","args":{"Path":"lib.rs"},"status":"running"}}}\n'
-        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"config_option_update","options":[]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","category":"model","currentValue":"gemini-2.5-pro","options":[{"value":"gemini-2.5-pro","name":"Gemini 2.5 Pro","description":"Reasoning"}]}]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"current_mode_update","currentModeId":"architect"}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"unknown_future_update","extra":123}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","name":"read_file","status":"completed","rawOutput":{"output":"fn main() {}"}}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-b","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-2","name":"run_command","status":"completed","content":[{"type":"content","content":{"type":"text","text":"ok-from-content"}}]}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-a","update":{"sessionUpdate":"session_info_update","title":"Branch A Title"}}}\n'
@@ -404,6 +406,19 @@ sleep 1
                 session_id: "sess-a".into(),
                 text: "thinking-a".into(),
             },
+            DriverEvent::AvailableCommandsUpdate {
+                session_id: "sess-a".into(),
+                commands: vec![
+                    AcpSlashCommand {
+                        name: "compact".into(),
+                        description: "Compact context".into(),
+                    },
+                    AcpSlashCommand {
+                        name: "help".into(),
+                        description: String::new(),
+                    },
+                ],
+            },
             DriverEvent::ToolCall {
                 session_id: "sess-a".into(),
                 tool_call_id: "tc-1".into(),
@@ -446,6 +461,24 @@ sleep 1
             DriverEvent::StreamChunk {
                 session_id: "sess-b".into(),
                 text: "hello-b".into(),
+            },
+            DriverEvent::ConfigOptionUpdate {
+                session_id: "sess-b".into(),
+                config_options: vec![AcpConfigOption {
+                    id: "model".into(),
+                    name: "Model".into(),
+                    category: Some("model".into()),
+                    current_value: "gemini-2.5-pro".into(),
+                    options: vec![AcpConfigChoice {
+                        value: "gemini-2.5-pro".into(),
+                        name: "Gemini 2.5 Pro".into(),
+                        description: Some("Reasoning".into()),
+                    }],
+                }],
+            },
+            DriverEvent::CurrentModeUpdate {
+                session_id: "sess-b".into(),
+                current_mode_id: "architect".into(),
             },
             DriverEvent::ToolCallUpdate {
                 session_id: "sess-b".into(),
@@ -1133,5 +1166,211 @@ done
     assert_eq!(
         timeout(Duration::from_secs(2), new_rx.recv()).await.unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn test_acp_driver_new_session_parses_models_modes_and_config_options() {
+    let script = r#"
+while IFS= read -r line; do
+    rest=${line#*\"id\":}
+    id=${rest%%,*}
+    id=${id%%\}*}
+    case "$line" in
+        *'"method":"session/new"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-cfg","models":{"currentModelId":"gemini-2.5-pro","availableModels":[{"modelId":"gemini-2.5-pro","name":"Gemini 2.5 Pro","description":"Reasoning"},{"modelId":"gemini-2.5-flash","name":"Gemini 2.5 Flash"}]},"modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code","description":"Write code"},{"id":"ask","name":"Ask"}]},"configOptions":[{"id":"thought_level","name":"Thinking Level","category":"thought_level","type":"select","currentValue":"high","options":[{"value":"low","name":"Low","description":"Fast"},{"value":"high","name":"High"}]}]}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()]);
+    let runner = StdioProcessRunner::spawn(config).await.expect("spawn");
+    let driver = AcpStdioDriver::new(runner);
+
+    let info = driver
+        .new_session("/workspace/repo", None)
+        .await
+        .expect("new_session should parse models, modes, and configOptions");
+
+    assert_eq!(
+        info,
+        AcpSessionInfo {
+            session_id: "sess-cfg".into(),
+            current_model_id: Some("gemini-2.5-pro".into()),
+            current_mode_id: Some("code".into()),
+            available_models: vec![
+                AcpModelOption {
+                    model_id: "gemini-2.5-pro".into(),
+                    name: "Gemini 2.5 Pro".into(),
+                    description: Some("Reasoning".into()),
+                },
+                AcpModelOption {
+                    model_id: "gemini-2.5-flash".into(),
+                    name: "Gemini 2.5 Flash".into(),
+                    description: None,
+                },
+            ],
+            available_modes: vec![
+                AcpModeOption {
+                    id: "code".into(),
+                    name: "Code".into(),
+                    description: Some("Write code".into()),
+                },
+                AcpModeOption {
+                    id: "ask".into(),
+                    name: "Ask".into(),
+                    description: None,
+                },
+            ],
+            config_options: vec![AcpConfigOption {
+                id: "thought_level".into(),
+                name: "Thinking Level".into(),
+                category: Some("thought_level".into()),
+                current_value: "high".into(),
+                options: vec![
+                    AcpConfigChoice {
+                        value: "low".into(),
+                        name: "Low".into(),
+                        description: Some("Fast".into()),
+                    },
+                    AcpConfigChoice {
+                        value: "high".into(),
+                        name: "High".into(),
+                        description: None,
+                    },
+                ],
+            }],
+        }
+    );
+
+    driver.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn test_acp_driver_set_model_mode_and_config_options() {
+    let capture = TempCaptureFile::new("set_config");
+    let script = r#"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$CAPTURE_FILE"
+    rest=${line#*\"id\":}
+    id=${rest%%,*}
+    id=${id%%\}*}
+    case "$line" in
+        *'"method":"session/set_model"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+            ;;
+        *'"method":"session/set_mode"'*)
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-set","update":{"sessionUpdate":"current_mode_update","modeId":"architect"}}}\n'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+            ;;
+        *'"method":"session/set_config_option"'*)
+            case "$line" in
+                *'"value":"bad"'*)
+                    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"invalid option value"}}\n' "$id"
+                    ;;
+                *)
+                    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-set","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"plan","description":"Switch to plan"}]}}}\n'
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"thought_level","name":"Thinking Level","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low","description":"Fast"},{"value":"high","name":"High"}]}]}}\n' "$id"
+                    ;;
+            esac
+            ;;
+    esac
+done
+"#;
+    let config = StdioProcessConfig::new("sh", vec!["-c".to_string(), script.to_string()])
+        .with_env([("CAPTURE_FILE".to_string(), capture.path_string())]);
+    let runner = StdioProcessRunner::spawn(config).await.expect("spawn");
+    let driver = Arc::new(AcpStdioDriver::new(runner));
+    let trait_driver: Arc<dyn AgentDriver> = driver.clone();
+
+    let mut rx = trait_driver.subscribe_session("sess-set");
+
+    trait_driver
+        .set_session_model("sess-set", "gemini-2.5-flash")
+        .await
+        .expect("set_session_model should succeed");
+
+    trait_driver
+        .set_session_mode("sess-set", "architect")
+        .await
+        .expect("set_session_mode should succeed");
+
+    let updated = trait_driver
+        .set_config_option("sess-set", "thought_level", "low")
+        .await
+        .expect("set_config_option should return parsed options");
+    assert_eq!(
+        updated,
+        vec![AcpConfigOption {
+            id: "thought_level".into(),
+            name: "Thinking Level".into(),
+            category: Some("thought_level".into()),
+            current_value: "low".into(),
+            options: vec![
+                AcpConfigChoice {
+                    value: "low".into(),
+                    name: "Low".into(),
+                    description: Some("Fast".into()),
+                },
+                AcpConfigChoice {
+                    value: "high".into(),
+                    name: "High".into(),
+                    description: None,
+                },
+            ],
+        }]
+    );
+
+    let err = driver
+        .set_config_option("sess-set", "thought_level", "bad")
+        .await
+        .expect_err("server error should propagate");
+    assert!(err.to_string().contains("invalid option value"));
+
+    let ev1 = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out ev1")
+        .expect("ev1");
+    assert_eq!(
+        ev1,
+        DriverEvent::CurrentModeUpdate {
+            session_id: "sess-set".into(),
+            current_mode_id: "architect".into(),
+        }
+    );
+
+    let ev2 = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out ev2")
+        .expect("ev2");
+    assert_eq!(
+        ev2,
+        DriverEvent::AvailableCommandsUpdate {
+            session_id: "sess-set".into(),
+            commands: vec![AcpSlashCommand {
+                name: "plan".into(),
+                description: "Switch to plan".into(),
+            }],
+        }
+    );
+
+    trait_driver.shutdown().await.expect("shutdown");
+
+    let captured = capture.read_json_lines();
+    assert_eq!(captured.len(), 4);
+    assert_eq!(captured[0]["method"], "session/set_model");
+    assert_eq!(
+        captured[0]["params"],
+        serde_json::json!({ "sessionId": "sess-set", "modelId": "gemini-2.5-flash" })
+    );
+    assert_eq!(captured[1]["method"], "session/set_mode");
+    assert_eq!(
+        captured[1]["params"],
+        serde_json::json!({ "sessionId": "sess-set", "modeId": "architect" })
+    );
+    assert_eq!(captured[2]["method"], "session/set_config_option");
+    assert_eq!(
+        captured[2]["params"],
+        serde_json::json!({ "sessionId": "sess-set", "configId": "thought_level", "value": "low" })
     );
 }

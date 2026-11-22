@@ -1202,6 +1202,9 @@ fn spawn_session_listener(
                                 }
                             }
                         }
+                        DriverEvent::CurrentModeUpdate { .. }
+                        | DriverEvent::ConfigOptionUpdate { .. }
+                        | DriverEvent::AvailableCommandsUpdate { .. } => {}
                     }
                 }
                 _ = sleep_fut, if quiet_deadline.is_some() => {
