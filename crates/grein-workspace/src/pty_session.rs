@@ -29,6 +29,35 @@ const POLL_TIMEOUT_MS: i32 = 100;
 const DROP_SIGHUP_GRACE: Duration = Duration::from_millis(100);
 const DROP_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+#[cfg(unix)]
+const SCRUBBED_TERMINAL_ENV_VARS: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "KITTY_WINDOW_ID",
+    "KITTY_INSTALLATION_DIR",
+    "KITTY_PID",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "WEZTERM_PANE",
+    "WEZTERM_EXECUTABLE",
+    "TMUX",
+    "TMUX_PANE",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "WT_SESSION",
+];
+
+#[cfg(unix)]
+const RESET_CHILD_SIGNALS: &[libc::c_int] = &[
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGCHLD,
+    libc::SIGPIPE,
+];
+
 #[cfg(all(unix, not(target_os = "linux")))]
 static PTSNAME_LOCK: Mutex<()> = Mutex::new(());
 
@@ -227,10 +256,7 @@ impl InteractivePtySession {
         let (wake_read_fd, wake_write_fd) = create_wake_pipe()?;
 
         let slave_raw_fd = slave_fd.as_raw_fd();
-        let mut cmd = Command::new(&shell);
-        cmd.current_dir(cwd)
-            .env("TERM", "xterm-256color")
-            .env("COLORTERM", "truecolor");
+        let mut cmd = build_pty_command(&shell, cwd);
 
         unsafe {
             cmd.pre_exec(move || {
@@ -254,7 +280,7 @@ impl InteractivePtySession {
                 if slave_raw_fd > 2 {
                     libc::close(slave_raw_fd);
                 }
-                Ok(())
+                reset_child_signals()
             });
         }
 
@@ -527,6 +553,36 @@ fn resolve_shell(shell_override: Option<&str>) -> String {
         }
     }
     "/bin/sh".to_string()
+}
+
+#[cfg(unix)]
+fn build_pty_command(shell: &str, cwd: &Path) -> Command {
+    let mut cmd = Command::new(shell);
+    cmd.current_dir(cwd)
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor");
+    for &var in SCRUBBED_TERMINAL_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+#[cfg(unix)]
+unsafe fn reset_child_signals() -> io::Result<()> {
+    let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    if libc::sigemptyset(set.as_mut_ptr()) < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let set = set.assume_init();
+    if libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for &sig in RESET_CHILD_SIGNALS {
+        if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1011,5 +1067,34 @@ mod tests {
         assert_eq!(resolve_shell(Some("/bin/sh")), "/bin/sh");
         assert!(!resolve_shell(Some("   ")).is_empty());
         assert!(!resolve_shell(None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_pty_command_scrubs_outer_terminal_env_and_sets_term() {
+        use std::collections::HashMap;
+        use std::ffi::OsStr;
+
+        let cmd = build_pty_command("/bin/sh", Path::new("/tmp"));
+        let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
+
+        assert_eq!(
+            envs.get(OsStr::new("TERM")),
+            Some(&Some(OsStr::new("xterm-256color")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("COLORTERM")),
+            Some(&Some(OsStr::new("truecolor")))
+        );
+        for &var in SCRUBBED_TERMINAL_ENV_VARS {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&None),
+                "expected {var} to be marked removed via env_remove"
+            );
+        }
+        assert!(!envs.contains_key(OsStr::new("PATH")));
+        assert!(!envs.contains_key(OsStr::new("HOME")));
+        assert!(!envs.contains_key(OsStr::new("STARSHIP_CONFIG")));
     }
 }
