@@ -33,12 +33,19 @@ pub fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
     parse_inline_spans_with_base(text, Style::default())
 }
 
+#[derive(Debug, Clone)]
+struct ActiveFence {
+    fence_char: char,
+    fence_len: usize,
+    lang: String,
+    in_block_comment: bool,
+    ansi_style: Style,
+}
+
 fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
     let raw_lines: Vec<&str> = markdown.lines().collect();
     let mut out = Vec::new();
-    let mut in_code_block = false;
-    let mut in_ansi_block = false;
-    let mut ansi_style = Style::default();
+    let mut active_fence: Option<ActiveFence> = None;
     let mut in_user_block = false;
     let mut idx = 0usize;
 
@@ -46,46 +53,48 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
         let line = raw_lines[idx];
         let trimmed = line.trim();
 
-        if in_ansi_block {
-            if is_closing_fence(trimmed) {
-                in_ansi_block = false;
-                ansi_style = Style::default();
+        if let Some(ref mut fence) = active_fence {
+            if is_closing_fence_for(trimmed, fence.fence_char, fence.fence_len) {
+                if !fence.lang.eq_ignore_ascii_case("ansi") {
+                    out.push(Line::from(Span::styled(
+                        "╰───".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                active_fence = None;
+            } else if fence.lang.eq_ignore_ascii_case("ansi") {
+                out.push(render_ansi_line(line, &mut fence.ansi_style));
             } else {
-                out.push(render_ansi_line(line, &mut ansi_style));
+                out.push(crate::syntax::highlight_code_line(
+                    &fence.lang,
+                    line,
+                    &mut fence.in_block_comment,
+                ));
             }
             idx += 1;
             continue;
         }
 
-        if in_code_block {
-            if trimmed.starts_with("```") {
-                in_code_block = false;
-                out.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            } else {
-                out.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            idx += 1;
-            continue;
-        }
-
-        if let Some(info) = trimmed.strip_prefix("```") {
+        if let Some((fence_char, fence_len, lang)) = parse_opening_fence(line) {
             in_user_block = false;
-            if info.trim() == "ansi" {
-                in_ansi_block = true;
-                ansi_style = Style::default();
-            } else {
-                in_code_block = true;
+            if !lang.eq_ignore_ascii_case("ansi") {
+                let header = if lang.is_empty() {
+                    "╭───".to_string()
+                } else {
+                    format!("╭─ {lang} ─")
+                };
                 out.push(Line::from(Span::styled(
-                    line.to_string(),
+                    header,
                     Style::default().fg(Color::DarkGray),
                 )));
             }
+            active_fence = Some(ActiveFence {
+                fence_char,
+                fence_len,
+                lang,
+                in_block_comment: false,
+                ansi_style: Style::default(),
+            });
             idx += 1;
             continue;
         }
@@ -189,8 +198,27 @@ fn render_markdown_internal(markdown: &str, max_width: Option<usize>) -> Vec<Lin
     out
 }
 
-fn is_closing_fence(trimmed: &str) -> bool {
-    trimmed.len() >= 3 && trimmed.bytes().all(|b| b == b'`')
+fn parse_opening_fence(line: &str) -> Option<(char, usize, String)> {
+    let trimmed_start = line.trim_start();
+    let first = trimmed_start.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let fence_len = trimmed_start.bytes().take_while(|&b| b == first as u8).count();
+    if fence_len < 3 {
+        return None;
+    }
+    let info = trimmed_start[fence_len..].trim();
+    if first == '`' && info.contains('`') {
+        return None;
+    }
+    let lang = info.split_whitespace().next().unwrap_or("").to_string();
+    Some((first, fence_len, lang))
+}
+
+fn is_closing_fence_for(trimmed: &str, fence_char: char, min_len: usize) -> bool {
+    let count = trimmed.bytes().take_while(|&b| b == fence_char as u8).count();
+    count >= min_len && trimmed[count..].trim().is_empty()
 }
 
 fn parse_shell_header_line(trimmed: &str) -> Option<(&str, i32)> {
@@ -202,6 +230,13 @@ fn parse_shell_header_line(trimmed: &str) -> Option<(&str, i32)> {
     }
     let exit_code = code_str.parse::<i32>().ok()?;
     Some((cmd, exit_code))
+}
+
+pub fn render_ansi_text(text: &str) -> Vec<Line<'static>> {
+    let mut style = Style::default();
+    text.lines()
+        .map(|line| render_ansi_line(line, &mut style))
+        .collect()
 }
 
 fn render_ansi_line(line: &str, style: &mut Style) -> Line<'static> {
@@ -594,7 +629,7 @@ fn parse_delimiter_row(line: &str) -> Option<Vec<Alignment>> {
 
 fn is_table_terminating_line(trimmed: &str) -> bool {
     trimmed.is_empty()
-        || trimmed.starts_with("```")
+        || parse_opening_fence(trimmed).is_some()
         || strip_heading_prefix(trimmed).is_some()
         || strip_blockquote_prefix(trimmed).is_some()
         || is_horizontal_rule(trimmed)
@@ -606,7 +641,7 @@ fn try_parse_table(raw_lines: &[&str], start: usize) -> Option<(TableData, usize
     let delim_line = raw_lines.get(start + 1)?;
 
     let header_trimmed = header_line.trim();
-    if header_trimmed.starts_with("```")
+    if parse_opening_fence(header_trimmed).is_some()
         || strip_blockquote_prefix(header_trimmed).is_some()
         || !contains_unescaped_pipe(header_trimmed)
     {
@@ -889,7 +924,7 @@ fn push_merged_char(target: &mut Vec<Span<'static>>, ch: char, style: Style) {
     target.push(Span::styled(ch.to_string(), style));
 }
 
-fn tokenize_spans(spans: Vec<Span<'static>>) -> Vec<CellSegment> {
+fn tokenize_spans(spans: Vec<Span<'static>>, normalize_ws: bool) -> Vec<CellSegment> {
     let mut segments: Vec<CellSegment> = Vec::new();
     for span in spans {
         let style = span.style;
@@ -905,7 +940,13 @@ fn tokenize_spans(spans: Vec<Span<'static>>) -> Vec<CellSegment> {
                     cur_start = byte_idx;
                 }
                 Some(prev_ws) if prev_ws != is_ws => {
-                    append_token_slice(&mut segments, &text[cur_start..byte_idx], prev_ws, style);
+                    append_token_slice(
+                        &mut segments,
+                        &text[cur_start..byte_idx],
+                        prev_ws,
+                        style,
+                        normalize_ws,
+                    );
                     cur_is_ws = Some(is_ws);
                     cur_start = byte_idx;
                 }
@@ -913,7 +954,13 @@ fn tokenize_spans(spans: Vec<Span<'static>>) -> Vec<CellSegment> {
             }
         }
         if let Some(prev_ws) = cur_is_ws {
-            append_token_slice(&mut segments, &text[cur_start..], prev_ws, style);
+            append_token_slice(
+                &mut segments,
+                &text[cur_start..],
+                prev_ws,
+                style,
+                normalize_ws,
+            );
         }
     }
     segments
@@ -924,21 +971,23 @@ fn append_token_slice(
     slice: &str,
     is_ws: bool,
     style: Style,
+    normalize_ws: bool,
 ) {
     if slice.is_empty() {
         return;
     }
     if is_ws {
-        let normalized = slice.replace(['\t', '\n', '\r'], " ");
-        let w = str_display_width(&normalized);
+        let text = if normalize_ws {
+            slice.replace(['\t', '\n', '\r'], " ")
+        } else {
+            slice.to_string()
+        };
+        let w = str_display_width(&text);
         if let Some(CellSegment::Space(spans, total_w)) = segments.last_mut() {
-            push_merged_span(spans, &normalized, style);
+            push_merged_span(spans, &text, style);
             *total_w += w;
         } else {
-            segments.push(CellSegment::Space(
-                vec![Span::styled(normalized, style)],
-                w,
-            ));
+            segments.push(CellSegment::Space(vec![Span::styled(text, style)], w));
         }
     } else {
         let w = str_display_width(slice);
@@ -954,9 +1003,29 @@ fn append_token_slice(
     }
 }
 
+fn push_spans_char_wrapped(
+    out: &mut Vec<Vec<Span<'static>>>,
+    cur_line: &mut Vec<Span<'static>>,
+    cur_w: &mut usize,
+    spans: Vec<Span<'static>>,
+    max_width: usize,
+) {
+    for sp in spans {
+        for ch in sp.content.chars() {
+            let cw = char_display_width(ch);
+            if *cur_w > 0 && *cur_w + cw > max_width {
+                out.push(std::mem::take(cur_line));
+                *cur_w = 0;
+            }
+            push_merged_char(cur_line, ch, sp.style);
+            *cur_w += cw;
+        }
+    }
+}
+
 fn wrap_spans_to_width(spans: Vec<Span<'static>>, col_width: usize) -> Vec<Vec<Span<'static>>> {
     let max_w = col_width.max(1);
-    let segments = tokenize_spans(spans);
+    let segments = tokenize_spans(spans, true);
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut cur_line: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
@@ -1007,17 +1076,13 @@ fn wrap_spans_to_width(spans: Vec<Span<'static>>, col_width: usize) -> Vec<Vec<S
                         }
                         cur_w = word_w;
                     } else {
-                        for sp in word_spans {
-                            for ch in sp.content.chars() {
-                                let cw = char_display_width(ch);
-                                if cur_w > 0 && cur_w + cw > max_w {
-                                    lines.push(std::mem::take(&mut cur_line));
-                                    cur_w = 0;
-                                }
-                                push_merged_char(&mut cur_line, ch, sp.style);
-                                cur_w += cw;
-                            }
-                        }
+                        push_spans_char_wrapped(
+                            &mut lines,
+                            &mut cur_line,
+                            &mut cur_w,
+                            word_spans,
+                            max_w,
+                        );
                     }
                 }
             }
@@ -1029,6 +1094,109 @@ fn wrap_spans_to_width(spans: Vec<Span<'static>>, col_width: usize) -> Vec<Vec<S
     }
 
     lines
+}
+
+pub fn wrap_styled_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_styled_line(line, max_width))
+        .collect()
+}
+
+pub fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return vec![line];
+    }
+
+    let line_style = line.style;
+    let line_alignment = line.alignment;
+    let segments = tokenize_spans(line.spans, false);
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur_line: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let mut has_word_on_line = false;
+    let mut pending_ws: Option<(Vec<Span<'static>>, usize)> = None;
+
+    for seg in segments {
+        match seg {
+            CellSegment::Space(sp_spans, sp_w) => {
+                if has_word_on_line {
+                    match &mut pending_ws {
+                        Some((existing, existing_w)) => {
+                            for sp in sp_spans {
+                                push_merged_span(existing, sp.content.as_ref(), sp.style);
+                            }
+                            *existing_w += sp_w;
+                        }
+                        None => pending_ws = Some((sp_spans, sp_w)),
+                    }
+                } else {
+                    push_spans_char_wrapped(&mut out, &mut cur_line, &mut cur_w, sp_spans, max_width);
+                }
+            }
+            CellSegment::Word(word_spans, word_w) => {
+                let ws_w = if has_word_on_line {
+                    pending_ws.as_ref().map_or(0, |(_, w)| *w)
+                } else {
+                    0
+                };
+
+                if cur_w + ws_w + word_w <= max_width {
+                    if let Some((sp_spans, _)) = pending_ws.take() {
+                        for sp in sp_spans {
+                            push_merged_span(&mut cur_line, sp.content.as_ref(), sp.style);
+                        }
+                    }
+                    for sp in word_spans {
+                        push_merged_span(&mut cur_line, sp.content.as_ref(), sp.style);
+                    }
+                    cur_w += ws_w + word_w;
+                } else {
+                    pending_ws = None;
+                    if cur_w > 0 && (has_word_on_line || word_w <= max_width) {
+                        out.push(std::mem::take(&mut cur_line));
+                        cur_w = 0;
+                    }
+
+                    if word_w <= max_width {
+                        for sp in word_spans {
+                            push_merged_span(&mut cur_line, sp.content.as_ref(), sp.style);
+                        }
+                        cur_w = word_w;
+                    } else {
+                        push_spans_char_wrapped(
+                            &mut out,
+                            &mut cur_line,
+                            &mut cur_w,
+                            word_spans,
+                            max_width,
+                        );
+                    }
+                }
+                has_word_on_line = true;
+            }
+        }
+    }
+
+    if let Some((sp_spans, sp_w)) = pending_ws.take() {
+        if cur_w + sp_w <= max_width {
+            for sp in sp_spans {
+                push_merged_span(&mut cur_line, sp.content.as_ref(), sp.style);
+            }
+        }
+    }
+
+    if !cur_line.is_empty() || out.is_empty() {
+        out.push(cur_line);
+    }
+
+    out.into_iter()
+        .map(|spans| {
+            let mut l = Line::from(spans).style(line_style);
+            l.alignment = line_alignment;
+            l
+        })
+        .collect()
 }
 
 fn parse_inline_spans_with_base(text: &str, base: Style) -> Vec<Span<'static>> {
@@ -1059,17 +1227,29 @@ fn parse_inline_into(text: &str, base: Style, out: &mut Vec<Span<'static>>) {
                 i = next_i;
             }
             '`' => {
-                let rest = &text[next_i..];
-                if let Some(rel_end) = rest.find('`') {
-                    if rel_end > 0 {
+                if let Some((open_len, close_start, next_pos)) =
+                    find_closing_backtick_run(text, i)
+                {
+                    let raw = &text[i + open_len..close_start];
+                    let code = if raw.len() >= 2
+                        && raw.starts_with(' ')
+                        && raw.ends_with(' ')
+                        && raw.bytes().any(|b| b != b' ')
+                    {
+                        &raw[1..raw.len() - 1]
+                    } else {
+                        raw
+                    };
+                    if !code.is_empty() {
                         push_merged_span(out, &text[plain_start..i], base);
-                        push_merged_span(out, &rest[..rel_end], base.fg(Color::Yellow));
-                        i = next_i + rel_end + 1;
+                        push_merged_span(out, code, base.fg(Color::Yellow));
+                        i = next_pos;
                         plain_start = i;
                         continue;
                     }
                 }
-                i = next_i;
+                let run = text[i..].bytes().take_while(|&b| b == b'`').count();
+                i += run;
             }
             '*' => {
                 if text[i..].starts_with("***") {
@@ -1156,11 +1336,29 @@ fn parse_inline_into(text: &str, base: Style, out: &mut Vec<Span<'static>>) {
     push_merged_span(out, &text[plain_start..], base);
 }
 
+fn find_closing_backtick_run(text: &str, start: usize) -> Option<(usize, usize, usize)> {
+    let open_len = text[start..].bytes().take_while(|&b| b == b'`').count();
+    if open_len == 0 {
+        return None;
+    }
+    let mut j = start + open_len;
+    while j < text.len() {
+        if text.as_bytes()[j] == b'`' {
+            let close_len = text[j..].bytes().take_while(|&b| b == b'`').count();
+            if close_len == open_len {
+                return Some((open_len, j, j + close_len));
+            }
+            j += close_len;
+        } else {
+            let ch = text[j..].chars().next().unwrap();
+            j += ch.len_utf8();
+        }
+    }
+    None
+}
+
 fn skip_backtick_span(text: &str, tick_pos: usize) -> Option<usize> {
-    let rest = &text[tick_pos + 1..];
-    rest.find('`')
-        .filter(|&rel| rel > 0)
-        .map(|rel| tick_pos + 1 + rel + 1)
+    find_closing_backtick_run(text, tick_pos).map(|(_, _, next_pos)| next_pos)
 }
 
 fn skip_escaped_or_backtick(text: &str, i: usize, ch: char) -> Option<usize> {
@@ -1174,7 +1372,10 @@ fn skip_escaped_or_backtick(text: &str, i: usize, ch: char) -> Option<usize> {
             }
             Some(next_i)
         }
-        '`' => Some(skip_backtick_span(text, i).unwrap_or(i + 1)),
+        '`' => {
+            let run = text[i..].bytes().take_while(|&b| b == b'`').count();
+            Some(skip_backtick_span(text, i).unwrap_or(i + run))
+        }
         _ => None,
     }
 }

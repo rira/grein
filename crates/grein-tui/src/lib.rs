@@ -16,6 +16,7 @@ pub mod render;
 pub mod runner;
 pub mod state;
 pub mod status;
+pub mod syntax;
 pub mod transcript;
 pub mod ui;
 pub mod views;

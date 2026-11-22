@@ -365,13 +365,13 @@ fn test_nested_lists_blockquotes_and_fenced_code_blocks_with_pipes() {
         .iter()
         .any(|s| s.content == "inline_fn" && s.style.fg == Some(Color::Yellow)));
 
-    assert_eq!(texts[4], "```markdown");
+    assert_eq!(texts[4], "╭─ markdown ─");
     assert_eq!(texts[5], "| a | b |");
     assert_eq!(texts[6], "| --- | --- |");
     assert_eq!(texts[7], "| 1 | 2 |");
     assert_eq!(texts[8], "# not a heading");
     assert_eq!(texts[9], "---");
-    assert_eq!(texts[10], "```");
+    assert_eq!(texts[10], "╰───");
 
     assert!(lines[4]
         .spans
@@ -381,8 +381,12 @@ fn test_nested_lists_blockquotes_and_fenced_code_blocks_with_pipes() {
         assert!(line
             .spans
             .iter()
-            .all(|s| s.style.fg == Some(Color::Yellow)));
+            .all(|s| s.style.fg == Some(Color::Reset)));
     }
+    assert!(lines[10]
+        .spans
+        .iter()
+        .all(|s| s.style.fg == Some(Color::DarkGray)));
     assert!(!texts.join("\n").contains('┌'));
 
     let reexport = render_mod_markdown_lines(md);
@@ -553,9 +557,9 @@ fn test_ansi_fenced_block_parses_sgr_styles_persists_across_lines_and_hides_fenc
     assert_eq!(texts[6], "persist_line2_after_empty_reset");
     assert_eq!(texts[7], "[stderr]");
     assert_eq!(texts[8], "err msg");
-    assert_eq!(texts[9], "```rust");
+    assert_eq!(texts[9], "╭─ rust ─");
     assert_eq!(texts[10], "let x = 1;");
-    assert_eq!(texts[11], "```");
+    assert_eq!(texts[11], "╰───");
 
     assert_eq!(lines[1].spans[0].style.fg, None);
     assert_eq!(lines[1].spans[0].style.bg, None);
@@ -628,7 +632,16 @@ fn test_ansi_fenced_block_parses_sgr_styles_persists_across_lines_and_hides_fenc
     assert_eq!(lines[8].spans[0].style.fg, Some(Color::Red));
 
     assert_eq!(lines[9].spans[0].style.fg, Some(Color::DarkGray));
-    assert_eq!(lines[10].spans[0].style.fg, Some(Color::Yellow));
+    assert_eq!(lines[10].spans[0].content, "let");
+    assert_eq!(lines[10].spans[0].style.fg, Some(Color::Magenta));
+    assert!(lines[10].spans[0]
+        .style
+        .add_modifier
+        .contains(Modifier::BOLD));
+    assert!(lines[10]
+        .spans
+        .iter()
+        .any(|s| s.content == "1" && s.style.fg == Some(Color::LightYellow)));
     assert_eq!(lines[11].spans[0].style.fg, Some(Color::DarkGray));
 }
 
