@@ -149,24 +149,6 @@ impl DaemonClient {
             .await
     }
 
-    pub async fn blackboard_list(&mut self) -> Result<Value, std::io::Error> {
-        self.json_rpc("blackboard.list", json!({})).await
-    }
-
-    pub async fn blackboard_upsert(
-        &mut self,
-        key: &str,
-        value: &str,
-    ) -> Result<Value, std::io::Error> {
-        self.json_rpc("blackboard.upsert", json!({"key": key, "value": value}))
-            .await
-    }
-
-    pub async fn blackboard_delete(&mut self, key: &str) -> Result<Value, std::io::Error> {
-        self.json_rpc("blackboard.delete", json!({"key": key}))
-            .await
-    }
-
     pub async fn permissions_resolve(
         &mut self,
         request_id: &str,

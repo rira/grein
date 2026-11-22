@@ -7,12 +7,11 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use grein_cli::args::{AttachArgs, Command, DaemonArgs};
 use grein_cli::engine::{
-    slugify_anchor, truncate_chars_with_ellipsis, DaemonEngine, InProcessEngine,
-    PermissionDecisionPayload, UnixSocketEngineClient,
+    truncate_chars_with_ellipsis, DaemonEngine, InProcessEngine, PermissionDecisionPayload,
+    UnixSocketEngineClient,
 };
 use grein_tui::engine_port::{
-    HydratedBlackboardEntry, HydratedSession, HydratedThread, HydratedTurn, ThreadMeta,
-    TuiEngineEvent, TuiEnginePort,
+    HydratedSession, HydratedThread, HydratedTurn, ThreadMeta, TuiEngineEvent, TuiEnginePort,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -125,14 +124,6 @@ where
                 turns,
             });
         }
-        let board = self.client.blackboard_list().await.map_err(to_io)?;
-        let blackboard = board
-            .into_iter()
-            .map(|entry| HydratedBlackboardEntry {
-                key: entry.key,
-                value: entry.value,
-            })
-            .collect();
         let active_thread_id = threads
             .first()
             .map(|t| t.id.clone())
@@ -152,7 +143,7 @@ where
         Ok(HydratedSession {
             active_thread_id,
             threads,
-            blackboard,
+            blackboard: Vec::new(),
         })
     }
 
@@ -342,24 +333,11 @@ where
             .await
             .map_err(to_io)?;
         if !self.has_live_stream.load(Ordering::SeqCst) {
-            let bb_key = format!("join:{}", slugify_anchor(&merged.title));
-            let resolved_summary = match summary.map(str::trim).filter(|s| !s.is_empty()) {
-                Some(explicit) => truncate_chars_with_ellipsis(explicit, 400),
-                None => self
-                    .client
-                    .blackboard_list()
-                    .await
-                    .ok()
-                    .and_then(|entries| entries.into_iter().find(|e| e.key == bb_key))
-                    .map(|e| e.value)
-                    .unwrap_or_default(),
-            };
-            if !resolved_summary.is_empty() {
-                self.emit(TuiEngineEvent::BlackboardUpdated {
-                    key: bb_key,
-                    value: resolved_summary.clone(),
-                });
-            }
+            let resolved_summary = summary
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|explicit| truncate_chars_with_ellipsis(explicit, 400))
+                .unwrap_or_default();
             let meta_opt = self.fetch_and_emit_thread_metadata().await;
             let resolved_target = target_opt
                 .filter(|t| *t != merged.thread_id)
@@ -395,19 +373,6 @@ where
 
     async fn cancel_turn(&self, thread_id: &str) -> io::Result<()> {
         self.client.cancel_turn(thread_id).await.map_err(to_io)
-    }
-
-    async fn upsert_blackboard(&self, key: &str, value: &str) -> io::Result<()> {
-        self.client
-            .blackboard_upsert(key, value)
-            .await
-            .map_err(to_io)?;
-        Ok(())
-    }
-
-    async fn delete_blackboard(&self, key: &str) -> io::Result<()> {
-        self.client.blackboard_delete(key).await.map_err(to_io)?;
-        Ok(())
     }
 
     async fn run_shell_command(&self, thread_id: &str, command: &str) -> io::Result<()> {
@@ -535,7 +500,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_engine_client_port_hydrates_main_thread_blackboard_and_no_duplicate_errors() {
+    async fn test_engine_client_port_hydrates_main_thread_and_no_duplicate_errors() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("session.db");
 
@@ -549,12 +514,13 @@ mod tests {
         assert_eq!(session.active_thread_id, session.threads[0].id);
         assert_eq!(session.threads[0].title, "Main");
         assert!(session.threads[0].turns.is_empty());
+        assert!(session.blackboard.is_empty());
 
         let mut rx = port.subscribe_events().await.expect("subscribe");
 
         port.upsert_blackboard("arch", "two-tier")
             .await
-            .expect("upsert");
+            .expect("default upsert is no-op");
         let forked = port
             .fork_branch(&session.active_thread_id, Some("auth"))
             .await
@@ -595,7 +561,9 @@ mod tests {
             TuiEngineEvent::ShellOutput { stdout, exit_code, .. } if stdout == "hi" && *exit_code == 0
         )));
 
-        port.delete_blackboard("arch").await.expect("delete");
+        port.delete_blackboard("arch")
+            .await
+            .expect("default delete is no-op");
         drop(port);
 
         let reopened =
@@ -728,8 +696,8 @@ done
     #[tokio::test]
     async fn test_engine_client_port_forwards_async_background_errors() {
         use grein_cli::engine::{
-            BlackboardEntry, EngineError, EngineEvent, SessionSnapshot, ShellCommandResult,
-            ThreadSummary, TranscriptEntry, TurnDispatchResult,
+            EngineError, EngineEvent, SessionSnapshot, ShellCommandResult, ThreadSummary,
+            TranscriptEntry, TurnDispatchResult,
         };
 
         struct BgErrorEngine {
@@ -814,19 +782,6 @@ done
             ) -> Result<ThreadSummary, EngineError> {
                 unreachable!()
             }
-            async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
-                Ok(Vec::new())
-            }
-            async fn blackboard_upsert(
-                &self,
-                _key: &str,
-                _value: &str,
-            ) -> Result<BlackboardEntry, EngineError> {
-                unreachable!()
-            }
-            async fn blackboard_delete(&self, _key: &str) -> Result<bool, EngineError> {
-                Ok(false)
-            }
             async fn resolve_permission(
                 &self,
                 _decision: PermissionDecisionPayload,
@@ -884,8 +839,8 @@ done
     #[tokio::test]
     async fn test_engine_client_port_offline_fallbacks_and_metadata_error_forwarding() {
         use grein_cli::engine::{
-            BlackboardEntry, EngineError, EngineEvent, SessionSnapshot, ShellCommandResult,
-            ThreadSummary, TranscriptEntry, TurnDispatchResult,
+            EngineError, EngineEvent, SessionSnapshot, ShellCommandResult, ThreadSummary,
+            TranscriptEntry, TurnDispatchResult,
         };
 
         let engine = InProcessEngine::in_memory().expect("in_memory");
@@ -935,11 +890,9 @@ done
                     && target_thread_id == &main_id
                     && summary == "Offline decision"
         )));
-        assert!(offline_evs.iter().any(|e| matches!(
-            e,
-            TuiEngineEvent::BlackboardUpdated { key, value }
-                if key == "join:offline-branch" && value == "Offline decision"
-        )));
+        assert!(!offline_evs
+            .iter()
+            .any(|e| matches!(e, TuiEngineEvent::BlackboardUpdated { .. })));
 
         struct FailingMetaEngine;
         #[async_trait::async_trait]
@@ -968,9 +921,6 @@ done
             async fn get_thread_transcript(&self, _: &str) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
             async fn merge_thread(&self, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
             async fn merge_thread_with_summary(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
-            async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> { Ok(Vec::new()) }
-            async fn blackboard_upsert(&self, _: &str, _: &str) -> Result<BlackboardEntry, EngineError> { unreachable!() }
-            async fn blackboard_delete(&self, _: &str) -> Result<bool, EngineError> { Ok(false) }
             async fn resolve_permission(&self, _: PermissionDecisionPayload) -> Result<EngineEvent, EngineError> { unreachable!() }
             async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> { Ok(()) }
             async fn run_shell_command(&self, _: &str, _: &str) -> Result<ShellCommandResult, EngineError> { unreachable!() }

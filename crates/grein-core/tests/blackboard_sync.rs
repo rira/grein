@@ -5,8 +5,8 @@ use grein_core::blackboard::{
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, ThreadId};
 use grein_core::storage::sqlite::SqliteDagStorage;
 use grein_core::sync::{
-    build_context_prompt, build_context_prompt_with_blackboard, format_whiteboard_delta_prefix,
-    import_thread_knowledge, synthesize_thread_merge, ContextCompiler, ContextPayload,
+    build_context_prompt, import_thread_knowledge, synthesize_thread_merge, ContextCompiler,
+    ContextPayload,
 };
 
 #[test]
@@ -90,40 +90,21 @@ fn test_blackboard_in_memory_and_markdown_rendering() {
 }
 
 #[test]
-fn test_compiler_build_context_prompt_injects_blackboard() -> Result<(), Box<dyn std::error::Error>>
-{
+fn test_compiler_build_context_prompt_pure_dag_without_blackboard(
+) -> Result<(), Box<dyn std::error::Error>> {
     let thread_id = ThreadId::new_v7();
 
-    // Default stub build_context_prompt
     let empty_payload = build_context_prompt(thread_id)?;
     assert_eq!(empty_payload.thread_id, Some(thread_id));
-    assert!(empty_payload.blackboard_notes.is_empty());
-
-    // Acceptance criterion 2: Compiler method injects active Blackboard notes
-    let mut bb = Blackboard::new();
-    bb.add_decision("port", "Port 8080 selected for REST gateway");
-    bb.register_active_file("crates/grein-core/src/sync.rs");
+    assert!(empty_payload.decision_landmarks.is_empty());
 
     let compiler = ContextCompiler::new("You are an expert pair-programming AI assistant.");
-    let payload = compiler.build_context_prompt_with_blackboard(thread_id, &bb)?;
-
-    // Free function contract test
-    let free_fn_payload: ContextPayload = build_context_prompt_with_blackboard(
-        thread_id,
-        "You are an expert pair-programming AI assistant.",
-        &bb,
-    )?;
-    assert_eq!(payload, free_fn_payload);
-
+    let payload = compiler.build_context_prompt(thread_id)?;
     assert_eq!(payload.thread_id, Some(thread_id));
-    assert!(payload.blackboard_notes.contains("Port 8080"));
-    assert_eq!(payload.active_files.len(), 1);
-    assert_eq!(payload.active_files[0], "crates/grein-core/src/sync.rs");
 
     let prompt = payload.build_system_prompt();
     assert!(prompt.contains("You are an expert pair-programming AI assistant."));
-    assert!(prompt.contains("# Shared Blackboard Working Memory"));
-    assert!(prompt.contains("Port 8080"));
+    assert!(!prompt.contains("# Shared Blackboard Working Memory"));
 
     Ok(())
 }
@@ -261,29 +242,6 @@ fn test_blackboard_notes_markdown_ordering_and_from_entries() {
 }
 
 #[test]
-fn test_format_whiteboard_delta_prefix() {
-    let empty_bb = Blackboard::new();
-    assert_eq!(format_whiteboard_delta_prefix(&empty_bb), "");
-
-    let mut bb = Blackboard::new();
-    bb.add_entry(BlackboardEntry::new(
-        "finding",
-        "Token TTL is 15m",
-        BlackboardEntryKind::Note,
-    ));
-
-    let prefix = format_whiteboard_delta_prefix(&bb);
-    let expected_md = bb.to_markdown();
-    assert_eq!(
-        prefix,
-        format!(
-            "[Shared Whiteboard Updated]\n{}\n\n---\n\n",
-            expected_md.trim()
-        )
-    );
-}
-
-#[test]
 fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
     let root_id = NodeId::new_v7();
     let trunk_1 = ConversationNode::new(
@@ -311,17 +269,14 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
         "Branch result".to_string(),
     );
 
-    let mut payload = ContextPayload::new(
-        "Base system prompt.",
-        "## Notes\n- **invariant**: Preserve UTF-8",
-    );
+    let mut payload = ContextPayload::new("Base system prompt.");
     payload.anchor_header = Some("## Auth Design".to_string());
     payload.trunk_path = vec![trunk_1, trunk_2];
     payload.branch_turns = vec![branch_1, branch_2];
 
     let without_branch = payload.build_acp_system_prompt_append(false, 0);
     assert!(without_branch.contains("Base system prompt."));
-    assert!(without_branch.contains("# Shared Blackboard Working Memory\n## Notes"));
+    assert!(!without_branch.contains("# Shared Blackboard Working Memory"));
     assert!(without_branch.contains("# Branch Context\n## Auth Design"));
     assert!(without_branch.contains("# Ancestor Conversation Trunk\n[user]\nOldest trunk turn"));
     assert!(without_branch.contains("[assistant]\nSecond trunk turn"));
@@ -329,13 +284,11 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
     assert!(!without_branch.contains("Branch question"));
 
     let full = payload.build_acp_system_prompt_append(true, 0);
+    assert!(!full.contains("# Shared Blackboard Working Memory"));
     assert!(full.contains("# Branch History\n[user]\nBranch question\n\n[tool_result]\nBranch result"));
 
-    // UTF-8 safe truncation preserving base, whiteboard, and branch context
-    let mut utf8_payload = ContextPayload::new(
-        "Base prompt.",
-        "## Notes\n- **wb**: Keep Whiteboard Intact",
-    );
+    // UTF-8 safe truncation preserving base and branch context
+    let mut utf8_payload = ContextPayload::new("Base prompt.");
     utf8_payload.anchor_header = Some("## Unicode Section".to_string());
     utf8_payload.trunk_path = vec![
         ConversationNode::new(
@@ -364,7 +317,7 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
     let truncated = utf8_payload.build_acp_system_prompt_append(false, max_chars);
 
     assert!(truncated.contains("Base prompt."));
-    assert!(truncated.contains("# Shared Blackboard Working Memory\n## Notes\n- **wb**: Keep Whiteboard Intact"));
+    assert!(!truncated.contains("# Shared Blackboard Working Memory"));
     assert!(truncated.contains("# Branch Context\n## Unicode Section"));
     assert!(truncated.contains("tail-marker"));
     assert!(!truncated.contains("Older entry"));
@@ -373,12 +326,12 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
     // When preserved sections already exceed max_chars, preserved sections stay intact.
     let small_limit = utf8_payload.build_acp_system_prompt_append(false, 10);
     assert!(small_limit.contains("Base prompt."));
-    assert!(small_limit.contains("# Shared Blackboard Working Memory\n## Notes\n- **wb**: Keep Whiteboard Intact"));
+    assert!(!small_limit.contains("# Shared Blackboard Working Memory"));
     assert!(small_limit.contains("# Branch Context\n## Unicode Section"));
     assert!(!small_limit.contains("# Ancestor Conversation Trunk"));
 
     // Branch turns preserved over older trunk turns when truncating with include_branch_turns=true.
-    let mut branch_payload = ContextPayload::new("Sys.", "Board.");
+    let mut branch_payload = ContextPayload::new("Sys.");
     branch_payload.trunk_path = vec![ConversationNode::new(
         NodeId::new_v7(),
         None::<NodeId>,
@@ -406,7 +359,7 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
         / 2;
     let branch_trimmed = branch_payload.build_acp_system_prompt_append(true, branch_budget);
     assert!(branch_trimmed.contains("Sys."));
-    assert!(branch_trimmed.contains("# Shared Blackboard Working Memory\nBoard."));
+    assert!(!branch_trimmed.contains("# Shared Blackboard Working Memory"));
     assert!(branch_trimmed.contains("Newest branch reply"));
     assert!(branch_trimmed.chars().count() <= branch_budget);
     assert!(!branch_trimmed.contains("Very long trunk context"));
@@ -419,6 +372,11 @@ fn test_build_acp_system_prompt_append_sections_and_utf8_truncation() {
 fn test_build_acp_system_prompt_append_preserves_decision_landmarks_across_truncation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage = SqliteDagStorage::in_memory()?;
+    storage.insert_blackboard_entry(&BlackboardEntry::new(
+        "legacy_bb_key",
+        "LEGACY_BLACKBOARD_SECRET",
+        BlackboardEntryKind::Decision,
+    ))?;
 
     let root = ConversationNode::new(
         NodeId::new_v7(),
@@ -463,23 +421,21 @@ fn test_build_acp_system_prompt_append_preserves_decision_landmarks_across_trunc
     storage.insert_node(&branch_turn)?;
     storage.update_thread_leaf(child_tid, branch_turn.id)?;
 
-    let mut bb = Blackboard::new();
-    bb.add_decision("bb_key", "Blackboard fact");
-
-    let payload = ContextCompiler::new("System base.")
-        .compile_thread_context(&storage, child_tid, &bb)?;
+    let payload = ContextCompiler::new("System base.").compile_thread_context(&storage, child_tid)?;
     assert_eq!(payload.decision_landmarks.len(), 1);
 
     let full = payload.build_acp_system_prompt_append(true, 0);
     assert!(full.contains("System base."));
-    assert!(full.contains("# Shared Blackboard Working Memory"));
+    assert!(!full.contains("# Shared Blackboard Working Memory"));
+    assert!(!full.contains("LEGACY_BLACKBOARD_SECRET"));
     assert!(full.contains("# Decision Landmarks"));
     assert!(full.contains("Adopted Ed25519 tokens with 15m TTL"));
 
     let small_budget = 260;
     let truncated = payload.build_acp_system_prompt_append(true, small_budget);
     assert!(truncated.contains("System base."));
-    assert!(truncated.contains("# Shared Blackboard Working Memory"));
+    assert!(!truncated.contains("# Shared Blackboard Working Memory"));
+    assert!(!truncated.contains("LEGACY_BLACKBOARD_SECRET"));
     assert!(truncated.contains("# Decision Landmarks"));
     assert!(
         truncated.contains("Adopted Ed25519 tokens with 15m TTL"),

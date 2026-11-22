@@ -3,9 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grein_cli::engine::{
-    AcpBackendConfig, DaemonEngine, InProcessEngine, PermissionDecisionPayload,
+    AcpBackendConfig, DaemonEngine, EngineError, InProcessEngine, PermissionDecisionPayload,
 };
+use grein_core::blackboard::{BlackboardEntry, BlackboardEntryKind};
+use grein_core::storage::sqlite::SqliteStorage;
 use grein_tui::engine_port::{SubagentStatus, TuiEngineEvent};
+use serde_json::Value;
 use tokio::time::timeout;
 
 fn fake_acp_script_path() -> PathBuf {
@@ -27,10 +30,36 @@ fn fake_acp_config(cwd: &Path) -> AcpBackendConfig {
     }
 }
 
+fn fake_acp_config_with_log(cwd: &Path, log_path: &Path) -> AcpBackendConfig {
+    AcpBackendConfig {
+        command: "python3".to_string(),
+        args: vec![
+            fake_acp_script_path().to_string_lossy().into_owned(),
+            "--log-file".to_string(),
+            log_path.to_string_lossy().into_owned(),
+        ],
+        auth_method: Some("oauth-personal".to_string()),
+        cwd: cwd.to_path_buf(),
+    }
+}
+
 #[tokio::test]
-async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_whiteboard_delta() {
+async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_legacy_db_compat() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db_path = temp.path().join("session.db");
+
+    // Seed legacy blackboard_entries rows before opening engine.
+    {
+        let legacy_storage = SqliteStorage::open(&db_path).expect("open legacy sqlite");
+        legacy_storage
+            .insert_blackboard_entry(&BlackboardEntry::new(
+                "architecture",
+                "two-tier-dag",
+                BlackboardEntryKind::Decision,
+            ))
+            .expect("insert legacy row");
+    }
+
     let cfg = fake_acp_config(temp.path());
 
     let engine = Arc::new(
@@ -40,11 +69,6 @@ async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_whiteb
 
     let main = engine.ensure_main_thread().await.expect("ensure main");
     assert_eq!(main.title, "Main");
-
-    engine
-        .blackboard_upsert("architecture", "two-tier-dag")
-        .await
-        .expect("upsert whiteboard");
 
     let mut rx = engine.subscribe_tui_events();
     let collect_main = tokio::spawn(async move {
@@ -114,8 +138,12 @@ async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_whiteb
         .content
         .clone();
     assert!(
-        dumped_prompt.contains("two-tier-dag"),
-        "expected whiteboard fact in systemPrompt.append, got: {dumped_prompt}"
+        !dumped_prompt.contains("two-tier-dag"),
+        "legacy blackboard_entries must be ignored in systemPrompt.append, got: {dumped_prompt}"
+    );
+    assert!(
+        !dumped_prompt.contains("# Shared Blackboard Working Memory"),
+        "systemPrompt.append must not inject Shared Blackboard section, got: {dumped_prompt}"
     );
     assert!(
         dumped_prompt.contains("main-trunk-anchor-secret"),
@@ -126,28 +154,20 @@ async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_whiteb
         "branch_a must be isolated from sibling branch_b, got: {dumped_prompt}"
     );
 
-    // Edit whiteboard mid-session -> branch_a's next prompt receives [Shared Whiteboard Updated].
-    engine
-        .blackboard_upsert("api_port", "9090")
-        .await
-        .expect("upsert api_port");
-
     engine
         .send_turn_for_thread(&branch_a.thread_id, "ECHO_LAST_PROMPT follow-up")
         .await
         .expect("branch_a echo last prompt");
 
-    let branch_a_after_wb = engine
+    let branch_a_after_echo = engine
         .get_thread_transcript(&branch_a.thread_id)
         .await
-        .expect("branch_a transcript after wb");
-    let echoed_prompt = &branch_a_after_wb
+        .expect("branch_a transcript after echo");
+    let echoed_prompt = &branch_a_after_echo
         .last()
         .expect("echoed assistant reply")
         .content;
-    assert!(echoed_prompt.contains("[Shared Whiteboard Updated]"));
-    assert!(echoed_prompt.contains("9090"));
-    assert!(echoed_prompt.ends_with("ECHO_LAST_PROMPT follow-up"));
+    assert_eq!(echoed_prompt, "ECHO_LAST_PROMPT follow-up");
 
     // Close DB and reopen engine -> verify SQLite hydration across restart.
     drop(engine);
@@ -161,9 +181,6 @@ async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_whiteb
     assert!(titles.contains(&"branch-a"));
     assert!(titles.contains(&"branch-b"));
 
-    let hydrated_bb = reopened.blackboard_list().await.expect("list blackboard");
-    assert_eq!(hydrated_bb.len(), 2);
-
     let persisted_a = reopened
         .get_thread_transcript(&branch_a.thread_id)
         .await
@@ -173,7 +190,7 @@ async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_whiteb
         .any(|t| t.role == "user" && t.content == "DUMP_SYSTEM_PROMPT"));
     assert!(persisted_a
         .iter()
-        .any(|t| t.role == "assistant" && t.content.contains("9090")));
+        .any(|t| t.role == "assistant" && t.content == "ECHO_LAST_PROMPT follow-up"));
 }
 
 #[tokio::test]
@@ -458,16 +475,12 @@ async fn live_agy_acp_smoke() {
     let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
         .expect("open live engine");
     let main = engine.ensure_main_thread().await.expect("ensure main");
-    engine
-        .blackboard_upsert("GREIN_SMOKE_SENTINEL", "CEDAR_99")
-        .await
-        .expect("upsert sentinel");
 
     timeout(
         Duration::from_secs(60),
         engine.send_turn_for_thread(
             &main.thread_id,
-            "Reply with only the single word PONG and do not call any tools.",
+            "Remember the exact code word CEDAR_99 for this conversation. Reply with only the single word PONG and do not call any tools.",
         ),
     )
     .await
@@ -492,7 +505,7 @@ async fn live_agy_acp_smoke() {
         Duration::from_secs(60),
         engine.send_turn_for_thread(
             &branch.thread_id,
-            "What is the exact value of GREIN_SMOKE_SENTINEL from the Shared Whiteboard? Reply with only the value and do not call any tools.",
+            "What is the exact code word from the ancestor conversation trunk? Reply with only the value and do not call any tools.",
         ),
     )
     .await
@@ -506,7 +519,7 @@ async fn live_agy_acp_smoke() {
     let reply2 = &branch_transcript.last().expect("reply 2").content;
     assert!(
         reply2.contains("CEDAR_99"),
-        "expected CEDAR_99 from live agy branch via Shared Whiteboard injection, got: {reply2}"
+        "expected CEDAR_99 from live agy branch via pure DAG trunk context, got: {reply2}"
     );
 }
 
@@ -514,17 +527,48 @@ async fn live_agy_acp_smoke() {
 async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db_path = temp.path().join("join_and_blank_root.db");
-    let cfg = fake_acp_config(temp.path());
+    let log_path = temp.path().join("fake_acp_wire.jsonl");
+
+    // Seed legacy blackboard_entries rows before opening engine.
+    {
+        let legacy_storage = SqliteStorage::open(&db_path).expect("open legacy sqlite");
+        legacy_storage
+            .insert_blackboard_entry(&BlackboardEntry::new(
+                "legacy_key",
+                "LEGACY_BB_SECRET",
+                BlackboardEntryKind::Decision,
+            ))
+            .expect("insert legacy row");
+    }
+
+    let cfg = fake_acp_config_with_log(temp.path(), &log_path);
 
     let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
         .expect("open engine");
     let main = engine.ensure_main_thread().await.expect("ensure main");
 
-    // Seed Main with a secret conversation turn.
+    // Seed Main with a secret conversation turn (creates Main's live ACP session sess-1).
     engine
         .send_turn_for_thread(&main.thread_id, "MAIN_SECRET_TURN_ALPHA")
         .await
         .expect("main turn");
+
+    // Joining a root context must return EngineError::InvalidParams and leave merged == false.
+    let root_join_err = engine
+        .merge_thread_with_summary(&main.thread_id, None, Some("cannot join root"))
+        .await
+        .expect_err("joining Main root must fail");
+    assert!(matches!(root_join_err, EngineError::InvalidParams(_)));
+    assert!(
+        !engine
+            .list_threads()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|t| t.thread_id == main.thread_id)
+            .unwrap()
+            .merged
+    );
 
     // Fork branch_a and branch_b off Main.
     let branch_a = engine
@@ -545,7 +589,7 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         .await
         .expect("branch_b turn 1");
 
-    // Run /join on branch_a -> promotes Decision to Blackboard & commits DecisionLandmark onto Main.
+    // Run /join on branch_a -> commits DecisionLandmark onto Main and queues pending landmark for live Main session.
     let joined = engine
         .merge_thread_with_summary(
             &branch_a.thread_id,
@@ -556,7 +600,7 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         .expect("join branch_a");
     assert!(joined.merged);
 
-    // Live sibling receives [Shared Whiteboard Updated] delta on its next prompt.
+    // Live sibling receives ZERO [Joined Context], ZERO [Shared Whiteboard Updated], ZERO landmark bleed.
     engine
         .send_turn_for_thread(&branch_b.thread_id, "ECHO_LAST_PROMPT after join")
         .await
@@ -565,9 +609,64 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         .get_thread_transcript(&branch_b.thread_id)
         .await
         .expect("branch_b transcript");
-    let echoed = &branch_b_turns.last().unwrap().content;
-    assert!(echoed.contains("[Shared Whiteboard Updated]"));
-    assert!(echoed.contains("LANDMARK_ED25519_SELECTED"));
+    let sibling_echoed = &branch_b_turns.last().unwrap().content;
+    assert_eq!(sibling_echoed, "ECHO_LAST_PROMPT after join");
+
+    // Live parent (Main) receives [Joined Context] with DecisionLandmark on its next turn while keeping SAME ACP session_id.
+    engine
+        .send_turn_for_thread(&main.thread_id, "ECHO_LAST_PROMPT parent after join")
+        .await
+        .expect("main turn 2");
+    let main_turns = engine
+        .get_thread_transcript(&main.thread_id)
+        .await
+        .expect("main transcript");
+    let parent_echoed = &main_turns.last().unwrap().content;
+    assert!(
+        parent_echoed.starts_with("[Joined Context]\n[Decision Landmark"),
+        "expected [Joined Context] prefix on live parent, got: {parent_echoed}"
+    );
+    assert!(parent_echoed.contains("LANDMARK_ED25519_SELECTED"));
+    assert!(parent_echoed.ends_with("---\n\nECHO_LAST_PROMPT parent after join"));
+
+    // Subsequent turn on Main has drained pending_landmarks -> no duplicate [Joined Context].
+    engine
+        .send_turn_for_thread(&main.thread_id, "ECHO_LAST_PROMPT parent turn 3")
+        .await
+        .expect("main turn 3");
+    let main_turns_3 = engine
+        .get_thread_transcript(&main.thread_id)
+        .await
+        .expect("main transcript 3");
+    assert_eq!(
+        main_turns_3.last().unwrap().content,
+        "ECHO_LAST_PROMPT parent turn 3"
+    );
+
+    // Verify Main kept the exact same ACP sessionId across /join without any session reset.
+    let wire_frames: Vec<Value> = std::fs::read_to_string(&log_path)
+        .expect("read fake_acp_wire.jsonl")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid json frame"))
+        .collect();
+    let main_prompt_sessions: Vec<&str> = wire_frames
+        .iter()
+        .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/prompt"))
+        .filter(|f| {
+            let txt = f["params"]["prompt"][0]["text"].as_str().unwrap_or("");
+            txt == "MAIN_SECRET_TURN_ALPHA"
+                || txt.contains("ECHO_LAST_PROMPT parent after join")
+                || txt == "ECHO_LAST_PROMPT parent turn 3"
+        })
+        .map(|f| f["params"]["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(main_prompt_sessions.len(), 3);
+    assert!(
+        main_prompt_sessions
+            .windows(2)
+            .all(|w| w[0] == w[1]),
+        "Main must reuse the exact same ACP sessionId after /join: {main_prompt_sessions:?}"
+    );
 
     // New child forked from Main after /join receives Decision Landmark in systemPrompt.append.
     let branch_c = engine
@@ -586,6 +685,8 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
     assert!(branch_c_sys.contains("MAIN_SECRET_TURN_ALPHA"));
     assert!(branch_c_sys.contains("# Decision Landmarks"));
     assert!(branch_c_sys.contains("LANDMARK_ED25519_SELECTED"));
+    assert!(!branch_c_sys.contains("# Shared Blackboard Working Memory"));
+    assert!(!branch_c_sys.contains("LEGACY_BB_SECRET"));
 
     // Blank Root Context Invariant: create a brand-new root after Main turns and /join landmark.
     let fresh_root = engine
@@ -601,6 +702,12 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
             .is_empty(),
         "new root must start with empty transcript"
     );
+    let fresh_join_err = engine
+        .merge_thread_with_summary(&fresh_root.thread_id, None, None)
+        .await
+        .expect_err("joining fresh root must fail");
+    assert!(matches!(fresh_join_err, EngineError::InvalidParams(_)));
+
     let meta = engine.thread_metadata().await.expect("metadata");
     let fresh_meta = meta
         .iter()
@@ -608,8 +715,9 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         .expect("fresh_root meta");
     assert_eq!(fresh_meta.parent_thread_id, None);
     assert_eq!(fresh_meta.inherited_turn_count, 0);
+    assert!(!fresh_meta.merged);
 
-    // Run DUMP_SYSTEM_PROMPT on fresh_root: ZERO Main turns or Decision Landmarks may leak.
+    // Run DUMP_SYSTEM_PROMPT on fresh_root: ZERO Main turns, Decision Landmarks, or Blackboard may leak.
     engine
         .send_turn_for_thread(&fresh_root.thread_id, "DUMP_SYSTEM_PROMPT")
         .await
@@ -635,9 +743,16 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         !fresh_sys.contains("[Decision Landmark"),
         "Main DecisionLandmark nodes must NOT leak into fresh root: {fresh_sys}"
     );
-    // Session-wide Shared Context Blackboard still applies cleanly.
     assert!(
-        fresh_sys.contains("# Shared Blackboard Working Memory"),
-        "session-wide Blackboard still applies to new root: {fresh_sys}"
+        !fresh_sys.contains("[Joined Context]"),
+        "Joined Context must NOT leak into fresh root: {fresh_sys}"
+    );
+    assert!(
+        !fresh_sys.contains("# Shared Blackboard Working Memory"),
+        "Shared Blackboard must NEVER appear in fresh root: {fresh_sys}"
+    );
+    assert!(
+        !fresh_sys.contains("LEGACY_BB_SECRET"),
+        "Legacy SQLite blackboard_entries rows must NEVER leak into fresh root: {fresh_sys}"
     );
 }

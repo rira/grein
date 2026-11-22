@@ -13,7 +13,4 @@ pub use blackboard::{
     BoundedScratchpad, DecisionLandmark, KnowledgeImport,
 };
 pub use error::CoreError;
-pub use sync::{
-    build_context_prompt, build_context_prompt_with_blackboard, format_whiteboard_delta_prefix,
-    ContextCompiler, ContextPayload,
-};
+pub use sync::{build_context_prompt, ContextCompiler, ContextPayload};

@@ -53,10 +53,7 @@ async fn handle_legacy(engine: &InProcessEngine, line: &str) -> String {
     }
     if line == "list_entries" {
         return match engine.snapshot().await {
-            Ok(snapshot) => format!(
-                "entries:{}\n",
-                snapshot.blackboard_entries + snapshot.node_count
-            ),
+            Ok(snapshot) => format!("entries:{}\n", snapshot.node_count),
             Err(e) => format!("error:{e}\n"),
         };
     }
@@ -211,12 +208,6 @@ mod tests {
             .expect("fork");
         assert_eq!(forked.title, "socket-branch");
 
-        client
-            .blackboard_upsert("mode", "daemon")
-            .await
-            .expect("upsert");
-        assert!(client.blackboard_delete("mode").await.expect("delete"));
-
         let shell_res = client
             .run_shell_command(&main.thread_id, "printf 'via-socket'")
             .await
@@ -245,14 +236,6 @@ mod tests {
         )));
         assert!(seen.iter().any(|e| matches!(
             e,
-            TuiEngineEvent::BlackboardUpdated { key, value } if key == "mode" && value == "daemon"
-        )));
-        assert!(seen.iter().any(|e| matches!(
-            e,
-            TuiEngineEvent::BlackboardDeleted { key } if key == "mode"
-        )));
-        assert!(seen.iter().any(|e| matches!(
-            e,
             TuiEngineEvent::ShellOutput { stdout, .. } if stdout == "via-socket"
         )));
 
@@ -276,6 +259,16 @@ mod tests {
             .await
             .expect("session_list_threads");
         assert_eq!(threads_val["result"].as_array().unwrap().len(), 2);
+        let bb_removed = raw_client
+            .json_rpc("blackboard.list", json!({}))
+            .await
+            .expect("blackboard.list rpc");
+        assert_eq!(bb_removed["error"]["code"], -32601);
+        let root_join_err = raw_client
+            .session_merge_thread(&main.thread_id)
+            .await
+            .expect("root join rpc");
+        assert_eq!(root_join_err["error"]["code"], -32602);
         let merged_val = raw_client
             .session_merge_thread(&forked.thread_id)
             .await

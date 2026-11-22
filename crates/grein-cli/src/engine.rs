@@ -8,15 +8,12 @@ use async_trait::async_trait;
 use grein_acp::{
     AcpPermissionOption, AcpStdioDriver, DriverEvent, StdioProcessConfig, StdioProcessRunner,
 };
-use grein_core::blackboard::{Blackboard, BlackboardEntry as CoreBlackboardEntry, BlackboardEntryKind};
 use grein_core::error::CoreError;
 use grein_core::model::{
     Anchor, AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadStatus,
 };
 use grein_core::storage::sqlite::SqliteStorage;
-use grein_core::sync::{
-    format_whiteboard_delta_prefix, synthesize_thread_merge, ContextCompiler,
-};
+use grein_core::sync::{synthesize_thread_merge, ContextCompiler};
 use grein_tui::engine_port::{
     HydratedThread, HydratedTurn, SubagentSnapshot, SubagentStatus, ThreadMeta, TuiEngineEvent,
 };
@@ -138,7 +135,6 @@ pub enum EngineEvent {
     TurnRecorded { node_id: String },
     ThreadForked { thread_id: String },
     ThreadMerged { thread_id: String },
-    BlackboardUpserted { key: String },
     PermissionResolved { request_id: String, allow: bool },
 }
 
@@ -163,16 +159,9 @@ pub struct TranscriptEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlackboardEntry {
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub node_count: usize,
     pub thread_count: usize,
-    pub blackboard_entries: usize,
     pub threads: Vec<ThreadSummary>,
 }
 
@@ -239,13 +228,6 @@ pub trait DaemonEngine: Send + Sync {
         target_id: Option<&str>,
         summary: Option<&str>,
     ) -> Result<ThreadSummary, EngineError>;
-    async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError>;
-    async fn blackboard_upsert(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> Result<BlackboardEntry, EngineError>;
-    async fn blackboard_delete(&self, key: &str) -> Result<bool, EngineError>;
     async fn resolve_permission(
         &self,
         decision: PermissionDecisionPayload,
@@ -292,10 +274,10 @@ enum SessionListenerCmd {
 
 struct ActiveAcpSession {
     session_id: String,
-    last_whiteboard_hash: String,
     driver_gen: u64,
     model: Option<String>,
     mode: Option<String>,
+    pending_landmarks: Vec<String>,
     cmd_tx: mpsc::UnboundedSender<SessionListenerCmd>,
     listener_handle: tokio::task::JoinHandle<()>,
 }
@@ -436,17 +418,6 @@ fn node_to_transcript_entry(node: &ConversationNode) -> TranscriptEntry {
         role: node.role.to_string(),
         content: node.content.clone(),
     }
-}
-
-fn whiteboard_hash(blackboard: &Blackboard) -> String {
-    let md = blackboard.to_markdown();
-    let mut hash: u128 = 0x6c62272e07bb0142_62b821756295c58d;
-    const PRIME: u128 = 0x0000000001000000_000000000000013b;
-    for byte in md.as_bytes() {
-        hash ^= u128::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:032x}")
 }
 
 fn select_permission_option(options: &[AcpPermissionOption], approved: bool) -> String {
@@ -1295,7 +1266,6 @@ impl InProcessEngine {
     ) -> Result<Self, EngineError> {
         let nodes = storage.list_nodes().map_err(storage_err)?;
         let threads = storage.list_threads().map_err(storage_err)?;
-        let _blackboard = storage.list_blackboard_entries().map_err(storage_err)?;
         let last_node = threads
             .first()
             .map(|t| t.active_leaf_id)
@@ -1421,10 +1391,6 @@ impl InProcessEngine {
         thread_id: &str,
     ) -> Result<Vec<TranscriptEntry>, EngineError> {
         DaemonEngine::get_thread_transcript(self, thread_id).await
-    }
-
-    pub async fn blackboard_delete(&self, key: &str) -> Result<bool, EngineError> {
-        DaemonEngine::blackboard_delete(self, key).await
     }
 
     pub async fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
@@ -1629,14 +1595,6 @@ impl DaemonEngine for InProcessEngine {
             }
         };
 
-        let entries = self
-            .runtime
-            .storage
-            .list_blackboard_entries()
-            .map_err(storage_err)?;
-        let blackboard = Blackboard::from_entries(entries);
-        let current_wb_hash = whiteboard_hash(&blackboard);
-
         let existing_handle = {
             let mut state = self.runtime.lock()?;
             let stale = state
@@ -1660,28 +1618,25 @@ impl DaemonEngine for InProcessEngine {
             Some(handle) => {
                 let prompt_text = {
                     let mut state = self.runtime.lock()?;
-                    if let Some(entry) = state.active_acp_sessions.get_mut(thread_id) {
-                        if entry.last_whiteboard_hash != current_wb_hash {
-                            let delta = format_whiteboard_delta_prefix(&blackboard);
-                            let updated = if delta.is_empty() {
-                                format!("[Shared Whiteboard Cleared]\n\n---\n\n{prompt}")
-                            } else {
-                                format!("{delta}{prompt}")
-                            };
-                            entry.last_whiteboard_hash = current_wb_hash;
-                            updated
-                        } else {
-                            prompt.to_string()
-                        }
-                    } else {
+                    let landmarks = state
+                        .active_acp_sessions
+                        .get_mut(thread_id)
+                        .map(|entry| std::mem::take(&mut entry.pending_landmarks))
+                        .unwrap_or_default();
+                    if landmarks.is_empty() {
                         prompt.to_string()
+                    } else {
+                        format!(
+                            "[Joined Context]\n{}\n\n---\n\n{prompt}",
+                            landmarks.join("\n\n")
+                        )
                     }
                 };
                 (handle, prompt_text)
             }
             None => {
                 let mut payload = ContextCompiler::new("")
-                    .compile_thread_context(&self.runtime.storage, tid, &blackboard)
+                    .compile_thread_context(&self.runtime.storage, tid)
                     .map_err(storage_err)?;
                 payload.trunk_path.retain(|n| !is_internal_root_node(n));
                 payload.branch_turns.retain(|n| n.id != user_node_id);
@@ -1739,10 +1694,10 @@ impl DaemonEngine for InProcessEngine {
                         thread_id.to_string(),
                         ActiveAcpSession {
                             session_id: info.session_id,
-                            last_whiteboard_hash: current_wb_hash,
                             driver_gen,
                             model: info.current_model_id,
                             mode: info.current_mode_id,
+                            pending_landmarks: Vec::new(),
                             cmd_tx,
                             listener_handle,
                         },
@@ -2129,6 +2084,12 @@ impl DaemonEngine for InProcessEngine {
             }
         };
 
+        let Some(target) = target_thread.filter(|t| t.id != source_tid) else {
+            return Err(EngineError::InvalidParams(
+                "cannot join a root context without a parent branch".to_string(),
+            ));
+        };
+
         let source_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
         let source_is_first = source_threads.first().is_some_and(|t| t.id == source.id);
         let source_title = thread_to_summary(&source, source_is_first).title;
@@ -2154,67 +2115,49 @@ impl DaemonEngine for InProcessEngine {
             }
         };
 
-        let bb_key = format!("join:{}", slugify_anchor(&source_title));
-        let bb_entry = CoreBlackboardEntry::new(
-            bb_key.clone(),
-            resolved_summary.clone(),
-            BlackboardEntryKind::Decision,
-        );
+        let target_id_str = target.id.0.to_string();
+        let target_cmd_tx = {
+            let state = self.runtime.lock()?;
+            state
+                .active_acp_sessions
+                .get(&target_id_str)
+                .map(|s| s.cmd_tx.clone())
+        };
+        if let Some(cmd_tx) = target_cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if cmd_tx
+                .send(SessionListenerCmd::PrepareSolicited { reply_tx })
+                .is_ok()
+            {
+                let _ = reply_rx.await;
+            }
+        }
+        let fresh_target = self
+            .runtime
+            .storage
+            .get_thread(target.id)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {target_id_str}")))?;
+        let landmark_node = synthesize_thread_merge(
+            source_tid,
+            &source_title,
+            &resolved_summary,
+            Some(fresh_target.active_leaf_id),
+        )
+        .map_err(storage_err)?;
         self.runtime
             .storage
-            .insert_blackboard_entry(&bb_entry)
+            .insert_node(&landmark_node)
             .map_err(storage_err)?;
-        self.runtime.emit_tui(TuiEngineEvent::BlackboardUpdated {
-            key: bb_key,
-            value: resolved_summary.clone(),
-        });
-
-        let mut target_thread_id = String::new();
-        if let Some(target) = target_thread {
-            if target.id != source_tid {
-                let target_id_str = target.id.0.to_string();
-                let target_cmd_tx = {
-                    let state = self.runtime.lock()?;
-                    state
-                        .active_acp_sessions
-                        .get(&target_id_str)
-                        .map(|s| s.cmd_tx.clone())
-                };
-                if let Some(cmd_tx) = target_cmd_tx {
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    if cmd_tx
-                        .send(SessionListenerCmd::PrepareSolicited { reply_tx })
-                        .is_ok()
-                    {
-                        let _ = reply_rx.await;
-                    }
-                }
-                let fresh_target = self
-                    .runtime
-                    .storage
-                    .get_thread(target.id)
-                    .map_err(storage_err)?
-                    .ok_or_else(|| EngineError::NotFound(format!("thread {target_id_str}")))?;
-                let landmark_node = synthesize_thread_merge(
-                    source_tid,
-                    &source_title,
-                    &resolved_summary,
-                    Some(fresh_target.active_leaf_id),
-                )
-                .map_err(storage_err)?;
-                self.runtime
-                    .storage
-                    .insert_node(&landmark_node)
-                    .map_err(storage_err)?;
-                self.runtime
-                    .storage
-                    .update_thread_leaf(fresh_target.id, landmark_node.id)
-                    .map_err(storage_err)?;
-                {
-                    let mut state = self.runtime.lock()?;
-                    state.last_node = Some(landmark_node.id);
-                }
-                target_thread_id = target_id_str;
+        self.runtime
+            .storage
+            .update_thread_leaf(fresh_target.id, landmark_node.id)
+            .map_err(storage_err)?;
+        {
+            let mut state = self.runtime.lock()?;
+            state.last_node = Some(landmark_node.id);
+            if let Some(entry) = state.active_acp_sessions.get_mut(&target_id_str) {
+                entry.pending_landmarks.push(landmark_node.content.clone());
             }
         }
 
@@ -2231,7 +2174,7 @@ impl DaemonEngine for InProcessEngine {
 
         self.runtime.emit_tui(TuiEngineEvent::ThreadMerged {
             thread_id: updated.id.0.to_string(),
-            target_thread_id,
+            target_thread_id: target_id_str,
             summary: resolved_summary,
         });
         let meta = self.runtime.compute_thread_metadata()?;
@@ -2239,61 +2182,6 @@ impl DaemonEngine for InProcessEngine {
             .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
 
         Ok(thread_to_summary(&updated, source_is_first))
-    }
-
-    async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
-        let entries = self
-            .runtime
-            .storage
-            .list_blackboard_entries()
-            .map_err(storage_err)?;
-        Ok(entries
-            .into_iter()
-            .map(|e| BlackboardEntry {
-                key: e.key,
-                value: e.value,
-            })
-            .collect())
-    }
-
-    async fn blackboard_upsert(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> Result<BlackboardEntry, EngineError> {
-        if key.trim().is_empty() {
-            return Err(EngineError::InvalidParams("key must not be empty".into()));
-        }
-        let entry = CoreBlackboardEntry::new(key, value, BlackboardEntryKind::Note);
-        self.runtime
-            .storage
-            .insert_blackboard_entry(&entry)
-            .map_err(storage_err)?;
-        self.runtime.emit_tui(TuiEngineEvent::BlackboardUpdated {
-            key: key.to_string(),
-            value: value.to_string(),
-        });
-        Ok(BlackboardEntry {
-            key: key.to_string(),
-            value: value.to_string(),
-        })
-    }
-
-    async fn blackboard_delete(&self, key: &str) -> Result<bool, EngineError> {
-        if key.trim().is_empty() {
-            return Err(EngineError::InvalidParams("key must not be empty".into()));
-        }
-        let deleted = self
-            .runtime
-            .storage
-            .delete_blackboard_entry(key)
-            .map_err(storage_err)?;
-        if deleted {
-            self.runtime.emit_tui(TuiEngineEvent::BlackboardDeleted {
-                key: key.to_string(),
-            });
-        }
-        Ok(deleted)
     }
 
     async fn resolve_permission(
@@ -2387,11 +2275,9 @@ impl DaemonEngine for InProcessEngine {
     async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
         let threads = DaemonEngine::list_threads(self).await?;
         let transcript = DaemonEngine::get_transcript(self).await?;
-        let blackboard = DaemonEngine::blackboard_list(self).await?;
         Ok(SessionSnapshot {
             node_count: transcript.len(),
             thread_count: threads.len(),
-            blackboard_entries: blackboard.len(),
             threads,
         })
     }
@@ -2583,17 +2469,6 @@ async fn route(
             json!({"next_active_thread_id": next_active_thread_id})
         }
         "session.agent_metadata" => to_json(&engine.agent_metadata().await?)?,
-        "blackboard.list" => to_json(&engine.blackboard_list().await?)?,
-        "blackboard.upsert" => {
-            let key = required_str(params, "key")?;
-            let value = required_str(params, "value")?;
-            to_json(&engine.blackboard_upsert(key, value).await?)?
-        }
-        "blackboard.delete" => {
-            let key = required_str(params, "key")?;
-            let deleted = engine.blackboard_delete(key).await?;
-            json!({"deleted": deleted})
-        }
         "permissions.resolve" => {
             let decision: PermissionDecisionPayload = serde_json::from_value(params.clone())
                 .map_err(|e| EngineError::InvalidParams(e.to_string()))?;
@@ -2829,27 +2704,6 @@ impl DaemonEngine for UnixSocketEngineClient {
             .await
     }
 
-    async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
-        self.call_typed("blackboard.list", json!({})).await
-    }
-
-    async fn blackboard_upsert(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> Result<BlackboardEntry, EngineError> {
-        self.call_typed("blackboard.upsert", json!({"key": key, "value": value}))
-            .await
-    }
-
-    async fn blackboard_delete(&self, key: &str) -> Result<bool, EngineError> {
-        let val = self.call("blackboard.delete", json!({"key": key})).await?;
-        Ok(val
-            .get("deleted")
-            .and_then(Value::as_bool)
-            .unwrap_or(false))
-    }
-
     async fn resolve_permission(
         &self,
         decision: PermissionDecisionPayload,
@@ -2879,11 +2733,9 @@ impl DaemonEngine for UnixSocketEngineClient {
     async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
         let threads = self.list_threads().await?;
         let transcript = self.get_transcript().await?;
-        let blackboard = self.blackboard_list().await?;
         Ok(SessionSnapshot {
             node_count: transcript.len(),
             thread_count: threads.len(),
-            blackboard_entries: blackboard.len(),
             threads,
         })
     }
@@ -3092,31 +2944,6 @@ impl DaemonEngine for EngineClient {
         }
     }
 
-    async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
-        match self {
-            Self::InProcess(e) => e.blackboard_list().await,
-            Self::Socket(e) => e.blackboard_list().await,
-        }
-    }
-
-    async fn blackboard_upsert(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> Result<BlackboardEntry, EngineError> {
-        match self {
-            Self::InProcess(e) => e.blackboard_upsert(key, value).await,
-            Self::Socket(e) => e.blackboard_upsert(key, value).await,
-        }
-    }
-
-    async fn blackboard_delete(&self, key: &str) -> Result<bool, EngineError> {
-        match self {
-            Self::InProcess(e) => e.blackboard_delete(key).await,
-            Self::Socket(e) => e.blackboard_delete(key).await,
-        }
-    }
-
     async fn resolve_permission(
         &self,
         decision: PermissionDecisionPayload,
@@ -3285,13 +3112,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlite_hydration_across_reopen_preserves_threads_blackboard_and_snapshot() {
+    async fn test_sqlite_hydration_across_reopen_preserves_threads_and_ignores_legacy_blackboard() {
+        use grein_core::blackboard::{BlackboardEntry as LegacyBbEntry, BlackboardEntryKind};
+
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("session.db");
 
+        // Pre-populate legacy blackboard_entries rows before opening InProcessEngine.
+        {
+            let legacy_storage = SqliteStorage::open(&db_path).expect("open legacy sqlite");
+            legacy_storage
+                .insert_blackboard_entry(&LegacyBbEntry::new(
+                    "legacy_goal",
+                    "LEGACY_BLACKBOARD_VAL",
+                    BlackboardEntryKind::Decision,
+                ))
+                .expect("insert legacy row");
+        }
+
         let engine =
             InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
-                .expect("open fresh db");
+                .expect("open legacy db");
         assert!(engine.list_threads().await.expect("list").is_empty());
 
         let main = engine.ensure_main_thread().await.expect("ensure main");
@@ -3305,27 +3146,24 @@ mod tests {
             .is_empty());
 
         let mut rx = engine.subscribe_tui_events();
-        engine
-            .blackboard_upsert("port", "8080")
-            .await
-            .expect("upsert port");
-        engine
-            .blackboard_upsert("arch", "two-tier")
-            .await
-            .expect("upsert arch");
-        assert_eq!(
-            engine.snapshot().await.expect("snapshot").blackboard_entries,
-            2
-        );
 
-        assert!(engine
-            .blackboard_delete("port")
+        // Joining a root thread must return EngineError::InvalidParams and leave merged == false.
+        let join_root_err = engine
+            .merge_thread_with_summary(&main.thread_id, None, Some("should fail"))
             .await
-            .expect("delete port"));
-        assert!(!engine
-            .blackboard_delete("missing")
+            .expect_err("joining a root thread must fail");
+        assert!(
+            matches!(join_root_err, EngineError::InvalidParams(_)),
+            "expected InvalidParams, got: {join_root_err:?}"
+        );
+        let main_after_err = engine
+            .list_threads()
             .await
-            .expect("delete missing"));
+            .expect("threads")
+            .into_iter()
+            .find(|t| t.thread_id == main.thread_id)
+            .expect("main exists");
+        assert!(!main_after_err.merged);
 
         let forked = engine
             .fork_thread_with_title(Some(&main.thread_id), Some("feat-auth"))
@@ -3339,17 +3177,18 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
-        assert!(events.iter().any(|e| matches!(
+        assert!(!events.iter().any(|e| matches!(
             e,
-            TuiEngineEvent::BlackboardUpdated { key, value } if key == "port" && value == "8080"
-        )));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            TuiEngineEvent::BlackboardDeleted { key } if key == "port"
+            TuiEngineEvent::BlackboardUpdated { .. } | TuiEngineEvent::BlackboardDeleted { .. }
         )));
         assert!(events.iter().any(|e| matches!(
             e,
             TuiEngineEvent::ThreadCreated { thread } if thread.id == forked.thread_id && thread.title == "feat-auth"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadMerged { thread_id, target_thread_id, .. }
+                if thread_id == &forked.thread_id && target_thread_id == &main.thread_id
         )));
 
         drop(engine);
@@ -3366,16 +3205,17 @@ mod tests {
         assert_eq!(threads[1].title, "feat-auth");
         assert!(threads[1].merged);
 
-        let bb = reopened.blackboard_list().await.expect("reopened bb");
-        assert_eq!(bb.len(), 2);
-        assert!(bb.iter().any(|e| e.key == "arch" && e.value == "two-tier"));
-        assert!(bb
+        let main_turns = reopened
+            .get_thread_transcript(&main.thread_id)
+            .await
+            .expect("main turns");
+        assert!(main_turns
             .iter()
-            .any(|e| e.key == "join:feat-auth" && e.value == "feat-auth"));
+            .any(|t| t.content.contains("[Decision Landmark") && t.content.contains("feat-auth")));
 
         let snap = reopened.snapshot().await.expect("reopened snapshot");
-        assert_eq!(snap.blackboard_entries, 2);
         assert_eq!(snap.thread_count, 2);
+        assert_eq!(snap.node_count, 1);
     }
 
     #[tokio::test]
@@ -3416,7 +3256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_live_acp_streaming_whiteboard_delta_resume_permissions_and_cancel() {
+    async fn test_live_acp_streaming_resume_permissions_and_cancel() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("session.db");
         let capture_path = temp.path().join("acp_capture.jsonl");
@@ -3492,10 +3332,6 @@ done
                 .expect("open"),
         );
         let main = engine.ensure_main_thread().await.expect("main");
-        engine
-            .blackboard_upsert("db", "sqlite")
-            .await
-            .expect("wb upsert");
 
         let mut rx = engine.subscribe_tui_events();
         let engine_perm = Arc::clone(&engine);
@@ -3543,11 +3379,7 @@ done
         assert!(evs1.iter().any(|e| matches!(e, TuiEngineEvent::StreamChunk { content, .. } if content == "world!")));
         assert!(evs1.iter().any(|e| matches!(e, TuiEngineEvent::TurnCompleted { .. })));
 
-        // Update whiteboard -> Turn 2 reuses sess-1 and prepends delta prefix.
-        engine
-            .blackboard_upsert("port", "9090")
-            .await
-            .expect("wb update");
+        // Turn 2 reuses sess-1 cleanly without whiteboard delta prefix.
         timeout(
             Duration::from_secs(5),
             engine.send_turn_for_thread(&main.thread_id, "second prompt"),
@@ -3556,7 +3388,7 @@ done
         .expect("turn2 timeout")
         .expect("turn2 ok");
 
-        // Turn 3 with unchanged whiteboard -> no delta prefix.
+        // Turn 3 reuses sess-1 cleanly.
         timeout(
             Duration::from_secs(5),
             engine.send_turn_for_thread(&main.thread_id, "third prompt"),
@@ -3663,8 +3495,8 @@ done
         assert_eq!(frames[2]["method"], "session/new");
         let sys_append_1 = frames[2]["params"]["_meta"]["antigravity"]["systemPrompt"]["append"]
             .as_str()
-            .expect("systemPrompt append");
-        assert!(sys_append_1.contains("sqlite"));
+            .unwrap_or("");
+        assert!(!sys_append_1.contains("# Shared Blackboard Working Memory"));
         assert!(!sys_append_1.contains("trigger-perm first prompt"));
 
         let perm_reply = frames
@@ -3683,9 +3515,7 @@ done
             })
             .collect();
         assert!(!prompts[0].contains("[Shared Whiteboard Updated]"));
-        assert!(prompts[1].contains("[Shared Whiteboard Updated]"));
-        assert!(prompts[1].contains("9090"));
-        assert!(prompts[1].ends_with("second prompt"));
+        assert_eq!(prompts[1], "second prompt");
         assert_eq!(prompts[2], "third prompt");
 
         assert!(frames
@@ -3749,24 +3579,39 @@ done
             TuiEngineEvent::ShellOutput { stdout, exit_code, .. } if stdout == "shell-ok" && exit_code == 0
         ));
 
-        let upsert_resp = dispatch_json_rpc(
+        let bb_list_resp = dispatch_json_rpc(
             &engine,
-            r#"{"jsonrpc":"2.0","id":3,"method":"blackboard.upsert","params":{"key":"k","value":"v"}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"blackboard.list","params":{}}"#,
         )
         .await;
-        assert!(serde_json::from_str::<Value>(&upsert_resp).unwrap()["result"].is_object());
+        assert_eq!(
+            serde_json::from_str::<Value>(&bb_list_resp).unwrap()["error"]["code"],
+            -32601
+        );
+
+        let upsert_resp = dispatch_json_rpc(
+            &engine,
+            r#"{"jsonrpc":"2.0","id":4,"method":"blackboard.upsert","params":{"key":"k","value":"v"}}"#,
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&upsert_resp).unwrap()["error"]["code"],
+            -32601
+        );
 
         let del_resp = dispatch_json_rpc(
             &engine,
-            r#"{"jsonrpc":"2.0","id":4,"method":"blackboard.delete","params":{"key":"k"}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"blackboard.delete","params":{"key":"k"}}"#,
         )
         .await;
-        let del_val: Value = serde_json::from_str(&del_resp).expect("del json");
-        assert_eq!(del_val["result"]["deleted"], true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&del_resp).unwrap()["error"]["code"],
+            -32601
+        );
     }
 
     #[tokio::test]
-    async fn test_acp_deny_permission_whiteboard_clear_and_crash_recovery() {
+    async fn test_acp_deny_permission_and_crash_recovery() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("session.db");
         let capture_path = temp.path().join("acp_deny_capture.jsonl");
@@ -3821,10 +3666,6 @@ done
                 .expect("open"),
         );
         let main = engine.ensure_main_thread().await.expect("main");
-        engine
-            .blackboard_upsert("temp", "val")
-            .await
-            .expect("upsert");
 
         // First call crashes on initialize -> error returned and driver reset cleanly.
         let crash_err = engine
@@ -3856,12 +3697,10 @@ done
             .expect("recovers cleanly");
         deny_task.await.expect("deny task");
 
-        // Clear whiteboard -> next turn sends [Shared Whiteboard Cleared].
-        assert!(engine.blackboard_delete("temp").await.expect("delete"));
         engine
-            .send_turn_for_thread(&main.thread_id, "after clear")
+            .send_turn_for_thread(&main.thread_id, "follow-up after recovery")
             .await
-            .expect("after clear");
+            .expect("follow-up");
 
         let frames: Vec<Value> = std::fs::read_to_string(&capture_path)
             .expect("capture")
@@ -3880,8 +3719,8 @@ done
         let text = last_prompt["params"]["prompt"][0]["text"]
             .as_str()
             .expect("text");
-        assert!(text.contains("[Shared Whiteboard Cleared]"));
-        assert!(text.ends_with("after clear"));
+        assert!(!text.contains("[Shared Whiteboard Cleared]"));
+        assert_eq!(text, "follow-up after recovery");
     }
 
     #[tokio::test]
@@ -4520,10 +4359,24 @@ done
     }
 
     #[tokio::test]
-    async fn test_manual_join_promotes_decision_commits_landmark_and_updates_sibling() {
+    async fn test_manual_join_delivers_landmark_to_live_parent_isolates_siblings_and_rejects_root() {
+        use grein_core::blackboard::{BlackboardEntry as LegacyBbEntry, BlackboardEntryKind};
+
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("join.db");
         let capture_path = temp.path().join("join_capture.jsonl");
+
+        // Seed legacy rows in SQLite blackboard_entries to prove they open cleanly and are ignored.
+        {
+            let legacy_storage = SqliteStorage::open(&db_path).expect("open legacy sqlite");
+            legacy_storage
+                .insert_blackboard_entry(&LegacyBbEntry::new(
+                    "legacy_secret",
+                    "SHOULD_BE_IGNORED",
+                    BlackboardEntryKind::Decision,
+                ))
+                .expect("seed legacy row");
+        }
 
         let mock_script = r#"
 sess_counter=0
@@ -4542,7 +4395,8 @@ while IFS= read -r line; do
             case "$line" in
                 *'"sessionId":"sess-1"'*) sid="sess-1" ;;
                 *'"sessionId":"sess-2"'*) sid="sess-2" ;;
-                *) sid="sess-3" ;;
+                *'"sessionId":"sess-3"'*) sid="sess-3" ;;
+                *) sid="sess-4" ;;
             esac
             printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Branch decision: use SQLite WAL mode."}}}}\n' "$sid"
             printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
@@ -4570,6 +4424,31 @@ done
             .send_turn_for_thread(&main.thread_id, "kickoff")
             .await
             .expect("main turn");
+
+        let main_tid: ThreadId = parse_typed_id(&main.thread_id).unwrap();
+        let main_session_id_before = engine
+            .runtime
+            .storage
+            .get_thread(main_tid)
+            .unwrap()
+            .unwrap()
+            .acp_session_id
+            .expect("main acp_session_id");
+        assert_eq!(main_session_id_before, "sess-1");
+
+        // Joining a root thread returns EngineError::InvalidParams and leaves merged == false.
+        let join_root_err = engine
+            .merge_thread_with_summary(&main.thread_id, None, Some("bad root join"))
+            .await
+            .expect_err("joining root must fail");
+        assert!(matches!(join_root_err, EngineError::InvalidParams(_)));
+        assert!(!engine
+            .runtime
+            .storage
+            .get_thread(main_tid)
+            .unwrap()
+            .unwrap()
+            .merged);
 
         let branch_a = engine
             .fork_thread_with_title(Some(&main.thread_id), Some("Storage Choice"))
@@ -4600,11 +4479,9 @@ done
         while let Ok(ev) = rx.try_recv() {
             evs.push(ev);
         }
-        assert!(evs.iter().any(|e| matches!(
-            e,
-            TuiEngineEvent::BlackboardUpdated { key, value }
-                if key == "join:storage-choice" && value.contains("SQLite WAL mode")
-        )));
+        assert!(!evs
+            .iter()
+            .any(|e| matches!(e, TuiEngineEvent::BlackboardUpdated { .. })));
         assert!(evs.iter().any(|e| matches!(
             e,
             TuiEngineEvent::ThreadMerged { thread_id, target_thread_id, summary }
@@ -4618,9 +4495,6 @@ done
                 if meta.iter().any(|m| m.thread_id == branch_a.thread_id && m.merged)
         )));
 
-        let bb = engine.blackboard_list().await.expect("bb");
-        assert!(bb.iter().any(|e| e.key == "join:storage-choice" && e.value.contains("SQLite WAL mode")));
-
         let main_transcript = engine
             .get_thread_transcript(&main.thread_id)
             .await
@@ -4629,26 +4503,116 @@ done
             t.content.contains("[Decision Landmark") && t.content.contains("SQLite WAL mode")
         }));
 
-        // Live sibling branch receives [Shared Whiteboard Updated] delta on its next prompt.
+        // Live sibling branch receives ZERO [Joined Context] and ZERO [Shared Whiteboard Updated].
         engine
             .send_turn_for_thread(&branch_b.thread_id, "sibling after join")
             .await
             .expect("branch_b turn 2");
+
+        // Live parent (Main) receives [Joined Context] on its next turn while keeping SAME ACP session_id.
+        engine
+            .send_turn_for_thread(&main.thread_id, "main after join")
+            .await
+            .expect("main turn 2");
+        let main_session_id_after = engine
+            .runtime
+            .storage
+            .get_thread(main_tid)
+            .unwrap()
+            .unwrap()
+            .acp_session_id
+            .expect("main acp_session_id after");
+        assert_eq!(main_session_id_after, main_session_id_before);
+
+        // Turn 3 on Main does NOT repeat [Joined Context].
+        engine
+            .send_turn_for_thread(&main.thread_id, "main follow-up 3")
+            .await
+            .expect("main turn 3");
+
+        // Newly created blank root receives ZERO [Joined Context] and ZERO legacy blackboard.
+        let blank_root = engine
+            .create_root_thread(Some("Blank Root"))
+            .await
+            .expect("create blank root");
+        let blank_join_err = engine
+            .merge_thread_with_summary(&blank_root.thread_id, None, None)
+            .await
+            .expect_err("joining blank root must fail");
+        assert!(matches!(blank_join_err, EngineError::InvalidParams(_)));
+        let blank_tid: ThreadId = parse_typed_id(&blank_root.thread_id).unwrap();
+        assert!(!engine
+            .runtime
+            .storage
+            .get_thread(blank_tid)
+            .unwrap()
+            .unwrap()
+            .merged);
+
+        engine
+            .send_turn_for_thread(&blank_root.thread_id, "blank root prompt")
+            .await
+            .expect("blank root turn");
 
         let frames: Vec<Value> = std::fs::read_to_string(&capture_path)
             .expect("capture")
             .lines()
             .map(|l| serde_json::from_str(l).expect("json"))
             .collect();
-        let prompts: Vec<&str> = frames
+
+        // Exactly 4 session/new calls: main, branch_a, branch_b, blank_root (no reset of main!).
+        let session_news: Vec<&Value> = frames
+            .iter()
+            .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
+            .collect();
+        assert_eq!(session_news.len(), 4);
+        for sn in &session_news {
+            let append = sn["params"]["_meta"]["antigravity"]["systemPrompt"]["append"]
+                .as_str()
+                .unwrap_or("");
+            assert!(!append.contains("# Shared Blackboard Working Memory"));
+            assert!(!append.contains("SHOULD_BE_IGNORED"));
+            assert!(!append.contains("[Joined Context]"));
+        }
+
+        let prompts: Vec<(&str, &str)> = frames
             .iter()
             .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/prompt"))
-            .map(|f| f["params"]["prompt"][0]["text"].as_str().unwrap())
+            .map(|f| {
+                (
+                    f["params"]["sessionId"].as_str().unwrap(),
+                    f["params"]["prompt"][0]["text"].as_str().unwrap(),
+                )
+            })
             .collect();
-        let last_prompt = prompts.last().copied().unwrap();
-        assert!(last_prompt.contains("[Shared Whiteboard Updated]"));
-        assert!(last_prompt.contains("join:storage-choice"));
-        assert!(last_prompt.contains("SQLite WAL mode"));
-        assert!(last_prompt.ends_with("sibling after join"));
+
+        // Sibling sess-3 got verbatim prompt, zero [Joined Context] / [Shared Whiteboard Updated].
+        let sibling_prompts: Vec<&str> = prompts
+            .iter()
+            .filter(|(sid, _)| *sid == "sess-3")
+            .map(|(_, text)| *text)
+            .collect();
+        assert_eq!(sibling_prompts, vec!["sibling initial", "sibling after join"]);
+
+        // Main sess-1 got [Joined Context] with DecisionLandmark on turn 2, and clean prompt on turn 3.
+        let main_prompts: Vec<&str> = prompts
+            .iter()
+            .filter(|(sid, _)| *sid == "sess-1")
+            .map(|(_, text)| *text)
+            .collect();
+        assert_eq!(main_prompts.len(), 3);
+        assert_eq!(main_prompts[0], "kickoff");
+        assert!(main_prompts[1].starts_with("[Joined Context]\n[Decision Landmark"));
+        assert!(main_prompts[1].contains("SQLite WAL mode"));
+        assert!(main_prompts[1].ends_with("---\n\nmain after join"));
+        assert_eq!(main_prompts[2], "main follow-up 3");
+
+        // Blank root sess-4 got clean prompt.
+        let blank_prompts: Vec<&str> = prompts
+            .iter()
+            .filter(|(sid, _)| *sid == "sess-4")
+            .map(|(_, text)| *text)
+            .collect();
+        assert_eq!(blank_prompts, vec!["blank root prompt"]);
     }
 }

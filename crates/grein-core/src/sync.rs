@@ -1,4 +1,4 @@
-use crate::blackboard::{Blackboard, BlackboardEntryKind, DecisionLandmark, KnowledgeImport};
+use crate::blackboard::{DecisionLandmark, KnowledgeImport};
 use crate::dag::DagStorage;
 use crate::error::CoreError;
 use crate::model::{ConversationNode, NodeId, ThreadId};
@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 pub struct ContextPayload {
     pub thread_id: Option<ThreadId>,
     pub base_system_prompt: String,
-    pub blackboard_notes: String,
-    pub active_files: Vec<String>,
     pub decision_landmarks: Vec<String>,
     /// Root -> `parent_node_id` path shared by every thread branching from that node.
     #[serde(default)]
@@ -23,11 +21,10 @@ pub struct ContextPayload {
 }
 
 impl ContextPayload {
-    pub fn new(base_system_prompt: impl Into<String>, blackboard_notes: impl Into<String>) -> Self {
+    pub fn new(base_system_prompt: impl Into<String>) -> Self {
         Self {
             thread_id: None,
             base_system_prompt: base_system_prompt.into(),
-            blackboard_notes: blackboard_notes.into(),
             ..Self::default()
         }
     }
@@ -38,20 +35,7 @@ impl ContextPayload {
     }
 
     pub fn build_system_prompt(&self) -> String {
-        if self.blackboard_notes.trim().is_empty() {
-            return self.base_system_prompt.clone();
-        }
-        if self.base_system_prompt.trim().is_empty() {
-            return format!(
-                "# Shared Blackboard Working Memory\n{}",
-                self.blackboard_notes.trim()
-            );
-        }
-        format!(
-            "{}\n\n# Shared Blackboard Working Memory\n{}",
-            self.base_system_prompt.trim(),
-            self.blackboard_notes.trim()
-        )
+        self.base_system_prompt.clone()
     }
 
     pub fn build_acp_system_prompt_append(
@@ -62,12 +46,6 @@ impl ContextPayload {
         let mut preserved_sections = Vec::new();
         if !self.base_system_prompt.trim().is_empty() {
             preserved_sections.push(self.base_system_prompt.trim().to_string());
-        }
-        if !self.blackboard_notes.trim().is_empty() {
-            preserved_sections.push(format!(
-                "# Shared Blackboard Working Memory\n{}",
-                self.blackboard_notes.trim()
-            ));
         }
         let landmarks: Vec<&str> = self
             .decision_landmarks
@@ -235,16 +213,7 @@ fn trim_single_node_section(
     }
 }
 
-pub fn format_whiteboard_delta_prefix(blackboard: &Blackboard) -> String {
-    let md = blackboard.to_markdown();
-    if md.trim().is_empty() {
-        String::new()
-    } else {
-        format!("[Shared Whiteboard Updated]\n{}\n\n---\n\n", md.trim())
-    }
-}
-
-/// Builds a context payload for a given thread with empty/default blackboard notes.
+/// Builds a context payload for a given thread.
 pub fn build_context_prompt(thread_id: ThreadId) -> Result<ContextPayload, CoreError> {
     Ok(ContextPayload {
         thread_id: Some(thread_id),
@@ -252,32 +221,10 @@ pub fn build_context_prompt(thread_id: ThreadId) -> Result<ContextPayload, CoreE
     })
 }
 
-/// Automatically injects active Blackboard notes into the system prompt across threads.
-pub fn build_context_prompt_with_blackboard(
-    thread_id: ThreadId,
-    base_prompt: &str,
-    blackboard: &Blackboard,
-) -> Result<ContextPayload, CoreError> {
-    let markdown_notes = blackboard.to_markdown();
-    let active_files = blackboard
-        .find_by_kind(BlackboardEntryKind::ActiveFile)
-        .iter()
-        .map(|entry| entry.value.clone())
-        .collect();
-
-    Ok(ContextPayload {
-        thread_id: Some(thread_id),
-        base_system_prompt: base_prompt.to_string(),
-        blackboard_notes: markdown_notes,
-        active_files,
-        ..ContextPayload::default()
-    })
-}
-
 /// Marker identifying decision landmark turns committed back to Trunk.
 const DECISION_LANDMARK_MARKER: &str = "Decision Landmark";
 
-/// Compiler service for building context prompts with injected blackboard working memory.
+/// Compiler service for building context prompts strictly from the conversation DAG.
 #[derive(Debug, Clone, Default)]
 pub struct ContextCompiler {
     base_prompt: String,
@@ -302,22 +249,14 @@ impl ContextCompiler {
         })
     }
 
-    pub fn build_context_prompt_with_blackboard(
+    /// Compiles the full context for a thread strictly from the DAG: the Trunk
+    /// (Root -> `parent_node_id`), the anchor header, the branch-local turns
+    /// (`parent_node_id` -> `active_leaf_id`, excluding sibling branches), and
+    /// decision landmarks.
+    pub fn compile_thread_context<S: DagStorage + ?Sized>(
         &self,
+        storage: &S,
         thread_id: ThreadId,
-        blackboard: &Blackboard,
-    ) -> Result<ContextPayload, CoreError> {
-        build_context_prompt_with_blackboard(thread_id, &self.base_prompt, blackboard)
-    }
-
-    /// Compiles the full context for a thread: the Trunk (Root -> `parent_node_id`),
-    /// the anchor header, the branch-local turns (`parent_node_id` -> `active_leaf_id`,
-    /// excluding sibling branches), decision landmarks, and blackboard notes.
-    pub fn compile_thread_context(
-        &self,
-        storage: &impl DagStorage,
-        thread_id: ThreadId,
-        blackboard: &Blackboard,
     ) -> Result<ContextPayload, CoreError> {
         let thread = storage
             .get_thread(&thread_id.0)?
@@ -354,17 +293,9 @@ impl ContextCompiler {
             .map(|node| node.content.clone())
             .collect();
 
-        let active_files = blackboard
-            .find_by_kind(BlackboardEntryKind::ActiveFile)
-            .iter()
-            .map(|entry| entry.value.clone())
-            .collect();
-
         Ok(ContextPayload {
             thread_id: Some(thread_id),
             base_system_prompt: self.base_prompt.clone(),
-            blackboard_notes: blackboard.to_markdown(),
-            active_files,
             decision_landmarks,
             trunk_path,
             anchor_header,

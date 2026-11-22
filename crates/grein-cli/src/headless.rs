@@ -27,7 +27,6 @@ pub struct StatusOutput {
     pub socket_path: PathBuf,
     pub socket_reachable: bool,
     pub thread_count: usize,
-    pub blackboard_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,16 +107,14 @@ pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
         false
     };
 
-    let (thread_count, blackboard_count) = if db_path.exists() {
+    let thread_count = if db_path.exists() {
         if let Ok(engine) = InProcessEngine::open_with_config(&db_path, cwd, None) {
-            let tc = engine.list_threads().await.map(|t| t.len()).unwrap_or(0);
-            let bc = engine.blackboard_list().await.map(|b| b.len()).unwrap_or(0);
-            (tc, bc)
+            engine.list_threads().await.map(|t| t.len()).unwrap_or(0)
         } else {
-            (0, 0)
+            0
         }
     } else {
-        (0, 0)
+        0
     };
 
     StatusOutput {
@@ -127,7 +124,6 @@ pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
         socket_path,
         socket_reachable,
         thread_count,
-        blackboard_count,
     }
 }
 
@@ -146,7 +142,6 @@ pub async fn handle_status(
         println!("Socket Path:       {}", status.socket_path.display());
         println!("Socket Reachable:  {}", status.socket_reachable);
         println!("Thread Count:      {}", status.thread_count);
-        println!("Blackboard Count:  {}", status.blackboard_count);
     }
 
     Ok(())
@@ -203,10 +198,6 @@ mod tests {
             .fork_thread_with_title(Some(&main.thread_id), Some("topic-a"))
             .await
             .expect("fork");
-        engine
-            .blackboard_upsert("goal", "ship")
-            .await
-            .expect("upsert");
         drop(engine);
 
         let threads_out = collect_threads_output(&ThreadsArgs {
@@ -229,7 +220,6 @@ mod tests {
         })
         .await;
         assert_eq!(status_out.thread_count, 2);
-        assert_eq!(status_out.blackboard_count, 1);
 
         handle_threads(&ThreadsArgs {
             json: true,
