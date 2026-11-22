@@ -901,3 +901,423 @@ done
 
     server.abort();
 }
+
+#[tokio::test]
+async fn test_pty_scroll_scrollback_navigation_and_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let work_dir = temp.path().join("scroll_ws");
+    std::fs::create_dir_all(&work_dir).expect("mkdir");
+    let canonical_work = std::fs::canonicalize(&work_dir).expect("canonical");
+    let db_path = temp.path().join("scroll.db");
+
+    let engine = InProcessEngine::open_with_config(&db_path, canonical_work, None).expect("open");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let term = engine
+        .create_terminal(Some(&main.thread_id), Some("Scroll Term"), None, 24, 80)
+        .await
+        .expect("create_terminal");
+
+    let mut rx = engine.subscribe_tui_events();
+
+    // Flood >40 lines into scrollback (leading newline for Nix sandbox bash-5.3 hermeticity).
+    engine
+        .pty_write(
+            &term.thread_id,
+            b"printf '\\n'; i=1; while [ \"$i\" -le 60 ]; do printf \"SCROLL_%02d\\n\" \"$i\"; i=$((i+1)); done\n".to_vec(),
+        )
+        .await
+        .expect("pty_write flood");
+
+    let bottom_snap = wait_for_pty_snapshot(&engine, &term.thread_id, 24, 80, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == "SCROLL_60")
+    })
+    .await;
+    assert_eq!(bottom_snap.scrollback_offset, 0);
+    let bottom_text = bottom_snap.plain_text();
+    assert!(
+        !bottom_text.lines().any(|l| l.trim() == "SCROLL_10"),
+        "SCROLL_10 should have scrolled off screen at offset 0:\n{bottom_text}"
+    );
+
+    // Drain prior PTY output events before issuing pty_scroll.
+    while rx.try_recv().is_ok() {}
+
+    let up_snap = engine
+        .pty_scroll(&term.thread_id, 10)
+        .await
+        .expect("pty_scroll up 10");
+    assert_eq!(up_snap.scrollback_offset, 10);
+    let up_text = up_snap.plain_text();
+    assert_ne!(up_text, bottom_text, "scrolling up must expose earlier lines");
+    let exposed_earlier = up_text
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with("SCROLL_") && !bottom_text.lines().any(|b| b.trim() == line));
+    assert!(
+        exposed_earlier,
+        "pty_scroll(+10) must expose earlier SCROLL_XX lines not visible at offset 0:\n{up_text}"
+    );
+
+    let mut saw_scroll_event = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(250), rx.recv()).await {
+        if let TuiEngineEvent::PtyScreenUpdated {
+            thread_id,
+            snapshot,
+        } = ev
+        {
+            if thread_id == term.thread_id && snapshot.scrollback_offset == 10 {
+                saw_scroll_event = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_scroll_event,
+        "pty_scroll must emit TuiEngineEvent::PtyScreenUpdated with updated scrollback_offset"
+    );
+
+    let down_snap = engine
+        .pty_scroll(&term.thread_id, -10)
+        .await
+        .expect("pty_scroll down 10");
+    assert_eq!(down_snap.scrollback_offset, 0);
+    assert!(
+        down_snap
+            .plain_text()
+            .lines()
+            .any(|l| l.trim() == "SCROLL_60"),
+        "scrolling back -10 must restore bottom screen:\n{}",
+        down_snap.plain_text()
+    );
+
+    // Guardrails: non-terminal and missing thread errors.
+    let agent_err = engine
+        .pty_scroll(&main.thread_id, 5)
+        .await
+        .expect_err("pty_scroll on agent thread must fail");
+    assert!(matches!(agent_err, EngineError::InvalidParams(_)));
+
+    let missing_err = engine
+        .pty_scroll("00000000-0000-0000-0000-000000000000", 5)
+        .await
+        .expect_err("pty_scroll on missing thread must fail");
+    assert!(matches!(missing_err, EngineError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn test_pty_restart_replaces_exited_pty_in_persisted_cwd_and_resets_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace_dir = temp.path().join("workspace");
+    let term_dir = temp.path().join("term_cwd");
+    std::fs::create_dir_all(&workspace_dir).expect("mkdir ws");
+    std::fs::create_dir_all(&term_dir).expect("mkdir term_cwd");
+    let canonical_term_dir = std::fs::canonicalize(&term_dir).expect("canonical term_dir");
+    let db_path = temp.path().join("restart.db");
+
+    let engine = InProcessEngine::open_with_config(&db_path, workspace_dir, None).expect("open");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let term = engine
+        .create_terminal(
+            Some(&main.thread_id),
+            Some("Restart Term"),
+            Some(&canonical_term_dir.to_string_lossy()),
+            24,
+            80,
+        )
+        .await
+        .expect("create_terminal");
+
+    engine
+        .pty_write(&term.thread_id, b"printf '\\nEXITING_NOW\\n'; exit 7\n".to_vec())
+        .await
+        .expect("pty_write exit 7");
+
+    let exited_snap = wait_for_pty_snapshot(&engine, &term.thread_id, 24, 80, Duration::from_secs(5), |s| {
+        s.exited && s.exit_code == Some(7)
+    })
+    .await;
+    assert!(exited_snap.exited);
+    assert_eq!(exited_snap.exit_code, Some(7));
+
+    let mut rx = engine.subscribe_tui_events();
+    let restarted = engine
+        .pty_restart(&term.thread_id, 30, 110)
+        .await
+        .expect("pty_restart");
+    assert!(!restarted.exited, "pty_restart must reset exited == false");
+    assert_eq!(restarted.exit_code, None, "pty_restart must reset exit_code == None");
+    assert_eq!((restarted.rows, restarted.cols), (30, 110));
+
+    let mut saw_meta_updated = false;
+    let mut saw_screen_updated = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !(saw_meta_updated && saw_screen_updated) {
+        match timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(TuiEngineEvent::ThreadMetadataUpdated { meta })) => {
+                if meta.iter().any(|m| {
+                    m.thread_id == term.thread_id
+                        && m.cwd.as_deref() == Some(canonical_term_dir.to_string_lossy().as_ref())
+                }) {
+                    saw_meta_updated = true;
+                }
+            }
+            Ok(Some(TuiEngineEvent::PtyScreenUpdated {
+                thread_id,
+                snapshot,
+            })) if thread_id == term.thread_id
+                && !snapshot.exited
+                && snapshot.exit_code.is_none()
+                && snapshot.rows == 30
+                && snapshot.cols == 110 =>
+            {
+                saw_screen_updated = true;
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(saw_meta_updated, "pty_restart must emit ThreadMetadataUpdated");
+    assert!(saw_screen_updated, "pty_restart must emit PtyScreenUpdated");
+
+    engine
+        .pty_write(
+            &term.thread_id,
+            b"printf '\\nRESTARTED_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+        )
+        .await
+        .expect("pty_write after restart");
+    let expected_pwd = format!("RESTARTED_PWD={}", canonical_term_dir.to_string_lossy());
+    let live_snap = wait_for_pty_snapshot(&engine, &term.thread_id, 30, 110, Duration::from_secs(5), |s| {
+        !s.exited
+            && s.exit_code.is_none()
+            && s.plain_text().lines().any(|l| l.trim() == expected_pwd)
+    })
+    .await;
+    assert!(!live_snap.exited);
+    assert_eq!(live_snap.exit_code, None);
+
+    // Guardrails: non-terminal and missing thread errors.
+    let agent_err = engine
+        .pty_restart(&main.thread_id, 24, 80)
+        .await
+        .expect_err("pty_restart on agent thread must fail");
+    assert!(matches!(agent_err, EngineError::InvalidParams(_)));
+
+    let missing_err = engine
+        .pty_restart("00000000-0000-0000-0000-000000000000", 24, 80)
+        .await
+        .expect_err("pty_restart on missing thread must fail");
+    assert!(matches!(missing_err, EngineError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn test_osc7_live_cwd_persistence_cold_reopen_and_ignores_nonexistent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let initial_dir = temp.path().join("initial");
+    let sub_dir = initial_dir.join("sub_osc7");
+    std::fs::create_dir_all(&sub_dir).expect("mkdir sub_dir");
+    let canonical_initial = std::fs::canonicalize(&initial_dir).expect("canonical initial");
+    let canonical_sub = std::fs::canonicalize(&sub_dir).expect("canonical sub");
+    let canonical_sub_str = canonical_sub.to_string_lossy().into_owned();
+    let db_path = temp.path().join("osc7.db");
+
+    let term_id = {
+        let engine = InProcessEngine::open_with_config(&db_path, canonical_initial.clone(), None)
+            .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        let term = engine
+            .create_terminal(Some(&main.thread_id), Some("OSC7 Term"), None, 24, 140)
+            .await
+            .expect("create_terminal");
+
+        let mut rx = engine.subscribe_tui_events();
+        let cmd = format!(
+            "printf '\\n'; printf '\\033]7;file://localhost%s\\007\\n' '{}'\n",
+            canonical_sub_str
+        );
+        engine
+            .pty_write(&term.thread_id, cmd.into_bytes())
+            .await
+            .expect("pty_write osc7");
+
+        let mut saw_cwd_meta = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(250), rx.recv()).await {
+                Ok(Some(TuiEngineEvent::ThreadMetadataUpdated { meta })) => {
+                    if meta.iter().any(|m| {
+                        m.thread_id == term.thread_id
+                            && m.cwd.as_deref() == Some(canonical_sub_str.as_str())
+                    }) {
+                        saw_cwd_meta = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+        assert!(
+            saw_cwd_meta,
+            "live OSC 7 cwd update must persist and emit ThreadMetadataUpdated with {canonical_sub_str}"
+        );
+
+        let meta_now = engine.thread_metadata().await.expect("thread_metadata");
+        let term_meta = meta_now
+            .iter()
+            .find(|m| m.thread_id == term.thread_id)
+            .expect("term meta");
+        assert_eq!(term_meta.cwd.as_deref(), Some(canonical_sub_str.as_str()));
+
+        // Writing normal output in same cwd must NOT trigger redundant ThreadMetadataUpdated loops.
+        while rx.try_recv().is_ok() {}
+        engine
+            .pty_write(&term.thread_id, b"printf '\\nNO_REDUNDANT_META\\n'\n".to_vec())
+            .await
+            .expect("pty_write marker");
+        wait_for_pty_snapshot(&engine, &term.thread_id, 24, 140, Duration::from_secs(5), |s| {
+            s.plain_text()
+                .lines()
+                .any(|l| l.trim() == "NO_REDUNDANT_META")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, TuiEngineEvent::ThreadMetadataUpdated { .. }),
+                "unchanged OSC 7 cwd must not re-emit ThreadMetadataUpdated: {ev:?}"
+            );
+        }
+
+        // Nonexistent OSC 7 directory must be ignored safely without overwriting persisted cwd.
+        let missing_path = temp.path().join("does_not_exist_osc7");
+        let bad_cmd = format!(
+            "printf '\\n'; printf '\\033]7;file://localhost%s\\007\\n' '{}'; printf 'BAD_OSC7_DONE\\n'\n",
+            missing_path.to_string_lossy()
+        );
+        engine
+            .pty_write(&term.thread_id, bad_cmd.into_bytes())
+            .await
+            .expect("pty_write bad osc7");
+        wait_for_pty_snapshot(&engine, &term.thread_id, 24, 140, Duration::from_secs(5), |s| {
+            s.plain_text().lines().any(|l| l.trim() == "BAD_OSC7_DONE")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let meta_after_bad = engine.thread_metadata().await.expect("meta after bad osc7");
+        let term_meta_after_bad = meta_after_bad
+            .iter()
+            .find(|m| m.thread_id == term.thread_id)
+            .expect("term meta");
+        assert_eq!(
+            term_meta_after_bad.cwd.as_deref(),
+            Some(canonical_sub_str.as_str()),
+            "nonexistent OSC 7 directory must be ignored safely"
+        );
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, TuiEngineEvent::ThreadMetadataUpdated { .. }),
+                "nonexistent OSC 7 cwd must not emit ThreadMetadataUpdated: {ev:?}"
+            );
+        }
+
+        term.thread_id
+    };
+
+    // Cold reopen: pty_snapshot lazily respawns PTY inside persisted $SUBDIR.
+    let reopened = InProcessEngine::open_with_config(&db_path, canonical_initial, None)
+        .expect("cold reopen");
+    let _ = reopened
+        .pty_snapshot(&term_id, 24, 140)
+        .await
+        .expect("lazy pty_snapshot");
+    reopened
+        .pty_write(
+            &term_id,
+            b"printf '\\nREOPEN_OSC7_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+        )
+        .await
+        .expect("pty_write after reopen");
+
+    let expected_pwd = format!("REOPEN_OSC7_PWD={canonical_sub_str}");
+    wait_for_pty_snapshot(&reopened, &term_id, 24, 140, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == expected_pwd)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_worktree_git_status_metadata_clean_and_dirty() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    init_test_git_repo(&repo_root);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let db_path = temp.path().join("wt_git.db");
+
+    let engine = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
+        .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let branch = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("wt-status"))
+        .await
+        .expect("fork branch");
+    let wt_path = engine
+        .ensure_thread_worktree(&branch.thread_id)
+        .await
+        .expect("ensure_thread_worktree");
+    let wt_term = engine
+        .create_terminal(Some(&branch.thread_id), Some("WT Term"), None, 24, 80)
+        .await
+        .expect("create_terminal");
+
+    let clean_meta = engine.thread_metadata().await.expect("clean thread_metadata");
+    let main_clean = clean_meta
+        .iter()
+        .find(|m| m.thread_id == main.thread_id)
+        .expect("main meta");
+    let branch_clean = clean_meta
+        .iter()
+        .find(|m| m.thread_id == branch.thread_id)
+        .expect("branch meta");
+    let term_clean = clean_meta
+        .iter()
+        .find(|m| m.thread_id == wt_term.thread_id)
+        .expect("wt term meta");
+
+    let expected_wt_branch = format!("worktree-{}", branch.thread_id);
+    assert!(
+        main_clean.git_branch.is_some(),
+        "main thread on git repo must populate git_branch"
+    );
+    assert_eq!(main_clean.git_dirty, 0);
+    assert_eq!(branch_clean.git_branch.as_deref(), Some(expected_wt_branch.as_str()));
+    assert_eq!(branch_clean.git_dirty, 0);
+    assert_eq!(term_clean.git_branch.as_deref(), Some(expected_wt_branch.as_str()));
+    assert_eq!(term_clean.git_dirty, 0);
+
+    // Dirty the isolated worktree without dirtying the primary repo root.
+    std::fs::write(Path::new(&wt_path).join("dirty_file.txt"), "uncommitted\n")
+        .expect("write dirty file");
+
+    let dirty_meta = engine.thread_metadata().await.expect("dirty thread_metadata");
+    let main_dirty = dirty_meta
+        .iter()
+        .find(|m| m.thread_id == main.thread_id)
+        .expect("main meta");
+    let branch_dirty = dirty_meta
+        .iter()
+        .find(|m| m.thread_id == branch.thread_id)
+        .expect("branch meta");
+    let term_dirty = dirty_meta
+        .iter()
+        .find(|m| m.thread_id == wt_term.thread_id)
+        .expect("wt term meta");
+
+    assert_eq!(main_dirty.git_dirty, 0, "primary repo root must stay clean");
+    assert_eq!(branch_dirty.git_branch.as_deref(), Some(expected_wt_branch.as_str()));
+    assert_eq!(branch_dirty.git_dirty, 1);
+    assert_eq!(term_dirty.git_branch.as_deref(), Some(expected_wt_branch.as_str()));
+    assert_eq!(term_dirty.git_dirty, 1);
+}

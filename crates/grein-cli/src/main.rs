@@ -509,6 +509,46 @@ where
         Ok(cwd)
     }
 
+    async fn pty_scroll(&self, thread_id: &str, delta: isize) -> io::Result<PtyScreenSnapshot> {
+        let snapshot = self
+            .client
+            .pty_scroll(thread_id, delta)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::PtyScreenUpdated {
+                thread_id: thread_id.to_string(),
+                snapshot: snapshot.clone(),
+            });
+        }
+        Ok(snapshot)
+    }
+
+    async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> io::Result<PtyScreenSnapshot> {
+        let snapshot = self
+            .client
+            .pty_restart(thread_id, rows, cols)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let _ = self.fetch_and_emit_thread_metadata().await;
+            self.emit(TuiEngineEvent::ThreadStatusChanged {
+                thread_id: thread_id.to_string(),
+                status: "idle".to_string(),
+            });
+            self.emit(TuiEngineEvent::PtyScreenUpdated {
+                thread_id: thread_id.to_string(),
+                snapshot: snapshot.clone(),
+            });
+        }
+        Ok(snapshot)
+    }
+
     async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
         let rx = self
             .events_rx
@@ -1299,6 +1339,91 @@ done
         assert!(
             meta_idx < created_idx,
             "non-live EngineClientPort ThreadMetadataUpdated (idx {meta_idx}) must precede ThreadCreated (idx {created_idx}): {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_pty_scroll_and_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work_dir = temp.path().join("port_pty_ws");
+        std::fs::create_dir_all(&work_dir).expect("mkdir");
+        let canonical_dir = std::fs::canonicalize(&work_dir).expect("canonical");
+        let db_path = temp.path().join("port_pty.db");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, canonical_dir.clone(), None).expect("open");
+        let port = EngineClientPort::new(engine);
+
+        let session = port.hydrate_session().await.expect("hydrate");
+        let mut rx = port.subscribe_events().await.expect("subscribe");
+        let term = port
+            .create_terminal(Some(&session.active_thread_id), Some("Port Term"), None, 24, 80)
+            .await
+            .expect("create_terminal");
+
+        port.pty_write(
+            &term.id,
+            b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf \"PORT_L_%02d\\n\" \"$i\"; i=$((i+1)); done\n".to_vec(),
+        )
+        .await
+        .expect("pty_write");
+
+        let mut saw_50 = false;
+        for _ in 0..150 {
+            let snap = port.pty_snapshot(&term.id, 24, 80).await.expect("snapshot");
+            if snap.plain_text().lines().any(|l| l.trim() == "PORT_L_50") {
+                saw_50 = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_50, "expected PORT_L_50 in EngineClientPort snapshot");
+
+        let scrolled = port.pty_scroll(&term.id, 10).await.expect("pty_scroll");
+        assert_eq!(scrolled.scrollback_offset, 10);
+        let restored = port.pty_scroll(&term.id, -10).await.expect("pty_scroll -10");
+        assert_eq!(restored.scrollback_offset, 0);
+
+        port.pty_write(&term.id, b"printf '\\n'; exit 7\n".to_vec())
+            .await
+            .expect("exit 7");
+        let mut saw_exit = false;
+        for _ in 0..150 {
+            let snap = port.pty_snapshot(&term.id, 24, 80).await.expect("snapshot exited");
+            if snap.exited && snap.exit_code == Some(7) {
+                saw_exit = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_exit, "expected exit code 7 before restart");
+
+        while rx.try_recv().is_ok() {}
+        let restarted = port.pty_restart(&term.id, 26, 96).await.expect("pty_restart");
+        assert!(!restarted.exited);
+        assert_eq!(restarted.exit_code, None);
+        assert_eq!((restarted.rows, restarted.cols), (26, 96));
+
+        let mut saw_restart_event = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(TuiEngineEvent::PtyScreenUpdated { thread_id, snapshot })) =
+                tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
+            {
+                if thread_id == term.id
+                    && !snapshot.exited
+                    && snapshot.exit_code.is_none()
+                    && snapshot.rows == 26
+                    && snapshot.cols == 96
+                {
+                    saw_restart_event = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_restart_event,
+            "EngineClientPort::pty_restart must forward PtyScreenUpdated"
         );
     }
 }

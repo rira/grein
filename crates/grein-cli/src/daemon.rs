@@ -392,4 +392,143 @@ mod tests {
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn test_daemon_socket_pty_scroll_and_restart_round_trip() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work_dir = temp.path().join("daemon_ws");
+        std::fs::create_dir_all(&work_dir).expect("mkdir");
+        let canonical_work = std::fs::canonicalize(&work_dir).expect("canonical");
+        let socket_path = temp.path().join("pty_rpc.sock");
+        let db_path = temp.path().join("pty_rpc.db");
+
+        let sock_clone = socket_path.clone();
+        let db_clone = db_path.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_daemon_with_socket_and_db(sock_clone, db_clone).await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client = UnixSocketEngineClient::connect(&socket_path)
+            .await
+            .expect("connect UnixSocketEngineClient");
+        let mut raw_client = connect_to_daemon(&socket_path)
+            .await
+            .expect("connect DaemonClient");
+
+        let main = client.ensure_main_thread().await.expect("ensure main");
+        let term = client
+            .create_terminal(
+                Some(&main.thread_id),
+                Some("RPC Scroll Term"),
+                Some(&canonical_work.to_string_lossy()),
+                24,
+                80,
+            )
+            .await
+            .expect("create_terminal");
+
+        client
+            .pty_write(
+                &term.thread_id,
+                b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf \"DAEMON_L_%02d\\n\" \"$i\"; i=$((i+1)); done\n".to_vec(),
+            )
+            .await
+            .expect("pty_write");
+
+        let mut saw_50 = false;
+        for _ in 0..150 {
+            let snap = client
+                .pty_snapshot(&term.thread_id, 24, 80)
+                .await
+                .expect("pty_snapshot");
+            if snap.plain_text().lines().any(|l| l.trim() == "DAEMON_L_50") {
+                saw_50 = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_50, "expected DAEMON_L_50 in daemon PTY snapshot");
+
+        let scroll_rpc = raw_client
+            .session_pty_scroll(&term.thread_id, 10)
+            .await
+            .expect("session_pty_scroll rpc");
+        let scroll_snap: grein_tui::engine_port::PtyScreenSnapshot =
+            serde_json::from_value(scroll_rpc["result"].clone()).expect("decode scroll snapshot");
+        assert_eq!(scroll_snap.scrollback_offset, 10);
+
+        let scroll_back = client
+            .pty_scroll(&term.thread_id, -10)
+            .await
+            .expect("UnixSocketEngineClient::pty_scroll -10");
+        assert_eq!(scroll_back.scrollback_offset, 0);
+
+        client
+            .pty_write(&term.thread_id, b"printf '\\n'; exit 7\n".to_vec())
+            .await
+            .expect("pty_write exit 7");
+
+        let mut saw_exited = false;
+        for _ in 0..150 {
+            let snap = client
+                .pty_snapshot(&term.thread_id, 24, 80)
+                .await
+                .expect("pty_snapshot exited");
+            if snap.exited && snap.exit_code == Some(7) {
+                saw_exited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_exited, "expected exited == true, exit_code == Some(7)");
+
+        let restart_rpc = raw_client
+            .session_pty_restart(&term.thread_id, 28, 100)
+            .await
+            .expect("session_pty_restart rpc");
+        let restart_snap: grein_tui::engine_port::PtyScreenSnapshot =
+            serde_json::from_value(restart_rpc["result"].clone()).expect("decode restart snapshot");
+        assert!(!restart_snap.exited);
+        assert_eq!(restart_snap.exit_code, None);
+        assert_eq!((restart_snap.rows, restart_snap.cols), (28, 100));
+
+        let restart_via_client = client
+            .pty_restart(&term.thread_id, 30, 105)
+            .await
+            .expect("UnixSocketEngineClient::pty_restart");
+        assert!(!restart_via_client.exited);
+        assert_eq!(restart_via_client.exit_code, None);
+        assert_eq!((restart_via_client.rows, restart_via_client.cols), (30, 105));
+
+        client
+            .pty_write(
+                &term.thread_id,
+                b"printf '\\nDAEMON_RESTART_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+            )
+            .await
+            .expect("pty_write after restart");
+        let expected_pwd = format!("DAEMON_RESTART_PWD={}", canonical_work.to_string_lossy());
+        let mut saw_pwd = false;
+        for _ in 0..150 {
+            let snap = client
+                .pty_snapshot(&term.thread_id, 30, 105)
+                .await
+                .expect("pty_snapshot after restart");
+            if !snap.exited && snap.plain_text().lines().any(|l| l.trim() == expected_pwd) {
+                saw_pwd = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(saw_pwd, "restarted daemon PTY must execute commands in persisted cwd");
+
+        server.abort();
+    }
 }

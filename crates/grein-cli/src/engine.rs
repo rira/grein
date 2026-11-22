@@ -24,6 +24,7 @@ use grein_tui::engine_port::{
 };
 use grein_workspace::allocator::{ThreadId as WorkspaceThreadId, WorktreeAllocator};
 use grein_workspace::git::{GitError, GitRepository};
+use grein_workspace::git_status::{inspect_git_status, RepoGitStatus};
 use grein_workspace::pty_session::{
     InteractivePtySession, PtyCell as WsPtyCell, PtyColor as WsPtyColor,
     PtyScreenSnapshot as WsPtyScreenSnapshot,
@@ -322,6 +323,25 @@ pub trait DaemonEngine: Send + Sync {
     async fn ensure_thread_worktree(&self, _thread_id: &str) -> Result<String, EngineError> {
         Err(EngineError::Protocol(
             "ensure_thread_worktree not supported".to_string(),
+        ))
+    }
+    async fn pty_scroll(
+        &self,
+        _thread_id: &str,
+        _delta: isize,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        Err(EngineError::Protocol(
+            "pty_scroll not supported".to_string(),
+        ))
+    }
+    async fn pty_restart(
+        &self,
+        _thread_id: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        Err(EngineError::Protocol(
+            "pty_restart not supported".to_string(),
         ))
     }
 }
@@ -1237,6 +1257,16 @@ impl EngineRuntime {
     }
 
     fn compute_thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
+        self.compute_thread_metadata_with_inspector(inspect_git_status)
+    }
+
+    fn compute_thread_metadata_with_inspector<F>(
+        &self,
+        mut inspector: F,
+    ) -> Result<Vec<ThreadMeta>, EngineError>
+    where
+        F: FnMut(&Path) -> Option<RepoGitStatus>,
+    {
         let threads = self.storage.list_threads().map_err(storage_err)?;
         if threads.is_empty() {
             return Ok(Vec::new());
@@ -1267,6 +1297,7 @@ impl EngineRuntime {
             }
         }
 
+        let mut git_cache: HashMap<PathBuf, Option<RepoGitStatus>> = HashMap::new();
         let mut meta = Vec::with_capacity(threads.len());
         for (idx, thread) in threads.iter().enumerate() {
             let trunk = path_from_node_map(thread.parent_node_id, &nodes_by_id);
@@ -1313,6 +1344,20 @@ impl EngineRuntime {
                     .count()
             };
 
+            let target_path = thread
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.cwd.clone());
+            let git_status = git_cache
+                .entry(target_path)
+                .or_insert_with_key(|path| inspector(path))
+                .as_ref();
+            let git_branch = git_status.and_then(|s| s.branch.clone());
+            let git_dirty = git_status.map_or(0, |s| s.dirty_count);
+
             meta.push(ThreadMeta {
                 thread_id: thread.id.0.to_string(),
                 parent_thread_id,
@@ -1320,8 +1365,8 @@ impl EngineRuntime {
                 merged: thread.merged,
                 kind: thread.kind,
                 cwd: thread.cwd.clone(),
-                git_branch: None,
-                git_dirty: 0,
+                git_branch,
+                git_dirty,
             });
         }
 
@@ -1461,6 +1506,7 @@ impl EngineRuntime {
     }
 
     fn flush_dirty_pty_threads(&self, dirty: HashSet<String>) {
+        let mut cwd_updated = false;
         for thread_id in dirty {
             let session = self
                 .active_pty_sessions
@@ -1470,13 +1516,36 @@ impl EngineRuntime {
             let Some(session) = session else {
                 continue;
             };
-            let snap = pty_snapshot_to_tui(session.snapshot());
+            let raw_snap = session.snapshot();
+            let raw_cwd = raw_snap.cwd.clone();
+            let snap = pty_snapshot_to_tui(raw_snap);
             let exited = snap.exited;
             let exit_code = snap.exit_code;
             self.emit_tui(TuiEngineEvent::PtyScreenUpdated {
                 thread_id: thread_id.clone(),
                 snapshot: snap,
             });
+            if let Some(raw_dir) = raw_cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(tid) = parse_typed_id::<ThreadId>(&thread_id) {
+                    let raw_path = Path::new(raw_dir);
+                    if raw_path.is_dir() {
+                        if let Ok(canonical_path) = std::fs::canonicalize(raw_path) {
+                            if let Some(canonical_dir) = canonical_path.to_str() {
+                                if let Ok(Some(thread)) = self.storage.get_thread(tid) {
+                                    if thread.cwd.as_deref() != Some(canonical_dir)
+                                        && self
+                                            .storage
+                                            .update_thread_cwd(&tid, Some(canonical_dir))
+                                            .is_ok()
+                                    {
+                                        cwd_updated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if exited {
                 let newly_exited = self
                     .pty_exited_threads
@@ -1490,7 +1559,7 @@ impl EngineRuntime {
                         }
                     }
                     self.emit_tui(TuiEngineEvent::PtyExited {
-                        thread_id: thread_id.clone(),
+                        thread_id: thread_id.to_string(),
                         exit_code,
                     });
                     self.emit_tui(TuiEngineEvent::ThreadStatusChanged {
@@ -1498,6 +1567,11 @@ impl EngineRuntime {
                         status: "idle".to_string(),
                     });
                 }
+            }
+        }
+        if cwd_updated {
+            if let Ok(meta) = self.compute_thread_metadata() {
+                self.emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
             }
         }
     }
@@ -2544,6 +2618,23 @@ impl InProcessEngine {
 
     pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         DaemonEngine::ensure_thread_worktree(self, thread_id).await
+    }
+
+    pub async fn pty_scroll(
+        &self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        DaemonEngine::pty_scroll(self, thread_id, delta).await
+    }
+
+    pub async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        DaemonEngine::pty_restart(self, thread_id, rows, cols).await
     }
 }
 
@@ -3912,6 +4003,79 @@ impl DaemonEngine for InProcessEngine {
         Ok(pty_snapshot_to_tui(snap))
     }
 
+    async fn pty_scroll(
+        &self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
+        let (session, _) = self
+            .runtime
+            .ensure_pty_session(thread_id, &thread, 24, 80)
+            .await?;
+        session.scroll_by(delta);
+        let snap = pty_snapshot_to_tui(session.snapshot());
+        self.runtime.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+            thread_id: thread_id.to_string(),
+            snapshot: snap.clone(),
+        });
+        Ok(snap)
+    }
+
+    async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        let (tid, _) = self.runtime.require_terminal_thread(thread_id)?;
+        let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
+        let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
+
+        let removed_pty = self
+            .runtime
+            .active_pty_sessions
+            .lock()
+            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
+            .remove(thread_id);
+        if let Ok(mut pending) = self.runtime.pending_pty_sizes.lock() {
+            pending.remove(thread_id);
+        }
+        if let Ok(mut exited) = self.runtime.pty_exited_threads.lock() {
+            exited.remove(thread_id);
+        }
+        if let Some(pty_session) = removed_pty {
+            let _ = tokio::task::spawn_blocking(move || drop(pty_session)).await;
+        }
+
+        let target_rows = if rows == 0 { 24 } else { rows.max(4) };
+        let target_cols = if cols == 0 { 80 } else { cols.max(10) };
+        let cwd = self.runtime.resolve_thread_cwd(&thread);
+        let session = self
+            .runtime
+            .spawn_pty_for_thread(thread_id, cwd, target_rows, target_cols)
+            .await?;
+
+        let _ = self
+            .runtime
+            .storage
+            .update_thread_status(tid, ThreadStatus::Idle);
+        let snap = pty_snapshot_to_tui(session.snapshot());
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadStatusChanged {
+                thread_id: thread_id.to_string(),
+                status: "idle".to_string(),
+            });
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        self.runtime.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+            thread_id: thread_id.to_string(),
+            snapshot: snap.clone(),
+        });
+        Ok(snap)
+    }
+
     async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
@@ -4172,6 +4336,17 @@ async fn route(
             let cwd = engine.ensure_thread_worktree(thread_id).await?;
             json!({"cwd": cwd})
         }
+        "session.pty_scroll" | "pty_scroll" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let delta = parse_req_isize(params, "delta")?;
+            to_json(&engine.pty_scroll(thread_id, delta).await?)?
+        }
+        "session.pty_restart" | "pty_restart" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let rows = parse_opt_u16(params, "rows", 24)?;
+            let cols = parse_opt_u16(params, "cols", 80)?;
+            to_json(&engine.pty_restart(thread_id, rows, cols).await?)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(value))
@@ -4193,6 +4368,14 @@ fn parse_req_u16(params: &Value, key: &str) -> Result<u16, EngineError> {
         .and_then(Value::as_u64)
         .and_then(|n| u16::try_from(n).ok())
         .ok_or_else(|| EngineError::InvalidParams(format!("missing u16 param `{key}`")))
+}
+
+fn parse_req_isize(params: &Value, key: &str) -> Result<isize, EngineError> {
+    params
+        .get(key)
+        .and_then(Value::as_i64)
+        .and_then(|n| isize::try_from(n).ok())
+        .ok_or_else(|| EngineError::InvalidParams(format!("missing isize param `{key}`")))
 }
 
 /// Handles one JSON-RPC 2.0 request line and returns the serialized response.
@@ -4250,6 +4433,8 @@ impl UnixSocketEngineClient {
                 | "session.pty_write"
                 | "session.pty_resize"
                 | "session.pty_snapshot"
+                | "session.pty_scroll"
+                | "session.pty_restart"
                 | "session.ensure_thread_worktree"
         )
     }
@@ -4397,6 +4582,23 @@ impl UnixSocketEngineClient {
 
     pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         DaemonEngine::ensure_thread_worktree(self, thread_id).await
+    }
+
+    pub async fn pty_scroll(
+        &self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        DaemonEngine::pty_scroll(self, thread_id, delta).await
+    }
+
+    pub async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        DaemonEngine::pty_restart(self, thread_id, rows, cols).await
     }
 }
 
@@ -4716,6 +4918,31 @@ impl DaemonEngine for UnixSocketEngineClient {
             .map(str::to_string)
             .ok_or_else(|| EngineError::Protocol("response missing cwd".into()))
     }
+
+    async fn pty_scroll(
+        &self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        self.call_dedicated_typed(
+            "session.pty_scroll",
+            json!({"thread_id": thread_id, "delta": delta}),
+        )
+        .await
+    }
+
+    async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        self.call_dedicated_typed(
+            "session.pty_restart",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+    }
 }
 
 /// Unified engine: standalone in-process or remote daemon.
@@ -4987,6 +5214,31 @@ impl DaemonEngine for EngineClient {
                 DaemonEngine::ensure_thread_worktree(e.as_ref(), thread_id).await
             }
             Self::Socket(e) => DaemonEngine::ensure_thread_worktree(e, thread_id).await,
+        }
+    }
+
+    async fn pty_scroll(
+        &self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::pty_scroll(e.as_ref(), thread_id, delta).await,
+            Self::Socket(e) => DaemonEngine::pty_scroll(e, thread_id, delta).await,
+        }
+    }
+
+    async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        match self {
+            Self::InProcess(e) => {
+                DaemonEngine::pty_restart(e.as_ref(), thread_id, rows, cols).await
+            }
+            Self::Socket(e) => DaemonEngine::pty_restart(e, thread_id, rows, cols).await,
         }
     }
 }
@@ -7015,6 +7267,14 @@ done
             .ensure_thread_worktree("t-1")
             .await
             .expect_err("ensure_thread_worktree should fail");
+        let err_scroll = client
+            .pty_scroll("t-1", 5)
+            .await
+            .expect_err("pty_scroll should fail");
+        let err_restart = client
+            .pty_restart("t-1", 24, 80)
+            .await
+            .expect_err("pty_restart should fail");
 
         for (name, err) in [
             ("create_terminal", err_create),
@@ -7022,6 +7282,8 @@ done
             ("pty_resize", err_resize),
             ("pty_snapshot", err_snap),
             ("ensure_thread_worktree", err_wt),
+            ("pty_scroll", err_scroll),
+            ("pty_restart", err_restart),
         ] {
             let msg = err.to_string().to_ascii_lowercase();
             assert!(
@@ -7163,5 +7425,103 @@ done
             .lock()
             .unwrap()
             .contains_key(&term_id));
+    }
+
+    #[tokio::test]
+    async fn test_compute_thread_metadata_deduplicates_git_status_per_unique_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root_dir = temp.path().join("root_ws");
+        let sub_dir = temp.path().join("sub_ws");
+        std::fs::create_dir_all(&root_dir).expect("mkdir root");
+        std::fs::create_dir_all(&sub_dir).expect("mkdir sub");
+        let canonical_root = std::fs::canonicalize(&root_dir).expect("canonical root");
+        let canonical_sub = std::fs::canonicalize(&sub_dir).expect("canonical sub");
+        let db_path = temp.path().join("dedup_git.db");
+
+        let engine = InProcessEngine::open_with_config(&db_path, canonical_root.clone(), None)
+            .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        let _branch1 = engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("b1"))
+            .await
+            .expect("b1");
+        let _branch2 = engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("b2"))
+            .await
+            .expect("b2");
+        let term1 = engine
+            .create_terminal(
+                Some(&main.thread_id),
+                Some("t1"),
+                Some(&canonical_sub.to_string_lossy()),
+                24,
+                80,
+            )
+            .await
+            .expect("t1");
+        let term2 = engine
+            .create_terminal(
+                Some(&main.thread_id),
+                Some("t2"),
+                Some(&canonical_sub.to_string_lossy()),
+                24,
+                80,
+            )
+            .await
+            .expect("t2");
+
+        let total_calls = AtomicUsize::new(0);
+        let calls_per_path: std::sync::Mutex<HashMap<PathBuf, usize>> =
+            std::sync::Mutex::new(HashMap::new());
+
+        let meta = engine
+            .runtime
+            .compute_thread_metadata_with_inspector(|path| {
+                total_calls.fetch_add(1, Ordering::SeqCst);
+                *calls_per_path
+                    .lock()
+                    .unwrap()
+                    .entry(path.to_path_buf())
+                    .or_insert(0) += 1;
+                if path == canonical_root.as_path() {
+                    Some(RepoGitStatus {
+                        branch: Some("main".to_string()),
+                        dirty_count: 2,
+                        is_worktree: false,
+                    })
+                } else if path == canonical_sub.as_path() {
+                    Some(RepoGitStatus {
+                        branch: Some("feat/sub".to_string()),
+                        dirty_count: 5,
+                        is_worktree: true,
+                    })
+                } else {
+                    None
+                }
+            })
+            .expect("compute_thread_metadata_with_inspector");
+
+        assert_eq!(meta.len(), 5);
+        assert_eq!(
+            total_calls.load(Ordering::SeqCst),
+            2,
+            "inspect_git_status must be called once per unique path across 5 threads"
+        );
+        let counts = calls_per_path.lock().unwrap();
+        assert_eq!(counts.get(&canonical_root).copied(), Some(1));
+        assert_eq!(counts.get(&canonical_sub).copied(), Some(1));
+
+        let main_meta = meta.iter().find(|m| m.thread_id == main.thread_id).unwrap();
+        assert_eq!(main_meta.git_branch.as_deref(), Some("main"));
+        assert_eq!(main_meta.git_dirty, 2);
+
+        let t1_meta = meta.iter().find(|m| m.thread_id == term1.thread_id).unwrap();
+        let t2_meta = meta.iter().find(|m| m.thread_id == term2.thread_id).unwrap();
+        assert_eq!(t1_meta.git_branch.as_deref(), Some("feat/sub"));
+        assert_eq!(t1_meta.git_dirty, 5);
+        assert_eq!(t2_meta.git_branch.as_deref(), Some("feat/sub"));
+        assert_eq!(t2_meta.git_dirty, 5);
     }
 }

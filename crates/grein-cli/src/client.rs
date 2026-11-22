@@ -260,6 +260,31 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn session_pty_scroll(
+        &mut self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.pty_scroll",
+            json!({"thread_id": thread_id, "delta": delta}),
+        )
+        .await
+    }
+
+    pub async fn session_pty_restart(
+        &mut self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.pty_restart",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+    }
+
     async fn send_command(&mut self, cmd: &str) -> Result<String, std::io::Error> {
         self.stream.write_all(format!("{cmd}\n").as_bytes()).await?;
         self.stream.flush().await?;
