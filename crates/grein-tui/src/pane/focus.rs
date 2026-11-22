@@ -5,7 +5,6 @@ pub enum PaneFocus {
     Workspace,
     Composer,
     Logs,
-    Blackboard,
 }
 
 impl PaneFocus {
@@ -15,7 +14,6 @@ impl PaneFocus {
             Self::Workspace => "Workspace",
             Self::Composer => "Composer",
             Self::Logs => "Logs",
-            Self::Blackboard => "Blackboard",
         }
     }
 
@@ -24,18 +22,16 @@ impl PaneFocus {
         match self {
             Self::Workspace => Self::Composer,
             Self::Composer => Self::Logs,
-            Self::Logs => Self::Blackboard,
-            Self::Blackboard => Self::Workspace,
+            Self::Logs => Self::Workspace,
         }
     }
 
     #[must_use]
     pub fn previous(&self) -> Self {
         match self {
-            Self::Workspace => Self::Blackboard,
+            Self::Workspace => Self::Logs,
             Self::Composer => Self::Workspace,
             Self::Logs => Self::Composer,
-            Self::Blackboard => Self::Logs,
         }
     }
 }
@@ -46,7 +42,6 @@ impl From<PaneFocus> for crate::app::FocusedPane {
             PaneFocus::Workspace => Self::Tree,
             PaneFocus::Logs => Self::Transcript,
             PaneFocus::Composer => Self::Composer,
-            PaneFocus::Blackboard => Self::Blackboard,
         }
     }
 }
@@ -57,7 +52,6 @@ impl From<crate::app::FocusedPane> for PaneFocus {
             crate::app::FocusedPane::Tree => Self::Workspace,
             crate::app::FocusedPane::Transcript => Self::Logs,
             crate::app::FocusedPane::Composer => Self::Composer,
-            crate::app::FocusedPane::Blackboard => Self::Blackboard,
         }
     }
 }

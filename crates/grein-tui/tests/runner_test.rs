@@ -88,7 +88,6 @@ fn test_pane_focus_round_trip_conversions_across_focus_modules() {
         (UiPaneFocus::Tree, FocusedPane::Tree),
         (UiPaneFocus::Chat, FocusedPane::Transcript),
         (UiPaneFocus::Composer, FocusedPane::Composer),
-        (UiPaneFocus::Blackboard, FocusedPane::Blackboard),
     ];
     for (ui, app_pane) in ui_pairs {
         assert_eq!(FocusedPane::from(ui), app_pane);
@@ -101,7 +100,6 @@ fn test_pane_focus_round_trip_conversions_across_focus_modules() {
         (PanePaneFocus::Workspace, FocusedPane::Tree),
         (PanePaneFocus::Logs, FocusedPane::Transcript),
         (PanePaneFocus::Composer, FocusedPane::Composer),
-        (PanePaneFocus::Blackboard, FocusedPane::Blackboard),
     ];
     for (pane, app_pane) in pane_pairs {
         assert_eq!(FocusedPane::from(pane), app_pane);
@@ -114,7 +112,6 @@ fn test_pane_focus_round_trip_conversions_across_focus_modules() {
         (FocusedPane::Tree, CorePaneFocus::Sidebar),
         (FocusedPane::Transcript, CorePaneFocus::Transcript),
         (FocusedPane::Composer, CorePaneFocus::Composer),
-        (FocusedPane::Blackboard, CorePaneFocus::Inspector),
     ];
     for (app_pane, core) in core_pairs {
         assert_eq!(CorePaneFocus::from(app_pane), core);
@@ -122,12 +119,7 @@ fn test_pane_focus_round_trip_conversions_across_focus_modules() {
     }
 
     // Cross-module round trips through app::FocusedPane
-    for ui in [
-        UiPaneFocus::Tree,
-        UiPaneFocus::Chat,
-        UiPaneFocus::Composer,
-        UiPaneFocus::Blackboard,
-    ] {
+    for ui in [UiPaneFocus::Tree, UiPaneFocus::Chat, UiPaneFocus::Composer] {
         let via_app: FocusedPane = ui.into();
         let pane: PanePaneFocus = via_app.into();
         let back: FocusedPane = pane.into();
@@ -139,24 +131,20 @@ fn test_pane_focus_round_trip_conversions_across_focus_modules() {
 }
 
 #[test]
-fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
+fn test_golden_e2e_two_column_integration_and_multiline_sqlite() {
     let backend = TestBackend::new(120, 36);
     let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
     let mut app = grein_tui::state::AppState::new();
 
     // 1. Focus Composer and type prompt including brackets '[' and ']', then submit with Enter
     app.set_focus(FocusedPane::Composer);
-    for ch in "Verify [4-pane] slice".chars() {
+    for ch in "Verify [2-col] slice".chars() {
         handle_key_event(
             &mut app,
             KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
         )
         .expect("char input should succeed");
     }
-    assert!(
-        !app.is_blackboard_collapsed(),
-        "Typing '[' or ']' in Composer must not collapse Blackboard"
-    );
     handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("Enter submit should succeed");
 
@@ -169,7 +157,7 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
 
     app.apply_agent_response("### Step 1: Tree & Transcript");
     app.persist_state_to_sqlite(&db_path);
-    app.apply_agent_response("- Rendered all 4 panes cleanly");
+    app.apply_agent_response("- Rendered 2-column layout cleanly");
     app.persist_state_to_sqlite(&db_path);
 
     let mut reloaded = grein_tui::state::AppState::new();
@@ -177,7 +165,7 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
     assert!(
         reloaded
             .active_transcript_md
-            .contains("Rendered all 4 panes cleanly"),
+            .contains("Rendered 2-column layout cleanly"),
         "Multi-line streamed agent output must persist across SQLite saves without truncating after line 1"
     );
     let _ = std::fs::remove_file(&db_path);
@@ -199,7 +187,7 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
         .unwrap();
     }
 
-    // 4. Render all 4 panes via draw_frame and verify non-empty expected text in all 4 panes
+    // 4. Render 2-column panes via draw_frame and verify non-empty expected text
     grein_tui::runner::draw_frame(&mut terminal, &app).expect("draw_frame must succeed");
 
     let buf = terminal.backend().buffer();
@@ -213,18 +201,17 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
 
     // Tree pane assertions
     assert!(
-        screen.contains("Tree") && screen.contains("Verify [4-pane] slice"),
+        screen.contains("ᛇ Grein") && screen.contains("Verify [2-col] slice"),
         "Tree pane must render thread context title"
     );
     // Transcript pane assertions
     assert!(
-        screen.contains("Transcript") && screen.contains("Rendered all 4 panes cleanly"),
+        screen.contains("Transcript") && screen.contains("Rendered 2-column layout cleanly"),
         "Transcript pane must render markdown turns"
     );
-    // Blackboard pane assertions
     assert!(
-        screen.contains("Blackboard") && screen.contains("No shared facts yet"),
-        "Blackboard pane must render whiteboard empty-state hint when empty"
+        !screen.contains("Blackboard"),
+        "Blackboard pane must not render in 2-column layout"
     );
     // Composer pane & status bar assertions
     assert!(

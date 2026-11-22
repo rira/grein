@@ -6,39 +6,37 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 #[test]
-fn default_focus_starts_on_composer_and_cycles_forward_through_four_panes() {
+fn default_focus_starts_on_composer_and_toggles_cleanly_with_tree() {
     let mut app = App::default();
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    app.handle_key_event(key(KeyCode::Tab));
-    assert_eq!(app.focused_pane(), FocusPane::Inspector);
-
-    app.handle_key_event(key(KeyCode::Tab));
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 
-    app.handle_key_event(key(KeyCode::Tab));
-    assert_eq!(app.focused_pane(), FocusPane::Transcript);
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    app.handle_key_event(key(KeyCode::Tab));
+    app.handle_key_event(key(KeyCode::Esc));
+    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
+
+    app.handle_key_event(key(KeyCode::Esc));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 }
 
 #[test]
-fn backtab_cycles_focus_backward_through_four_panes() {
+fn tab_and_backtab_preserve_focus_when_cycling_branches() {
     let mut app = App::default();
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-    assert_eq!(app.focused_pane(), FocusPane::Transcript);
-
-    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
-
-    app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-    assert_eq!(app.focused_pane(), FocusPane::Inspector);
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
 
     app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
+
+    app.set_focused_pane(FocusPane::Sidebar);
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 }
 
 #[test]
@@ -50,9 +48,8 @@ fn character_input_routes_to_composer_only_when_composer_focused() {
     app.handle_key_event(key(KeyCode::Char('x')));
     assert_eq!(app.composer_input(), "");
 
-    // Focus Composer (Sidebar -> Transcript -> Composer)
-    app.handle_key_event(key(KeyCode::Tab));
-    app.handle_key_event(key(KeyCode::Tab));
+    // Focus Composer via Ctrl+G (Sidebar <-> Composer)
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
     app.handle_key_event(key(KeyCode::Char('h')));

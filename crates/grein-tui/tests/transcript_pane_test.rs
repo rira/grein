@@ -32,7 +32,7 @@ fn test_transcript_pane_focus_transitions() {
 
 #[test]
 fn test_pane_focus_tab_and_backtab_navigation_order() {
-    // 4-Pane navigation: Sidebar -> Transcript -> Composer -> Details -> Sidebar
+    // 3-Pane navigation: Sidebar -> Transcript -> Composer -> Sidebar
     assert_eq!(
         PaneFocus::Sidebar.next(FocusDirection::Forward),
         PaneFocus::Transcript
@@ -43,14 +43,10 @@ fn test_pane_focus_tab_and_backtab_navigation_order() {
     );
     assert_eq!(
         PaneFocus::Composer.next(FocusDirection::Forward),
-        PaneFocus::Details
-    );
-    assert_eq!(
-        PaneFocus::Details.next(FocusDirection::Forward),
         PaneFocus::Sidebar
     );
 
-    // Reverse (BackTab): Sidebar <- Transcript <- Composer <- Details <- Sidebar
+    // Reverse (BackTab): Sidebar <- Transcript <- Composer <- Sidebar
     assert_eq!(
         PaneFocus::Transcript.next(FocusDirection::Backward),
         PaneFocus::Sidebar
@@ -60,12 +56,8 @@ fn test_pane_focus_tab_and_backtab_navigation_order() {
         PaneFocus::Transcript
     );
     assert_eq!(
-        PaneFocus::Details.next(FocusDirection::Backward),
-        PaneFocus::Composer
-    );
-    assert_eq!(
         PaneFocus::Sidebar.next(FocusDirection::Backward),
-        PaneFocus::Details
+        PaneFocus::Composer
     );
 }
 

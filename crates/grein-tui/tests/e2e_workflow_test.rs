@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,8 +5,8 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use grein_tui::app::{App, AppAction, FocusedPane};
 use grein_tui::engine_port::{
-    HydratedBlackboardEntry, HydratedSession, HydratedThread, HydratedTurn, SubagentSnapshot,
-    SubagentStatus, ThreadMeta, TuiEngineEvent, TuiEnginePort,
+    HydratedSession, HydratedThread, HydratedTurn, SubagentSnapshot, SubagentStatus, ThreadMeta,
+    TuiEngineEvent, TuiEnginePort,
 };
 use grein_tui::layout::{compute_layout_with_chrome, subagent_strip_height};
 use grein_tui::runner::{
@@ -25,9 +24,7 @@ struct MockEngineState {
     thread_meta: Vec<ThreadMeta>,
     deleted_threads: Vec<String>,
     active_thread_id: String,
-    blackboard: BTreeMap<String, String>,
     recorded_turns: Vec<(String, String)>,
-    recorded_blackboard_syncs: Vec<(String, String)>,
     resolved_permissions: Vec<(String, bool)>,
     cancelled_threads: Vec<String>,
     shell_commands: Vec<(String, String)>,
@@ -88,16 +85,8 @@ impl MockLiveEngine {
         }
     }
 
-    fn snapshot_blackboard(&self) -> BTreeMap<String, String> {
-        self.state.lock().unwrap().blackboard.clone()
-    }
-
     fn recorded_turns(&self) -> Vec<(String, String)> {
         self.state.lock().unwrap().recorded_turns.clone()
-    }
-
-    fn recorded_blackboard_syncs(&self) -> Vec<(String, String)> {
-        self.state.lock().unwrap().recorded_blackboard_syncs.clone()
     }
 
     fn resolved_permissions(&self) -> Vec<(String, bool)> {
@@ -129,36 +118,19 @@ impl MockLiveEngine {
 impl TuiEnginePort for MockLiveEngine {
     async fn hydrate_session(&self) -> io::Result<HydratedSession> {
         let guard = self.state.lock().unwrap();
-        let blackboard = guard
-            .blackboard
-            .iter()
-            .map(|(k, v)| HydratedBlackboardEntry {
-                key: k.clone(),
-                value: v.clone(),
-            })
-            .collect();
         Ok(HydratedSession {
             active_thread_id: guard.active_thread_id.clone(),
             threads: guard.threads.clone(),
-            blackboard,
+            blackboard: Vec::new(),
         })
     }
 
     async fn send_turn(&self, thread_id: &str, prompt: &str) -> io::Result<()> {
-        let (tx, slow_notify, wb_snapshot) = {
+        let (tx, slow_notify) = {
             let mut guard = self.state.lock().unwrap();
             guard
                 .recorded_turns
                 .push((thread_id.to_string(), prompt.to_string()));
-            let wb_md = guard
-                .blackboard
-                .iter()
-                .map(|(k, v)| format!("- {k}: {v}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            guard
-                .recorded_blackboard_syncs
-                .push((thread_id.to_string(), wb_md.clone()));
             if let Some(thread) = guard.threads.iter_mut().find(|t| t.id == thread_id) {
                 thread.turns.push(HydratedTurn {
                     id: format!("u-{}", thread.turns.len() + 1),
@@ -173,7 +145,7 @@ impl TuiEnginePort for MockLiveEngine {
             } else {
                 None
             };
-            (guard.event_tx.clone(), notify, wb_md)
+            (guard.event_tx.clone(), notify)
         };
 
         let Some(tx) = tx else {
@@ -202,10 +174,8 @@ impl TuiEnginePort for MockLiveEngine {
 
         let reply = if prompt.contains("GFM_TABLE") {
             "### Auth Matrix\n\n| Layer | Role | Status |\n| :--- | :---: | ---: |\n| Tree | context-only | ok |\n| Transcript | `gfm_table` | 100 |".to_string()
-        } else if wb_snapshot.is_empty() {
-            format!("Reply({thread_id}): {prompt}")
         } else {
-            format!("Reply({thread_id}): {prompt} [WB:{wb_snapshot}]")
+            format!("Reply({thread_id}): {prompt}")
         };
 
         // Deliver token-by-token StreamChunk slices to verify seamless concatenation.
@@ -313,18 +283,6 @@ impl TuiEnginePort for MockLiveEngine {
             if let Some(meta) = guard.thread_meta.iter_mut().find(|m| m.thread_id == source_id) {
                 meta.merged = true;
             }
-            if target_id.is_empty() {
-                let title = guard
-                    .threads
-                    .iter()
-                    .find(|t| t.id == source_id)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_else(|| source_id.to_string());
-                guard.blackboard.insert(
-                    format!("joined:{title}"),
-                    summary.unwrap_or("summary").to_string(),
-                );
-            }
             guard.event_tx.clone()
         };
         if let Some(tx) = tx {
@@ -365,20 +323,6 @@ impl TuiEnginePort for MockLiveEngine {
         if let Some(n) = notify {
             n.notify_waiters();
         }
-        Ok(())
-    }
-
-    async fn upsert_blackboard(&self, key: &str, value: &str) -> io::Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .blackboard
-            .insert(key.to_string(), value.to_string());
-        Ok(())
-    }
-
-    async fn delete_blackboard(&self, key: &str) -> io::Result<()> {
-        self.state.lock().unwrap().blackboard.remove(key);
         Ok(())
     }
 
@@ -521,26 +465,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
 
-    // 3. Editable Whiteboard: /wb set api_port 8080 persists across turns
-    send_text(&key_tx, "/wb set api_port 8080");
-    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
-    wait_for("whiteboard api_port stored", || {
-        engine.snapshot_blackboard().get("api_port").map(String::as_str) == Some("8080")
-    })
-    .await;
-
-    // Send another turn to prove whiteboard state syncs with turns
-    send_text(&key_tx, "sync check");
-    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
-    wait_for("sync check recorded", || {
-        engine
-            .recorded_blackboard_syncs()
-            .iter()
-            .any(|(_, wb)| wb.contains("api_port: 8080"))
-    })
-    .await;
-
-    // 4. Shell escape !echo hi emits ShellOutput
+    // 3. Shell escape !echo hi emits ShellOutput
     send_text(&key_tx, "!echo hi");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("shell command recorded", || {
@@ -551,7 +476,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
 
-    // 5. Branching via Ctrl+N and /branch bugfix
+    // 4. Branching via Ctrl+N and /branch bugfix
     send_key(&key_tx, KeyCode::Char('n'), KeyModifiers::CONTROL);
     wait_for("ctrl+n branch created", || {
         engine.state.lock().unwrap().threads.len() == 2
@@ -579,7 +504,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 6. PermissionRequested popup -> 'y' approves, second popup -> 'n' denies
+    // 5. PermissionRequested popup -> 'y' approves, second popup -> 'n' denies
     engine.emit(TuiEngineEvent::PermissionRequested {
         request_id: "perm-1".to_string(),
         description: "Allow run_command: echo ok?".to_string(),
@@ -606,7 +531,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
 
-    // 7. Esc during streaming emits cancel_turn
+    // 6. Esc during streaming emits cancel_turn
     send_text(&key_tx, "SLOW_TURN");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("slow turn started", || {
@@ -622,12 +547,12 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
     wait_for("slow turn completed after cancel", || {
-        engine.completed_turns_count() >= 4
+        engine.completed_turns_count() >= 3
     })
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 7b. Tree Esc + Up + Enter switches back to Trunk, submits turn, then switches back to bugfix.
+    // 6b. Tree Esc + Up + Enter switches back to Trunk, submits turn, then switches back to bugfix.
     // Context-only Tree lists only thread branches: t-trunk (0), t-branch-1 (1), t-branch-2 (2).
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     for _ in 0..6 {
@@ -644,7 +569,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
     wait_for("trunk turn completed", || {
-        engine.completed_turns_count() >= 5
+        engine.completed_turns_count() >= 4
     })
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
@@ -665,22 +590,12 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
     wait_for("bugfix return turn completed", || {
-        engine.completed_turns_count() >= 6
+        engine.completed_turns_count() >= 5
     })
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 8. Pane 3 (Blackboard) 'd' deletion
-    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    send_key(&key_tx, KeyCode::Char('d'), KeyModifiers::NONE);
-    wait_for("api_port deleted from blackboard", || {
-        !engine.snapshot_blackboard().contains_key("api_port")
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(40)).await;
-
-    // 9. Quit cleanly via Ctrl+Q and inspect rendered terminal buffer
+    // 7. Quit cleanly via Ctrl+Q and inspect rendered terminal buffer
     send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
     let terminal = timeout(Duration::from_secs(3), runner_handle)
         .await
@@ -708,22 +623,17 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
         "expected bugfix branch in Tree pane:\n{screen}"
     );
     assert!(
-        screen.contains("No shared facts yet."),
-        "deleted blackboard entry should leave Blackboard empty:\n{screen}"
-    );
-    assert!(
-        !screen.contains("• api_port: 8080"),
-        "deleted blackboard bullet should no longer be visible:\n{screen}"
+        !screen.contains("Blackboard"),
+        "Blackboard pane must not render in 2-column layout:\n{screen}"
     );
 
-    // Re-hydrating confirms deleted key stays deleted and turns persisted on engine
+    // Re-hydrating confirms turns persisted on engine
     let rehydrated = engine.hydrate_session().await.unwrap();
-    assert!(rehydrated.blackboard.is_empty());
     assert_eq!(rehydrated.threads.len(), 3);
 }
 
 #[tokio::test]
-async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_whiteboard_shell_permission() {
+async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_permission() {
     let engine = MockLiveEngine::new_with_trunk("t-trunk", "Trunk");
     let mut rx = engine.subscribe_events().await.unwrap();
     let session = engine.hydrate_session().await.unwrap();
@@ -779,55 +689,7 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_whiteboar
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     assert!(render_to_string(&terminal).contains("Tokens concatenate smoothly"));
 
-    // 3. Editable Whiteboard: /wb set api_port 8080 + persistence across turn sync + Pane 3 'd' delete
-    app.input_buffer = "/wb set api_port 8080".to_string();
-    app.cursor_position = app.input_buffer.len();
-    handle_event(
-        &mut app,
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-    )
-    .unwrap();
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::UpsertBlackboard {
-            key: "api_port".to_string(),
-            value: "8080".to_string(),
-        })
-    );
-    engine.upsert_blackboard("api_port", "8080").await.unwrap();
-    apply_engine_event(
-        &mut app,
-        TuiEngineEvent::BlackboardUpdated {
-            key: "api_port".to_string(),
-            value: "8080".to_string(),
-        },
-    );
-    draw_frame_mut(&mut terminal, &mut app).unwrap();
-    assert!(render_to_string(&terminal).contains("api_port: 8080"));
-
-    // Simulated turn sync preserves whiteboard entries in both app and engine
-    engine.send_turn("t-trunk", "check wb").await.unwrap();
-    while let Ok(ev) = rx.try_recv() {
-        apply_engine_event(&mut app, ev);
-    }
-    assert!(app.blackboard_entries.iter().any(|e| e.key == "api_port" && e.value == "8080"));
-    assert!(
-        engine
-            .recorded_blackboard_syncs()
-            .iter()
-            .any(|(_, wb)| wb.contains("- api_port: 8080"))
-    );
-
-    // Re-hydrating a fresh App from engine session still retains api_port: 8080
-    let synced_session = engine.hydrate_session().await.unwrap();
-    let mut fresh_app = App::new();
-    apply_hydrated_session(&mut fresh_app, &synced_session);
-    assert!(fresh_app
-        .blackboard_entries
-        .iter()
-        .any(|e| e.key == "api_port" && e.value == "8080"));
-
-    // 4. Shell escape !echo hi emits ShellOutput block into transcript
+    // 3. Shell escape !echo hi emits ShellOutput block into transcript
     app.input_buffer = "!echo hi".to_string();
     app.cursor_position = app.input_buffer.len();
     handle_event(
@@ -852,7 +714,7 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_whiteboar
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     assert!(render_to_string(&terminal).contains("$ echo hi (exit 0)"));
 
-    // 5. Branching via Ctrl+N and /branch bugfix + Tree Enter switching & transcript isolation
+    // 4. Branching via Ctrl+N and /branch bugfix + Tree Enter switching & transcript isolation
     handle_event(
         &mut app,
         Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
@@ -969,33 +831,7 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_whiteboar
     assert!(app.active_transcript_md.contains("BUGFIX_ISOLATED"));
     assert!(!app.active_transcript_md.contains("Tokens concatenate smoothly"));
 
-    // 6. Pane 3 (Blackboard) deletion via 'd'
-    handle_event(
-        &mut app,
-        Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-    )
-    .unwrap();
-    assert_eq!(app.focused_pane(), FocusedPane::Blackboard);
-    handle_event(
-        &mut app,
-        Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
-    )
-    .unwrap();
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::DeleteBlackboard {
-            key: "api_port".to_string(),
-        })
-    );
-    apply_engine_event(
-        &mut app,
-        TuiEngineEvent::BlackboardDeleted {
-            key: "api_port".to_string(),
-        },
-    );
-    assert!(app.blackboard_entries.is_empty());
-
-    // 7. PermissionRequested popup renders visibly -> 'y' approves, 'n' denies
+    // 5. PermissionRequested popup renders visibly -> 'y' approves, 'n' denies
     apply_engine_event(
         &mut app,
         TuiEngineEvent::PermissionRequested {
@@ -1150,7 +986,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 140, 32), false, 0);
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 140, 32), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
 
@@ -1254,7 +1090,7 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 100, 10), false, 0);
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 100, 10), 0);
     let tree_down = render_rect_to_string(&terminal_a, layout.tree_area);
     assert!(
         tree_down.contains("Branch-13"),
@@ -1428,7 +1264,7 @@ async fn test_e2e_fork_grein_close_delete_tree_x_d_and_sole_thread_guard() {
     );
     assert_eq!(engine.threads_count(), 1);
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 30), false, 0);
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 30), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
 
@@ -1485,7 +1321,7 @@ async fn test_e2e_transcript_fork_banner_on_branch_vs_omitted_on_root() {
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 140, 28), false, 0);
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 140, 28), 0);
     let branch_transcript = render_rect_to_string(&terminal_branch, layout.transcript_area);
     assert!(
         branch_transcript
@@ -1556,7 +1392,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
         .unwrap()
         .unwrap();
 
-    let idle_layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 32), false, 0);
+    let idle_layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 32), 0);
     let idle_full = render_to_string(&terminal_idle);
     let idle_status = render_rect_to_string(&terminal_idle, idle_layout.status_bar_area);
     assert!(!idle_full.contains("Subagents"));
@@ -1628,7 +1464,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
         .unwrap();
 
     let busy_layout =
-        compute_layout_with_chrome(Rect::new(0, 0, 120, 32), false, subagent_strip_height(7));
+        compute_layout_with_chrome(Rect::new(0, 0, 120, 32), subagent_strip_height(7));
     let strip_area = busy_layout
         .subagent_strip_area
         .expect("subagent strip area must be allocated");
@@ -1746,7 +1582,7 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
             .unwrap()
             .unwrap();
 
-        let layout = compute_layout_with_chrome(Rect::new(0, 0, 110, 30), false, 0);
+        let layout = compute_layout_with_chrome(Rect::new(0, 0, 110, 30), 0);
         let composer_bottom_row = render_rect_to_string(
             &terminal,
             Rect::new(
@@ -1764,7 +1600,7 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
             "Composer bottom border must not contain keybind legend ({trigger}): {composer_bottom_row:?}"
         );
 
-        let centered_modal_rect = Rect::new(18, 3, 74, 23);
+        let centered_modal_rect = Rect::new(18, 3, 74, 24);
         let modal_text = render_rect_to_string(&terminal, centered_modal_rect);
         assert!(
             modal_text.contains("Keybindings & Commands"),
@@ -1983,7 +1819,7 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 26), false, 0);
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 26), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
 
@@ -2090,7 +1926,7 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 130, 30), false, 0);
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 130, 30), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
 
@@ -2105,4 +1941,210 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
         transcript_text.contains("Joined from Auth Spike: Token rotation verified"),
         "Expected joined summary blockquote in Main transcript:\n{transcript_text}"
     );
+}
+
+#[tokio::test]
+async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_guard() {
+    let long_lines = (1..=45)
+        .map(|i| format!("Long root line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preview_lines = (1..=45)
+        .map(|i| format!("Preview branch line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let threads = vec![
+        HydratedThread {
+            id: "r1".to_string(),
+            title: "Root One".to_string(),
+            turns: vec![HydratedTurn {
+                id: "u-r1".to_string(),
+                role: "Assistant".to_string(),
+                content: long_lines,
+            }],
+        },
+        HydratedThread {
+            id: "b1".to_string(),
+            title: "Branch 1A".to_string(),
+            turns: vec![HydratedTurn {
+                id: "u-b1".to_string(),
+                role: "Assistant".to_string(),
+                content: preview_lines,
+            }],
+        },
+        HydratedThread {
+            id: "b2".to_string(),
+            title: "Branch 1B".to_string(),
+            turns: vec![HydratedTurn {
+                id: "u-b2".to_string(),
+                role: "Assistant".to_string(),
+                content: "MARKER_BRANCH_1B".to_string(),
+            }],
+        },
+        HydratedThread {
+            id: "r2".to_string(),
+            title: "Root Two".to_string(),
+            turns: vec![HydratedTurn {
+                id: "u-r2".to_string(),
+                role: "Assistant".to_string(),
+                content: "MARKER_ROOT_TWO".to_string(),
+            }],
+        },
+        HydratedThread {
+            id: "r3".to_string(),
+            title: "Lone Root".to_string(),
+            turns: vec![HydratedTurn {
+                id: "u-r3".to_string(),
+                role: "Assistant".to_string(),
+                content: "MARKER_LONE_ROOT".to_string(),
+            }],
+        },
+    ];
+    let meta = vec![
+        ThreadMeta {
+            thread_id: "r1".to_string(),
+            parent_thread_id: None,
+            inherited_turn_count: 0,
+            merged: false,
+        },
+        ThreadMeta {
+            thread_id: "b1".to_string(),
+            parent_thread_id: Some("r1".to_string()),
+            inherited_turn_count: 1,
+            merged: false,
+        },
+        ThreadMeta {
+            thread_id: "b2".to_string(),
+            parent_thread_id: Some("r1".to_string()),
+            inherited_turn_count: 1,
+            merged: false,
+        },
+        ThreadMeta {
+            thread_id: "r2".to_string(),
+            parent_thread_id: None,
+            inherited_turn_count: 0,
+            merged: false,
+        },
+        ThreadMeta {
+            thread_id: "r3".to_string(),
+            parent_thread_id: None,
+            inherited_turn_count: 0,
+            merged: false,
+        },
+    ];
+
+    let engine = MockLiveEngine::new_with_session("r1", threads, meta);
+    let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
+    let mut terminal = Terminal::new(TestBackend::new(120, 26)).unwrap();
+
+    let (key_tx, key_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_with_engine_events(&mut terminal, App::new(), engine_dyn, key_rx).await?;
+        Ok::<_, io::Error>(terminal)
+    });
+
+    wait_for("engine subscription", || {
+        engine.state.lock().unwrap().event_tx.is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 1. Alt+1..9 remain unbound; Alt+Home scrolls active r1 to top from Composer
+    for digit in '1'..='9' {
+        send_key(&key_tx, KeyCode::Char(digit), KeyModifiers::ALT);
+    }
+    send_key(&key_tx, KeyCode::Home, KeyModifiers::ALT);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // 2. Tab cycles r1 -> b1 -> b2, then Shift+Tab -> b1 -> r1; Alt+J -> r2 -> r3
+    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('j'), KeyModifiers::ALT);
+    // Now on r2; Alt+J moves to r3 (lone root), Tab stays on r3
+    send_key(&key_tx, KeyCode::Char('j'), KeyModifiers::ALT);
+    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
+    // Alt+K wraps back to r2, Alt+Shift+Up returns to r1
+    send_key(&key_tx, KeyCode::Char('k'), KeyModifiers::ALT);
+    send_key(&key_tx, KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT);
+
+    // 3. Ctrl+G toggles Composer -> Tree during SLOW_TURN without cancelling, Esc cancels turn
+    send_text(&key_tx, "SLOW_TURN");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    wait_for("slow turn started on r1", || {
+        engine.state.lock().unwrap().slow_turn_cancel.is_some()
+    })
+    .await;
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        engine.cancelled_threads().is_empty(),
+        "Ctrl+G must toggle focus without cancelling streaming turn"
+    );
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    wait_for("Esc cancelled r1 turn", || {
+        engine.cancelled_threads().contains(&"r1".to_string())
+    })
+    .await;
+    wait_for("slow turn finished", || engine.completed_turns_count() >= 1).await;
+
+    // 4. Attempting Tree 'm' and Composer /join on root r1 sets notice without merging
+    send_key(&key_tx, KeyCode::Char('m'), KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    send_text(&key_tx, "/join");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+
+    // 5. Enter Tree, preview b1, scroll preview transcript to top via Alt+Home so line 01 renders
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Down, KeyModifiers::NONE);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    send_key(&key_tx, KeyCode::Home, KeyModifiers::ALT);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    let terminal = timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("runner exit")
+        .unwrap()
+        .unwrap();
+
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 26), 0);
+    let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
+    let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
+
+    assert!(
+        transcript_text.contains("Transcript (Preview: Branch 1A)"),
+        "Expected Tree preview of Branch 1A:\n{transcript_text}"
+    );
+    assert!(
+        transcript_text.contains("Preview branch line 01"),
+        "Expected Alt+Home in Tree preview to scroll b1 to top:\n{transcript_text}"
+    );
+    assert!(
+        status_text.contains("Cannot join a root context (no parent branch)"),
+        "Expected root join guard notice in status bar:\n{status_text}"
+    );
+    assert!(
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .thread_meta
+            .iter()
+            .all(|m| !m.merged),
+        "Root /join attempt must not mark any thread merged"
+    );
+
+    // Help modal must contain new keymap rows and zero /wb or Ctrl+B
+    let mut help_app = App::new();
+    help_app.show_help_modal = true;
+    let mut help_term = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    draw_frame_mut(&mut help_term, &mut help_app).unwrap();
+    let help_screen = render_to_string(&help_term);
+    assert!(help_screen.contains("Tab / Shift+Tab"), "{help_screen}");
+    assert!(help_screen.contains("Alt+↑/↓, PgUp/PgDn"), "{help_screen}");
+    assert!(help_screen.contains("Alt+Shift+↑/↓, Alt+J/K"), "{help_screen}");
+    assert!(help_screen.contains("Esc / Ctrl+G"), "{help_screen}");
+    assert!(!help_screen.contains("/wb"), "{help_screen}");
+    assert!(!help_screen.contains("Ctrl+B"), "{help_screen}");
 }

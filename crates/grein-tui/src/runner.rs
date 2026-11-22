@@ -128,17 +128,6 @@ fn strip_trailing_shell_stub(buf: &mut String, command: &str) {
     }
 }
 
-fn parse_wb_kv(rest: &str) -> Option<(String, String)> {
-    let trimmed = rest.trim();
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let key = parts.next()?.trim();
-    let value = parts.next()?.trim();
-    if key.is_empty() || value.is_empty() {
-        None
-    } else {
-        Some((key.to_string(), value.to_string()))
-    }
-}
 
 pub fn now_epoch_ms() -> u64 {
     SystemTime::now()
@@ -364,7 +353,7 @@ impl App {
                 ensure_paragraph_break(&mut self.active_transcript_md);
                 self.active_transcript_md
                     .push_str(&format!("> $ {command}\n\n"));
-                self.sync_anchors_and_blackboard();
+                self.sync_anchors();
                 self.status_notice = None;
                 self.thread_active_tool.remove(&self.active_thread_id);
                 self.thread_turn_started_ms
@@ -445,42 +434,8 @@ impl App {
             }
             "/join" | "/merge" => {
                 let source_thread_id = self.active_thread_id.clone();
-                let target_thread_id = self.resolve_merge_target(&source_thread_id);
                 let summary = (!rest.is_empty()).then(|| rest.to_string());
-                self.status_notice = None;
-                self.pending_actions.push_back(AppAction::MergeBranch {
-                    source_thread_id,
-                    target_thread_id,
-                    summary,
-                });
-                return;
-            }
-            "/pin" => {
-                if let Some((key, value)) = parse_wb_kv(rest) {
-                    self.pending_actions
-                        .push_back(AppAction::UpsertBlackboard { key, value });
-                }
-                return;
-            }
-            "/wb" => {
-                let mut sub = rest.splitn(2, char::is_whitespace);
-                match sub.next().unwrap_or("") {
-                    "set" => {
-                        if let Some((key, value)) = parse_wb_kv(sub.next().unwrap_or("")) {
-                            self.pending_actions
-                                .push_back(AppAction::UpsertBlackboard { key, value });
-                        }
-                    }
-                    "del" => {
-                        let key = sub.next().unwrap_or("").trim();
-                        if !key.is_empty() {
-                            self.pending_actions.push_back(AppAction::DeleteBlackboard {
-                                key: key.to_string(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
+                self.request_join_thread(source_thread_id, summary);
                 return;
             }
             "/quit" => {
@@ -494,7 +449,7 @@ impl App {
         self.active_transcript_md
             .push_str(&render_node(&AuthorRole::User, trimmed));
         self.last_submitted_prompt = Some(trimmed.to_string());
-        self.sync_anchors_and_blackboard();
+        self.sync_anchors();
         self.status_notice = None;
         self.thread_active_tool.remove(&self.active_thread_id);
         self.thread_turn_started_ms
@@ -528,10 +483,10 @@ impl App {
             self.active_transcript_md
                 .push_str(&render_node(&AuthorRole::Assistant, clean));
         }
-        self.sync_anchors_and_blackboard();
+        self.sync_anchors();
     }
 
-    pub fn sync_anchors_and_blackboard(&mut self) {
+    pub fn sync_anchors(&mut self) {
         let turns = collect_turns(&self.active_transcript_md);
         if self.threads.is_empty() && !turns.is_empty() {
             let title = turns
@@ -666,10 +621,6 @@ impl App {
         let entries = [
             ("active_thread_id".to_string(), real_tid.to_string()),
             ("active_thread_title".to_string(), title),
-            (
-                "blackboard_notes".to_string(),
-                self.blackboard_notes.clone(),
-            ),
         ];
 
         for (key, value) in entries {
@@ -732,17 +683,7 @@ impl App {
         }];
         self.active_thread_id = thread.id.to_string();
 
-        self.sync_anchors_and_blackboard();
-
-        if let Some(notes_entry) = storage
-            .get_blackboard_entry("blackboard_notes")
-            .ok()
-            .flatten()
-        {
-            if !notes_entry.value.is_empty() {
-                self.blackboard_notes = notes_entry.value;
-            }
-        }
+        self.sync_anchors();
     }
 }
 
@@ -781,7 +722,7 @@ fn render_turns_md(turns: &[crate::engine_port::HydratedTurn]) -> String {
     transcript
 }
 
-/// Seeds the app (threads, transcript nodes, blackboard) from a hydrated session.
+/// Seeds the app (threads, transcript nodes) from a hydrated session.
 pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.threads.clear();
     app.thread_transcripts.clear();
@@ -829,9 +770,7 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
         .cloned()
         .unwrap_or_default();
 
-    app.blackboard_entries = session.blackboard.clone();
-    app.sync_blackboard_notes();
-    app.sync_anchors_and_blackboard();
+    app.sync_anchors();
     app.select_active_thread_in_tree();
 }
 
@@ -986,7 +925,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.thread_turn_started_ms.remove(&thread_id);
             app.thread_statuses.insert(thread_id.clone(), "idle".to_string());
             if thread_id == app.active_thread_id {
-                app.sync_anchors_and_blackboard();
+                app.sync_anchors();
             }
         }
         TuiEngineEvent::ThreadCreated { thread } => {
@@ -1051,7 +990,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                     buf.push_str(&note);
                 });
                 if target_thread_id == app.active_thread_id {
-                    app.sync_anchors_and_blackboard();
+                    app.sync_anchors();
                 }
                 let target_title = app
                     .threads
@@ -1168,7 +1107,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 .insert(thread_id.clone(), "idle".to_string());
             with_thread_transcript_mut(app, &thread_id, ensure_paragraph_break);
             if thread_id == app.active_thread_id {
-                app.sync_anchors_and_blackboard();
+                app.sync_anchors();
             } else {
                 let anchors = app
                     .thread_transcripts
@@ -1202,12 +1141,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             app.thread_statuses.insert(thread_id, status);
         }
-        TuiEngineEvent::BlackboardUpdated { key, value } => {
-            app.upsert_blackboard_entry(key, value);
-        }
-        TuiEngineEvent::BlackboardDeleted { key } => {
-            app.remove_blackboard_entry(&key);
-        }
+        TuiEngineEvent::BlackboardUpdated { .. } | TuiEngineEvent::BlackboardDeleted { .. } => {}
         TuiEngineEvent::Error { message } => {
             let active = app.active_thread_id.clone();
             app.streaming_assistant_threads.remove(&active);
@@ -1220,7 +1154,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 ensure_paragraph_break(buf);
                 buf.push_str(&format!("Error: {message}\n\n"));
             });
-            app.sync_anchors_and_blackboard();
+            app.sync_anchors();
         }
     }
 }
@@ -1378,34 +1312,6 @@ fn dispatch_action(
                     }
                     Err(err) => {
                         let _ = err_tx.send((Some(thread_id), err));
-                    }
-                }
-            });
-        }
-        AppAction::UpsertBlackboard { key, value } => {
-            tokio::spawn(async move {
-                match engine.upsert_blackboard(&key, &value).await {
-                    Ok(()) => {
-                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
-                            TuiEngineEvent::BlackboardUpdated { key, value },
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = err_tx.send((None, err.to_string()));
-                    }
-                }
-            });
-        }
-        AppAction::DeleteBlackboard { key } => {
-            tokio::spawn(async move {
-                match engine.delete_blackboard(&key).await {
-                    Ok(()) => {
-                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
-                            TuiEngineEvent::BlackboardDeleted { key },
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = err_tx.send((None, err.to_string()));
                     }
                 }
             });
@@ -1595,7 +1501,7 @@ pub async fn run_with_engine_events<B: Backend>(
                     buf.push_str(&format!("Error: {message}\n\n"));
                 });
                 if target_thread == app.active_thread_id {
-                    app.sync_anchors_and_blackboard();
+                    app.sync_anchors();
                 }
             }
             _ = tick.tick() => {

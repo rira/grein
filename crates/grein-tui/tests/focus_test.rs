@@ -12,9 +12,9 @@ fn test_pane_focus_tree_variant_exists_and_traits() {
 fn test_focus_navigation_includes_tree_in_tab_cycle() {
     let mut nav = FocusNavigation::default();
 
-    // Cycle forward through the 4-pane navigation sequence
+    // Cycle forward through the 3-pane navigation sequence
     let mut visited = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..3 {
         visited.push(nav.current());
         nav.next();
     }
@@ -26,7 +26,7 @@ fn test_focus_navigation_includes_tree_in_tab_cycle() {
     assert_eq!(
         nav.current(),
         visited[0],
-        "Focus navigation should wrap around after 4 Tab advances"
+        "Focus navigation should wrap around after 3 Tab advances"
     );
 }
 
@@ -34,9 +34,9 @@ fn test_focus_navigation_includes_tree_in_tab_cycle() {
 fn test_focus_navigation_includes_tree_in_backtab_cycle() {
     let mut nav = FocusNavigation::default();
 
-    // Cycle backward through the 4-pane navigation sequence
+    // Cycle backward through the 3-pane navigation sequence
     let mut visited = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..3 {
         visited.push(nav.current());
         nav.prev();
     }
@@ -48,7 +48,7 @@ fn test_focus_navigation_includes_tree_in_backtab_cycle() {
     assert_eq!(
         nav.current(),
         visited[0],
-        "Focus navigation should wrap around after 4 BackTab steps"
+        "Focus navigation should wrap around after 3 BackTab steps"
     );
 }
 

@@ -70,7 +70,6 @@ fn test_full_bidirectional_cyclic_invariants_across_all_panes() {
         PaneFocus::Sidebar,
         PaneFocus::Transcript,
         PaneFocus::Composer,
-        PaneFocus::Inspector,
     ];
 
     for &pane in &all_panes {

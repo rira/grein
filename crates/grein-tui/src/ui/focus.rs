@@ -4,7 +4,6 @@ pub enum PaneFocus {
     Composer,
     Tree,
     Chat,
-    Blackboard,
 }
 
 #[allow(non_upper_case_globals)]
@@ -15,17 +14,15 @@ impl PaneFocus {
         match self {
             Self::Composer => Self::Tree,
             Self::Tree => Self::Chat,
-            Self::Chat => Self::Blackboard,
-            Self::Blackboard => Self::Composer,
+            Self::Chat => Self::Composer,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Composer => Self::Blackboard,
+            Self::Composer => Self::Chat,
             Self::Tree => Self::Composer,
             Self::Chat => Self::Tree,
-            Self::Blackboard => Self::Chat,
         }
     }
 }
@@ -36,7 +33,6 @@ impl From<PaneFocus> for crate::app::FocusedPane {
             PaneFocus::Tree => Self::Tree,
             PaneFocus::Chat => Self::Transcript,
             PaneFocus::Composer => Self::Composer,
-            PaneFocus::Blackboard => Self::Blackboard,
         }
     }
 }
@@ -47,7 +43,6 @@ impl From<crate::app::FocusedPane> for PaneFocus {
             crate::app::FocusedPane::Tree => Self::Tree,
             crate::app::FocusedPane::Transcript => Self::Chat,
             crate::app::FocusedPane::Composer => Self::Composer,
-            crate::app::FocusedPane::Blackboard => Self::Blackboard,
         }
     }
 }

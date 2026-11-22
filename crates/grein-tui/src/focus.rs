@@ -6,36 +6,30 @@ pub enum PaneFocus {
     /// Bottom pane prompt composer (default active pane).
     #[default]
     Composer,
-    Inspector,
     Sidebar,
     Transcript,
     Sessions,
     Chat,
-    Diff,
-    Details,
 }
 
 #[allow(non_upper_case_globals)]
 impl PaneFocus {
     pub const Output: Self = Self::Transcript;
     /// Cycles forward to the next pane in sequence:
-    /// Sidebar -> Transcript -> Composer -> Inspector -> Sidebar
+    /// Sidebar -> Transcript -> Composer -> Sidebar
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
             Self::Sidebar => Self::Transcript,
             Self::Transcript => Self::Composer,
-            Self::Composer => Self::Inspector,
-            Self::Inspector => Self::Sidebar,
+            Self::Composer => Self::Sidebar,
             Self::Sessions => Self::Chat,
-            Self::Chat => Self::Diff,
-            Self::Diff => Self::Composer,
-            Self::Details => Self::Sidebar,
+            Self::Chat => Self::Composer,
         }
     }
 
     /// Cycles backward to the previous pane in sequence:
-    /// Sidebar <- Transcript <- Composer <- Inspector <- Sidebar
+    /// Sidebar <- Transcript <- Composer <- Sidebar
     #[must_use]
     pub const fn prev(self) -> Self {
         self.previous()
@@ -45,14 +39,11 @@ impl PaneFocus {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::Sidebar => Self::Inspector,
+            Self::Sidebar => Self::Composer,
             Self::Transcript => Self::Sidebar,
             Self::Composer => Self::Transcript,
-            Self::Inspector => Self::Composer,
             Self::Sessions => Self::Composer,
             Self::Chat => Self::Sessions,
-            Self::Diff => Self::Chat,
-            Self::Details => Self::Composer,
         }
     }
 }
@@ -63,7 +54,6 @@ impl From<crate::app::FocusedPane> for PaneFocus {
             crate::app::FocusedPane::Tree => Self::Sidebar,
             crate::app::FocusedPane::Transcript => Self::Transcript,
             crate::app::FocusedPane::Composer => Self::Composer,
-            crate::app::FocusedPane::Blackboard => Self::Inspector,
         }
     }
 }

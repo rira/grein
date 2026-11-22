@@ -152,3 +152,62 @@ fn test_per_thread_composer_draft_save_and_restore() {
     assert_eq!(app.input_buffer, issue_draft);
     assert_eq!(app.cursor_position, issue_draft.len());
 }
+
+#[test]
+fn test_global_scroll_shortcuts_from_composer_and_tree_preview() {
+    let mut app = App::new();
+    app.threads = vec![
+        grein_tui::app::ThreadItem {
+            id: "trunk".to_string(),
+            title: "Trunk".to_string(),
+            anchors: Vec::new(),
+        },
+        grein_tui::app::ThreadItem {
+            id: "preview".to_string(),
+            title: "Preview".to_string(),
+            anchors: Vec::new(),
+        },
+    ];
+    app.sync_anchors();
+    app.select_active_thread_in_tree();
+
+    app.transcript_viewport_mut("trunk").set_max_scroll(100);
+    app.transcript_viewport_mut("trunk").scroll_to_bottom();
+    app.transcript_viewport_mut("preview").set_max_scroll(60);
+    app.transcript_viewport_mut("preview").scroll_to_bottom();
+
+    // Composer focused: Alt+Up/Down scroll by 6, PageUp/PageDown by 10, Alt+Home/End top/bottom
+    app.set_focus(FocusedPane::Composer);
+    app.input_buffer = "keep".to_string();
+    app.cursor_position = 2;
+
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 94);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)));
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
+
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 90);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)));
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
+
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::ALT)));
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 0);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::ALT)));
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
+
+    // Plain Home/End still operate on Composer line bounds
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+    assert_eq!(app.cursor_position, 0);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+    assert_eq!(app.cursor_position, 4);
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
+
+    // Tree focused & previewing "preview": scrolling targets previewed thread, not trunk
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.active_thread_id(), "trunk");
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+    assert_eq!(app.transcript_viewport("preview").scroll_offset(), 54);
+    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
+}

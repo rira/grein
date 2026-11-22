@@ -478,19 +478,19 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
 fn test_layout_with_chrome_and_subagent_strip_auto_hide_and_overflow() {
     let area = Rect::new(0, 0, 120, 30);
     // Keep legacy compute_layout intact
-    let legacy = compute_layout(area, false);
+    let legacy = compute_layout(area);
     assert_eq!(legacy.composer_area.height, 3);
 
     // Zero subagents -> strip hidden (None)
     assert_eq!(subagent_strip_height(0), 0);
-    let hidden = compute_layout_with_chrome(area, false, 0);
+    let hidden = compute_layout_with_chrome(area, 0);
     assert!(hidden.subagent_strip_area.is_none());
     assert_eq!(hidden.status_bar_area, Rect::new(0, 29, 120, 1));
     assert_eq!(hidden.composer_area.y + hidden.composer_area.height, 29);
 
     // 7 subagents -> capped at 5 + 1 overflow + 2 border = 8 rows
     assert_eq!(subagent_strip_height(7), 8);
-    let shown = compute_layout_with_chrome(area, false, subagent_strip_height(7));
+    let shown = compute_layout_with_chrome(area, subagent_strip_height(7));
     assert_eq!(shown.subagent_strip_area, Some(Rect::new(0, 21, 120, 8)));
     assert_eq!(shown.status_bar_area, Rect::new(0, 29, 120, 1));
     assert_eq!(shown.composer_area.y + shown.composer_area.height, 21);
@@ -703,7 +703,7 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert!(modal_screen.contains("/delete"));
     assert!(modal_screen.contains("/help"));
     assert!(modal_screen.contains("!cmd"));
-    assert!(modal_screen.contains("Tab/Shift+Tab"));
+    assert!(modal_screen.contains("Tab / Shift+Tab"));
     assert!(modal_screen.contains("Ctrl+C"));
 
     // Dismiss with Esc without quitting or changing focus
@@ -735,12 +735,8 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert!(!app.show_help_modal);
     assert_eq!(app.composer_input(), "");
 
-    // Open from Tree, Transcript, Blackboard and dismiss with Enter
-    for pane in [
-        FocusedPane::Tree,
-        FocusedPane::Transcript,
-        FocusedPane::Blackboard,
-    ] {
+    // Open from Tree and Transcript and dismiss with Enter
+    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
         app.set_focus(pane);
         app.handle_key_event(key(KeyCode::Char('?')));
         assert!(app.show_help_modal, "Expected '?' to open modal from {pane:?}");
@@ -1174,13 +1170,10 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
     );
     app.tree.select_index(0);
     app.handle_key_event(key(KeyCode::Char('m')));
+    assert!(app.pending_actions.is_empty());
     assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::MergeBranch {
-            source_thread_id: "t-root".to_string(),
-            target_thread_id: String::new(),
-            summary: None,
-        })
+        app.status_notice.as_deref(),
+        Some("Cannot join a root context (no parent branch)")
     );
 
     // ThreadMerged marks .merged = true, appends "> ↳ Joined from ..." into target transcript, sets status_notice

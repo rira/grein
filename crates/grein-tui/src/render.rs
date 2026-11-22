@@ -456,8 +456,10 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let rows = [
-        ("Tab/Shift+Tab", "Cycle focus across panes"),
-        ("Esc", "Cancel streaming turn, or focus Tree"),
+        ("Tab / Shift+Tab", "Cycle branches in active root"),
+        ("Alt+↑/↓, PgUp/PgDn", "Scroll Transcript (Alt+Home/End top/bottom)"),
+        ("Alt+Shift+↑/↓, Alt+J/K", "Switch between top-level roots"),
+        ("Esc / Ctrl+G", "Toggle Composer / Tree (Esc cancels stream)"),
         ("Shift+Enter", "Newline in Composer (Enter sends/activates)"),
         ("Ctrl+A / Ctrl+E", "Move to line start / end (Home / End)"),
         ("Alt+← / Alt+→", "Move by word (Ctrl+←/→, Alt+B / Alt+F)"),
@@ -467,20 +469,19 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         ("/fork, /grein", "Fork new child context (/branch)"),
         ("/root, /new", "Create new blank root context"),
         ("/rename <name>", "Rename active or selected context"),
-        ("/join, /merge", "Join context into parent (or Shared Context)"),
+        ("/join, /merge", "Join branch into parent context"),
         ("/close, /delete", "Close active fork (>1 context)"),
-        ("/wb set|del", "Upsert or delete Blackboard entry"),
         ("/?, /help, ?", "Open this keybindings help modal"),
         ("n / r / m (ᛇ Grein)", "New root / rename / join (x/d close, j/k/↑/↓)"),
         ("Ctrl+N / Alt+N", "Quick-fork branch / new blank root"),
-        ("Alt+R / F2 / Ctrl+B", "Rename context / toggle Blackboard ([ / ])"),
+        ("Alt+R / F2", "Rename active or selected context"),
         ("Ctrl+C / Ctrl+Q", "Quit application"),
     ];
     let mut lines: Vec<Line<'static>> = rows
         .into_iter()
         .map(|(k, desc)| {
             Line::from(vec![
-                Span::styled(format!(" {k:<20}"), key_style),
+                Span::styled(format!(" {k:<24}"), key_style),
                 Span::raw(desc),
             ])
         })
@@ -521,8 +522,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let strip_h = subagent_strip_height(active_subagents.len());
-    let mut layout =
-        compute_layout_with_chrome(f.area(), state.is_blackboard_collapsed(), strip_h);
+    let mut layout = compute_layout_with_chrome(f.area(), strip_h);
 
     let line_count = state.input_buffer.split('\n').count().max(1) as u16;
     let max_composer_h = layout
@@ -536,9 +536,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         let delta = desired_height - layout.composer_area.height;
         layout.tree_area.height = layout.tree_area.height.saturating_sub(delta);
         layout.transcript_area.height = layout.transcript_area.height.saturating_sub(delta);
-        if let Some(ref mut bb_area) = layout.blackboard_area {
-            bb_area.height = bb_area.height.saturating_sub(delta);
-        }
         layout.composer_area.y = layout.composer_area.y.saturating_sub(delta);
         layout.composer_area.height = desired_height;
     }
@@ -548,7 +545,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         || state.focused_pane == PaneFocus::Tree
         || state.focus == PaneFocus::Tree;
     let transcript_focused = focused_debug.contains("Transcript");
-    let blackboard_focused = focused_debug.contains("Blackboard");
     let composer_focused = focused_debug.contains("Composer")
         || focused_debug.contains("Input")
         || state.active_focus == PaneFocus::Composer
@@ -624,54 +620,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> (String, u16, u16) {
         .wrap(Wrap { trim: false })
         .scroll((transcript_scroll_y, 0));
     f.render_widget(transcript_widget, layout.transcript_area);
-
-    if let Some(bb_area) = layout.blackboard_area {
-        let bb_block = Block::default()
-            .title(" Blackboard ")
-            .borders(Borders::ALL)
-            .border_style(border_style(blackboard_focused));
-        let bb_lines: Vec<Line<'static>> = if !state.blackboard_entries.is_empty() {
-            state
-                .blackboard_entries
-                .iter()
-                .enumerate()
-                .map(|(idx, entry)| {
-                    let text = format!("• {}: {}", entry.key, entry.value);
-                    if blackboard_focused && idx == state.blackboard_selected {
-                        Line::from(Span::styled(
-                            text,
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                        ))
-                    } else {
-                        Line::from(vec![
-                            Span::styled(
-                                format!("• {}: ", entry.key),
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(entry.value.clone()),
-                        ])
-                    }
-                })
-                .collect()
-        } else if !state.blackboard_notes.trim().is_empty() {
-            state
-                .blackboard_notes
-                .lines()
-                .map(|l| Line::raw(l.to_string()))
-                .collect()
-        } else {
-            vec![Line::from(Span::styled(
-                "No shared facts yet. Press 'a' or type /wb set <k> <v>",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        };
-        let bb_widget = Paragraph::new(bb_lines)
-            .block(bb_block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(bb_widget, bb_area);
-    }
 
     let composer_block = Block::default()
         .title(" Composer ")
@@ -771,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_writes_max_scroll_renders_popup_whiteboard_and_tree_status() {
+    fn test_render_writes_max_scroll_renders_popup_and_tree_status() {
         let backend = TestBackend::new(110, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
@@ -796,8 +744,7 @@ mod tests {
             .map(|i| format!("Line {i}: long wrapped content for testing transcript scroll"))
             .collect::<Vec<_>>()
             .join("\n");
-        app.upsert_blackboard_entry("mode", "fast");
-        app.sync_anchors_and_blackboard();
+        app.sync_anchors();
 
         terminal.draw(|f| render_app_mut(f, &mut app)).unwrap();
         let vp = app.transcript_viewport("t-1");
@@ -828,7 +775,7 @@ mod tests {
         }
         assert!(screen.contains("Permission Required"));
         assert!(screen.contains("[y] Allow  [n] Deny"));
-        assert!(screen.contains("mode: fast"));
+        assert!(!screen.contains("Blackboard"));
         assert!(screen.contains("●"));
         assert!(screen.contains("⚠"));
         assert!(screen.contains("esc to cancel"));

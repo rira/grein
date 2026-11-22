@@ -3,34 +3,31 @@ use grein_tui::composer::{Composer, ComposerAction, ComposerEventResult};
 use grein_tui::focus::PaneFocus;
 
 #[test]
-fn test_pane_focus_four_way_cycle_forward() {
+fn test_pane_focus_three_way_cycle_forward() {
     let initial = PaneFocus::Composer;
     let second = initial.next();
     let third = second.next();
-    let fourth = third.next();
-    let looped = fourth.next();
+    let looped = third.next();
 
     assert_ne!(initial, second, "Focus must change on forward navigation");
     assert_ne!(second, third, "Focus must change to third pane");
-    assert_ne!(third, fourth, "Focus must change to fourth pane");
     assert_eq!(
         initial, looped,
-        "Focus cycle must return to initial pane after four steps"
+        "Focus cycle must return to initial pane after three steps"
     );
 }
 
 #[test]
-fn test_pane_focus_four_way_cycle_backward() {
+fn test_pane_focus_three_way_cycle_backward() {
     let initial = PaneFocus::Composer;
     let prev = initial.prev();
     let prev_prev = prev.prev();
-    let prev_prev_prev = prev_prev.prev();
-    let looped = prev_prev_prev.prev();
+    let looped = prev_prev.prev();
 
     assert_ne!(initial, prev, "Focus must change on backward navigation");
     assert_eq!(
         initial, looped,
-        "Focus reverse cycle must return to initial pane after four steps"
+        "Focus reverse cycle must return to initial pane after three steps"
     );
     assert_eq!(
         initial.next().prev(),
@@ -52,14 +49,13 @@ fn test_pane_focus_default_and_variants() {
         PaneFocus::Composer,
         PaneFocus::Sessions,
         PaneFocus::Chat,
-        PaneFocus::Diff,
     ];
 
     for i in 0..all_variants.len() {
         for j in (i + 1)..all_variants.len() {
             assert_ne!(
                 all_variants[i], all_variants[j],
-                "All 4 pane focus variants must be distinct"
+                "All 3 pane focus variants must be distinct"
             );
         }
     }
@@ -174,7 +170,7 @@ fn test_composer_event_routing_ignored_when_unfocused() {
     );
 
     let key_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    let enter_result = composer.handle_key_event(key_enter, PaneFocus::Diff);
+    let enter_result = composer.handle_key_event(key_enter, PaneFocus::Sessions);
     assert_eq!(enter_result, ComposerEventResult::Ignored);
     assert_eq!(composer.text(), "existing");
 }

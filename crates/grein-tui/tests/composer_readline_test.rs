@@ -317,10 +317,12 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
     app.input_buffer = "keep this draft".to_string();
     app.cursor_position = 4;
 
-    // Ctrl+B still toggles Blackboard when Composer is focused (and does not edit)
-    assert!(!app.is_blackboard_collapsed());
-    assert!(app.handle_key_event(ctrl('b')));
-    assert!(app.is_blackboard_collapsed());
+    // Ctrl+G toggles Composer <-> Tree while preserving input_buffer and cursor_position
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert!(app.handle_key_event(ctrl('g')));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert!(app.handle_key_event(ctrl('g')));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
     assert_eq!(app.input_buffer, "keep this draft");
     assert_eq!(app.cursor_position, 4);
 
@@ -348,11 +350,7 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
 
     // Non-Composer panes must not trigger Composer Readline edits
     app.kill_ring = "preserved".to_string();
-    for pane in [
-        FocusedPane::Tree,
-        FocusedPane::Transcript,
-        FocusedPane::Blackboard,
-    ] {
+    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
         app.set_focus(pane);
         for ev in [
             ctrl('a'),

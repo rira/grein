@@ -415,7 +415,7 @@ async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
         .unwrap();
 
     // Even while send_turn is blocked on Notify, UI keeps accepting commands and receives errors.
-    for ch in "/wb set env dev".chars() {
+    for ch in "!false".chars() {
         key_tx
             .send(Event::Key(KeyEvent::new(
                 KeyCode::Char(ch),
@@ -426,7 +426,7 @@ async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
     key_tx
         .send(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
         .unwrap();
-    for ch in "!false".chars() {
+    for ch in "/fork side-check".chars() {
         key_tx
             .send(Event::Key(KeyEvent::new(
                 KeyCode::Char(ch),
@@ -470,7 +470,7 @@ async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
     unblock.notify_waiters();
     let recorded = engine.calls.lock().unwrap().clone();
     assert!(recorded.contains(&"send:t-1:hello async".to_string()));
-    assert!(recorded.contains(&"wb_set:env:dev".to_string()));
+    assert!(recorded.contains(&"fork:t-1:side-check".to_string()));
     assert!(recorded.contains(&"shell:t-1:false".to_string()));
     assert!(recorded.contains(&"perm:perm-99:true".to_string()));
 
@@ -482,20 +482,17 @@ async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
         }
         screen.push('\n');
     }
-    assert!(screen.contains("shell failed cleanly"));
-    assert!(screen.contains("env: dev"));
+    assert!(screen.contains("side-check"));
 }
 
 #[test]
-fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_whiteboard() {
+fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_ignores_blackboard() {
     use grein_tui::app::FocusedPane;
     use grein_tui::runner::{apply_engine_event, apply_hydrated_session};
 
     let mut app = App::new();
     apply_hydrated_session(&mut app, &sample_session());
     assert_eq!(app.active_thread_id(), "t-1");
-    assert_eq!(app.blackboard_entries.len(), 1);
-    assert!(app.blackboard_notes.contains("goal: ship"));
 
     apply_engine_event(
         &mut app,
@@ -585,11 +582,17 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_whiteboard(
 
     apply_engine_event(
         &mut app,
+        TuiEngineEvent::BlackboardUpdated {
+            key: "goal".to_string(),
+            value: "ship".to_string(),
+        },
+    );
+    apply_engine_event(
+        &mut app,
         TuiEngineEvent::BlackboardDeleted {
             key: "goal".to_string(),
         },
     );
-    assert!(app.blackboard_entries.is_empty());
 
     apply_engine_event(
         &mut app,
