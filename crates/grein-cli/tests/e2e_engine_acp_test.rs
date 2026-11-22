@@ -20,8 +20,8 @@ fn fake_acp_script_path() -> PathBuf {
 
 fn fake_acp_config(cwd: &Path) -> AcpBackendConfig {
     AcpBackendConfig {
-        command: fake_acp_script_path().to_string_lossy().into_owned(),
-        args: Vec::new(),
+        command: "python3".to_string(),
+        args: vec![fake_acp_script_path().to_string_lossy().into_owned()],
         auth_method: Some("oauth-personal".to_string()),
         cwd: cwd.to_path_buf(),
     }

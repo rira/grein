@@ -24,6 +24,7 @@
             };
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ pkgs.sqlite ];
+            nativeCheckInputs = [ pkgs.python3 pkgs.git ];
             doCheck = true;
           };
         in

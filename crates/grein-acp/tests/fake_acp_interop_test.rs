@@ -86,10 +86,12 @@ async fn spawn_fake_driver(
     env: Vec<(String, String)>,
 ) -> AcpStdioDriver {
     let script = fake_acp_script_path();
-    let config = StdioProcessConfig::new(script.to_string_lossy(), extra_args).with_env(env);
+    let mut args = vec![script.to_string_lossy().into_owned()];
+    args.extend(extra_args);
+    let config = StdioProcessConfig::new("python3", args).with_env(env);
     let runner = StdioProcessRunner::spawn(config)
         .await
-        .expect("fake_acp_server.py must be executable and spawn cleanly");
+        .expect("fake_acp_server.py must spawn cleanly via python3");
     AcpStdioDriver::new(runner)
 }
 
