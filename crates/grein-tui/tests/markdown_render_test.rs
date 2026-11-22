@@ -1,8 +1,10 @@
 use grein_tui::app::App;
+use grein_tui::engine_port::TuiEngineEvent;
 use grein_tui::markdown::{
     parse_inline_spans, render_markdown_lines, render_markdown_lines_with_width,
 };
 use grein_tui::render::{render_app, render_markdown_lines as render_mod_markdown_lines};
+use grein_tui::runner::apply_engine_event;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
@@ -476,4 +478,289 @@ fn test_user_prompts_render_with_chevron_in_leaf_green() {
         .spans
         .iter()
         .all(|s| s.style.fg != Some(Color::Green)));
+}
+
+#[test]
+fn test_shell_header_lines_style_command_bold_and_exit_status_colored() {
+    let md = "\
+$ ls -latr (exit 0)
+$ false (exit 2)
+$ sleep 99 (exit -1)
+$ echo \" (exit 1)\" (exit 0)";
+
+    let lines = render_markdown_lines(md);
+    assert_eq!(lines.len(), 4);
+    assert_eq!(
+        lines_text(&lines),
+        vec![
+            "$ ls -latr (exit 0)",
+            "$ false (exit 2)",
+            "$ sleep 99 (exit -1)",
+            "$ echo \" (exit 1)\" (exit 0)",
+        ]
+    );
+
+    assert_eq!(lines[0].spans[0].content, "$ ls -latr ");
+    assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(lines[0].spans[1].content, "(exit 0)");
+    assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
+
+    assert_eq!(lines[1].spans[0].content, "$ false ");
+    assert!(lines[1].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(lines[1].spans[1].content, "(exit 2)");
+    assert_eq!(lines[1].spans[1].style.fg, Some(Color::Red));
+
+    assert_eq!(lines[2].spans[0].content, "$ sleep 99 ");
+    assert_eq!(lines[2].spans[1].content, "(exit -1)");
+    assert_eq!(lines[2].spans[1].style.fg, Some(Color::Red));
+
+    assert_eq!(lines[3].spans[0].content, "$ echo \" (exit 1)\" ");
+    assert_eq!(lines[3].spans[1].content, "(exit 0)");
+    assert_eq!(lines[3].spans[1].style.fg, Some(Color::Green));
+}
+
+#[test]
+fn test_ansi_fenced_block_parses_sgr_styles_persists_across_lines_and_hides_fences() {
+    let md = concat!(
+        "$ ls -latr (exit 0)\n",
+        "```ansi\n",
+        "plain default\n",
+        "\x1b[1;34mdir\x1b[0m \x1b[2mdim\x1b[22m \x1b[3mit\x1b[23m \x1b[4mul\x1b[24m \x1b[7mrev\x1b[27m\n",
+        "\x1b[91mbright_red\x1b[39m \x1b[42mbg_green\x1b[49m \x1b[104mbright_bg\x1b[0m\n",
+        "\x1b[38;5;208morange256\x1b[0m \x1b[48;5;17mbg256\x1b[0m \x1b[38;2;12;34;56;48;2;78;90;12mrgb\x1b[0m\n",
+        "\x1b[32mpersist_line1\n",
+        "persist_line2\x1b[m_after_empty_reset\n",
+        "[stderr]\n",
+        "\x1b[31merr msg\x1b[0m\n",
+        "```\n",
+        "```rust\n",
+        "let x = 1;\n",
+        "```"
+    );
+
+    let lines = render_markdown_lines(md);
+    let texts = lines_text(&lines);
+    assert!(
+        !texts.iter().any(|t| t == "```ansi" || t == "```" && t.is_empty()),
+        "ansi fences must be hidden: {texts:?}"
+    );
+    assert_eq!(texts[0], "$ ls -latr (exit 0)");
+    assert_eq!(texts[1], "plain default");
+    assert_eq!(texts[2], "dir dim it ul rev");
+    assert_eq!(texts[3], "bright_red bg_green bright_bg");
+    assert_eq!(texts[4], "orange256 bg256 rgb");
+    assert_eq!(texts[5], "persist_line1");
+    assert_eq!(texts[6], "persist_line2_after_empty_reset");
+    assert_eq!(texts[7], "[stderr]");
+    assert_eq!(texts[8], "err msg");
+    assert_eq!(texts[9], "```rust");
+    assert_eq!(texts[10], "let x = 1;");
+    assert_eq!(texts[11], "```");
+
+    assert_eq!(lines[1].spans[0].style.fg, None);
+    assert_eq!(lines[1].spans[0].style.bg, None);
+
+    assert!(lines[2]
+        .spans
+        .iter()
+        .any(|s| s.content == "dir"
+            && s.style.fg == Some(Color::Blue)
+            && s.style.add_modifier.contains(Modifier::BOLD)));
+    assert!(lines[2]
+        .spans
+        .iter()
+        .any(|s| s.content == "dim" && s.style.add_modifier.contains(Modifier::DIM)));
+    assert!(lines[2].spans.iter().any(|s| {
+        s.content == "it"
+            && s.style.add_modifier.contains(Modifier::ITALIC)
+            && !s.style.add_modifier.contains(Modifier::DIM)
+    }));
+    assert!(lines[2].spans.iter().any(|s| {
+        s.content == "ul"
+            && s.style.add_modifier.contains(Modifier::UNDERLINED)
+            && !s.style.add_modifier.contains(Modifier::ITALIC)
+    }));
+    assert!(lines[2].spans.iter().any(|s| {
+        s.content == "rev"
+            && s.style.add_modifier.contains(Modifier::REVERSED)
+            && !s.style.add_modifier.contains(Modifier::UNDERLINED)
+    }));
+
+    assert!(lines[3]
+        .spans
+        .iter()
+        .any(|s| s.content == "bright_red" && s.style.fg == Some(Color::LightRed)));
+    assert!(lines[3]
+        .spans
+        .iter()
+        .any(|s| s.content == "bg_green" && s.style.fg.is_none() && s.style.bg == Some(Color::Green)));
+    assert!(lines[3]
+        .spans
+        .iter()
+        .any(|s| s.content == "bright_bg" && s.style.bg == Some(Color::LightBlue)));
+
+    assert!(lines[4]
+        .spans
+        .iter()
+        .any(|s| s.content == "orange256" && s.style.fg == Some(Color::Indexed(208))));
+    assert!(lines[4]
+        .spans
+        .iter()
+        .any(|s| s.content == "bg256" && s.style.bg == Some(Color::Indexed(17))));
+    assert!(lines[4].spans.iter().any(|s| {
+        s.content == "rgb"
+            && s.style.fg == Some(Color::Rgb(12, 34, 56))
+            && s.style.bg == Some(Color::Rgb(78, 90, 12))
+    }));
+
+    assert_eq!(lines[5].spans[0].style.fg, Some(Color::Green));
+    assert!(lines[6]
+        .spans
+        .iter()
+        .any(|s| s.content == "persist_line2" && s.style.fg == Some(Color::Green)));
+    assert!(lines[6]
+        .spans
+        .iter()
+        .any(|s| s.content == "_after_empty_reset" && s.style.fg.is_none()));
+
+    assert_eq!(lines[7].spans[0].content, "[stderr]");
+    assert_eq!(lines[7].spans[0].style.fg, Some(Color::Red));
+    assert_eq!(lines[8].spans[0].style.fg, Some(Color::Red));
+
+    assert_eq!(lines[9].spans[0].style.fg, Some(Color::DarkGray));
+    assert_eq!(lines[10].spans[0].style.fg, Some(Color::Yellow));
+    assert_eq!(lines[11].spans[0].style.fg, Some(Color::DarkGray));
+}
+
+#[test]
+fn test_ansi_strips_non_sgr_osc_cr_and_survives_malformed_sequences() {
+    let md = concat!(
+        "```ansi\n",
+        "\x1b[01;31m\x1b[Khit\x1b[m\x1b[K\r\n",
+        "\x1b[2J\x1b[?25h\x1b]8;;https://example.com\x07link\x1b]8;;\x07 \x1b]0;title\x1b\\ok\n",
+        "trailing_esc\x1b\n",
+        "trunc_csi\x1b[38;2;10;20\n",
+        "utf8_csi\x1b[31🦀safe\n",
+        "trunc_osc\x1b]0;🦀title\n",
+        "over_256\x1b[38;5;999;32mok\x1b[0m\n",
+        "```"
+    );
+
+    let lines = render_markdown_lines(md);
+    let texts = lines_text(&lines);
+    assert_eq!(
+        texts,
+        vec![
+            "hit",
+            "link ok",
+            "trailing_esc",
+            "trunc_csi",
+            "utf8_csi🦀safe",
+            "trunc_osc",
+            "over_256ok",
+        ]
+    );
+    assert!(lines[0]
+        .spans
+        .iter()
+        .any(|s| s.content == "hit" && s.style.fg == Some(Color::Red)));
+    assert!(lines[6]
+        .spans
+        .iter()
+        .any(|s| s.content == "ok" && s.style.fg == Some(Color::Green)));
+}
+
+#[test]
+fn test_ratatui_test_backend_shell_ansi_colors_and_runner_dedup() {
+    let mut app = App::new();
+    app.submit_composer_prompt("!ls -latr");
+    assert!(app.active_transcript_md.contains("> $ ls -latr"));
+
+    let tid = app.active_thread_id.clone();
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ShellOutput {
+            thread_id: tid.clone(),
+            command: "ls -latr".to_string(),
+            stdout: "\x1b[01;34msrc\x1b[0m \x1b[38;5;208mCargo.toml\x1b[0m \x1b[38;2;10;200;30mrgb\x1b[0m plain\n".to_string(),
+            stderr: "warn\n".to_string(),
+            exit_code: 0,
+        },
+    );
+
+    assert!(
+        !app.active_transcript_md.contains("> $ ls -latr"),
+        "pending stub must be deduplicated: {:?}",
+        app.active_transcript_md
+    );
+    assert_eq!(app.active_transcript_md.matches("$ ls -latr").count(), 1);
+    assert!(app
+        .active_transcript_md
+        .contains("$ ls -latr (exit 0)\n```ansi\n"));
+
+    app.submit_composer_prompt("!false");
+    let tid2 = app.active_thread_id.clone();
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ShellOutput {
+            thread_id: tid2,
+            command: "false".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 2,
+        },
+    );
+    assert!(!app.active_transcript_md.contains("> $ false"));
+    assert!(app.active_transcript_md.contains("$ false (exit 2)\n\n"));
+    assert!(!app
+        .active_transcript_md
+        .contains("$ false (exit 2)\n```ansi"));
+
+    let backend = TestBackend::new(110, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_app(f, &app)).unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut screen_rows = Vec::new();
+    for y in 0..buf.area.height {
+        let mut row = String::new();
+        for x in 0..buf.area.width {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        screen_rows.push(row);
+    }
+    let screen = screen_rows.join("\n");
+
+    assert!(screen.contains("$ ls -latr (exit 0)"), "{screen}");
+    assert!(screen.contains("$ false (exit 2)"), "{screen}");
+    assert!(!screen.contains("```ansi"), "{screen}");
+    assert!(!screen.contains("> $ ls -latr"), "{screen}");
+
+    let find_cell = |needle: &str| -> (Color, Modifier) {
+        for y in 0..buf.area.height {
+            let row = &screen_rows[y as usize];
+            if let Some(byte_idx) = row.find(needle) {
+                let col = row[..byte_idx].chars().count() as u16;
+                let cell = &buf[(col, y)];
+                return (cell.fg, cell.modifier);
+            }
+        }
+        panic!("needle {needle:?} not found on screen:\n{screen}");
+    };
+
+    let (exit0_fg, _) = find_cell("(exit 0)");
+    assert_eq!(exit0_fg, Color::Green);
+    let (exit2_fg, _) = find_cell("(exit 2)");
+    assert_eq!(exit2_fg, Color::Red);
+    let (dir_fg, dir_mod) = find_cell("src");
+    assert_eq!(dir_fg, Color::Blue);
+    assert!(dir_mod.contains(Modifier::BOLD));
+    let (idx_fg, _) = find_cell("Cargo.toml");
+    assert_eq!(idx_fg, Color::Indexed(208));
+    let (rgb_fg, _) = find_cell("rgb");
+    assert_eq!(rgb_fg, Color::Rgb(10, 200, 30));
+    let (plain_fg, _) = find_cell("plain");
+    assert_eq!(plain_fg, Color::Reset);
+    let (stderr_fg, _) = find_cell("[stderr]");
+    assert_eq!(stderr_fg, Color::Red);
 }

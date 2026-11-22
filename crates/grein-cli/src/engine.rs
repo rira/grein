@@ -2054,7 +2054,7 @@ impl DaemonEngine for InProcessEngine {
         let cwd = self.runtime.cwd.clone();
         let cmd = command.to_string();
         let output = tokio::task::spawn_blocking(move || {
-            grein_workspace::shell::run_shell_command_blocking(
+            grein_workspace::shell::run_shell_command_with_pty_blocking(
                 &cwd,
                 &cmd,
                 SHELL_COMMAND_TIMEOUT,

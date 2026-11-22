@@ -572,7 +572,7 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_whiteboard(
     );
     assert!(app
         .active_transcript_md
-        .contains("$ echo hi (exit 0)\n```text\nhi\n```"));
+        .contains("$ echo hi (exit 0)\n```ansi\nhi\n```"));
 
     apply_engine_event(
         &mut app,

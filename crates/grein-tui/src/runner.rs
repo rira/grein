@@ -117,6 +117,17 @@ fn ensure_paragraph_break(buf: &mut String) {
     }
 }
 
+fn strip_trailing_shell_stub(buf: &mut String, command: &str) {
+    let trimmed_end = buf.trim_end();
+    let stub = format!("> $ {command}");
+    if let Some(prefix) = trimmed_end.strip_suffix(&stub) {
+        if prefix.is_empty() || prefix.ends_with('\n') {
+            let clean_len = prefix.trim_end_matches(['\r', '\n']).len();
+            buf.truncate(clean_len);
+        }
+    }
+}
+
 fn parse_wb_kv(rest: &str) -> Option<(String, String)> {
     let trimmed = rest.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -866,14 +877,22 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 body.push_str(stdout.trim_end_matches(['\r', '\n']));
             }
             if !stderr.is_empty() {
-                if !body.is_empty() {
-                    body.push('\n');
+                let clean_stderr = stderr.trim_end_matches(['\r', '\n']);
+                if !clean_stderr.is_empty() {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str("[stderr]\n");
+                    body.push_str(clean_stderr);
                 }
-                body.push_str("[stderr]\n");
-                body.push_str(stderr.trim_end_matches(['\r', '\n']));
             }
-            let block = format!("$ {command} (exit {exit_code})\n```text\n{body}\n```\n\n");
+            let block = if body.is_empty() {
+                format!("$ {command} (exit {exit_code})\n\n")
+            } else {
+                format!("$ {command} (exit {exit_code})\n```ansi\n{body}\n```\n\n")
+            };
             with_thread_transcript_mut(app, &thread_id, |buf| {
+                strip_trailing_shell_stub(buf, &command);
                 ensure_paragraph_break(buf);
                 buf.push_str(&block);
             });

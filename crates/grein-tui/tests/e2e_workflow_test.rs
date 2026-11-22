@@ -775,7 +775,7 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_whiteboar
     }
     assert!(app
         .active_transcript_md
-        .contains("$ echo hi (exit 0)\n```text\nhi\n```"));
+        .contains("$ echo hi (exit 0)\n```ansi\nhi\n```"));
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     assert!(render_to_string(&terminal).contains("$ echo hi (exit 0)"));
 
