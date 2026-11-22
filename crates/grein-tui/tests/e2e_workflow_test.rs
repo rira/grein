@@ -266,6 +266,77 @@ impl TuiEnginePort for MockLiveEngine {
         Ok(id)
     }
 
+    async fn create_root(&self, title: Option<&str>) -> io::Result<HydratedThread> {
+        let mut guard = self.state.lock().unwrap();
+        guard.branch_counter += 1;
+        let id = format!("t-root-{}", guard.branch_counter);
+        let resolved_title = title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Root {}", guard.branch_counter));
+        let thread = HydratedThread {
+            id: id.clone(),
+            title: resolved_title,
+            turns: Vec::new(),
+        };
+        guard.threads.push(thread.clone());
+        guard.thread_meta.push(ThreadMeta {
+            thread_id: id.clone(),
+            parent_thread_id: None,
+            inherited_turn_count: 0,
+            merged: false,
+        });
+        guard.active_thread_id = id;
+        Ok(thread)
+    }
+
+    async fn rename_thread(&self, thread_id: &str, title: &str) -> io::Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        let thread = guard
+            .threads
+            .iter_mut()
+            .find(|t| t.id == thread_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "thread not found"))?;
+        thread.title = title.to_string();
+        Ok(())
+    }
+
+    async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        summary: Option<&str>,
+    ) -> io::Result<()> {
+        let tx = {
+            let mut guard = self.state.lock().unwrap();
+            if let Some(meta) = guard.thread_meta.iter_mut().find(|m| m.thread_id == source_id) {
+                meta.merged = true;
+            }
+            if target_id.is_empty() {
+                let title = guard
+                    .threads
+                    .iter()
+                    .find(|t| t.id == source_id)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_else(|| source_id.to_string());
+                guard.blackboard.insert(
+                    format!("joined:{title}"),
+                    summary.unwrap_or("summary").to_string(),
+                );
+            }
+            guard.event_tx.clone()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(TuiEngineEvent::ThreadMerged {
+                thread_id: source_id.to_string(),
+                target_thread_id: target_id.to_string(),
+                summary: summary.unwrap_or("merged summary").to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn merge_thread(&self, _source_id: &str, _target_id: &str) -> io::Result<()> {
         Ok(())
     }
@@ -1088,12 +1159,16 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
         "expected root context in Grein panel:\n{tree_text}"
     );
     assert!(
-        tree_text.contains("  ᛉ Auth Child"),
-        "expected depth-1 child context in Grein panel:\n{tree_text}"
+        tree_text.contains("└─ Auth Child"),
+        "expected depth-1 box-connected idle child context without ᛉ:\n{tree_text}"
     );
     assert!(
-        tree_text.contains("    ᛉ JWT Grandchild"),
-        "expected depth-2 grandchild context in Grein panel:\n{tree_text}"
+        tree_text.contains("   └─ JWT Grandchild"),
+        "expected depth-2 box-connected idle grandchild context without ᛉ:\n{tree_text}"
+    );
+    assert!(
+        !tree_text.contains("ᛉ Auth Child") && !tree_text.contains("ᛉ JWT Grandchild"),
+        "idle sub-branches must omit ᛉ:\n{tree_text}"
     );
     assert!(!tree_text.contains('⚓'), "Tree must not contain ⚓:\n{tree_text}");
     assert!(
@@ -1689,15 +1764,20 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
             "Composer bottom border must not contain keybind legend ({trigger}): {composer_bottom_row:?}"
         );
 
-        let centered_modal_rect = Rect::new(18, 5, 74, 20);
+        let centered_modal_rect = Rect::new(18, 3, 74, 23);
         let modal_text = render_rect_to_string(&terminal, centered_modal_rect);
         assert!(
             modal_text.contains("Keybindings & Commands"),
             "Help modal must render centered for trigger {trigger}:\n{modal_text}"
         );
         assert!(modal_text.contains("/fork, /grein"));
+        assert!(modal_text.contains("/root, /new"));
+        assert!(modal_text.contains("/rename"));
+        assert!(modal_text.contains("/join, /merge"));
         assert!(modal_text.contains("/close, /delete"));
         assert!(modal_text.contains("/?, /help, ?"));
+        assert!(modal_text.contains("Alt+N"));
+        assert!(modal_text.contains("Alt+R / F2"));
         assert!(modal_text.contains("Press Esc, q, ?, or Enter to close"));
         assert!(engine.recorded_turns().is_empty());
     }
@@ -1771,4 +1851,258 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
     assert!(!final_screen.contains("Enter: Send"));
     assert!(final_screen.contains("Reply(t-trunk): why?"));
     assert!(final_screen.contains("Reply(t-trunk): still interactive"));
+}
+
+#[tokio::test]
+async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadata_error_notice() {
+    struct OrderingAndSlowMetadataEngine {
+        call_log: Mutex<Vec<&'static str>>,
+        event_tx: Mutex<Option<mpsc::UnboundedSender<TuiEngineEvent>>>,
+        allow_fork_meta: Arc<Notify>,
+        fail_metadata: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl TuiEnginePort for OrderingAndSlowMetadataEngine {
+        async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
+            self.call_log.lock().unwrap().push("subscribe_events");
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.event_tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        }
+        async fn hydrate_session(&self) -> io::Result<HydratedSession> {
+            self.call_log.lock().unwrap().push("hydrate_session");
+            // Emitting during hydrate_session only succeeds if subscribe_events ran first
+            if let Some(tx) = self.event_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(TuiEngineEvent::AgentMetaUpdated {
+                    thread_id: "t-root".to_string(),
+                    model: Some("early-model".to_string()),
+                    mode: Some("code".to_string()),
+                });
+            }
+            Ok(HydratedSession {
+                active_thread_id: "t-root".to_string(),
+                threads: vec![HydratedThread {
+                    id: "t-root".to_string(),
+                    title: "Main".to_string(),
+                    turns: Vec::new(),
+                }],
+                blackboard: Vec::new(),
+            })
+        }
+        async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
+            let calls = {
+                let mut log = self.call_log.lock().unwrap();
+                log.push("thread_metadata");
+                log.iter().filter(|&&c| c == "thread_metadata").count()
+            };
+            if calls >= 2 {
+                self.allow_fork_meta.notified().await;
+            }
+            if self.fail_metadata.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("metadata backend offline".to_string());
+            }
+            Ok(vec![ThreadMeta {
+                thread_id: "t-root".to_string(),
+                parent_thread_id: None,
+                inherited_turn_count: 0,
+                merged: false,
+            }])
+        }
+        async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
+            Ok(())
+        }
+        async fn fork_thread(&self, _thread_id: &str, title: &str) -> io::Result<String> {
+            Ok(if title.is_empty() {
+                "t-fork-1".to_string()
+            } else {
+                format!("t-fork-{title}")
+            })
+        }
+        async fn merge_thread(&self, _source_id: &str, _target_id: &str) -> io::Result<()> {
+            Ok(())
+        }
+        async fn resolve_permission(&self, _request_id: &str, _approved: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let allow_meta = Arc::new(Notify::new());
+    let engine = Arc::new(OrderingAndSlowMetadataEngine {
+        call_log: Mutex::new(Vec::new()),
+        event_tx: Mutex::new(None),
+        allow_fork_meta: Arc::clone(&allow_meta),
+        fail_metadata: std::sync::atomic::AtomicBool::new(true),
+    });
+    let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
+    let mut terminal = Terminal::new(TestBackend::new(120, 26)).unwrap();
+
+    let (key_tx, key_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_with_engine_events(&mut terminal, App::new(), engine_dyn, key_rx).await?;
+        Ok::<_, io::Error>(terminal)
+    });
+
+    wait_for("startup metadata called", || {
+        engine
+            .call_log
+            .lock()
+            .unwrap()
+            .contains(&"thread_metadata")
+    })
+    .await;
+
+    // subscribe_events must precede hydrate_session and thread_metadata
+    {
+        let log = engine.call_log.lock().unwrap();
+        let sub_idx = log.iter().position(|&c| c == "subscribe_events").unwrap();
+        let hyd_idx = log.iter().position(|&c| c == "hydrate_session").unwrap();
+        let meta_idx = log.iter().position(|&c| c == "thread_metadata").unwrap();
+        assert!(sub_idx < hyd_idx && hyd_idx < meta_idx, "call order: {log:?}");
+    }
+
+    // Fork a branch while second thread_metadata() call is still blocked on Notify
+    send_text(&key_tx, "/branch opt-child");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Unblock failing metadata poll -> surfaces non-intrusive status_notice
+    allow_meta.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Switch back to t-root via Tree so status bar displays t-root's early-model metadata too
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Up, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    let terminal = timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("runner exit")
+        .unwrap()
+        .unwrap();
+
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 26), false, 0);
+    let tree_text = render_rect_to_string(&terminal, layout.tree_area);
+    let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
+
+    assert!(
+        tree_text.contains("└─ opt-child"),
+        "Optimistic fork must nest under parent even before metadata resolves:\n{tree_text}"
+    );
+    assert!(
+        !tree_text.contains("ᛉ opt-child"),
+        "Idle optimistic sub-branch must omit ᛉ:\n{tree_text}"
+    );
+    assert!(
+        status_text.contains("metadata backend offline") && status_text.contains("code · early-model"),
+        "Status bar must surface metadata failure non-intrusively and retain early subscription events:\n{status_text}"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
+    let engine = MockLiveEngine::new_with_trunk("t-main", "Main");
+    let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
+    let mut terminal = Terminal::new(TestBackend::new(130, 30)).unwrap();
+
+    let (key_tx, key_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_with_engine_events(&mut terminal, App::new(), engine_dyn, key_rx).await?;
+        Ok::<_, io::Error>(terminal)
+    });
+
+    wait_for("engine subscription", || {
+        engine.state.lock().unwrap().event_tx.is_some()
+    })
+    .await;
+
+    // 1. Fork child from Main and rename it via Alt+R
+    send_text(&key_tx, "/branch temp-name");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    wait_for("child forked", || engine.threads_count() == 2).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    send_key(&key_tx, KeyCode::Char('r'), KeyModifiers::ALT);
+    // Ctrl+U clears "/rename temp-name", then enter new /rename command
+    send_key(&key_tx, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    send_text(&key_tx, "/rename Auth Spike");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    wait_for("child renamed", || {
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .threads
+            .iter()
+            .any(|t| t.id == "t-branch-1" && t.title == "Auth Spike")
+    })
+    .await;
+
+    // 2. Join child into Main via /join with summary
+    send_text(&key_tx, "/join Token rotation verified");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    wait_for("child marked merged", || {
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .thread_meta
+            .iter()
+            .any(|m| m.thread_id == "t-branch-1" && m.merged)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // 3. Create new root via Alt+N, then rename it via F2
+    send_key(&key_tx, KeyCode::Char('n'), KeyModifiers::ALT);
+    wait_for("new root created", || engine.threads_count() == 3).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    send_key(&key_tx, KeyCode::F(2), KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    send_text(&key_tx, "/rename Docs Root");
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    wait_for("new root renamed", || {
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .threads
+            .iter()
+            .any(|t| t.title == "Docs Root")
+    })
+    .await;
+
+    // 4. Switch to Main in Tree so its transcript (with Joined note) renders on screen
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    for _ in 0..4 {
+        send_key(&key_tx, KeyCode::Up, KeyModifiers::NONE);
+    }
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    let terminal = timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("runner exit")
+        .unwrap()
+        .unwrap();
+
+    let layout = compute_layout_with_chrome(Rect::new(0, 0, 130, 30), false, 0);
+    let tree_text = render_rect_to_string(&terminal, layout.tree_area);
+    let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
+
+    assert!(tree_text.contains("ᛉ Main"), "{tree_text}");
+    assert!(
+        tree_text.contains("└─ Auth Spike [joined]"),
+        "Expected joined badge and tree connector without ᛉ on idle sub-branch:\n{tree_text}"
+    );
+    assert!(!tree_text.contains("ᛉ Auth Spike"), "{tree_text}");
+    assert!(tree_text.contains("ᛉ Docs Root"), "{tree_text}");
+    assert!(
+        transcript_text.contains("Joined from Auth Spike: Token rotation verified"),
+        "Expected joined summary blockquote in Main transcript:\n{transcript_text}"
+    );
 }

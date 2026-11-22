@@ -55,6 +55,18 @@ pub enum AppAction {
         source_thread_id: String,
         title: Option<String>,
     },
+    CreateRoot {
+        title: Option<String>,
+    },
+    RenameThread {
+        thread_id: String,
+        title: String,
+    },
+    MergeBranch {
+        source_thread_id: String,
+        target_thread_id: String,
+        summary: Option<String>,
+    },
     DeleteThread(String),
     UpsertBlackboard {
         key: String,
@@ -216,6 +228,7 @@ pub struct App {
     pub tick_count: u64,
     pub show_help_modal: bool,
     pub status_notice: Option<String>,
+    pub pending_rename_thread_id: Option<String>,
 }
 
 pub type AppState = App;
@@ -258,6 +271,7 @@ impl Default for App {
             tick_count: 0,
             show_help_modal: false,
             status_notice: None,
+            pending_rename_thread_id: None,
         }
     }
 }
@@ -345,6 +359,7 @@ impl App {
 
     pub fn switch_thread(&mut self, thread_id: impl Into<String>) {
         let target_thread = thread_id.into();
+        self.pending_rename_thread_id = None;
         self.thread_drafts
             .insert(self.active_thread_id.clone(), self.input_buffer.clone());
         self.thread_transcripts.insert(
@@ -673,6 +688,59 @@ impl App {
         self.handle_key_event(key)
     }
 
+    fn thread_title_or_empty(&self, thread_id: &str) -> String {
+        self.threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default()
+    }
+
+    fn selected_tree_thread_info(&self) -> (String, String) {
+        let selected_id = self
+            .tree
+            .selected_index()
+            .and_then(|idx| self.tree.nodes.get(idx))
+            .map(|node| match node {
+                crate::ui::tree::TreeNode::Thread(t) => t.id.clone(),
+                crate::ui::tree::TreeNode::Anchor(a) => a.thread_id.clone(),
+            })
+            .unwrap_or_else(|| self.active_thread_id.clone());
+        let title = self
+            .tree
+            .selected_index()
+            .and_then(|idx| self.tree.nodes.get(idx))
+            .and_then(|node| match node {
+                crate::ui::tree::TreeNode::Thread(t) => Some(t.title.clone()),
+                crate::ui::tree::TreeNode::Anchor(_) => None,
+            })
+            .unwrap_or_else(|| self.thread_title_or_empty(&selected_id));
+        (selected_id, title)
+    }
+
+    pub(crate) fn resolve_merge_target(&self, source_thread_id: &str) -> String {
+        self.thread_meta
+            .get(source_thread_id)
+            .and_then(|m| m.parent_thread_id.as_deref())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn begin_rename_prefill(&mut self) {
+        let (target_id, target_title) = if self.focused_pane == FocusedPane::Tree {
+            self.selected_tree_thread_info()
+        } else {
+            let id = self.active_thread_id.clone();
+            let title = self.thread_title_or_empty(&id);
+            (id, title)
+        };
+        self.pending_rename_thread_id = Some(target_id);
+        self.input_buffer = format!("/rename {target_title}");
+        self.cursor_position = self.input_buffer.len();
+        self.focused_pane = FocusedPane::Composer;
+        self.sync_focus_out();
+    }
+
     pub fn handle_key_tree(&mut self, key: KeyEvent) -> Option<TreeAction> {
         self.sync_focus_in();
         if self.focused_pane != FocusedPane::Tree {
@@ -702,16 +770,29 @@ impl App {
                 }
                 None
             }
+            KeyCode::Char('n') if no_ctrl_alt => {
+                self.status_notice = None;
+                self.pending_actions
+                    .push_back(AppAction::CreateRoot { title: None });
+                None
+            }
+            KeyCode::Char('r') if no_ctrl_alt => {
+                self.begin_rename_prefill();
+                None
+            }
+            KeyCode::Char('m') if no_ctrl_alt => {
+                let (source_thread_id, _) = self.selected_tree_thread_info();
+                let target_thread_id = self.resolve_merge_target(&source_thread_id);
+                self.status_notice = None;
+                self.pending_actions.push_back(AppAction::MergeBranch {
+                    source_thread_id,
+                    target_thread_id,
+                    summary: None,
+                });
+                None
+            }
             KeyCode::Char('d') | KeyCode::Char('x') if no_ctrl_alt => {
-                let target_id = self
-                    .tree
-                    .selected_index()
-                    .and_then(|idx| self.tree.nodes.get(idx))
-                    .map(|node| match node {
-                        crate::ui::tree::TreeNode::Thread(t) => t.id.clone(),
-                        crate::ui::tree::TreeNode::Anchor(a) => a.thread_id.clone(),
-                    })
-                    .unwrap_or_else(|| self.active_thread_id.clone());
+                let (target_id, _) = self.selected_tree_thread_info();
                 self.request_delete_thread(target_id);
                 None
             }
@@ -1008,7 +1089,9 @@ impl App {
             return true;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
             match key.code {
                 KeyCode::Char('b') | KeyCode::Char('B') => {
                     self.toggle_blackboard();
@@ -1024,6 +1107,34 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            match key.code {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.status_notice = None;
+                    self.pending_actions
+                        .push_back(AppAction::CreateRoot { title: None });
+                    self.sync_focus_out();
+                    return true;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.begin_rename_prefill();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if key.code == KeyCode::F(2)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.begin_rename_prefill();
+            return true;
         }
 
         match key.code {
@@ -1053,6 +1164,7 @@ impl App {
                     return true;
                 }
                 if self.focused_pane == FocusedPane::Composer {
+                    self.pending_rename_thread_id = None;
                     self.focused_pane = FocusedPane::Tree;
                     self.sync_focus_out();
                     return true;

@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use crate::app::{AppState, PaneFocus};
 use crate::engine_port::{SubagentSnapshot, SubagentStatus};
 use crate::layout::{compute_layout_with_chrome, subagent_strip_height};
-use crate::runner::compute_ordered_thread_indices;
+use crate::runner::{compute_ordered_thread_entries, compute_ordered_thread_indices};
 use crate::ui::tree::{compute_tree_scroll_offset, TreeNode};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -26,11 +28,12 @@ pub fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
     crate::markdown::render_markdown_lines(markdown)
 }
 
-fn thread_status_glyph(status: Option<&str>) -> (&'static str, Color) {
+fn thread_status_glyph(status: Option<&str>, depth: usize) -> Option<(&'static str, Color)> {
     match status.unwrap_or("idle") {
-        "streaming" | "executing" | "thinking" => ("●", Color::Yellow),
-        "permission" | "permission_required" | "error" => ("⚠", Color::Red),
-        _ => ("ᛉ", Color::Green),
+        "streaming" | "executing" | "thinking" => Some(("●", Color::Yellow)),
+        "permission" | "permission_required" | "error" => Some(("⚠", Color::Red)),
+        _ if depth == 0 => Some(("ᛉ", Color::Green)),
+        _ => None,
     }
 }
 
@@ -74,22 +77,33 @@ fn render_thread_row(
     id: &str,
     title: &str,
     depth: usize,
+    prefix: &str,
     is_selected: bool,
     state: &AppState,
 ) -> Line<'static> {
     let is_active = id == state.active_thread_id;
-    let (glyph, glyph_color) =
-        thread_status_glyph(state.thread_statuses.get(id).map(String::as_str));
-    let indent = "  ".repeat(depth);
+    let is_merged = state.thread_meta.get(id).is_some_and(|m| m.merged);
+    let glyph_opt =
+        thread_status_glyph(state.thread_statuses.get(id).map(String::as_str), depth);
 
     if is_selected {
         let style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        Line::from(vec![Span::styled(
-            format!("{indent}{glyph} {title}"),
-            style,
-        )])
+        let label = match glyph_opt {
+            Some((glyph, _)) => format!("{prefix}{glyph} {title}"),
+            None => format!("{prefix}{title}"),
+        };
+        let mut spans = vec![Span::styled(label, style)];
+        if is_merged {
+            spans.push(Span::styled(
+                " [joined]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::REVERSED),
+            ));
+        }
+        Line::from(spans)
     } else {
         let title_style = if is_active {
             Style::default()
@@ -98,11 +112,24 @@ fn render_thread_row(
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        Line::from(vec![
-            Span::raw(indent),
-            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-            Span::styled(title.to_string(), title_style),
-        ])
+        let mut spans = vec![Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+        if let Some((glyph, glyph_color)) = glyph_opt {
+            spans.push(Span::styled(
+                format!("{glyph} "),
+                Style::default().fg(glyph_color),
+            ));
+        }
+        spans.push(Span::styled(title.to_string(), title_style));
+        if is_merged {
+            spans.push(Span::styled(
+                " [joined]",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Line::from(spans)
     }
 }
 
@@ -116,20 +143,45 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
     let mut selected_line_idx: Option<usize> = None;
 
     if !state.tree.nodes.is_empty() {
+        let fallback_layout: Option<HashMap<&str, (usize, String)>> =
+            if state.tree.prefixes.is_empty() && !state.threads.is_empty() {
+                Some(
+                    compute_ordered_thread_entries(&state.threads, &state.thread_meta)
+                        .into_iter()
+                        .map(|e| (state.threads[e.index].id.as_str(), (e.depth, e.prefix)))
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
         for (node_idx, node) in state.tree.nodes.iter().enumerate() {
             if let TreeNode::Thread(t) = node {
                 let is_selected = selected == Some(node_idx);
                 if is_selected {
                     selected_line_idx = Some(lines.len());
                 }
-                let depth = state.tree.depth_for(&t.id);
-                lines.push(render_thread_row(&t.id, &t.title, depth, is_selected, state));
+                let (depth, prefix) = if let Some(ref map) = fallback_layout {
+                    map.get(t.id.as_str())
+                        .map(|(d, p)| (*d, p.as_str()))
+                        .unwrap_or((state.tree.depth_for(&t.id), state.tree.prefix_for(&t.id)))
+                } else {
+                    (state.tree.depth_for(&t.id), state.tree.prefix_for(&t.id))
+                };
+                lines.push(render_thread_row(
+                    &t.id,
+                    &t.title,
+                    depth,
+                    prefix,
+                    is_selected,
+                    state,
+                ));
             }
         }
     } else if !state.threads.is_empty() {
-        let ordered = compute_ordered_thread_indices(&state.threads, &state.thread_meta);
-        for (row_idx, (idx, depth)) in ordered.into_iter().enumerate() {
-            let thread = &state.threads[idx];
+        let ordered = compute_ordered_thread_entries(&state.threads, &state.thread_meta);
+        for (row_idx, entry) in ordered.into_iter().enumerate() {
+            let thread = &state.threads[entry.index];
             let is_selected = selected == Some(row_idx);
             if is_selected {
                 selected_line_idx = Some(lines.len());
@@ -137,7 +189,8 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
             lines.push(render_thread_row(
                 &thread.id,
                 &thread.title,
-                depth,
+                entry.depth,
+                &entry.prefix,
                 is_selected,
                 state,
             ));
@@ -412,19 +465,22 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         ("Ctrl+Y / Ctrl+D", "Yank kill ring / delete char (Ctrl+F next)"),
         ("!cmd", "Run shell command in active context"),
         ("/fork, /grein", "Fork new child context (/branch)"),
-        ("/merge", "Merge active branch into parent"),
+        ("/root, /new", "Create new blank root context"),
+        ("/rename <name>", "Rename active or selected context"),
+        ("/join, /merge", "Join context into parent (or Shared Context)"),
         ("/close, /delete", "Close active fork (>1 context)"),
         ("/wb set|del", "Upsert or delete Blackboard entry"),
         ("/?, /help, ?", "Open this keybindings help modal"),
-        ("x/d, f/m, ↑/↓", "Tree close/fork/merge; j/k/↑/↓ navigate"),
-        ("Ctrl+N / Ctrl+B", "Quick-fork / toggle Blackboard ([ / ])"),
+        ("n / r / m (ᛇ Grein)", "New root / rename / join (x/d close, j/k/↑/↓)"),
+        ("Ctrl+N / Alt+N", "Quick-fork branch / new blank root"),
+        ("Alt+R / F2 / Ctrl+B", "Rename context / toggle Blackboard ([ / ])"),
         ("Ctrl+C / Ctrl+Q", "Quit application"),
     ];
     let mut lines: Vec<Line<'static>> = rows
         .into_iter()
         .map(|(k, desc)| {
             Line::from(vec![
-                Span::styled(format!(" {k:<16}"), key_style),
+                Span::styled(format!(" {k:<20}"), key_style),
                 Span::raw(desc),
             ])
         })

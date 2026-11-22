@@ -138,16 +138,20 @@ fn test_tree_is_context_only_nested_and_scrollable() {
     );
     assert!(screen.contains("ᛉ Main"), "Expected root context:\n{screen}");
     assert!(
-        screen.contains("  ● Child Context"),
-        "Expected depth-1 indented child context:\n{screen}"
+        screen.contains("├─ ● Child Context"),
+        "Expected depth-1 box-connected streaming child context:\n{screen}"
     );
     assert!(
-        screen.contains("    ᛉ Grandchild"),
-        "Expected depth-2 indented grandchild context:\n{screen}"
+        screen.contains("│  └─ Grandchild"),
+        "Expected depth-2 box-connected idle grandchild without ᛉ:\n{screen}"
     );
     assert!(
-        screen.contains("  ᛉ Second Child"),
-        "Expected depth-1 sibling context:\n{screen}"
+        screen.contains("└─ Second Child"),
+        "Expected depth-1 last idle sibling without ᛉ:\n{screen}"
+    );
+    assert!(
+        !screen.contains("ᛉ Grandchild") && !screen.contains("ᛉ Second Child"),
+        "Idle sub-branches must omit ᛉ:\n{screen}"
     );
 
     // User and agent messages remain visible in Transcript
@@ -816,4 +820,432 @@ fn test_live_branch_preview_and_rune_lore() {
     let swapped_screen = render_screen(&terminal);
     assert!(!swapped_screen.contains("Transcript (Preview:"));
     assert!(swapped_screen.contains("❯ feature preview prompt"));
+}
+
+#[test]
+fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "r1".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "r1".to_string(),
+                    title: "Main".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "b1".to_string(),
+                    title: "Branch A".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "b2".to_string(),
+                    title: "Branch B".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "g1".to_string(),
+                    title: "Grandchild".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "gg1".to_string(),
+                    title: "Great-Grand".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "r2".to_string(),
+                    title: "Root 2".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "r2c".to_string(),
+                    title: "Root2 Child".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+            blackboard: Vec::new(),
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMetadataUpdated {
+            meta: vec![
+                ThreadMeta {
+                    thread_id: "r1".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                },
+                ThreadMeta {
+                    thread_id: "b1".to_string(),
+                    parent_thread_id: Some("r1".to_string()),
+                    inherited_turn_count: 0,
+                    merged: true,
+                },
+                ThreadMeta {
+                    thread_id: "b2".to_string(),
+                    parent_thread_id: Some("r1".to_string()),
+                    inherited_turn_count: 0,
+                    merged: false,
+                },
+                ThreadMeta {
+                    thread_id: "g1".to_string(),
+                    parent_thread_id: Some("b2".to_string()),
+                    inherited_turn_count: 0,
+                    merged: false,
+                },
+                ThreadMeta {
+                    thread_id: "gg1".to_string(),
+                    parent_thread_id: Some("g1".to_string()),
+                    inherited_turn_count: 0,
+                    merged: true,
+                },
+                ThreadMeta {
+                    thread_id: "r2".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                },
+                ThreadMeta {
+                    thread_id: "r2c".to_string(),
+                    parent_thread_id: Some("r2".to_string()),
+                    inherited_turn_count: 0,
+                    merged: false,
+                },
+            ],
+        },
+    );
+
+    assert_eq!(app.tree.prefix_for("r1"), "");
+    assert_eq!(app.tree.prefix_for("b1"), "├─ ");
+    assert_eq!(app.tree.prefix_for("b2"), "└─ ");
+    assert_eq!(app.tree.prefix_for("g1"), "   └─ ");
+    assert_eq!(app.tree.prefix_for("gg1"), "      └─ ");
+    assert_eq!(app.tree.prefix_for("r2"), "");
+    assert_eq!(app.tree.prefix_for("r2c"), "└─ ");
+
+    let mut terminal = Terminal::new(TestBackend::new(130, 28)).unwrap();
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let screen = render_screen(&terminal);
+
+    assert!(screen.contains("ᛉ Main"), "{screen}");
+    assert!(screen.contains("├─ Branch A [joined]"), "{screen}");
+    assert!(screen.contains("└─ Branch B"), "{screen}");
+    assert!(screen.contains("   └─ Grandchild"), "{screen}");
+    assert!(screen.contains("      └─ Great-Grand [joined]"), "{screen}");
+    assert!(screen.contains("ᛉ Root 2"), "{screen}");
+    assert!(screen.contains("└─ Root2 Child"), "{screen}");
+    assert!(
+        !screen.contains("ᛉ Branch")
+            && !screen.contains("ᛉ Grandchild")
+            && !screen.contains("ᛉ Great-Grand")
+            && !screen.contains("ᛉ Root2 Child"),
+        "Idle sub-branches must omit ᛉ:\n{screen}"
+    );
+
+    // Verify [joined] badge uses DarkGray styling
+    let buf = terminal.backend().buffer();
+    let mut found_dark_gray_joined = false;
+    for y in 0..buf.area.height {
+        let mut row = String::new();
+        for x in 0..buf.area.width {
+            row.push_str(buf[(x, y)].symbol());
+        }
+        if let Some(byte_idx) = row.find("[joined]") {
+            let col_idx = row[..byte_idx].chars().count() as u16;
+            assert_eq!(buf[(col_idx, y)].fg, ratatui::style::Color::DarkGray);
+            found_dark_gray_joined = true;
+            break;
+        }
+    }
+    assert!(found_dark_gray_joined, "Expected [joined] styled with Color::DarkGray");
+
+    // Fallback when tree.nodes is empty still computes box connectors on the fly
+    app.tree.nodes.clear();
+    app.tree.prefixes.clear();
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let fallback_screen = render_screen(&terminal);
+    assert!(fallback_screen.contains("├─ Branch A [joined]"), "{fallback_screen}");
+    assert!(fallback_screen.contains("      └─ Great-Grand [joined]"), "{fallback_screen}");
+    assert!(!fallback_screen.contains("ᛉ Branch"), "{fallback_screen}");
+}
+
+#[test]
+fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-main".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-main".to_string(),
+                    title: "Main".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-child".to_string(),
+                    title: "Side Work".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+            blackboard: Vec::new(),
+        },
+    );
+
+    // /root and /new in Composer
+    app.set_focus(FocusedPane::Composer);
+    app.submit_composer_prompt("/root Fresh Trunk");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateRoot {
+            title: Some("Fresh Trunk".to_string()),
+        })
+    );
+    app.submit_composer_prompt("/new");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateRoot { title: None })
+    );
+
+    // 'n' in Tree emits CreateRoot { title: None }
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Char('n')));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateRoot { title: None })
+    );
+
+    // Global Alt+N from Composer and Tree emits CreateRoot { title: None }
+    for pane in [FocusedPane::Composer, FocusedPane::Tree, FocusedPane::Transcript] {
+        app.set_focus(pane);
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)));
+        assert_eq!(
+            app.pending_actions.pop_front(),
+            Some(AppAction::CreateRoot { title: None })
+        );
+    }
+
+    // Alt+1..9 remain unbound
+    app.set_focus(FocusedPane::Composer);
+    for digit in '1'..='9' {
+        assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT)));
+    }
+
+    // Empty /rename sets usage status_notice without emitting RenameThread
+    app.submit_composer_prompt("/rename   ");
+    assert!(app.pending_actions.is_empty());
+    assert_eq!(
+        app.status_notice.as_deref(),
+        Some("Usage: /rename <new title>")
+    );
+
+    // 'r' in Tree on unselected child prefills "/rename Side Work" and targets child
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1);
+    app.handle_key_event(key(KeyCode::Char('r')));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert_eq!(app.composer_input(), "/rename Side Work");
+    assert_eq!(app.cursor_position, "/rename Side Work".len());
+    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-child"));
+
+    // Submitting edited /rename targets pending_rename_thread_id (t-child) while active stays t-main
+    app.input_buffer = "/rename Auth Branch".to_string();
+    app.cursor_position = app.input_buffer.len();
+    app.handle_key_event(key(KeyCode::Enter));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::RenameThread {
+            thread_id: "t-child".to_string(),
+            title: "Auth Branch".to_string(),
+        })
+    );
+    assert!(app.pending_rename_thread_id.is_none());
+
+    // Global Alt+R from Composer targets active_thread_id (t-main)
+    app.set_focus(FocusedPane::Composer);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert_eq!(app.composer_input(), "/rename Main");
+    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-main"));
+    app.handle_key_event(key(KeyCode::Enter));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::RenameThread {
+            thread_id: "t-main".to_string(),
+            title: "Main".to_string(),
+        })
+    );
+
+    // Global F2 from Tree targets selected thread, and from Transcript targets active_thread_id
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1);
+    assert!(app.handle_key_event(key(KeyCode::F(2))));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert_eq!(app.composer_input(), "/rename Side Work");
+    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-child"));
+
+    app.switch_thread("t-main");
+    assert!(app.pending_rename_thread_id.is_none());
+    app.set_focus(FocusedPane::Transcript);
+    assert!(app.handle_key_event(key(KeyCode::F(2))));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert_eq!(app.composer_input(), "/rename Main");
+    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-main"));
+}
+
+#[test]
+fn test_join_merge_commands_hotkey_event_and_help_modal() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-child".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-root".to_string(),
+                    title: "Main".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-child".to_string(),
+                    title: "Auth Fix".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+            blackboard: Vec::new(),
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMetadataUpdated {
+            meta: vec![
+                ThreadMeta {
+                    thread_id: "t-root".to_string(),
+                    parent_thread_id: None,
+                    inherited_turn_count: 0,
+                    merged: false,
+                },
+                ThreadMeta {
+                    thread_id: "t-child".to_string(),
+                    parent_thread_id: Some("t-root".to_string()),
+                    inherited_turn_count: 1,
+                    merged: false,
+                },
+            ],
+        },
+    );
+
+    // /join with summary and /merge without summary on child thread
+    app.set_focus(FocusedPane::Composer);
+    app.submit_composer_prompt("/join JWT check works");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::MergeBranch {
+            source_thread_id: "t-child".to_string(),
+            target_thread_id: "t-root".to_string(),
+            summary: Some("JWT check works".to_string()),
+        })
+    );
+    app.submit_composer_prompt("/merge");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::MergeBranch {
+            source_thread_id: "t-child".to_string(),
+            target_thread_id: "t-root".to_string(),
+            summary: None,
+        })
+    );
+
+    // 'm' in Tree on child -> target t-root; on root -> target ""
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1);
+    app.handle_key_event(key(KeyCode::Char('m')));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::MergeBranch {
+            source_thread_id: "t-child".to_string(),
+            target_thread_id: "t-root".to_string(),
+            summary: None,
+        })
+    );
+    app.tree.select_index(0);
+    app.handle_key_event(key(KeyCode::Char('m')));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::MergeBranch {
+            source_thread_id: "t-root".to_string(),
+            target_thread_id: String::new(),
+            summary: None,
+        })
+    );
+
+    // ThreadMerged marks .merged = true, appends "> ↳ Joined from ..." into target transcript, sets status_notice
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMerged {
+            thread_id: "t-child".to_string(),
+            target_thread_id: "t-root".to_string(),
+            summary: "JWT check works".to_string(),
+        },
+    );
+    assert!(app.thread_meta.get("t-child").is_some_and(|m| m.merged));
+    assert!(app
+        .thread_transcripts
+        .get("t-root")
+        .is_some_and(|md| md.contains("> ↳ Joined from Auth Fix: JWT check works")));
+    assert!(app
+        .status_notice
+        .as_deref()
+        .is_some_and(|n| n.contains("Joined") && n.contains("Auth Fix")));
+
+    // Root ThreadMerged sets status_notice without modifying target transcript
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMerged {
+            thread_id: "t-root".to_string(),
+            target_thread_id: String::new(),
+            summary: "Promoted summary".to_string(),
+        },
+    );
+    assert!(app.thread_meta.get("t-root").is_some_and(|m| m.merged));
+    assert!(app
+        .status_notice
+        .as_deref()
+        .is_some_and(|n| n.contains("Shared Context")));
+
+    // Help modal renders /root, /rename, /join, n / r / m, Alt+N, Alt+R / F2 cleanly without clipping
+    app.show_help_modal = true;
+    let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let help_screen = render_screen(&terminal);
+    assert!(help_screen.contains("/root, /new"), "{help_screen}");
+    assert!(help_screen.contains("/rename"), "{help_screen}");
+    assert!(help_screen.contains("/join, /merge"), "{help_screen}");
+    assert!(help_screen.contains("n / r / m (ᛇ Grein)"), "{help_screen}");
+    assert!(help_screen.contains("Alt+N"), "{help_screen}");
+    assert!(help_screen.contains("Alt+R / F2"), "{help_screen}");
+    assert!(help_screen.contains("Press Esc, q, ?, or Enter to close"), "{help_screen}");
+
+    // Also fits cleanly on a standard 80x24 terminal without clipping footer
+    let mut small_term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    draw_frame_mut(&mut small_term, &mut app).unwrap();
+    let small_help = render_screen(&small_term);
+    assert!(small_help.contains("Press Esc, q, ?, or Enter to close"), "{small_help}");
+
+    // Non-idle error sub-branch retains ⚠ glyph with tree connector
+    app.show_help_modal = false;
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadStatusChanged {
+            thread_id: "t-child".to_string(),
+            status: "error".to_string(),
+        },
+    );
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let err_screen = render_screen(&terminal);
+    assert!(err_screen.contains("└─ ⚠ Auth Fix [joined]"), "{err_screen}");
 }

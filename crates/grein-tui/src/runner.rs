@@ -164,11 +164,66 @@ fn parse_anchors_for_transcript(transcript: &str) -> Vec<AnchorItem> {
         .collect()
 }
 
-/// Orders threads in parent-child depth-first order along with their nesting depth.
-pub fn compute_ordered_thread_indices(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderedThreadEntry {
+    pub index: usize,
+    pub depth: usize,
+    pub prefix: String,
+}
+
+struct TreeOrderCtx<'a> {
+    threads: &'a [ThreadItem],
+    children: HashMap<&'a str, Vec<usize>>,
+    visited: Vec<bool>,
+    ordered: Vec<OrderedThreadEntry>,
+}
+
+impl<'a> TreeOrderCtx<'a> {
+    fn visit(
+        &mut self,
+        idx: usize,
+        depth: usize,
+        prefix: String,
+        ancestor_continuations: &[bool],
+    ) {
+        if self.visited[idx] {
+            return;
+        }
+        self.visited[idx] = true;
+        self.ordered.push(OrderedThreadEntry {
+            index: idx,
+            depth,
+            prefix,
+        });
+        let Some(child_indices) = self.children.get(self.threads[idx].id.as_str()) else {
+            return;
+        };
+        let pending_children: Vec<usize> = child_indices
+            .iter()
+            .copied()
+            .filter(|&c| !self.visited[c])
+            .collect();
+        let total = pending_children.len();
+        for (pos, child_idx) in pending_children.into_iter().enumerate() {
+            let is_last = pos + 1 == total;
+            let mut child_prefix = String::new();
+            for &has_more in ancestor_continuations {
+                child_prefix.push_str(if has_more { "│  " } else { "   " });
+            }
+            child_prefix.push_str(if is_last { "└─ " } else { "├─ " });
+
+            let mut next_continuations = ancestor_continuations.to_vec();
+            next_continuations.push(!is_last);
+            self.visit(child_idx, depth + 1, child_prefix, &next_continuations);
+        }
+    }
+}
+
+/// Orders threads in parent-child depth-first order along with nesting depth and box-drawing prefix.
+pub fn compute_ordered_thread_entries(
     threads: &[ThreadItem],
     thread_meta: &HashMap<String, ThreadMeta>,
-) -> Vec<(usize, usize)> {
+) -> Vec<OrderedThreadEntry> {
     let known_ids: HashSet<&str> = threads.iter().map(|t| t.id.as_str()).collect();
     let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut roots: Vec<usize> = Vec::new();
@@ -186,54 +241,44 @@ pub fn compute_ordered_thread_indices(
         roots.push(idx);
     }
 
-    fn visit(
-        idx: usize,
-        depth: usize,
-        threads: &[ThreadItem],
-        children: &HashMap<&str, Vec<usize>>,
-        visited: &mut [bool],
-        out: &mut Vec<(usize, usize)>,
-    ) {
-        if visited[idx] {
-            return;
-        }
-        visited[idx] = true;
-        out.push((idx, depth));
-        if let Some(child_indices) = children.get(threads[idx].id.as_str()) {
-            for &child_idx in child_indices {
-                visit(child_idx, depth + 1, threads, children, visited, out);
-            }
-        }
-    }
-
-    let mut visited = vec![false; threads.len()];
-    let mut ordered = Vec::with_capacity(threads.len());
+    let mut ctx = TreeOrderCtx {
+        threads,
+        children,
+        visited: vec![false; threads.len()],
+        ordered: Vec::with_capacity(threads.len()),
+    };
     for root_idx in roots {
-        visit(
-            root_idx,
-            0,
-            threads,
-            &children,
-            &mut visited,
-            &mut ordered,
-        );
+        ctx.visit(root_idx, 0, String::new(), &[]);
     }
     for idx in 0..threads.len() {
-        if !visited[idx] {
-            visit(idx, 0, threads, &children, &mut visited, &mut ordered);
+        if !ctx.visited[idx] {
+            ctx.visit(idx, 0, String::new(), &[]);
         }
     }
-    ordered
+    ctx.ordered
+}
+
+/// Orders threads in parent-child depth-first order along with their nesting depth.
+pub fn compute_ordered_thread_indices(
+    threads: &[ThreadItem],
+    thread_meta: &HashMap<String, ThreadMeta>,
+) -> Vec<(usize, usize)> {
+    compute_ordered_thread_entries(threads, thread_meta)
+        .into_iter()
+        .map(|entry| (entry.index, entry.depth))
+        .collect()
 }
 
 fn rebuild_tree_nodes(app: &mut App) {
-    let ordered = compute_ordered_thread_indices(&app.threads, &app.thread_meta);
+    let ordered = compute_ordered_thread_entries(&app.threads, &app.thread_meta);
     let mut nodes = Vec::with_capacity(ordered.len());
     let mut depths = BTreeMap::new();
+    let mut prefixes = BTreeMap::new();
 
-    for (idx, depth) in ordered {
-        let thread = &app.threads[idx];
-        depths.insert(thread.id.clone(), depth);
+    for entry in ordered {
+        let thread = &app.threads[entry.index];
+        depths.insert(thread.id.clone(), entry.depth);
+        prefixes.insert(thread.id.clone(), entry.prefix);
         nodes.push(crate::ui::tree::TreeNode::Thread(
             crate::ui::tree::ThreadNode {
                 id: thread.id.clone(),
@@ -257,6 +302,7 @@ fn rebuild_tree_nodes(app: &mut App) {
 
     app.tree = crate::ui::tree::TreeState::new(nodes);
     app.tree.set_depths(depths);
+    app.tree.set_prefixes(prefixes);
     app.tree.set_scroll_offset(prev_scroll);
 
     if node_count > 0 {
@@ -337,6 +383,10 @@ impl App {
         let head = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("").trim();
 
+        if head != "/rename" && !matches!(head, "/?" | "/help") {
+            self.pending_rename_thread_id = None;
+        }
+
         match head {
             "/?" | "/help" => {
                 self.show_help_modal = true;
@@ -367,6 +417,41 @@ impl App {
                 self.pending_actions.push_back(AppAction::ForkBranch {
                     source_thread_id: self.active_thread_id.clone(),
                     title,
+                });
+                return;
+            }
+            "/root" | "/new" => {
+                let title = (!rest.is_empty()).then(|| rest.to_string());
+                self.status_notice = None;
+                self.pending_actions
+                    .push_back(AppAction::CreateRoot { title });
+                return;
+            }
+            "/rename" => {
+                if rest.is_empty() {
+                    self.status_notice = Some("Usage: /rename <new title>".to_string());
+                } else {
+                    let thread_id = self
+                        .pending_rename_thread_id
+                        .take()
+                        .unwrap_or_else(|| self.active_thread_id.clone());
+                    self.status_notice = None;
+                    self.pending_actions.push_back(AppAction::RenameThread {
+                        thread_id,
+                        title: rest.to_string(),
+                    });
+                }
+                return;
+            }
+            "/join" | "/merge" => {
+                let source_thread_id = self.active_thread_id.clone();
+                let target_thread_id = self.resolve_merge_target(&source_thread_id);
+                let summary = (!rest.is_empty()).then(|| rest.to_string());
+                self.status_notice = None;
+                self.pending_actions.push_back(AppAction::MergeBranch {
+                    source_thread_id,
+                    target_thread_id,
+                    summary,
                 });
                 return;
             }
@@ -709,6 +794,7 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.thread_active_tool.clear();
     app.thread_turn_started_ms.clear();
     app.status_notice = None;
+    app.pending_rename_thread_id = None;
 
     for t in &session.threads {
         let transcript = render_turns_md(&t.turns);
@@ -932,7 +1018,53 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             rebuild_tree_nodes(app);
         }
-        TuiEngineEvent::ThreadMerged { .. } => {}
+        TuiEngineEvent::ThreadMerged {
+            thread_id,
+            target_thread_id,
+            summary,
+        } => {
+            let has_target = !target_thread_id.is_empty() && target_thread_id != thread_id;
+            app.thread_meta
+                .entry(thread_id.clone())
+                .and_modify(|m| m.merged = true)
+                .or_insert_with(|| ThreadMeta {
+                    thread_id: thread_id.clone(),
+                    parent_thread_id: has_target.then(|| target_thread_id.clone()),
+                    inherited_turn_count: 0,
+                    merged: true,
+                });
+            let source_title = app
+                .threads
+                .iter()
+                .find(|t| t.id == thread_id)
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| thread_id.clone());
+            if has_target {
+                let clean_summary = summary.trim();
+                let note = if clean_summary.is_empty() {
+                    format!("> ↳ Joined from {source_title}\n\n")
+                } else {
+                    format!("> ↳ Joined from {source_title}: {clean_summary}\n\n")
+                };
+                with_thread_transcript_mut(app, &target_thread_id, |buf| {
+                    ensure_paragraph_break(buf);
+                    buf.push_str(&note);
+                });
+                if target_thread_id == app.active_thread_id {
+                    app.sync_anchors_and_blackboard();
+                }
+                let target_title = app
+                    .threads
+                    .iter()
+                    .find(|t| t.id == target_thread_id)
+                    .map(|t| t.title.as_str())
+                    .unwrap_or(target_thread_id.as_str());
+                app.status_notice = Some(format!("Joined {source_title} → {target_title}"));
+            } else {
+                app.status_notice = Some(format!("Joined {source_title} to Shared Context"));
+            }
+            rebuild_tree_nodes(app);
+        }
         TuiEngineEvent::ThreadMetadataUpdated { meta } => {
             app.thread_meta.clear();
             for m in meta {
@@ -957,6 +1089,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.thread_active_tool.remove(&thread_id);
             app.thread_turn_started_ms.remove(&thread_id);
             app.status_notice = None;
+            app.pending_rename_thread_id = None;
 
             if app.active_thread_id == thread_id
                 || !app.threads.iter().any(|t| t.id == app.active_thread_id)
@@ -1092,10 +1225,42 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
     }
 }
 
+enum RunnerLocalEvent {
+    Engine(TuiEngineEvent),
+    OptimisticThreadMeta(ThreadMeta),
+    StatusNotice(String),
+    MergeFallback {
+        thread_id: String,
+        target_thread_id: String,
+        summary: Option<String>,
+    },
+    MergeAborted(String),
+}
+
+async fn poll_metadata_to_local(
+    engine: &dyn TuiEnginePort,
+    local_ev_tx: &mpsc::UnboundedSender<RunnerLocalEvent>,
+) {
+    match engine.thread_metadata().await {
+        Ok(meta) => {
+            if !meta.is_empty() {
+                let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                    TuiEngineEvent::ThreadMetadataUpdated { meta },
+                ));
+            }
+        }
+        Err(err) => {
+            let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                "Metadata sync failed: {err}"
+            )));
+        }
+    }
+}
+
 fn dispatch_action(
     engine: Arc<dyn TuiEnginePort>,
     action: AppAction,
-    local_ev_tx: mpsc::UnboundedSender<TuiEngineEvent>,
+    local_ev_tx: mpsc::UnboundedSender<RunnerLocalEvent>,
     err_tx: mpsc::UnboundedSender<(Option<String>, String)>,
 ) {
     match action {
@@ -1120,15 +1285,80 @@ fn dispatch_action(
             tokio::spawn(async move {
                 match engine.fork_branch(&source_thread_id, title.as_deref()).await {
                     Ok(thread) => {
-                        let _ = local_ev_tx.send(TuiEngineEvent::ThreadCreated { thread });
-                        if let Ok(meta) = engine.thread_metadata().await {
-                            if !meta.is_empty() {
-                                let _ = local_ev_tx
-                                    .send(TuiEngineEvent::ThreadMetadataUpdated { meta });
-                            }
-                        }
+                        let optimistic = ThreadMeta {
+                            thread_id: thread.id.clone(),
+                            parent_thread_id: Some(source_thread_id),
+                            inherited_turn_count: 0,
+                            merged: false,
+                        };
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::ThreadCreated { thread },
+                        ));
+                        let _ =
+                            local_ev_tx.send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
                     }
                     Err(err) => {
+                        let _ = err_tx.send((Some(source_thread_id), err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::CreateRoot { title } => {
+            tokio::spawn(async move {
+                match engine.create_root(title.as_deref()).await {
+                    Ok(thread) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::ThreadCreated { thread },
+                        ));
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((None, err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::RenameThread { thread_id, title } => {
+            tokio::spawn(async move {
+                match engine.rename_thread(&thread_id, &title).await {
+                    Ok(()) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::ThreadTitleUpdated { thread_id, title },
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((Some(thread_id), err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::MergeBranch {
+            source_thread_id,
+            target_thread_id,
+            summary,
+        } => {
+            tokio::spawn(async move {
+                match engine
+                    .merge_thread_with_summary(
+                        &source_thread_id,
+                        &target_thread_id,
+                        summary.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        tokio::task::yield_now().await;
+                        let _ = local_ev_tx.send(RunnerLocalEvent::MergeFallback {
+                            thread_id: source_thread_id,
+                            target_thread_id,
+                            summary,
+                        });
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx
+                            .send(RunnerLocalEvent::MergeAborted(source_thread_id.clone()));
                         let _ = err_tx.send((Some(source_thread_id), err.to_string()));
                     }
                 }
@@ -1138,14 +1368,13 @@ fn dispatch_action(
             tokio::spawn(async move {
                 match engine.delete_thread(&thread_id).await {
                     Ok(next_active_thread_id) => {
-                        let _ = local_ev_tx.send(TuiEngineEvent::ThreadDeleted {
-                            thread_id,
-                            next_active_thread_id,
-                        });
-                        if let Ok(meta) = engine.thread_metadata().await {
-                            let _ = local_ev_tx
-                                .send(TuiEngineEvent::ThreadMetadataUpdated { meta });
-                        }
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::ThreadDeleted {
+                                thread_id,
+                                next_active_thread_id,
+                            },
+                        ));
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
                     }
                     Err(err) => {
                         let _ = err_tx.send((Some(thread_id), err));
@@ -1157,7 +1386,9 @@ fn dispatch_action(
             tokio::spawn(async move {
                 match engine.upsert_blackboard(&key, &value).await {
                     Ok(()) => {
-                        let _ = local_ev_tx.send(TuiEngineEvent::BlackboardUpdated { key, value });
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::BlackboardUpdated { key, value },
+                        ));
                     }
                     Err(err) => {
                         let _ = err_tx.send((None, err.to_string()));
@@ -1169,7 +1400,9 @@ fn dispatch_action(
             tokio::spawn(async move {
                 match engine.delete_blackboard(&key).await {
                     Ok(()) => {
-                        let _ = local_ev_tx.send(TuiEngineEvent::BlackboardDeleted { key });
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::BlackboardDeleted { key },
+                        ));
                     }
                     Err(err) => {
                         let _ = err_tx.send((None, err.to_string()));
@@ -1196,6 +1429,21 @@ fn dispatch_action(
         }
         AppAction::Scrolled { .. } | AppAction::None => {}
     }
+}
+
+fn handle_streamed_engine_event(
+    app: &mut App,
+    event: TuiEngineEvent,
+    pending_local_merges: &mut HashMap<String, usize>,
+) {
+    if let TuiEngineEvent::ThreadMerged { ref thread_id, .. } = event {
+        if let Some(cnt) = pending_local_merges.get_mut(thread_id) {
+            if *cnt > 0 {
+                *cnt -= 1;
+            }
+        }
+    }
+    apply_engine_event(app, event);
 }
 
 fn spawn_key_reader(
@@ -1240,17 +1488,26 @@ pub async fn run_with_engine_events<B: Backend>(
     engine: Arc<dyn TuiEnginePort>,
     mut key_rx: mpsc::UnboundedReceiver<Event>,
 ) -> io::Result<()> {
+    let mut engine_events = engine.subscribe_events().await?;
     let session = engine.hydrate_session().await?;
     apply_hydrated_session(&mut app, &session);
-    if let Ok(meta) = engine.thread_metadata().await {
-        if !meta.is_empty() {
-            apply_engine_event(&mut app, TuiEngineEvent::ThreadMetadataUpdated { meta });
+    match engine.thread_metadata().await {
+        Ok(meta) => {
+            if !meta.is_empty() {
+                apply_engine_event(&mut app, TuiEngineEvent::ThreadMetadataUpdated { meta });
+            }
+        }
+        Err(err) => {
+            app.status_notice = Some(format!("Metadata sync failed: {err}"));
         }
     }
-    let mut engine_events = engine.subscribe_events().await?;
 
-    let (local_ev_tx, mut local_ev_rx) = mpsc::unbounded_channel::<TuiEngineEvent>();
+    let (local_ev_tx, mut local_ev_rx) = mpsc::unbounded_channel::<RunnerLocalEvent>();
     let (err_tx, mut err_rx) = mpsc::unbounded_channel::<(Option<String>, String)>();
+    let mut pending_local_merges: HashMap<String, usize> = HashMap::new();
+    while let Ok(event) = engine_events.try_recv() {
+        handle_streamed_engine_event(&mut app, event, &mut pending_local_merges);
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
     loop {
@@ -1266,6 +1523,11 @@ pub async fn run_with_engine_events<B: Backend>(
                 };
                 handle_event(&mut app, ev)?;
                 while let Some(action) = app.pending_actions.pop_front() {
+                    if let AppAction::MergeBranch { ref source_thread_id, .. } = action {
+                        *pending_local_merges
+                            .entry(source_thread_id.clone())
+                            .or_default() += 1;
+                    }
                     dispatch_action(
                         Arc::clone(&engine),
                         action,
@@ -1275,10 +1537,50 @@ pub async fn run_with_engine_events<B: Backend>(
                 }
             }
             Some(event) = engine_events.recv() => {
-                apply_engine_event(&mut app, event);
+                handle_streamed_engine_event(&mut app, event, &mut pending_local_merges);
             }
-            Some(event) = local_ev_rx.recv() => {
-                apply_engine_event(&mut app, event);
+            Some(local_event) = local_ev_rx.recv() => {
+                match local_event {
+                    RunnerLocalEvent::Engine(event) => apply_engine_event(&mut app, event),
+                    RunnerLocalEvent::OptimisticThreadMeta(meta) => {
+                        if !app.thread_meta.contains_key(&meta.thread_id) {
+                            app.thread_meta.insert(meta.thread_id.clone(), meta);
+                            rebuild_tree_nodes(&mut app);
+                        }
+                    }
+                    RunnerLocalEvent::StatusNotice(notice) => {
+                        app.status_notice = Some(notice);
+                    }
+                    RunnerLocalEvent::MergeFallback {
+                        thread_id,
+                        target_thread_id,
+                        summary,
+                    } => {
+                        while let Ok(ev) = engine_events.try_recv() {
+                            handle_streamed_engine_event(&mut app, ev, &mut pending_local_merges);
+                        }
+                        if let Some(cnt) = pending_local_merges.get_mut(&thread_id) {
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                                apply_engine_event(
+                                    &mut app,
+                                    TuiEngineEvent::ThreadMerged {
+                                        thread_id,
+                                        target_thread_id,
+                                        summary: summary.unwrap_or_default(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    RunnerLocalEvent::MergeAborted(thread_id) => {
+                        if let Some(cnt) = pending_local_merges.get_mut(&thread_id) {
+                            if *cnt > 0 {
+                                *cnt -= 1;
+                            }
+                        }
+                    }
+                }
             }
             Some((thread_id_opt, message)) = err_rx.recv() => {
                 let target_thread = thread_id_opt.unwrap_or_else(|| app.active_thread_id.clone());

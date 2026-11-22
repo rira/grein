@@ -27,6 +27,7 @@ pub struct TreeState {
     active_anchor_id: Option<String>,
     pub scroll_offset: u16,
     pub depths: BTreeMap<String, usize>,
+    pub prefixes: BTreeMap<String, String>,
 }
 
 /// Computes the vertical scroll offset keeping `selected_row` visible within `viewport_height`.
@@ -62,6 +63,7 @@ impl TreeState {
             active_anchor_id: None,
             scroll_offset: 0,
             depths: BTreeMap::new(),
+            prefixes: BTreeMap::new(),
         }
     }
 
@@ -101,6 +103,17 @@ impl TreeState {
 
     pub fn set_depths(&mut self, depths: BTreeMap<String, usize>) {
         self.depths = depths;
+    }
+
+    pub fn prefix_for(&self, thread_id: &str) -> &str {
+        self.prefixes
+            .get(thread_id)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub fn set_prefixes(&mut self, prefixes: BTreeMap<String, String>) {
+        self.prefixes = prefixes;
     }
 
     pub fn ensure_selected_visible(&mut self, viewport_height: u16) {
