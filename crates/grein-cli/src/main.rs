@@ -1,7 +1,8 @@
 use std::io;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use grein_cli::args::{AttachArgs, Command, DaemonArgs};
@@ -9,8 +10,8 @@ use grein_cli::engine::{
     DaemonEngine, InProcessEngine, PermissionDecisionPayload, UnixSocketEngineClient,
 };
 use grein_tui::engine_port::{
-    HydratedBlackboardEntry, HydratedSession, HydratedThread, HydratedTurn, TuiEngineEvent,
-    TuiEnginePort,
+    HydratedBlackboardEntry, HydratedSession, HydratedThread, HydratedTurn, ThreadMeta,
+    TuiEngineEvent, TuiEnginePort,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -27,6 +28,9 @@ struct EngineClientPort<E> {
     events_tx: mpsc::UnboundedSender<TuiEngineEvent>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>>,
     has_live_stream: AtomicBool,
+    in_flight_turns: Arc<AtomicUsize>,
+    buffered_sync_errors: Arc<StdMutex<Vec<String>>>,
+    suppressed_sync_errors: Arc<StdMutex<Vec<(String, Instant)>>>,
 }
 
 impl<E> EngineClientPort<E> {
@@ -37,12 +41,19 @@ impl<E> EngineClientPort<E> {
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
             has_live_stream: AtomicBool::new(false),
+            in_flight_turns: Arc::new(AtomicUsize::new(0)),
+            buffered_sync_errors: Arc::new(StdMutex::new(Vec::new())),
+            suppressed_sync_errors: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
     fn emit(&self, event: TuiEngineEvent) {
         let _ = self.events_tx.send(event);
     }
+}
+
+fn error_matches_sync(err_msg: &str, event_msg: &str) -> bool {
+    !event_msg.is_empty() && (err_msg == event_msg || err_msg.ends_with(event_msg))
 }
 
 fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
@@ -90,6 +101,22 @@ where
             .first()
             .map(|t| t.id.clone())
             .unwrap_or(main.thread_id);
+        if let Ok(meta) = self.client.thread_metadata().await {
+            if !meta.is_empty() {
+                self.emit(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            }
+        }
+        if let Ok(agent_metas) = self.client.agent_metadata().await {
+            for entry in agent_metas {
+                if entry.model.is_some() || entry.mode.is_some() {
+                    self.emit(TuiEngineEvent::AgentMetaUpdated {
+                        thread_id: entry.thread_id,
+                        model: entry.model,
+                        mode: entry.mode,
+                    });
+                }
+            }
+        }
         Ok(HydratedSession {
             active_thread_id,
             threads,
@@ -99,10 +126,44 @@ where
 
     async fn send_turn(&self, thread_id: &str, prompt: &str) -> io::Result<()> {
         if self.has_live_stream.load(Ordering::SeqCst) {
-            self.client
-                .send_turn_for_thread(thread_id, prompt)
-                .await
-                .map_err(to_io)?;
+            self.in_flight_turns.fetch_add(1, Ordering::SeqCst);
+            let res = self.client.send_turn_for_thread(thread_id, prompt).await;
+            if let Err(ref err) = res {
+                let err_msg = err.to_string();
+                let consumed_from_buffer = {
+                    let mut buf = self
+                        .buffered_sync_errors
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if let Some(pos) = buf.iter().position(|m| error_matches_sync(&err_msg, m)) {
+                        buf.remove(pos);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !consumed_from_buffer {
+                    let mut sup = self
+                        .suppressed_sync_errors
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    sup.push((err_msg, Instant::now()));
+                }
+            }
+            let remaining = self.in_flight_turns.fetch_sub(1, Ordering::SeqCst) - 1;
+            if remaining == 0 {
+                let leftover: Vec<String> = {
+                    let mut buf = self
+                        .buffered_sync_errors
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    std::mem::take(&mut *buf)
+                };
+                for msg in leftover {
+                    self.emit(TuiEngineEvent::Error { message: msg });
+                }
+            }
+            res.map(|_| ()).map_err(to_io)?;
             return Ok(());
         }
 
@@ -247,6 +308,20 @@ where
         Ok(())
     }
 
+    async fn delete_thread(&self, thread_id: &str) -> Result<String, String> {
+        self.client
+            .delete_thread(thread_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
+        self.client
+            .thread_metadata()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
         let rx = self
             .events_rx
@@ -257,11 +332,34 @@ where
         if let Some(mut engine_rx) = self.client.subscribe_events().await.map_err(to_io)? {
             self.has_live_stream.store(true, Ordering::SeqCst);
             let tx = self.events_tx.clone();
+            let in_flight = Arc::clone(&self.in_flight_turns);
+            let buffered = Arc::clone(&self.buffered_sync_errors);
+            let suppressed = Arc::clone(&self.suppressed_sync_errors);
             tokio::spawn(async move {
                 while let Some(ev) = engine_rx.recv().await {
-                    // Synchronous Err returns from TuiEnginePort already surface errors via runner.rs.
-                    if matches!(ev, TuiEngineEvent::Error { .. }) {
-                        continue;
+                    if let TuiEngineEvent::Error { ref message } = ev {
+                        let is_suppressed = {
+                            let mut sup = suppressed.lock().unwrap_or_else(|p| p.into_inner());
+                            let now = Instant::now();
+                            sup.retain(|(_, ts)| now.duration_since(*ts) < Duration::from_secs(5));
+                            if let Some(pos) = sup
+                                .iter()
+                                .position(|(err_msg, _)| error_matches_sync(err_msg, message))
+                            {
+                                sup.remove(pos);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if is_suppressed {
+                            continue;
+                        }
+                        if in_flight.load(Ordering::SeqCst) > 0 {
+                            let mut buf = buffered.lock().unwrap_or_else(|p| p.into_inner());
+                            buf.push(message.clone());
+                            continue;
+                        }
                     }
                     if tx.send(ev).is_err() {
                         break;
@@ -462,7 +560,20 @@ done
             .fork_branch(&main_id, Some("side-branch"))
             .await
             .expect("fork_branch");
-        assert_eq!(forked.turns.len(), 2);
+        assert!(
+            forked.turns.is_empty(),
+            "forked branch must hydrate only branch-local turns, got {:?}",
+            forked.turns
+        );
+        let meta = port.thread_metadata().await.expect("thread_metadata");
+        assert_eq!(meta.len(), 2);
+        let fork_meta = meta
+            .iter()
+            .find(|m| m.thread_id == forked.id)
+            .expect("fork meta");
+        assert_eq!(fork_meta.parent_thread_id.as_deref(), Some(main_id.as_str()));
+        assert_eq!(fork_meta.inherited_turn_count, 2);
+
         port.merge_thread(&forked.id, &main_id)
             .await
             .expect("merge_thread");
@@ -470,14 +581,156 @@ done
             .await
             .expect("resolve_permission");
 
+        let next_active = port
+            .delete_thread(&forked.id)
+            .await
+            .expect("delete_thread");
+        assert_eq!(next_active, main_id);
+        assert!(port.delete_thread(&main_id).await.is_err());
+
         let reopened =
             InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
                 .expect("reopen");
         let port2 = EngineClientPort::new(reopened);
         let hydrated = port2.hydrate_session().await.expect("rehydrate");
-        assert_eq!(hydrated.threads.len(), 2);
+        assert_eq!(hydrated.threads.len(), 1);
         assert_eq!(hydrated.threads[0].turns.len(), 2);
         assert_eq!(hydrated.threads[0].turns[0].content, "ping acp");
         assert_eq!(hydrated.threads[0].turns[1].content, "Mocked TUI Reply");
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_forwards_async_background_errors() {
+        use grein_cli::engine::{
+            BlackboardEntry, EngineError, EngineEvent, SessionSnapshot, ShellCommandResult,
+            ThreadSummary, TranscriptEntry, TurnDispatchResult,
+        };
+
+        struct BgErrorEngine {
+            rx: Mutex<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl DaemonEngine for BgErrorEngine {
+            async fn ping(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
+                Ok(ThreadSummary {
+                    thread_id: "t-1".into(),
+                    title: "Main".into(),
+                    parent_node_id: "n-1".into(),
+                    active_leaf_id: "n-1".into(),
+                    merged: false,
+                    status: Default::default(),
+                })
+            }
+            async fn send_turn(&self, _prompt: &str) -> Result<TurnDispatchResult, EngineError> {
+                Ok(TurnDispatchResult {
+                    node_id: "n-2".into(),
+                })
+            }
+            async fn send_turn_for_thread(
+                &self,
+                _thread_id: &str,
+                _prompt: &str,
+            ) -> Result<TurnDispatchResult, EngineError> {
+                Ok(TurnDispatchResult {
+                    node_id: "n-2".into(),
+                })
+            }
+            async fn fork_thread(
+                &self,
+                _parent_node_id: Option<&str>,
+            ) -> Result<ThreadSummary, EngineError> {
+                unreachable!()
+            }
+            async fn fork_thread_with_title(
+                &self,
+                _source: Option<&str>,
+                _title: Option<&str>,
+            ) -> Result<ThreadSummary, EngineError> {
+                unreachable!()
+            }
+            async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
+                Ok(vec![self.ensure_main_thread().await?])
+            }
+            async fn get_transcript(&self) -> Result<Vec<TranscriptEntry>, EngineError> {
+                Ok(Vec::new())
+            }
+            async fn get_thread_transcript(
+                &self,
+                _thread_id: &str,
+            ) -> Result<Vec<TranscriptEntry>, EngineError> {
+                Ok(Vec::new())
+            }
+            async fn merge_thread(&self, _thread_id: &str) -> Result<ThreadSummary, EngineError> {
+                unreachable!()
+            }
+            async fn blackboard_list(&self) -> Result<Vec<BlackboardEntry>, EngineError> {
+                Ok(Vec::new())
+            }
+            async fn blackboard_upsert(
+                &self,
+                _key: &str,
+                _value: &str,
+            ) -> Result<BlackboardEntry, EngineError> {
+                unreachable!()
+            }
+            async fn blackboard_delete(&self, _key: &str) -> Result<bool, EngineError> {
+                Ok(false)
+            }
+            async fn resolve_permission(
+                &self,
+                _decision: PermissionDecisionPayload,
+            ) -> Result<EngineEvent, EngineError> {
+                unreachable!()
+            }
+            async fn cancel_turn(&self, _thread_id: &str) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn run_shell_command(
+                &self,
+                _thread_id: &str,
+                _command: &str,
+            ) -> Result<ShellCommandResult, EngineError> {
+                unreachable!()
+            }
+            async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
+                unreachable!()
+            }
+            async fn subscribe_events(
+                &self,
+            ) -> Result<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>, EngineError> {
+                Ok(self.rx.lock().await.take())
+            }
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let port = EngineClientPort::new(BgErrorEngine {
+            rx: Mutex::new(Some(rx)),
+        });
+        let _ = port.hydrate_session().await.expect("hydrate");
+        let mut sub_rx = port.subscribe_events().await.expect("subscribe");
+
+        tx.send(TuiEngineEvent::Error {
+            message: "async wakeup failed".to_string(),
+        })
+        .expect("send bg error");
+
+        let mut saw_bg_err = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(150), sub_rx.recv()).await
+        {
+            if matches!(ev, TuiEngineEvent::Error { ref message } if message == "async wakeup failed")
+            {
+                saw_bg_err = true;
+                break;
+            }
+        }
+        assert!(
+            saw_bg_err,
+            "async background TuiEngineEvent::Error must be forwarded to TUI"
+        );
     }
 }

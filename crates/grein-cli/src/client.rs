@@ -154,6 +154,15 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn session_thread_metadata(&mut self) -> Result<Value, std::io::Error> {
+        self.json_rpc("session.thread_metadata", json!({})).await
+    }
+
+    pub async fn session_delete_thread(&mut self, thread_id: &str) -> Result<Value, std::io::Error> {
+        self.json_rpc("session.delete_thread", json!({"thread_id": thread_id}))
+            .await
+    }
+
     async fn send_command(&mut self, cmd: &str) -> Result<String, std::io::Error> {
         self.stream.write_all(format!("{cmd}\n").as_bytes()).await?;
         self.stream.flush().await?;

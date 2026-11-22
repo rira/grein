@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod engine;
 pub mod headless;
 pub mod standalone;
+pub mod subagent_watch;
 
 pub use args::{AgentsArgs, AttachArgs, Cli, Command, DaemonArgs, StatusArgs, ThreadsArgs};
 pub use client::{connect_to_daemon, DaemonClient};

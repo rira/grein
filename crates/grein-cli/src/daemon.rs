@@ -224,14 +224,24 @@ mod tests {
         assert_eq!(shell_res.stdout, "via-socket");
 
         let mut seen = Vec::new();
-        for _ in 0..4 {
-            if let Ok(Some(ev)) = timeout(Duration::from_secs(2), rx.recv()).await {
+        for _ in 0..8 {
+            if let Ok(Some(ev)) = timeout(Duration::from_millis(300), rx.recv()).await {
+                let done = matches!(ev, TuiEngineEvent::ShellOutput { .. });
                 seen.push(ev);
+                if done {
+                    break;
+                }
+            } else {
+                break;
             }
         }
         assert!(seen.iter().any(|e| matches!(
             e,
             TuiEngineEvent::ThreadCreated { thread } if thread.id == forked.thread_id
+        )));
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadMetadataUpdated { meta } if meta.len() == 2
         )));
         assert!(seen.iter().any(|e| matches!(
             e,
@@ -246,9 +256,21 @@ mod tests {
             TuiEngineEvent::ShellOutput { stdout, .. } if stdout == "via-socket"
         )));
 
+        let socket_meta = client.thread_metadata().await.expect("thread_metadata");
+        assert_eq!(socket_meta.len(), 2);
+        assert_eq!(
+            socket_meta[1].parent_thread_id.as_deref(),
+            Some(main.thread_id.as_str())
+        );
+
         let mut raw_client = connect_to_daemon(&socket_path)
             .await
             .expect("connect DaemonClient");
+        let meta_val = raw_client
+            .session_thread_metadata()
+            .await
+            .expect("session_thread_metadata");
+        assert_eq!(meta_val["result"].as_array().unwrap().len(), 2);
         let threads_val = raw_client
             .session_list_threads()
             .await
@@ -259,6 +281,16 @@ mod tests {
             .await
             .expect("session_merge_thread");
         assert_eq!(merged_val["result"]["merged"], true);
+
+        let deleted_val = raw_client
+            .session_delete_thread(&forked.thread_id)
+            .await
+            .expect("session_delete_thread");
+        assert_eq!(
+            deleted_val["result"]["next_active_thread_id"],
+            main.thread_id
+        );
+        assert_eq!(client.list_threads().await.expect("after delete").len(), 1);
 
         server.abort();
     }
