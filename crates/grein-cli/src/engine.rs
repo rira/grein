@@ -978,6 +978,9 @@ fn spawn_session_listener(
                             runtime.emit_tui(TuiEngineEvent::ToolInvoked {
                                 thread_id: thread_id.clone(),
                                 tool_name: tool_name.clone(),
+                                tool_call_id: (!tool_call_id.is_empty())
+                                    .then(|| tool_call_id.clone()),
+                                summary: None,
                             });
                             runtime.emit_tui(TuiEngineEvent::ToolActivityUpdated {
                                 thread_id: thread_id.clone(),
@@ -1046,6 +1049,9 @@ fn spawn_session_listener(
                                     thread_id: thread_id.clone(),
                                     tool_name: resolved_name,
                                     output: resolved_output.clone(),
+                                    tool_call_id: (!tool_call_id.is_empty())
+                                        .then(|| tool_call_id.clone()),
+                                    is_error: is_failed,
                                 });
                                 runtime.emit_tui(TuiEngineEvent::ToolActivityUpdated {
                                     thread_id: thread_id.clone(),

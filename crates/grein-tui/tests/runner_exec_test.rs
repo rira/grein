@@ -510,6 +510,8 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_ignores_bla
         TuiEngineEvent::ToolInvoked {
             thread_id: "t-1".to_string(),
             tool_name: "read".to_string(),
+            tool_call_id: None,
+            summary: None,
         },
     );
     apply_engine_event(
@@ -518,6 +520,8 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_ignores_bla
             thread_id: "t-1".to_string(),
             tool_name: "read".to_string(),
             output: "42 lines".to_string(),
+            tool_call_id: None,
+            is_error: false,
         },
     );
     apply_engine_event(

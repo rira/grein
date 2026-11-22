@@ -815,6 +815,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
         TuiEngineEvent::ToolInvoked {
             thread_id,
             tool_name,
+            ..
         } => {
             app.thread_thoughts.remove(&thread_id);
             app.thread_turn_started_ms
@@ -840,6 +841,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             thread_id,
             tool_name,
             output,
+            ..
         } => {
             app.thread_thoughts.remove(&thread_id);
             app.thread_active_tool.remove(&thread_id);
@@ -1075,6 +1077,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             if mode.is_some() {
                 entry.1 = mode;
             }
+        }
+        TuiEngineEvent::AgentConfigUpdated { .. } | TuiEngineEvent::AgentCommandsUpdated { .. } => {
         }
         TuiEngineEvent::SubagentUpdated {
             thread_id,

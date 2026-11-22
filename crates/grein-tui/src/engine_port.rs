@@ -56,6 +56,45 @@ pub struct SubagentSnapshot {
     pub started_at_ms: u64,
 }
 
+/// Selectable option value inside an ACP session config option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfigChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Configurable ACP session property (such as model, thought_level, or mode).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    pub current_value: String,
+    #[serde(default)]
+    pub options: Vec<AgentConfigChoice>,
+}
+
+/// Agent-advertised slash command or skill exposed by ACP `available_commands_update`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Available ACP config options and commands for a thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentOptionsSnapshot {
+    pub thread_id: String,
+    #[serde(default)]
+    pub config_options: Vec<AgentConfigOption>,
+    #[serde(default)]
+    pub available_commands: Vec<AgentSlashCommand>,
+}
+
 /// Events streamed from the engine to the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuiEngineEvent {
@@ -69,11 +108,19 @@ pub enum TuiEngineEvent {
     ToolInvoked {
         thread_id: String,
         tool_name: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
     },
     ToolResult {
         thread_id: String,
         tool_name: String,
         output: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        is_error: bool,
     },
     PermissionRequested {
         request_id: String,
@@ -110,6 +157,14 @@ pub enum TuiEngineEvent {
         thread_id: String,
         model: Option<String>,
         mode: Option<String>,
+    },
+    AgentConfigUpdated {
+        thread_id: String,
+        config_options: Vec<AgentConfigOption>,
+    },
+    AgentCommandsUpdated {
+        thread_id: String,
+        commands: Vec<AgentSlashCommand>,
     },
     SubagentUpdated {
         thread_id: String,
@@ -199,6 +254,27 @@ pub trait TuiEnginePort: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "rename_thread not supported",
+        ))
+    }
+
+    async fn agent_options(&self, thread_id: &str) -> io::Result<AgentOptionsSnapshot> {
+        Ok(AgentOptionsSnapshot {
+            thread_id: thread_id.to_string(),
+            config_options: Vec::new(),
+            available_commands: Vec::new(),
+        })
+    }
+
+    async fn set_agent_config(
+        &self,
+        _thread_id: &str,
+        _config_id: &str,
+        _value: &str,
+        _set_default: bool,
+    ) -> io::Result<AgentOptionsSnapshot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "set_agent_config not supported",
         ))
     }
 }

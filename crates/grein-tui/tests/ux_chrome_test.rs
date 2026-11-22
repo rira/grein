@@ -648,6 +648,8 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
         TuiEngineEvent::ToolInvoked {
             thread_id: "t-1".to_string(),
             tool_name: "grep_search".to_string(),
+            tool_call_id: None,
+            summary: None,
         },
     );
     draw_frame_mut(&mut terminal, &mut app).unwrap();
@@ -659,6 +661,8 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
             thread_id: "t-1".to_string(),
             tool_name: "grep_search".to_string(),
             output: "ok".to_string(),
+            tool_call_id: None,
+            is_error: false,
         },
     );
     draw_frame_mut(&mut terminal, &mut app).unwrap();
