@@ -1815,6 +1815,8 @@ mod tests {
                 parent_thread_id: None,
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.thread_meta.insert(
@@ -1824,6 +1826,8 @@ mod tests {
                 parent_thread_id: Some("r1".to_string()),
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.thread_meta.insert(
@@ -1833,6 +1837,8 @@ mod tests {
                 parent_thread_id: Some("b1".to_string()),
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.thread_meta.insert(
@@ -1842,6 +1848,8 @@ mod tests {
                 parent_thread_id: Some("r1".to_string()),
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.thread_meta.insert(
@@ -1851,6 +1859,8 @@ mod tests {
                 parent_thread_id: None,
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.thread_meta.insert(
@@ -1860,6 +1870,8 @@ mod tests {
                 parent_thread_id: Some("r2".to_string()),
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.thread_meta.insert(
@@ -1869,6 +1881,8 @@ mod tests {
                 parent_thread_id: None,
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             },
         );
         app.sync_anchors();

@@ -1200,6 +1200,8 @@ impl EngineRuntime {
                 parent_thread_id,
                 inherited_turn_count,
                 merged: thread.merged,
+                kind: thread.kind,
+                cwd: thread.cwd.clone(),
             });
         }
 

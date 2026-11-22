@@ -26,7 +26,7 @@ pub struct HydratedSession {
     pub threads: Vec<HydratedThread>,
 }
 
-/// Structural parent/child metadata for a conversation thread.
+/// Structural parent/child metadata for a conversation or terminal thread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMeta {
     pub thread_id: String,
@@ -34,6 +34,76 @@ pub struct ThreadMeta {
     pub inherited_turn_count: usize,
     #[serde(default)]
     pub merged: bool,
+    #[serde(default)]
+    pub kind: grein_core::ThreadKind,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// Terminal foreground/background color captured from VT100 emulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PtyColor {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// A single rendered cell inside a live embedded PTY screen snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PtyCell {
+    pub contents: String,
+    pub fg: PtyColor,
+    pub bg: PtyColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+    pub is_wide_continuation: bool,
+}
+
+/// Live virtual terminal screen snapshot streamed from an interactive PTY thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PtyScreenSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    pub cells: Vec<Vec<PtyCell>>,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub hide_cursor: bool,
+    pub application_cursor: bool,
+    pub bracketed_paste: bool,
+    pub alternate_screen: bool,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+}
+
+impl PtyScreenSnapshot {
+    /// Extracts clean UTF-8 lines from the visible screen (skipping wide continuations).
+    pub fn plain_text(&self) -> String {
+        let mut lines: Vec<String> = self
+            .cells
+            .iter()
+            .map(|row| {
+                let mut line = String::new();
+                for cell in row {
+                    if cell.is_wide_continuation {
+                        continue;
+                    }
+                    if cell.contents.is_empty() {
+                        line.push(' ');
+                    } else {
+                        line.push_str(&cell.contents);
+                    }
+                }
+                line.trim_end().to_string()
+            })
+            .collect();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
 }
 
 /// Execution lifecycle status of a live subagent.
@@ -185,6 +255,14 @@ pub enum TuiEngineEvent {
         stderr: String,
         exit_code: i32,
     },
+    PtyScreenUpdated {
+        thread_id: String,
+        snapshot: PtyScreenSnapshot,
+    },
+    PtyExited {
+        thread_id: String,
+        exit_code: Option<i32>,
+    },
     Error {
         message: String,
     },
@@ -275,6 +353,50 @@ pub trait TuiEnginePort: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "set_agent_config not supported",
+        ))
+    }
+
+    async fn create_terminal(
+        &self,
+        _parent_thread_id: Option<&str>,
+        _title: Option<&str>,
+        _cwd: Option<&str>,
+        _rows: u16,
+        _cols: u16,
+    ) -> io::Result<HydratedThread> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "create_terminal not supported",
+        ))
+    }
+
+    async fn pty_write(&self, _thread_id: &str, _bytes: Vec<u8>) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pty_write not supported",
+        ))
+    }
+
+    async fn pty_resize(&self, _thread_id: &str, _rows: u16, _cols: u16) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn pty_snapshot(
+        &self,
+        _thread_id: &str,
+        _rows: u16,
+        _cols: u16,
+    ) -> io::Result<PtyScreenSnapshot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pty_snapshot not supported",
+        ))
+    }
+
+    async fn ensure_thread_worktree(&self, _thread_id: &str) -> io::Result<String> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ensure_thread_worktree not supported",
         ))
     }
 }

@@ -1279,6 +1279,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                     parent_thread_id: has_target.then(|| target_thread_id.clone()),
                     inherited_turn_count: 0,
                     merged: true,
+                    kind: grein_core::ThreadKind::Agent,
+                    cwd: None,
                 });
             let source_title = app
                 .threads
@@ -1492,6 +1494,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             app.thread_statuses.insert(thread_id, status);
         }
+        TuiEngineEvent::PtyScreenUpdated { .. } | TuiEngineEvent::PtyExited { .. } => {}
         TuiEngineEvent::Error { message } => {
             let active = app.active_thread_id.clone();
             app.streaming_assistant_threads.remove(&active);
@@ -1598,6 +1601,8 @@ fn dispatch_action(
                             parent_thread_id: Some(source_thread_id),
                             inherited_turn_count: 0,
                             merged: false,
+                            kind: grein_core::ThreadKind::Agent,
+                            cwd: None,
                         };
                         let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
                             TuiEngineEvent::ThreadCreated { thread },

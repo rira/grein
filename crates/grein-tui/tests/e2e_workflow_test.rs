@@ -52,6 +52,8 @@ impl MockLiveEngine {
                 parent_thread_id: None,
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             }],
             active_thread_id: trunk_id.to_string(),
             turn_completed_notify: Arc::new(Notify::new()),
@@ -230,6 +232,8 @@ impl TuiEnginePort for MockLiveEngine {
             parent_thread_id: Some(thread_id.to_string()),
             inherited_turn_count,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         });
         guard.active_thread_id = id.clone();
         Ok(id)
@@ -255,6 +259,8 @@ impl TuiEnginePort for MockLiveEngine {
             parent_thread_id: None,
             inherited_turn_count: 0,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         });
         guard.active_thread_id = id;
         Ok(thread)
@@ -940,18 +946,24 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             parent_thread_id: None,
             inherited_turn_count: 0,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
         ThreadMeta {
             thread_id: "t-child".to_string(),
             parent_thread_id: Some("t-root".to_string()),
             inherited_turn_count: 2,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
         ThreadMeta {
             thread_id: "t-grand".to_string(),
             parent_thread_id: Some("t-child".to_string()),
             inherited_turn_count: 2,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
     ];
     let engine = MockLiveEngine::new_with_session("t-grand", threads, meta);
@@ -1057,6 +1069,8 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
                 parent_thread_id: None,
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             })
             .collect();
         (threads, meta)
@@ -1739,6 +1753,8 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
                 parent_thread_id: None,
                 inherited_turn_count: 0,
                 merged: false,
+                kind: grein_core::ThreadKind::Agent,
+                cwd: None,
             }])
         }
         async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
@@ -2003,30 +2019,40 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             parent_thread_id: None,
             inherited_turn_count: 0,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
         ThreadMeta {
             thread_id: "b1".to_string(),
             parent_thread_id: Some("r1".to_string()),
             inherited_turn_count: 1,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
         ThreadMeta {
             thread_id: "b2".to_string(),
             parent_thread_id: Some("r1".to_string()),
             inherited_turn_count: 1,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
         ThreadMeta {
             thread_id: "r2".to_string(),
             parent_thread_id: None,
             inherited_turn_count: 0,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
         ThreadMeta {
             thread_id: "r3".to_string(),
             parent_thread_id: None,
             inherited_turn_count: 0,
             merged: false,
+            kind: grein_core::ThreadKind::Agent,
+            cwd: None,
         },
     ];
 
