@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::IsTerminal;
 use thiserror::Error;
 
 use crate::engine_port::HydratedBlackboardEntry;
@@ -457,6 +458,9 @@ impl App {
     }
 
     pub fn poll_events(&mut self, timeout: std::time::Duration) -> Result<(), TuiError> {
+        if !std::io::stdin().is_terminal() {
+            return Ok(());
+        }
         if crossterm::event::poll(timeout)? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 self.handle_key_event(key);
