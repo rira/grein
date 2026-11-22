@@ -1,8 +1,9 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -21,7 +22,7 @@ use tokio::sync::mpsc;
 use crate::app::{
     AnchorItem, App, AppAction, FocusedPane, PendingPermission, ThreadItem, TreeAction, TuiError,
 };
-use crate::engine_port::{HydratedSession, TuiEngineEvent, TuiEnginePort};
+use crate::engine_port::{HydratedSession, ThreadMeta, TuiEngineEvent, TuiEnginePort};
 
 const USER_PREFIX: &str = "# User: ";
 const AGENT_HEADER: &str = "## Agent (agy)";
@@ -128,57 +129,135 @@ fn parse_wb_kv(rest: &str) -> Option<(String, String)> {
     }
 }
 
+pub fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn parse_anchors_for_transcript(transcript: &str) -> Vec<AnchorItem> {
-    let parsed = grein_core::anchor::parse_anchors(transcript);
-    let mut anchor_items: Vec<AnchorItem> = parsed
+    grein_core::anchor::parse_anchors(transcript)
         .into_iter()
+        .filter(|a| {
+            let raw = transcript
+                .get(a.byte_range.clone())
+                .map(str::trim)
+                .unwrap_or("");
+            !raw.starts_with(USER_PREFIX) && raw != AGENT_HEADER && raw != ASSISTANT_HEADER
+        })
         .map(|a| AnchorItem {
             id: a.slug,
             label: a.title,
         })
-        .collect();
+        .collect()
+}
 
-    if anchor_items.is_empty() {
-        let turns = collect_turns(transcript);
-        for (idx, (role, content)) in turns.iter().enumerate() {
-            if *role == AuthorRole::User {
-                let label = content.lines().next().unwrap_or("Turn").to_string();
-                anchor_items.push(AnchorItem {
-                    id: format!("anchor-{}", idx + 1),
-                    label,
-                });
+/// Orders threads in parent-child depth-first order along with their nesting depth.
+pub fn compute_ordered_thread_indices(
+    threads: &[ThreadItem],
+    thread_meta: &HashMap<String, ThreadMeta>,
+) -> Vec<(usize, usize)> {
+    let known_ids: HashSet<&str> = threads.iter().map(|t| t.id.as_str()).collect();
+    let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+
+    for (idx, thread) in threads.iter().enumerate() {
+        let parent = thread_meta
+            .get(&thread.id)
+            .and_then(|m| m.parent_thread_id.as_deref());
+        if let Some(pid) = parent {
+            if pid != thread.id && known_ids.contains(pid) {
+                children.entry(pid).or_default().push(idx);
+                continue;
+            }
+        }
+        roots.push(idx);
+    }
+
+    fn visit(
+        idx: usize,
+        depth: usize,
+        threads: &[ThreadItem],
+        children: &HashMap<&str, Vec<usize>>,
+        visited: &mut [bool],
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        if visited[idx] {
+            return;
+        }
+        visited[idx] = true;
+        out.push((idx, depth));
+        if let Some(child_indices) = children.get(threads[idx].id.as_str()) {
+            for &child_idx in child_indices {
+                visit(child_idx, depth + 1, threads, children, visited, out);
             }
         }
     }
-    anchor_items
+
+    let mut visited = vec![false; threads.len()];
+    let mut ordered = Vec::with_capacity(threads.len());
+    for root_idx in roots {
+        visit(
+            root_idx,
+            0,
+            threads,
+            &children,
+            &mut visited,
+            &mut ordered,
+        );
+    }
+    for idx in 0..threads.len() {
+        if !visited[idx] {
+            visit(idx, 0, threads, &children, &mut visited, &mut ordered);
+        }
+    }
+    ordered
 }
 
 fn rebuild_tree_nodes(app: &mut App) {
-    let mut nodes = Vec::new();
-    for thread in &app.threads {
+    let ordered = compute_ordered_thread_indices(&app.threads, &app.thread_meta);
+    let mut nodes = Vec::with_capacity(ordered.len());
+    let mut depths = BTreeMap::new();
+
+    for (idx, depth) in ordered {
+        let thread = &app.threads[idx];
+        depths.insert(thread.id.clone(), depth);
         nodes.push(crate::ui::tree::TreeNode::Thread(
             crate::ui::tree::ThreadNode {
                 id: thread.id.clone(),
                 title: thread.title.clone(),
             },
         ));
-        for anchor in &thread.anchors {
-            nodes.push(crate::ui::tree::TreeNode::Anchor(
-                crate::ui::tree::AnchorNode {
-                    id: anchor.id.clone(),
-                    thread_id: thread.id.clone(),
-                    label: anchor.label.clone(),
-                },
-            ));
-        }
     }
+
+    let prev_selected_id = app
+        .tree
+        .selected_index()
+        .and_then(|idx| app.tree.nodes.get(idx))
+        .and_then(|node| match node {
+            crate::ui::tree::TreeNode::Thread(t) => Some(t.id.clone()),
+            crate::ui::tree::TreeNode::Anchor(a) => Some(a.thread_id.clone()),
+        });
     let prev_selected = app.tree.selected_index();
+    let prev_scroll = app.tree.scroll_offset;
     let prev_active = app.tree.active_anchor_id().map(str::to_string);
     let node_count = nodes.len();
+
     app.tree = crate::ui::tree::TreeState::new(nodes);
-    if let Some(idx) = prev_selected {
-        if node_count > 0 {
-            app.tree.select_index(idx.min(node_count - 1));
+    app.tree.set_depths(depths);
+    app.tree.set_scroll_offset(prev_scroll);
+
+    if node_count > 0 {
+        let restored_idx = prev_selected_id
+            .and_then(|id| {
+                app.tree.nodes.iter().position(|n| {
+                    matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == id)
+                })
+            })
+            .or_else(|| prev_selected.map(|i| i.min(node_count - 1)));
+        if let Some(idx) = restored_idx {
+            app.tree.select_index(idx);
         }
     }
     if let Some(active_id) = prev_active {
@@ -229,6 +308,10 @@ impl App {
                 self.active_transcript_md
                     .push_str(&format!("> $ {command}\n\n"));
                 self.sync_anchors_and_blackboard();
+                self.status_notice = None;
+                self.thread_active_tool.remove(&self.active_thread_id);
+                self.thread_turn_started_ms
+                    .insert(self.active_thread_id.clone(), now_epoch_ms());
                 self.thread_statuses
                     .insert(self.active_thread_id.clone(), "executing".to_string());
                 self.pending_actions.push_back(AppAction::RunShell {
@@ -244,6 +327,26 @@ impl App {
         let rest = parts.next().unwrap_or("").trim();
 
         match head {
+            "/?" | "/help" => {
+                self.show_help_modal = true;
+                return;
+            }
+            "/delete" => {
+                let target_id = if rest.is_empty() {
+                    Some(self.active_thread_id.clone())
+                } else {
+                    self.threads
+                        .iter()
+                        .find(|t| t.id == rest || t.title == rest)
+                        .map(|t| t.id.clone())
+                };
+                if let Some(id) = target_id {
+                    self.request_delete_thread(id);
+                } else {
+                    self.status_notice = Some(format!("Unknown context: {rest}"));
+                }
+                return;
+            }
             "/branch" | "/fork" => {
                 let title = if rest.is_empty() {
                     None
@@ -296,6 +399,10 @@ impl App {
             .push_str(&render_node(&AuthorRole::User, trimmed));
         self.last_submitted_prompt = Some(trimmed.to_string());
         self.sync_anchors_and_blackboard();
+        self.status_notice = None;
+        self.thread_active_tool.remove(&self.active_thread_id);
+        self.thread_turn_started_ms
+            .insert(self.active_thread_id.clone(), now_epoch_ms());
         self.thread_statuses
             .insert(self.active_thread_id.clone(), "streaming".to_string());
         self.pending_actions.push_back(AppAction::SendPrompt {
@@ -585,6 +692,12 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.thread_statuses.clear();
     app.streaming_assistant_threads.clear();
     app.thread_thoughts.clear();
+    app.thread_meta.clear();
+    app.thread_subagents.clear();
+    app.thread_agent_meta.clear();
+    app.thread_active_tool.clear();
+    app.thread_turn_started_ms.clear();
+    app.status_notice = None;
 
     for t in &session.threads {
         let transcript = render_turns_md(&t.turns);
@@ -630,6 +743,9 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
     match event {
         TuiEngineEvent::StreamChunk { thread_id, content } => {
             app.thread_thoughts.remove(&thread_id);
+            app.thread_turn_started_ms
+                .entry(thread_id.clone())
+                .or_insert_with(now_epoch_ms);
             app.thread_statuses
                 .insert(thread_id.clone(), "streaming".to_string());
             let is_first = app.streaming_assistant_threads.insert(thread_id.clone());
@@ -643,6 +759,18 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             });
         }
         TuiEngineEvent::ThoughtChunk { thread_id, content } => {
+            app.thread_turn_started_ms
+                .entry(thread_id.clone())
+                .or_insert_with(now_epoch_ms);
+            let is_executing = app
+                .thread_statuses
+                .get(&thread_id)
+                .map(String::as_str)
+                == Some("executing");
+            if !is_executing {
+                app.thread_statuses
+                    .insert(thread_id.clone(), "thinking".to_string());
+            }
             app.thread_thoughts
                 .entry(thread_id)
                 .or_default()
@@ -652,6 +780,12 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             thread_id,
             tool_name,
         } => {
+            app.thread_thoughts.remove(&thread_id);
+            app.thread_turn_started_ms
+                .entry(thread_id.clone())
+                .or_insert_with(now_epoch_ms);
+            app.thread_active_tool
+                .insert(thread_id.clone(), Some(tool_name.clone()));
             app.thread_statuses
                 .insert(thread_id.clone(), "executing".to_string());
             let is_first = app.streaming_assistant_threads.insert(thread_id.clone());
@@ -671,6 +805,17 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             tool_name,
             output,
         } => {
+            app.thread_thoughts.remove(&thread_id);
+            app.thread_active_tool.remove(&thread_id);
+            if app
+                .thread_statuses
+                .get(&thread_id)
+                .map(String::as_str)
+                == Some("executing")
+            {
+                app.thread_statuses
+                    .insert(thread_id.clone(), "streaming".to_string());
+            }
             let is_first = app.streaming_assistant_threads.insert(thread_id.clone());
             let formatted = format_tool_result(&tool_name, &output);
             with_thread_transcript_mut(app, &thread_id, |buf| {
@@ -683,6 +828,31 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 }
                 buf.push_str(&formatted);
             });
+        }
+        TuiEngineEvent::ToolActivityUpdated {
+            thread_id,
+            tool_name,
+        } => {
+            app.thread_thoughts.remove(&thread_id);
+            if let Some(name) = tool_name {
+                app.thread_turn_started_ms
+                    .entry(thread_id.clone())
+                    .or_insert_with(now_epoch_ms);
+                app.thread_active_tool.insert(thread_id.clone(), Some(name));
+                app.thread_statuses
+                    .insert(thread_id, "executing".to_string());
+            } else {
+                app.thread_active_tool.remove(&thread_id);
+                if app
+                    .thread_statuses
+                    .get(&thread_id)
+                    .map(String::as_str)
+                    == Some("executing")
+                {
+                    app.thread_statuses
+                        .insert(thread_id, "streaming".to_string());
+                }
+            }
         }
         TuiEngineEvent::ShellOutput {
             thread_id,
@@ -707,6 +877,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 ensure_paragraph_break(buf);
                 buf.push_str(&block);
             });
+            app.thread_active_tool.remove(&thread_id);
+            app.thread_turn_started_ms.remove(&thread_id);
             app.thread_statuses.insert(thread_id.clone(), "idle".to_string());
             if thread_id == app.active_thread_id {
                 app.sync_anchors_and_blackboard();
@@ -741,9 +913,104 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
             rebuild_tree_nodes(app);
         }
+        TuiEngineEvent::ThreadMetadataUpdated { meta } => {
+            app.thread_meta.clear();
+            for m in meta {
+                app.thread_meta.insert(m.thread_id.clone(), m);
+            }
+            rebuild_tree_nodes(app);
+        }
+        TuiEngineEvent::ThreadDeleted {
+            thread_id,
+            next_active_thread_id,
+        } => {
+            app.threads.retain(|t| t.id != thread_id);
+            app.thread_transcripts.remove(&thread_id);
+            app.thread_statuses.remove(&thread_id);
+            app.streaming_assistant_threads.remove(&thread_id);
+            app.thread_thoughts.remove(&thread_id);
+            app.thread_viewports.remove(&thread_id);
+            app.thread_drafts.remove(&thread_id);
+            app.thread_meta.remove(&thread_id);
+            app.thread_subagents.remove(&thread_id);
+            app.thread_agent_meta.remove(&thread_id);
+            app.thread_active_tool.remove(&thread_id);
+            app.thread_turn_started_ms.remove(&thread_id);
+            app.status_notice = None;
+
+            if app.active_thread_id == thread_id
+                || !app.threads.iter().any(|t| t.id == app.active_thread_id)
+            {
+                let target = if !next_active_thread_id.is_empty()
+                    && app.threads.iter().any(|t| t.id == next_active_thread_id)
+                {
+                    next_active_thread_id
+                } else {
+                    app.threads
+                        .first()
+                        .map(|t| t.id.clone())
+                        .unwrap_or_default()
+                };
+                app.active_thread_id = target;
+                app.input_buffer = app
+                    .thread_drafts
+                    .get(&app.active_thread_id)
+                    .cloned()
+                    .unwrap_or_default();
+                app.cursor_position = app.input_buffer.len();
+                app.active_transcript_md = app
+                    .thread_transcripts
+                    .get(&app.active_thread_id)
+                    .cloned()
+                    .unwrap_or_default();
+                app.thread_viewports
+                    .entry(app.active_thread_id.clone())
+                    .or_default();
+            }
+
+            rebuild_tree_nodes(app);
+            app.select_active_thread_in_tree();
+        }
+        TuiEngineEvent::AgentMetaUpdated {
+            thread_id,
+            model,
+            mode,
+        } => {
+            let entry = app.thread_agent_meta.entry(thread_id).or_default();
+            if model.is_some() {
+                entry.0 = model;
+            }
+            if mode.is_some() {
+                entry.1 = mode;
+            }
+        }
+        TuiEngineEvent::SubagentUpdated {
+            thread_id,
+            subagent,
+        } => {
+            let list = app.thread_subagents.entry(thread_id).or_default();
+            if let Some(existing) = list.iter_mut().find(|s| s.id == subagent.id) {
+                *existing = subagent;
+            } else {
+                list.push(subagent);
+            }
+        }
+        TuiEngineEvent::SubagentRemoved {
+            thread_id,
+            subagent_id,
+        } => {
+            if let Some(list) = app.thread_subagents.get_mut(&thread_id) {
+                list.retain(|s| s.id != subagent_id);
+                if list.is_empty() {
+                    app.thread_subagents.remove(&thread_id);
+                }
+            }
+        }
         TuiEngineEvent::TurnCompleted { thread_id } => {
             app.streaming_assistant_threads.remove(&thread_id);
             app.thread_thoughts.remove(&thread_id);
+            app.thread_active_tool.remove(&thread_id);
+            app.thread_turn_started_ms.remove(&thread_id);
             app.thread_statuses
                 .insert(thread_id.clone(), "idle".to_string());
             with_thread_transcript_mut(app, &thread_id, ensure_paragraph_break);
@@ -771,6 +1038,15 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             });
         }
         TuiEngineEvent::ThreadStatusChanged { thread_id, status } => {
+            if matches!(status.as_str(), "idle" | "error") {
+                app.thread_active_tool.remove(&thread_id);
+                app.thread_turn_started_ms.remove(&thread_id);
+                app.thread_thoughts.remove(&thread_id);
+            } else if matches!(status.as_str(), "streaming" | "executing" | "thinking") {
+                app.thread_turn_started_ms
+                    .entry(thread_id.clone())
+                    .or_insert_with(now_epoch_ms);
+            }
             app.thread_statuses.insert(thread_id, status);
         }
         TuiEngineEvent::BlackboardUpdated { key, value } => {
@@ -783,6 +1059,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             let active = app.active_thread_id.clone();
             app.streaming_assistant_threads.remove(&active);
             app.thread_thoughts.remove(&active);
+            app.thread_active_tool.remove(&active);
+            app.thread_turn_started_ms.remove(&active);
             app.thread_statuses
                 .insert(active.clone(), "error".to_string());
             with_thread_transcript_mut(app, &active, |buf| {
@@ -823,9 +1101,34 @@ fn dispatch_action(
                 match engine.fork_branch(&source_thread_id, title.as_deref()).await {
                     Ok(thread) => {
                         let _ = local_ev_tx.send(TuiEngineEvent::ThreadCreated { thread });
+                        if let Ok(meta) = engine.thread_metadata().await {
+                            if !meta.is_empty() {
+                                let _ = local_ev_tx
+                                    .send(TuiEngineEvent::ThreadMetadataUpdated { meta });
+                            }
+                        }
                     }
                     Err(err) => {
                         let _ = err_tx.send((Some(source_thread_id), err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::DeleteThread(thread_id) => {
+            tokio::spawn(async move {
+                match engine.delete_thread(&thread_id).await {
+                    Ok(next_active_thread_id) => {
+                        let _ = local_ev_tx.send(TuiEngineEvent::ThreadDeleted {
+                            thread_id,
+                            next_active_thread_id,
+                        });
+                        if let Ok(meta) = engine.thread_metadata().await {
+                            let _ = local_ev_tx
+                                .send(TuiEngineEvent::ThreadMetadataUpdated { meta });
+                        }
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((Some(thread_id), err));
                     }
                 }
             });
@@ -919,6 +1222,11 @@ pub async fn run_with_engine_events<B: Backend>(
 ) -> io::Result<()> {
     let session = engine.hydrate_session().await?;
     apply_hydrated_session(&mut app, &session);
+    if let Ok(meta) = engine.thread_metadata().await {
+        if !meta.is_empty() {
+            apply_engine_event(&mut app, TuiEngineEvent::ThreadMetadataUpdated { meta });
+        }
+    }
     let mut engine_events = engine.subscribe_events().await?;
 
     let (local_ev_tx, mut local_ev_rx) = mpsc::unbounded_channel::<TuiEngineEvent>();
@@ -956,6 +1264,8 @@ pub async fn run_with_engine_events<B: Backend>(
                 let target_thread = thread_id_opt.unwrap_or_else(|| app.active_thread_id.clone());
                 app.streaming_assistant_threads.remove(&target_thread);
                 app.thread_thoughts.remove(&target_thread);
+                app.thread_active_tool.remove(&target_thread);
+                app.thread_turn_started_ms.remove(&target_thread);
                 app.thread_statuses
                     .insert(target_thread.clone(), "error".to_string());
                 with_thread_transcript_mut(&mut app, &target_thread, |buf| {
@@ -966,7 +1276,9 @@ pub async fn run_with_engine_events<B: Backend>(
                     app.sync_anchors_and_blackboard();
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                app.tick_count = app.tick_count.wrapping_add(1);
+            }
         }
     }
 

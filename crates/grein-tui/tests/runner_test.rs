@@ -214,7 +214,7 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
     // Tree pane assertions
     assert!(
         screen.contains("Tree") && screen.contains("Verify [4-pane] slice"),
-        "Tree pane must render thread title and anchors"
+        "Tree pane must render thread context title"
     );
     // Transcript pane assertions
     assert!(
@@ -231,7 +231,7 @@ fn test_golden_e2e_four_pane_integration_and_multiline_sqlite() {
         screen.contains("Composer")
             && screen.contains("Draft line 1")
             && screen.contains("Draft line 2")
-            && screen.contains("Enter: Send"),
-        "Composer pane must auto-grow for multi-line draft and display keybinding status bar"
+            && (screen.contains("? for help") || screen.contains("esc to cancel")),
+        "Composer pane must auto-grow for multi-line draft and render bottom status bar"
     );
 }

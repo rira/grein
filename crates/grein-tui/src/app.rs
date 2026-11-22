@@ -1,9 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::IsTerminal;
 use thiserror::Error;
 
-use crate::engine_port::HydratedBlackboardEntry;
+use crate::engine_port::{HydratedBlackboardEntry, SubagentSnapshot, ThreadMeta};
 use crate::transcript::TranscriptViewport;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -55,6 +55,7 @@ pub enum AppAction {
         source_thread_id: String,
         title: Option<String>,
     },
+    DeleteThread(String),
     UpsertBlackboard {
         key: String,
         value: String,
@@ -206,6 +207,14 @@ pub struct App {
     pub pending_permissions: VecDeque<PendingPermission>,
     pub pending_actions: VecDeque<AppAction>,
     pub config: AppConfig,
+    pub thread_meta: HashMap<String, ThreadMeta>,
+    pub thread_subagents: HashMap<String, Vec<SubagentSnapshot>>,
+    pub thread_agent_meta: HashMap<String, (Option<String>, Option<String>)>,
+    pub thread_active_tool: HashMap<String, Option<String>>,
+    pub thread_turn_started_ms: HashMap<String, u64>,
+    pub tick_count: u64,
+    pub show_help_modal: bool,
+    pub status_notice: Option<String>,
 }
 
 pub type AppState = App;
@@ -239,6 +248,14 @@ impl Default for App {
             pending_permissions: VecDeque::new(),
             pending_actions: VecDeque::new(),
             config: AppConfig::default(),
+            thread_meta: HashMap::new(),
+            thread_subagents: HashMap::new(),
+            thread_agent_meta: HashMap::new(),
+            thread_active_tool: HashMap::new(),
+            thread_turn_started_ms: HashMap::new(),
+            tick_count: 0,
+            show_help_modal: false,
+            status_notice: None,
         }
     }
 }
@@ -293,6 +310,17 @@ impl App {
         }) {
             self.tree.select_index(idx);
         }
+    }
+
+    /// Queues thread deletion or records a status notice when only a single context remains.
+    pub fn request_delete_thread(&mut self, thread_id: impl Into<String>) {
+        if self.threads.len() <= 1 {
+            self.status_notice = Some("Cannot delete the only context".to_string());
+            return;
+        }
+        self.status_notice = None;
+        self.pending_actions
+            .push_back(AppAction::DeleteThread(thread_id.into()));
     }
 
     pub fn sync_blackboard_notes(&mut self) {
@@ -559,7 +587,10 @@ impl App {
     pub fn handle_event(&mut self, event: AppEvent) -> bool {
         match event {
             AppEvent::Key(k) => self.handle_key_event(k),
-            AppEvent::Tick => false,
+            AppEvent::Tick => {
+                self.tick_count = self.tick_count.wrapping_add(1);
+                false
+            }
             AppEvent::Quit => {
                 self.should_quit = true;
                 true
@@ -581,6 +612,10 @@ impl App {
             return None;
         }
 
+        let no_ctrl_alt = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 if !self.tree.nodes.is_empty() {
@@ -598,6 +633,19 @@ impl App {
                         self.tree.select_index(curr - 1);
                     }
                 }
+                None
+            }
+            KeyCode::Char('d') if no_ctrl_alt => {
+                let target_id = self
+                    .tree
+                    .selected_index()
+                    .and_then(|idx| self.tree.nodes.get(idx))
+                    .and_then(|node| match node {
+                        crate::ui::tree::TreeNode::Thread(t) => Some(t.id.clone()),
+                        crate::ui::tree::TreeNode::Anchor(a) => Some(a.thread_id.clone()),
+                    })
+                    .unwrap_or_else(|| self.active_thread_id.clone());
+                self.request_delete_thread(target_id);
                 None
             }
             KeyCode::Enter => {
@@ -713,6 +761,34 @@ impl App {
             return true;
         }
 
+        if self.show_help_modal {
+            let no_ctrl_alt = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.show_help_modal = false;
+                }
+                KeyCode::Char('q') | KeyCode::Char('?') if no_ctrl_alt => {
+                    self.show_help_modal = false;
+                }
+                _ => {}
+            }
+            self.sync_focus_out();
+            return true;
+        }
+
+        if key.code == KeyCode::Char('?')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && (self.focused_pane != FocusedPane::Composer || self.input_buffer.is_empty())
+        {
+            self.show_help_modal = true;
+            self.sync_focus_out();
+            return true;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('b') | KeyCode::Char('B') => {
@@ -758,7 +834,7 @@ impl App {
                     .get(&self.active_thread_id)
                     .map(String::as_str)
                     .unwrap_or("idle");
-                if matches!(status, "streaming" | "executing") {
+                if matches!(status, "streaming" | "executing" | "thinking") {
                     self.pending_actions.push_back(AppAction::CancelTurn {
                         thread_id: self.active_thread_id.clone(),
                     });

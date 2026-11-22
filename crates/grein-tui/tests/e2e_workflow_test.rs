@@ -473,8 +473,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     // 7b. Tree Esc + Up + Enter switches back to Trunk, submits turn, then switches back to bugfix.
-    // AnchorParser indexes both "# User: ..." and "## Assistant" headings as anchors:
-    // t-trunk (0) + 4 anchors (1..=4) + t-branch-1 (5) + t-branch-2 (6).
+    // Context-only Tree lists only thread branches: t-trunk (0), t-branch-1 (1), t-branch-2 (2).
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     for _ in 0..6 {
         send_key(&key_tx, KeyCode::Up, KeyModifiers::NONE);
@@ -495,7 +494,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // t-trunk now has 6 anchors (1..=6), t-branch-1 is at 7, t-branch-2 is at 8.
+    // Move Down back to t-branch-2 (index 2).
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     for _ in 0..8 {
         send_key(&key_tx, KeyCode::Down, KeyModifiers::NONE);

@@ -18,14 +18,15 @@ fn test_composer_enter_updates_transcript_anchors_blackboard_and_sqlite() {
         .active_transcript_md
         .contains("# User: Inspect DAG anchors"));
     assert_eq!(app.threads.len(), 1);
-    assert!(!app.threads[0].anchors.is_empty());
-    assert!(!app.tree.nodes.is_empty());
+    assert!(app.threads[0].anchors.is_empty());
+    assert_eq!(app.tree.nodes.len(), 1);
     app.upsert_blackboard_entry("goal", "inspect");
     assert!(app.blackboard_notes.contains("goal: inspect"));
 
     app.apply_agent_response("### Verification Plan\n- Checked SQLite persistence");
     assert!(app.active_transcript_md.contains("## Agent (agy)"));
-    assert!(app.threads[0].anchors.len() >= 2);
+    assert_eq!(app.threads[0].anchors.len(), 1);
+    assert_eq!(app.tree.nodes.len(), 1);
     assert!(app.blackboard_notes.contains("goal: inspect"));
 }
 
@@ -47,7 +48,7 @@ fn test_sqlite_persistence_roundtrip() {
     assert!(loaded_app
         .active_transcript_md
         .contains("# User: Verify persistence roundtrip"));
-    assert!(!loaded_app.threads[0].anchors.is_empty());
+    assert!(loaded_app.threads[0].anchors.is_empty());
 
     let _ = std::fs::remove_file(&temp_db);
 }

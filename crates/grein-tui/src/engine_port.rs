@@ -34,6 +34,34 @@ pub struct HydratedSession {
     pub blackboard: Vec<HydratedBlackboardEntry>,
 }
 
+/// Structural parent/child metadata for a conversation thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadMeta {
+    pub thread_id: String,
+    pub parent_thread_id: Option<String>,
+    pub inherited_turn_count: usize,
+}
+
+/// Execution lifecycle status of a live subagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Point-in-time snapshot of a subagent running under a thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSnapshot {
+    pub id: String,
+    pub role: String,
+    pub agent_type: String,
+    pub model: Option<String>,
+    pub activity: Option<String>,
+    pub status: SubagentStatus,
+    pub started_at_ms: u64,
+}
+
 /// Events streamed from the engine to the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TuiEngineEvent {
@@ -78,6 +106,30 @@ pub enum TuiEngineEvent {
     ThreadTitleUpdated {
         thread_id: String,
         title: String,
+    },
+    ThreadMetadataUpdated {
+        meta: Vec<ThreadMeta>,
+    },
+    ThreadDeleted {
+        thread_id: String,
+        next_active_thread_id: String,
+    },
+    AgentMetaUpdated {
+        thread_id: String,
+        model: Option<String>,
+        mode: Option<String>,
+    },
+    SubagentUpdated {
+        thread_id: String,
+        subagent: SubagentSnapshot,
+    },
+    SubagentRemoved {
+        thread_id: String,
+        subagent_id: String,
+    },
+    ToolActivityUpdated {
+        thread_id: String,
+        tool_name: Option<String>,
     },
     ShellOutput {
         thread_id: String,
@@ -133,5 +185,13 @@ pub trait TuiEnginePort: Send + Sync {
 
     async fn run_shell_command(&self, _thread_id: &str, _command: &str) -> io::Result<()> {
         Ok(())
+    }
+
+    async fn delete_thread(&self, _thread_id: &str) -> Result<String, String> {
+        Err("delete_thread not supported".to_string())
+    }
+
+    async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, String> {
+        Ok(Vec::new())
     }
 }
