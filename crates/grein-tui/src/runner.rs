@@ -33,7 +33,7 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
-        if io::stdout().is_terminal() {
+        if io::stdout().is_terminal() && io::stdin().is_terminal() {
             enable_raw_mode()?;
             execute!(io::stdout(), EnterAlternateScreen)?;
             Ok(Self { active: true })
