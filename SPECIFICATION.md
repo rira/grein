@@ -11,59 +11,58 @@ Modern agentic coding workflows present a severe friction point:
 * **Synchronous Human Blocking:** Developers are blocked from drafting thoughts or exploring alternate sub-tasks while an agent executes long-running tools or streams responses.
 
 ### 1.2 The Solution
-A dedicated **Agentic TUI Manager** built around a **Directed Acyclic Graph (DAG) Context Tree** paired with a **Two-Tier Client-Daemon RPC Architecture**.
-* Conversations fork cleanly off structural anchors (such as markdown headings `#### 1. ...`).
-* Threads share root context and global working memory without interleaving orthogonal discussion turns.
-* Non-blocking TUI interface allows switching between threads, typing drafts, and reviewing background tool executions simultaneously.
+A dedicated **Agentic TUI Manager** built around a **Pure-Tree Directed Acyclic Graph (DAG) Context Model** paired with a **Two-Tier Client-Daemon RPC Architecture**.
+* Conversations fork cleanly off structural anchors or active turns (`parent_thread_id` lineage), or start as blank independent roots (`/root`, `/new`).
+* Child branches inherit their ancestor trunk up to the fork point without interleaving sibling turns, while separate roots remain completely isolated until manually joined onto a parent via `/join` / `/merge`.
+* Non-blocking 2-column TUI allows browsing branches with live transcript previews, scrolling globally, drafting per-context prompts, and reviewing background tool/subagent executions simultaneously.
 
 ---
 
 ## 2. Core Architectural Pillars
 
 ### 2.1 Pillar I: The Conversation DAG Engine
-Conversations are not lists; they are trees of immutable turn nodes.
+Conversations are not flat lists or globally shared scratchpads; they form a Git-like forest of trees of immutable turn nodes.
 
 ```
-                  [Root Node: Project System Prompt]
-                                  │
-                  [Turn 1: Baseline Architecture]
-                                  │
-          [Turn 2 (Assistant): 3-Part Architecture Proposal]
-             ├── Anchor [1]: Database Schema & Storage
-             ├── Anchor [2]: Ingress Routing & DTOs
-             └── Anchor [3]: Frontend Rune Binding
-                                  │
-            ┌─────────────────────┼─────────────────────┐
-            ▼                     ▼                     ▼
-     [Thread Branch 1]     [Thread Branch 2]     [Thread Branch 3]
-     Target: Anchor [1]    Target: Anchor [2]    Target: Anchor [3]
-     Turns: 1A, 1B, 1C     Turns: 2A, 2B         Turns: 3A
-            │                     │
-            └──────────┬──────────┘
-                       ▼
-            [Thread Convergence / Merge]
-   (Concise synthesized decision committed back to Trunk)
+   [Root 1 (`ᛉ`): Project Architecture]            [Root 2 (`ᛉ`): Blank Independent Root]
+                    │                                                 │
+        [Turn 1..N: Baseline Analysis]                       [Isolated Turns...]
+          ├── Anchor [1]: Database Schema
+          └── Anchor [2]: Ingress Routing
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+  [Branch A]              [Branch B]         (explicit `parent_thread_id` = Root 1)
+  (DB Schema)             (Ingress Routing)
+        │                       │
+        │ /join (`m`)           │ (sibling turns remain strictly isolated)
+        ▼
+  [DecisionLandmark] committed directly onto Root 1's active leaf
+  (delivered append-only as `[Joined Context]` if Root 1 has a live ACP session)
 ```
 
-#### Node Structure
-Each message node represents an immutable conversational event:
-* `node_id`: UUIDv7 (time-sortable).
-* `parent_id`: `Option<UUID>` pointing to the fork or preceding turn.
-* `role`: `User`, `Assistant`, `System`, or `ToolResult`.
-* `content`: Full textual content.
-* `anchors`: Extracted semantic anchors (heading level, title, slug, range).
-* `metadata`: Token metrics, generation latency, tool invocation IDs.
+#### Node & Lineage Structure
+Each message node represents an immutable conversational event (`ConversationNode`):
+* `id` (`NodeId`): UUIDv7 (time-sortable).
+* `parent_id`: `Option<NodeId>` pointing to the preceding turn or fork point.
+* `role` (`AuthorRole`): `User`, `Assistant`, `System`, or `ToolResult`.
+* `content`: Full textual content (including `DecisionLandmark` commits).
+
+Each branch head (`Thread`) tracks explicit tree lineage and lifecycle state:
+* `id` (`ThreadId`), `parent_node_id` (`NodeId`), `active_leaf_id` (`NodeId`), `anchor_id` (`AnchorId`).
+* `parent_thread_id`: `Option<ThreadId>` (`None` for top-level roots; explicit parent thread ID for forked child branches).
+* `title`, `status` (`ThreadStatus`), `acp_session_id` (`Option<String>`), `merged` (`bool`, rendered as `[joined]` when committed back to parent).
 
 #### Anchor Extraction & Filtering Algorithm
 To provide rapid branching without cluttering the interface with trivial step-by-step checklists, the parser applies structural heuristics:
 1. **Markdown Headings:** All `#`, `##`, `###`, `####` elements are automatically registered as Primary Anchors.
 2. **Titled Numbered Lists:** Numbered items matching `^([0-9]+)\.\s+(\*\*[^*]+\*\*|[^:\n]+:|^[\n]{20,})` are registered as Secondary Anchors (e.g. `1. **Database Schema**:` or `1. API Gateway Routing:`). Trivial short items (e.g. `1. Run tests`, `2. Commit code`) are filtered out to prevent anchor spam.
-3. **Manual Selection Forking (`Ctrl+N`):** Users can highlight any block of text or select any turn in the transcript and press `Ctrl+N` to manually fork a thread from that exact anchor.
+3. **Manual Branch Forking & Blank Roots:** Users can fork a child branch from the active context via `Ctrl+N`, `/fork`, `/branch`, or `/grein`, or create a blank independent root context (`parent_thread_id = None`) via `Alt+N`, `/root`, `/new`, or `n` in `ᛇ Grein`.
 
 #### Branch Context Resolution
 When a prompt is dispatched for Thread $K$ branching from Anchor $A$ at Turn $N$:
 $$\text{Context Payload} = \text{RootSystemPrompt} + \text{TrunkPath}(Root \to N) + \text{AnchorHeader}(A) + \text{BranchTurns}(N \to K)$$
-Turns present in Thread Branch 2 or 3 are excluded from Thread Branch 1's prompt. Context remains focused, bounded, and free of cross-talk.
+Turns present on sibling branches or separate top-level roots are strictly excluded from Thread $K$'s prompt, and no global Blackboard scratchpad is injected. Context remains focused, bounded, and KV-cache-friendly.
 
 ---
 
@@ -74,19 +73,19 @@ To ensure long-term stability and clean separation of concerns, the system split
 ┌─────────────────────────────────────────────────────────────┐
 │                 Tier 1: TUI Client (Ratatui)                │
 │  - Non-blocking input loop & event multiplexer              │
-│  - Thread tree & anchor navigation pane                     │
-│  - Streaming markdown & tool log renderer                   │
-│  - Draft persistence per thread                             │
+│  - `ᛇ Grein` context tree sidebar & live Transcript preview │
+│  - Full-width Markdown, GFM table & ANSI PTY log renderer   │
+│  - Per-context draft persistence & global scroll viewports  │
 └──────────────────────────────▲──────────────────────────────┘
                                │
                IPC over Local Unix Domain Socket
-               (Bidirectional JSON-RPC 2.0 / SSE)
+               (Newline-delimited JSON-RPC 2.0 + event stream)
                                │
 ┌──────────────────────────────▼──────────────────────────────┐
 │                  Tier 2: Agent Engine Daemon                │
-│  - Context DAG persistence (SQLite/Redb)                    │
-│  - LLM API gateway & token budget tracker                   │
-│  - Model Context Protocol (MCP) tool host                   │
+│  - Context DAG persistence (SQLite via rusqlite)            │
+│  - ACP stdio / LLM gateway & prompt context compiler        │
+│  - PTY command execution & subagent watcher                 │
 │  - Workspace isolation & worktree lease manager             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -95,10 +94,14 @@ To ensure long-term stability and clean separation of concerns, the system split
 * **Non-Blocking UI:** The TUI client never calls LLMs, executes bash processes, or writes directly to disk. It is a pure terminal presentation and input client.
 * **Resilience:** If the TUI process closes, crashes, or is detached, the daemon continues running agent streams, tool calls, and background jobs. Re-opening the TUI reconnects and re-hydrates state instantly.
 * **Standardized RPC Methods:**
-  * `session.fork_thread(parent_node_id, anchor_id)` $\to$ `thread_id`
-  * `session.send_turn(thread_id, content)` $\to$ `turn_id`
-  * `session.merge_thread(thread_id, target_node_id, strategy)` $\to$ `merged_node_id`
-  * `events`: `StreamChunk`, `ToolInvoked`, `ToolResult`, `AnchorDiscovered`, `WorktreePromoted`.
+  * `session.create_root_thread(title?)` $\to$ `ThreadSummary`
+  * `session.fork_thread(source_thread_id | parent_node_id, title?)` $\to$ `ThreadSummary`
+  * `session.rename_thread(thread_id, title)` $\to$ `ThreadSummary`
+  * `session.send_turn` / `session.send_thread_turn(thread_id, prompt)` $\to$ `TurnDispatchResult`
+  * `session.merge_thread(thread_id, target_thread_id?, summary?)` $\to$ `ThreadSummary`
+  * `session.delete_thread(thread_id)` $\to$ `next_active_thread_id`
+  * `session.cancel(thread_id)`, `session.shell(thread_id, command)`, `permissions.resolve`
+  * `events`: `StreamChunk`, `ThoughtChunk`, `ToolInvoked`, `ToolResult`, `ToolActivityUpdated`, `ShellOutput`, `PermissionRequested`, `ThreadCreated`, `ThreadTitleUpdated`, `ThreadMerged`, `ThreadMetadataUpdated`, `ThreadDeleted`, `ThreadStatusChanged`, `AgentMetaUpdated`, `SubagentUpdated`, `SubagentRemoved`, `Error`.
 
 ---
 
@@ -111,7 +114,7 @@ When file mutations occur (`write_file`, `edit_file`, build commands), the daemo
 | Workspace Mode | Detection Condition | Read Operations | Mutating Operations | Teardown / Merge Mechanism |
 | :--- | :--- | :--- | :--- | :--- |
 | **Mode 1: Git-Backed Worktree** | `.git` root detected in current or parent directory | Primary repository checkout | Dynamic `git worktree` (`.grein/worktrees/thread-<id>`) | Clean: auto-prune. Dirty: prompt `[Keep/Discard/Merge]`. Merges via Git cherry-pick. |
-| **Mode 2: Standalone / Non-Git** | No `.git` found, or `git` binary absent from `$PATH` | Primary working directory | **Snapshot Shadowing:** Hardlink/reflink copy into `.grein/shadow/thread-<id>/` | Interactive diff review via pure-Rust `similar` crate; copy back to root on merge. |
+| **Mode 2: Standalone / Non-Git** | No `.git` found, or `git` binary absent from `$PATH` | Primary working directory | **Snapshot Shadowing:** Hardlink/reflink copy into `.grein/shadow/thread-<id>/` | Interactive diff review via embedded pure-Rust line diff engine; copy back to root on merge. |
 
 #### Mode 1: Git Worktree Workflow (When in a Git Repo)
 1. Thread starts in shared inspection mode against the primary checkout.
@@ -124,37 +127,33 @@ When file mutations occur (`write_file`, `edit_file`, build commands), the daemo
 #### Mode 2: Standalone Snapshot Workflow (When outside Git)
 1. Thread reads live files in current directory.
 2. On first write tool call, daemon clones modified target files or subtrees into an ephemeral shadow directory using filesystem hardlinks (`cp -al` on Linux / APFS clonefile on macOS) to avoid storage duplication.
-3. Changes are compared against primary files using an embedded pure-Rust diff engine (`similar` crate).
+3. Changes are compared against primary files using an embedded pure-Rust line diff engine.
 4. Merging writes the approved shadow files back to the primary directory.
 
 ---
 
-### 2.4 Pillar IV: Shared Context & Memory (The Blackboard)
-While threads diverge in conversational turns, they often need to share critical facts (e.g., agreed port numbers, database schema decisions, architectural constraints).
+### 2.4 Pillar IV: Pure-Tree Lineage, Multi-Root Isolation & Manual Join
+Rather than mutating a global shared Blackboard across unrelated tasks, **grein** enforces strict Git-like tree boundaries so prompt prefixes remain stable and free of cross-branch contamination:
 
-1. **Shared Trunk Baseline:** All threads automatically inherit all turns up to the branch point.
-2. **Global Working Memory (The Blackboard):**
-   * A bounded markdown scratchpad managed by the daemon.
-   * Automatically injected into the system prompt across all active threads.
-   * Contains:
-     * Active architectural decisions.
-     * Established domain models and invariants.
-     * Modified file registry across threads.
-3. **On-Demand Thread Knowledge Import (`Ctrl+R` / `/import <thread>`):**
-   * When working in Thread 2, the user can import conclusions from Thread 1 by typing `/import 1` or pressing `Ctrl+R`.
-   * The daemon prompts the agent to synthesize an atomic decision turn from Thread 1:
-     `[Context Import from Thread 1 (DB Schema): Finalized user table with columns id, email, created_at]`.
-   * This turn is inserted into Thread 2's transcript, immediately informing Thread 2 without merging the entire conversation.
-4. **Thread Merge & Synthesis:**
-   * When a sub-topic concludes (e.g. `#### 1. Database Schema` is resolved), the user triggers `Merge to Trunk`.
-   * The model synthesizes an atomic 2–3 line summary of the conclusion.
-   * This summary is appended to the Trunk as a permanent landmark visible to all subsequent branches.
+1. **Explicit `parent_thread_id` Lineage & Sibling Isolation:**
+   * Every forked branch records an explicit `parent_thread_id` alongside its `parent_node_id` fork anchor.
+   * Branches inherit ancestor turns along `Root -> parent_node_id`, while sibling branches remain completely invisible to one another during context compilation.
+   * Global Blackboard working memory is not injected into prompts, avoiding prompt prefix invalidation and cross-talk.
+2. **Independent Blank Roots & In-Place Renaming:**
+   * Create a blank top-level root (`parent_thread_id = None`) at any time via `/root [title]`, `/new [title]`, `Alt+N`, or `n` in `ᛇ Grein`. Each root starts a fresh DAG tree with zero shared context from other roots.
+   * Rename the active or selected context via `/rename <title>`, `Alt+R`, `F2`, or `r` in `ᛇ Grein`.
+3. **Manual Branch Join (`/join`, `/merge`, `m` in `ᛇ Grein`):**
+   * When a branch finishes an investigation or sub-task, the user manually joins it into its parent branch (resolved via `parent_thread_id`, or an explicit target) using `/join [summary]`, `/merge [summary]`, or `m` on the selected branch in `ᛇ Grein`.
+   * The engine commits a synthesized `DecisionLandmark` node (`AuthorRole::System`, `[Decision Landmark (Thread <id> - <topic>)]:\n<summary>`) directly onto the parent branch's `active_leaf_id` and marks the child `merged = true` (`[joined]` badge in `ᛇ Grein`).
+   * **KV-Cache-Preserving Append-Only Delivery:** If the parent branch already holds a live ACP session, the joined summary is delivered on the parent's next turn as an append-only `[Joined Context]` note rather than rewriting the system prompt or restarting the session—preserving LLM KV caches while isolating sibling branches and independent roots.
+4. **Branch Closing & Reparenting (`/close`, `/delete`, `d` / `x` in `ᛇ Grein`):**
+   * Deleting a context (permitted whenever more than one context exists) removes it cleanly and reparents any nested children to the deleted branch's `parent_thread_id` (or promotes them to top-level roots if none).
 
 ---
 
 ### 2.5 Pillar V: Pluggable Agent Driver SPI & Agent-Agnostic Core
 
-The system is strictly **agent-agnostic**: it has **zero default agent or vendor preference**. 
+The system is strictly **agent-agnostic**: it has **zero default agent or vendor preference**.
 
 A critical reality of modern developer tooling is that CLI agents (such as Google Antigravity `agy`, Anthropic `claude`, or OpenAI ACP agents) do not provide or require raw API keys. Instead, they authenticate via **enterprise SSO, Google Workspace login, or web OAuth**, storing credentials in local session caches (`~/.gemini/`, `~/.claude/`, system keychains).
 
@@ -189,7 +188,7 @@ To support any installed agent CLI while allowing direct API connections, the da
   # Configured command to spawn the ACP stdio server
   command = ["agy", "acp", "--stdio"]
   protocol = "acp"
-  
+
   # Or alternatively for other agents:
   # command = ["claude", "--acp"]
   # command = ["ollama", "run", "llama3"]
@@ -212,17 +211,18 @@ To support any installed agent CLI while allowing direct API connections, the da
 To prevent rogue commands while eliminating prompt fatigue during multi-step tasks, the daemon integrates a two-stage security policy engine:
 
 #### 1. Interactive TUI Permission Prompt
-When an agent invokes a tool (e.g., executing a bash command or writing a file) that is not pre-authorized by policy, the active thread transcript halts tool execution and displays an inline permission card:
+When an agent invokes a tool (e.g., executing a bash command or writing a file) that is not pre-authorized by policy, the TUI queues a centered permission modal while preserving background typing immunity:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ ⚠️  Tool Execution Request: run_command                                │
-│ Command: cargo test --lib                                              │
-│ Working Directory: .grein/worktrees/thread-8f2a/ (Isolated)            │
-├────────────────────────────────────────────────────────────────────────┤
-│ [a] Allow Once   [d] Deny   [t] Always for Thread   [s] Always Session │
+│ Permission Required                                                    │
+│                                                                        │
+│ Run cargo test --lib in .grein/worktrees/thread-8f2a/                  │
+│                                                                        │
+│ [y] Allow  [n] Deny                                                    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+(`y`, `Y`, or `Enter` approves; `n`, `N`, or `Esc` denies.)
 
 #### 2. Declarative Allowlist Policy Files
 The policy engine evaluates security rules hierarchically from two files:
@@ -267,120 +267,159 @@ When parallel threads are active (e.g., Thread 1 running an agent query while th
 
 #### 2. Strict Focus Non-Stealing Invariant
 A notorious flaw in terminal multiplexers and IDEs is popups stealing focus while the user is actively typing.
-* **Typing Immunity:** When the user is composing text in the input box, incoming stream completions, finished tool runs, or permission requests **never steal keyboard focus**.
-* **Non-Intrusive Indicators:** Alerts and permission requests display as badge counters or unread indicators on the thread tab. They only become interactive when the user presses `Esc` or cycles focus to the transcript.
+* **Typing Immunity:** When the user is composing text in `Composer`, incoming stream completions, finished tool runs, or background thread updates **never steal keyboard focus**.
+* **Non-Intrusive Indicators:** Thread activity and permission alerts surface as status glyphs (`●`, `⚠`) in the `ᛇ Grein` sidebar and live indicators in the bottom status bar. Keyboard focus moves strictly on explicit user command (`Esc` or `Ctrl+G`).
 
 ---
 
 ### 2.8 Pillar VIII: Session Persistence & Multi-Run Resume
 
 #### 1. Storage Location
-All conversation DAG trees, branch points, blackboard entries, and worktree leases are stored transactionally in a local embedded SQLite database:
+All conversation DAG nodes, thread lineage metadata, and anchors are stored transactionally in a local embedded SQLite database (`rusqlite` in WAL mode):
 * **Project-Local Mode (Default):** `.grein/session.db` in the repository root (added to `.gitignore`).
 * **Global Mode (Fallback for non-git directories):** `~/.local/share/grein/projects/<repo-hash>/session.db`.
 
-#### 2. State Hydration on Launch
-* Launching `grein` in a repository immediately resumes the active session, restoring all branches, unmerged worktrees, and input drafts.
-* If a previous run was abruptly killed (e.g. terminal crash), the database journal recovers state cleanly and cleans up orphaned PIDs.
+#### 2. SQLite Schema & Legacy Compatibility
+* `nodes`: Immutable conversation turns (`id`, `parent_id`, `role`, `content`, `created_at`), including synthesized `DecisionLandmark` nodes committed on `/join`.
+* `threads`: Branch heads and explicit DAG lineage (`id`, `parent_node_id`, `anchor_id`, `active_leaf_id`, `status`, `created_at`, `title`, `acp_session_id`, `merged`, `parent_thread_id`).
+* `anchors` & `node_anchors`: Extracted structural anchors linked to turn nodes.
+* `blackboard_entries`: **Legacy compatibility table** retained read-compatible in the schema for safe migration and opening of older `.grein/session.db` files; **unused by pure-tree context compilation**.
+
+#### 3. State Hydration on Launch
+* Launching `grein` in a repository immediately resumes the active session, restoring all roots, branches (`parent_thread_id` hierarchy), `[joined]` status, unmerged worktrees, and input drafts.
+* If a previous run was abruptly killed (e.g. terminal crash), the SQLite WAL journal recovers state cleanly and cleans up orphaned PIDs.
 
 ---
 
 ## 3. Terminal User Interface (TUI) Specification
 
 ### 3.1 Screen Layout Breakdown
-The interface uses a 4-pane responsive layout powered by Ratatui:
+The interface uses a **pure 2-column responsive layout** powered by Ratatui—with **no Blackboard side pane or Blackboard focus**—paired with a bottom `Composer`, an optional auto-hiding `Subagents` strip, and a 1-line status bar:
 
 ```
-┌─────────────────┬──────────────────────────────────────┬────────────────┐
-│ [1] THREADS     │ [2] ACTIVE THREAD TRANSCRIPT         │ [3] BLACKBOARD │
-│                 │                                      │                │
-│ ▼ Trunk         │ # Ingress Routing & DTOs             │ ## Decisions   │
-│   ├── [1] DB *  │                                      │ - Port: 8080   │
-│   └── [2] API   │ [Agent 10:52]                        │ - DB: Postgres │
-│       ├── (You) │ We should use pure Java records      │                │
-│       └── (Ag.) │ for all ingress DTOs.                │ ## Worktrees   │
-│                 │                                      │ - th-1: clean  │
-│ [STREAMING th-1]│ > ran cargo check (exit 0)           │ - th-2: dirty  │
-│ [IDLE      th-2]│                                      │                │
-├─────────────────┴──────────────────────────────────────┴────────────────┤
-│ [4] INPUT COMPOSER (Replying to: #### 2. Ingress Routing) [Alt+1 to sw] │
-│ > Type message here... (Esc to normal mode, Ctrl+Enter to dispatch)     │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────┬───────────────────────────────────────────────────┐
+│ ᛇ Grein (34%)             │ Transcript (66% — or Transcript (Preview: <title>))│
+│                           │                                                   │
+│ ᛉ Main                    │ ❯ Design ingress DTOs and database schema         │
+│ ├─ ● DB Schema            │                                                   │
+│ │  └─ Auth Tokens         │ ## Agent (agy)                                    │
+│ └─ Ingress API [joined]   │ > ↳ Joined from Ingress API: Use pure DTOs...     │
+│ ᛉ Scratchpad              │                                                   │
+│                           │ $ cargo check (exit 0)                            │
+│                           │ > ✓ `read_file`: crates/grein-core/src/model.rs   │
+├───────────────────────────┴───────────────────────────────────────────────────┤
+│ Composer (auto-growing 3–10 lines, per-context preserved draft)               │
+│ > Type message, /command, or !shell... (Esc/Ctrl+G to toggle ᛇ Grein focus)   │
+├───────────────────────────────────────────────────────────────────────────────┤
+│ Subagents (auto-hides when empty; up to 5 active rows + overflow)             │
+├───────────────────────────────────────────────────────────────────────────────┤
+│ ? for help                                agent · default · ✓ idle · 0 subagents │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Pane 1: Thread & Anchor Navigator (Left, ~22% width)
-* Tree visualization of conversation trunks, active branches, and nested replies.
-* Anchor badges extracted from headings and titled numbered items (`[1] DB Schema`, `[2] API Routes`).
-* Real-time status glyphs (e.g. `⠋` streaming, `⚙` executing tool, `⚠️` permission required, `💬` awaiting input).
-* Workspace dirty marker (`*`) indicating uncommitted code modifications in that thread.
-* Unread message dot (`●`) for background turns completed while viewing another thread.
+#### Left Column (`34%` width): `ᛇ Grein` Context Tree Sidebar
+* Displays the full multi-root conversation forest: top-level roots marked with `ᛉ`, and child branches nested depth-first via `parent_thread_id` with Unicode box-drawing connectors (`├─`, `└─`, `│`).
+* Real-time status glyphs (`●` streaming/executing/thinking, `⚠` permission required or error) and `[joined]` suffix on merged branches.
+* **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript in the right-hand `Transcript` pane (`Transcript (Preview: <title>)`) without changing the active `Composer` thread until confirmed with `Enter`.
 
-#### Pane 2: Active Thread Transcript (Center, ~56% width)
-* Markdown syntax rendering with code block highlighting.
-* Automatic breadcrumb trail: `Root > Milestone 1 > Anchor #### 2. API Routes`.
-* Collapsible tool execution cards (bash runs, file edits, git status).
-* **Diff Preview & External Pager Integration:**
-  * When a thread modifies files, an inline diff card shows modified files and `+`/`-` line statistics.
-  * Pressing `o` (or `Enter` when focusing the diff card) suspends Ratatui and opens the full colorized diff in `$PAGER` (e.g. `delta`, `git diff`, `less`), cleanly restoring the TUI upon exit.
-* Independent scrollback buffer per thread (scrolling thread 2 does not reset thread 1).
+#### Right Column (`66%` width): Full-Width `Transcript` Pane
+* Full-width Markdown rendering including headings, inline formatting, GFM tables, horizontal rules, code blocks, leaf-green `❯ ` user prompt prefix, lineage banners (`> ↳ Forked from <parent> (<N> ancestor turns in LLM context)`), join markers (`> ↳ Joined from <branch>`), and ANSI-colored PTY shell blocks (`$ cmd (exit N)`).
+* **Global Transcript Scrolling:** Independent scrollback buffer per context (`TranscriptViewport`), controllable globally from anywhere in the UI via `Alt+↑` / `Alt+↓`, `PgUp` / `PgDn`, and `Alt+Home` / `Alt+End`—including while live-previewing another branch in `ᛇ Grein`.
+* **External `$PAGER` Diff Integration:** Pressing `o` when inspecting a diff card suspends Ratatui and opens the colorized diff in `$PAGER` (e.g. `delta`, `git diff`, `less`), cleanly restoring the TUI on exit.
 
-#### Pane 3: Blackboard & Global Inspector (Right, ~22% width, Collapsible)
-* Pinned architectural invariants and cross-thread decisions.
-* Worktree registry: shows active isolated worktrees and modified file counts.
-* Token metrics: input/output tokens and cost per thread.
-
-#### Pane 4: Non-Blocking Input Composer (Bottom, fixed height)
-* Independent input draft per thread: switching between threads preserves what you were typing.
-* Automatic contextual reply prefix:
-  `[Replying to: #### 2. Ingress Routing & DTOs]`
-* **Zero-Friction Native Terminal Keybindings:**
-  * `Enter`: Dispatch turn immediately (identical to native CLI agents).
-  * `Shift+Enter` or `Ctrl+Enter`: Insert newline for multi-line drafting.
-  * `Ctrl+E`: Open `$EDITOR` (Neovim/Helix/Nano) on a temporary scratch buffer, populating the input composer on save and exit.
-* Shortcut bar showing available anchor switch keys (`Alt+1`, `Alt+2`, `Tab`).
+#### Bottom Area: `Composer`, Optional `Subagents` Strip & Status Bar
+* **`Composer`:** Auto-grows from 3 to 10 lines for multi-line drafts, preserves an independent input draft per context, supports full Readline editing/kill-ring shortcuts, `!cmd` PTY shell execution, and slash commands.
+* **`Subagents` Strip:** Auto-hiding panel below `Composer` (renders only when subagents are active on the focused context, up to 5 rows + `+N more` overflow) showing live subagent type, role, model, activity, and elapsed time.
+* **1-Line Status Bar:** Left side displays `? for help` (or `esc to cancel` while streaming/executing); right side displays `<mode> · <model> · <live_status> · <N subagents>`.
 
 ---
 
-### 3.2 Keyboard Navigation & Shortcuts
+### 3.2 Compact Keyboard Navigation & Commands (`Option 1`)
+
+#### Focus, Tree Navigation & Global Transcript Scrolling
+
+| Keybinding | Scope | Action |
+| :--- | :--- | :--- |
+| `Esc` | Global | Cancel active streaming/executing turn; otherwise toggle focus between `Composer` and `ᛇ Grein` sidebar |
+| `Ctrl+G` | Global | Toggle focus between `Composer` and `ᛇ Grein` sidebar without cancelling active turns |
+| `Tab` / `Shift+Tab` | Global | Cycle forward / backward across branches within the active root's subtree (no-op on lone roots) |
+| `Alt+Shift+↑` / `Alt+Shift+↓` | Global | Switch to previous / next top-level root |
+| `Alt+J` / `Alt+K` | Global | Switch to next / previous top-level root |
+| `Alt+↑` / `Alt+↓` | Global | Scroll `Transcript` up / down (including live previewed branches when browsing `ᛇ Grein`) |
+| `PgUp` / `PgDn` | Global | Page `Transcript` up / down (including live previewed branches) |
+| `Alt+Home` / `Alt+End` | Global | Jump to top / bottom of `Transcript` (re-enables auto-scroll at bottom) |
+| `Ctrl+N` | Global | Fork a new child branch from the active context |
+| `Alt+N` | Global | Create a new blank independent root context |
+| `Alt+R` / `F2` | Global | Prefill `/rename <title>` for active (or `ᛇ Grein`-selected) context and focus `Composer` |
+| `?` | Global (when `Composer` empty or outside `Composer`) | Open Keybindings & Commands help modal |
+| `Ctrl+C` / `Ctrl+Q` | Global | Quit `grein` |
+| `o` | Diff card | Open selected diff in external `$PAGER` |
+
+#### `ᛇ Grein` Sidebar Keys (When Focused)
 
 | Keybinding | Action |
 | :--- | :--- |
-| `Enter` | Dispatch message to active thread (in input composer). |
-| `Shift+Enter` / `Ctrl+Enter` | Insert newline in input composer. |
-| `Ctrl+E` | Open active prompt in `$EDITOR` (external editor). |
-| `Tab` / `Shift+Tab` | Cycle focus between Panes (Threads $\to$ Transcript $\to$ Input $\to$ Blackboard). |
-| `Alt+1` .. `Alt+9` | Instantly jump to and focus Anchor/Thread 1 through 9. |
-| `Ctrl+N` | Fork new thread from currently selected message or heading anchor. |
-| `Ctrl+R` | On-demand knowledge import: pull summarized conclusions from another thread. |
-| `Ctrl+M` | Trigger thread merge (summarize branch decisions back to Trunk). |
-| `Ctrl+B` | Toggle Blackboard pane visibility. |
-| `o` | Open selected diff in external `$PAGER` (e.g., `delta`, `less`). |
-| `Esc` | Return to Normal/Navigation mode from Input mode. |
+| `↑` / `↓` or `k` / `j` | Move selection through the tree and live-preview in `Transcript` |
+| `Enter` | Activate selected branch/root (or anchor) and move focus to `Composer` |
+| `n` | Create a new blank independent root context |
+| `r` | Prefill `/rename <title>` for the selected context and focus `Composer` |
+| `m` | Manually join (`/join`) the selected branch into its parent branch |
+| `d` / `x` | Close/delete the selected context (when >1 context exists) |
+| `q` | Quit `grein` |
+
+#### `Composer` Readline & Editing Keys
+
+| Keybinding | Action |
+| :--- | :--- |
+| `Enter` | Dispatch prompt, slash command, or `!cmd` shell command |
+| `Shift+Enter` / `Ctrl+Enter` / `Alt+Enter` / `Ctrl+J` | Insert newline in `Composer` |
+| `Ctrl+A` / `Home` | Move cursor to start of line |
+| `Ctrl+E` / `End` | Move cursor to end of line |
+| `Ctrl+F` / `→` / `←` | Move forward / backward by one character |
+| `Alt+←` / `Alt+→`, `Ctrl+←` / `Ctrl+→`, `Alt+B` / `Alt+F` | Move backward / forward by word |
+| `Ctrl+K` / `Ctrl+U` | Kill to end of line / kill to start of line |
+| `Ctrl+W` / `Alt+Backspace` | Kill previous word |
+| `Alt+D` / `Ctrl+Delete` / `Alt+Delete` | Kill next word |
+| `Ctrl+Y` / `Ctrl+D` | Yank from kill ring / delete character under cursor |
+
+#### Slash Commands & Shell Escape
+
+| Command | Action |
+| :--- | :--- |
+| `!cmd` | Execute shell command in a PTY under the active context (`$ cmd (exit N)` with ANSI rendering) |
+| `/fork [title]`, `/branch [title]`, `/grein [title]` | Fork a new child branch off the active context (`parent_thread_id`) |
+| `/root [title]`, `/new [title]` | Create a new blank independent root context |
+| `/rename <name>` | Rename the active or selected context |
+| `/join [summary]`, `/merge [summary]` | Manually join active branch into its parent branch, committing a `DecisionLandmark` |
+| `/close [target]`, `/delete [target]` | Close/delete the active or named context (>1 context required) |
+| `/?`, `/help` | Open the Keybindings & Commands help modal |
+| `/quit` | Quit `grein` |
 
 ---
 
 ### 3.3 Thread Status Lifecycle & Symbolic Indicators
 
-To give the developer instant situational awareness across all active branches without switching panes, each entry in the Thread Navigator displays a compact status symbol and state marker:
+To give instant situational awareness across all active roots and branches without losing context:
 
-| State | Unicode / Nerd Font | ASCII Fallback | Color Anchor | Semantic Meaning |
-| :--- | :--- | :--- | :--- | :--- |
-| **Streaming / Generating** | `⠋` (animated spinner) | `[*]` | Cyan / Yellow | Agent is actively generating tokens or reasoning thoughts. |
-| **Executing Tool** | `⚙` / `▶` | `[>]` | Blue | Running a bash command, file read, or external process. |
-| **Permission Request** | `⚠️` / `🔑` | `[!]` | Bold Amber | Blocked: requires user authorization (`Allow` / `Deny`). |
-| **Awaiting Input** | `💬` / `?` | `[?]` | Magenta | Agent finished its turn; waiting for human prompt. |
-| **Idle / Completed** | `✓` / `○` | `[-]` | Dim Green / Gray | Thread is quiescent with no pending turns. |
-| **Error / Failed** | `✖` / `✗` | `[x]` | Red | Tool execution failed, command crashed, or rate limit hit. |
-| **Dirty Workspace** | `*` (suffix) | `*` | Orange | Thread has uncommitted code modifications in its worktree. |
-| **Unread Updates** | `●` (prefix) | `+` | Bright White | Completed turns or background events since last viewed. |
+| Indicator | Location | Color | Semantic Meaning |
+| :--- | :--- | :--- | :--- |
+| `ᛉ` | `ᛇ Grein` root row (when idle) | Green | Top-level independent root context |
+| `├─` / `└─` / `│` | `ᛇ Grein` child rows | Dark Gray | Depth-first tree connectors showing `parent_thread_id` hierarchy |
+| `●` | `ᛇ Grein` row | Yellow | Context is actively `streaming`, `executing`, or `thinking` |
+| `⚠` | `ᛇ Grein` row & Status Bar | Red | Context requires tool permission or hit an error |
+| `[joined]` | `ᛇ Grein` row suffix | Dark Gray | Branch was manually joined into its parent via `/join` / `/merge` |
+| `⠋` .. `⠏` | Status Bar | Yellow | Live animated spinner with active tool name or reasoning preview |
+| `✓ idle` | Status Bar | Green | Active context is idle and ready for input |
+| `●` / `✓` / `✖` | `Subagents` strip | Yellow / Green / Red | Live subagent status (`running` / `completed` / `failed`) |
 
-#### Visual Rendering Example (Pane 1):
+#### Visual Rendering Example (`ᛇ Grein`):
 ```text
-▼ Root: Architecture Design
-  ├── [1] DB Schema *      ⚙ [cargo check]
-  ├── [2] Ingress API      ⚠️ [needs permission]
-  ├── [3] Frontend Runes   ● 💬 [waiting for you]
-  └── [4] Auth Handlers    ✓ [-]
+ᛉ Main
+├─ ● DB Schema
+│  └─ Auth Tokens
+└─ Ingress API [joined]
+ᛉ Investigation
+└─ ⚠ Migration Check
 ```
 
 ---
@@ -388,15 +427,14 @@ To give the developer instant situational awareness across all active branches w
 ## 4. Technical Stack & Implementation Boundary
 
 * **Language:** Rust (2021 edition)
-* **TUI Layer:** `ratatui` + `crossterm`
+* **TUI Layer:** `ratatui` + `crossterm` + pure-Rust Markdown/GFM/ANSI renderer (`grein-tui`)
 * **Concurrency Runtime:** `tokio` (multi-threaded async runtime)
-* **Local Persistence:** `rusqlite` or `redb` (embedded, zero external daemon dependency)
+* **Local Persistence:** `rusqlite` (embedded SQLite in WAL mode, zero external DB server)
 * **Serialization & RPC:** `serde`, `serde_json`, Unix Domain Sockets (`tokio::net::UnixListener`)
-* **Markdown Parsing & Syntax Highlighting:** `pulldown-cmark`, `syntect`
-* **Process Execution Model:** Native OS subprocess runner (`tokio::process::Command`) with `cwd` scoped to the dedicated worktree directory. Environment sanitization with explicit PATH pass-through. Zero container requirement (no Docker, no Podman).
+* **Process Execution Model:** Native OS subprocess runner (`tokio::process::Command`) and PTY shell runner with `cwd` scoped to the dedicated worktree directory. Environment sanitization with explicit `PATH` pass-through. Zero container requirement (no Docker, no Podman).
 * **Distribution Target:** Single static or self-contained binary packaged for Homebrew (`brew install`), Nix (`nix profile install` / Flake), and Cargo (`cargo install`).
 * **Deployment Topology (Single Binary, Dual Mode):**
-  * **Default (Standalone):** `grein` launches TUI and embeds the daemon engine internally within Tokio tasks. Zero socket setup required.
+  * **Default (Standalone):** `grein` (or `grein standalone`) launches TUI and embeds the daemon engine internally within Tokio tasks. Zero socket setup required.
   * **Headless / Multi-Client:** `grein daemon` runs headless in the background; `grein attach` connects over a local Unix domain socket (`.grein/daemon.sock`).
   * **Headless Inspection Subcommands:** `grein threads`, `grein status`, and `grein agents --json` for scriptable and CLI introspection.
 
@@ -404,7 +442,7 @@ To give the developer instant situational awareness across all active branches w
 
 ## 5. Verification & Specification Milestones
 
-1. **Milestone 1:** Headless DAG Engine & Persistence (SQLite message DAG, branch forks, anchor parser).
-2. **Milestone 2:** Daemon RPC Protocol (Unix socket server, streaming SSE events, tool execution loop).
-3. **Milestone 3:** Ratatui Shell & Non-Blocking Multiplexer (Thread navigator, transcript viewer, composer).
-4. **Milestone 4:** Lazy Worktree Allocator & Merging Engine (CoW worktrees, diff viewer, summary merge).
+1. **Milestone 1:** Headless DAG Engine & Persistence (SQLite message DAG, explicit `parent_thread_id` lineage, anchor parser).
+2. **Milestone 2:** Daemon RPC Protocol (Unix socket server, streaming event notifications, ACP & PTY execution loops).
+3. **Milestone 3:** Pure 2-Column Ratatui Shell & Non-Blocking Multiplexer (`ᛇ Grein` tree sidebar, full-width `Transcript` with live preview & global scrolling, `Composer`, `Subagents` strip, compact Option 1 keymap).
+4. **Milestone 4:** Lazy Worktree Allocator & Manual Join Engine (CoW worktrees, diff viewer, `DecisionLandmark` commit & `[Joined Context]` delivery).
