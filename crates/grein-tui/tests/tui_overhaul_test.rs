@@ -665,3 +665,34 @@ async fn test_e2e_preferences_load_palette_diff_preview_and_prune() {
         Some(AppAction::PruneWorktrees)
     );
 }
+
+#[test]
+fn test_sidebar_width_stays_identical_across_grein_and_worktrees_tabs() {
+    let mut app = App::new();
+    seed_agent_and_terminal(&mut app);
+
+    app.sidebar_view = SidebarView::Grein;
+    let width_grein_empty = compute_sidebar_width(&app, 120);
+    app.sidebar_view = SidebarView::Worktrees;
+    let width_wt_empty = compute_sidebar_width(&app, 120);
+    assert_eq!(width_grein_empty, width_wt_empty);
+
+    app.worktrees = vec![WorktreeEntry {
+        repo_root: "/repos/example".to_string(),
+        repo_name: "example".to_string(),
+        path: "/repos/example/.grein/worktrees/feature-very-long-worktree-branch".to_string(),
+        branch: Some("feature/very-long-worktree-branch".to_string()),
+        head_short: None,
+        is_detached: false,
+        is_primary: false,
+        is_grein_managed: true,
+        dirty_count: 1,
+        attached_thread_ids: vec!["t-agent".to_string()],
+    }];
+
+    app.sidebar_view = SidebarView::Grein;
+    let width_grein_populated = compute_sidebar_width(&app, 120);
+    app.sidebar_view = SidebarView::Worktrees;
+    let width_wt_populated = compute_sidebar_width(&app, 120);
+    assert_eq!(width_grein_populated, width_wt_populated);
+}

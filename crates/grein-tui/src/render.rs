@@ -47,7 +47,7 @@ fn rounded_block(theme: &ThemePalette, is_focused: bool) -> Block<'static> {
 }
 
 fn max_grein_sidebar_row_width(state: &AppState) -> usize {
-    let mut max_w = 24usize;
+    let mut max_w = 26usize;
     if !state.tree.nodes.is_empty() {
         for node in &state.tree.nodes {
             if let TreeNode::Thread(t) = node {
@@ -123,11 +123,9 @@ pub fn compute_sidebar_width(state: &AppState, total_w: u16) -> u16 {
                 .clamp(min_floor, max_allowed);
             let max_cols = (((total_w as u32 * state.sidebar_layout.max_pct as u32) / 100) as u16)
                 .clamp(min_cols, max_allowed);
-            let content_w = match state.sidebar_view {
-                SidebarView::Grein => max_grein_sidebar_row_width(state),
-                SidebarView::Worktrees => max_worktree_sidebar_row_width(state),
-            }
-            .min(u16::MAX as usize) as u16;
+            let content_w = max_grein_sidebar_row_width(state)
+                .max(max_worktree_sidebar_row_width(state))
+                .min(u16::MAX as usize) as u16;
             content_w.clamp(min_cols, max_cols)
         }
     }
