@@ -213,7 +213,8 @@ mod tests {
             .fork_thread_with_title(Some(&main.thread_id), Some("socket-branch"))
             .await
             .expect("fork");
-        assert_eq!(forked.title, "socket-branch");
+        assert_eq!(forked.custom_name.as_deref(), Some("socket-branch"));
+        assert_eq!(forked.title, "Branch 2");
 
         let shell_res = client
             .run_shell_command(&main.thread_id, "printf 'via-socket'")
@@ -300,13 +301,22 @@ mod tests {
             .as_str()
             .expect("root2 id")
             .to_string();
-        assert_eq!(root2_val["result"]["title"], "Second Root");
+        assert_eq!(root2_val["result"]["custom_name"], "Second Root");
+        assert_eq!(root2_val["result"]["title"], "Root 2");
+
+        let cleared_val = raw_client
+            .session_rename_thread(&root2_id, "")
+            .await
+            .expect("clear session_rename_thread");
+        assert_eq!(cleared_val["result"]["custom_name"], Value::Null);
+        assert_eq!(cleared_val["result"]["title"], "Root 2");
 
         let renamed_val = raw_client
             .session_rename_thread(&root2_id, "Renamed Root")
             .await
             .expect("session_rename_thread");
-        assert_eq!(renamed_val["result"]["title"], "Renamed Root");
+        assert_eq!(renamed_val["result"]["custom_name"], "Renamed Root");
+        assert_eq!(renamed_val["result"]["title"], "Root 2");
 
         let forked2 = client
             .fork_thread_with_title(Some(&root2_id), Some("Socket Join Branch"))
@@ -328,8 +338,13 @@ mod tests {
         }
         assert!(post_events.iter().any(|e| matches!(
             e,
-            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
-                if thread_id == &root2_id && title == "Renamed Root"
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &root2_id && custom_name.is_none()
+        )));
+        assert!(post_events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &root2_id && custom_name.as_deref() == Some("Renamed Root")
         )));
         assert!(post_events.iter().any(|e| matches!(
             e,
@@ -347,7 +362,8 @@ mod tests {
             .as_str()
             .expect("term_id")
             .to_string();
-        assert_eq!(term_rpc["result"]["title"], "Daemon Term");
+        assert_eq!(term_rpc["result"]["custom_name"], "Daemon Term");
+        assert_eq!(term_rpc["result"]["title"], "Terminal");
 
         let resize_rpc = raw_client
             .session_pty_resize(&term_id, 26, 96)
@@ -701,6 +717,126 @@ mod tests {
             .expect("session_prune_worktrees rpc");
         assert!(prune_rpc["result"]["summary"].is_string());
         let _ = client.prune_worktrees().await.expect("prune_worktrees");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_socket_rename_thread_dedicated_and_blank_clear() {
+        use crate::engine::{AcpBackendConfig, DaemonEngine as _, InProcessEngine};
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("slow_acp.sh");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"slow","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-slow"}}\n' "$id"
+            ;;
+        *'"method":"session/prompt"'*)
+            sleep 0.4
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-slow","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"slow reply"}}}}\n'
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        std::fs::write(&script_path, script).expect("write slow script");
+        let mut perms = std::fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let socket_path = temp.path().join("dedicated_rename.sock");
+        let db_path = temp.path().join("dedicated_rename.db");
+        let cfg = AcpBackendConfig {
+            command: script_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        };
+        let engine = Arc::new(
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+                .expect("open engine"),
+        );
+
+        let sock_clone = socket_path.clone();
+        let engine_clone = Arc::clone(&engine);
+        let server = tokio::spawn(async move {
+            let _ = run_daemon_with_engine(sock_clone, engine_clone).await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client = Arc::new(
+            UnixSocketEngineClient::connect(&socket_path)
+                .await
+                .expect("connect"),
+        );
+        let mut rx = client
+            .subscribe_events()
+            .await
+            .expect("subscribe")
+            .expect("receiver");
+
+        let main = client.ensure_main_thread().await.expect("ensure main");
+
+        // Hold the shared socket `io` lock with an in-flight slow turn.
+        let turn_client = Arc::clone(&client);
+        let turn_tid = main.thread_id.clone();
+        let turn_handle = tokio::spawn(async move {
+            turn_client
+                .send_turn_for_thread(&turn_tid, "slow prompt")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // `rename_thread` must bypass `self.io` via `call_dedicated_typed` and finish promptly.
+        let renamed = timeout(
+            Duration::from_millis(200),
+            client.rename_thread(&main.thread_id, "Terminal"),
+        )
+        .await
+        .expect("dedicated rename must not block behind in-flight turn")
+        .expect("rename_thread");
+        assert_eq!(renamed.custom_name.as_deref(), Some("Terminal"));
+        assert_eq!(renamed.title, "Main");
+
+        turn_handle
+            .await
+            .expect("turn join")
+            .expect("slow turn completes");
+
+        let cleared = client
+            .rename_thread(&main.thread_id, "")
+            .await
+            .expect("blank rename clears custom_name");
+        assert_eq!(cleared.custom_name, None);
+        assert_eq!(cleared.title, "Main");
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(150), rx.recv()).await {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &main.thread_id && custom_name.as_deref() == Some("Terminal")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &main.thread_id && custom_name.is_none()
+        )));
 
         server.abort();
     }

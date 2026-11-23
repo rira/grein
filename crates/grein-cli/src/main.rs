@@ -86,6 +86,7 @@ impl<E: DaemonEngine> EngineClientPort<E> {
             threads.push(HydratedThread {
                 id: summary.thread_id,
                 title: summary.title,
+                custom_name: summary.custom_name,
                 turns,
             });
         }
@@ -143,6 +144,7 @@ where
                     let hydrated = HydratedThread {
                         id: term.thread_id.clone(),
                         title: term.title,
+                        custom_name: term.custom_name,
                         turns: Vec::new(),
                     };
                     (term.thread_id, vec![hydrated])
@@ -156,6 +158,7 @@ where
                         threads.push(HydratedThread {
                             id: main.thread_id.clone(),
                             title: main.title,
+                            custom_name: main.custom_name,
                             turns,
                         });
                     }
@@ -301,6 +304,7 @@ where
                 thread: HydratedThread {
                     id: forked.thread_id.clone(),
                     title: forked.title,
+                    custom_name: forked.custom_name,
                     turns,
                 },
             });
@@ -323,6 +327,7 @@ where
         let hydrated = HydratedThread {
             id: forked.thread_id,
             title: forked.title,
+            custom_name: forked.custom_name,
             turns,
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {
@@ -339,6 +344,7 @@ where
         let hydrated = HydratedThread {
             id: created.thread_id,
             title: created.title,
+            custom_name: created.custom_name,
             turns: Vec::new(),
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {
@@ -357,9 +363,9 @@ where
             .await
             .map_err(to_io)?;
         if !self.has_live_stream.load(Ordering::SeqCst) {
-            self.emit(TuiEngineEvent::ThreadTitleUpdated {
+            self.emit(TuiEngineEvent::ThreadCustomNameUpdated {
                 thread_id: renamed.thread_id,
-                title: renamed.title,
+                custom_name: renamed.custom_name,
             });
         }
         Ok(())
@@ -501,6 +507,7 @@ where
         let hydrated = HydratedThread {
             id: created.thread_id,
             title: created.title,
+            custom_name: created.custom_name,
             turns: Vec::new(),
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {
@@ -808,7 +815,8 @@ mod tests {
             .fork_branch(&session.active_thread_id, Some("auth"))
             .await
             .expect("fork_branch");
-        assert_eq!(forked.title, "auth");
+        assert_eq!(forked.custom_name.as_deref(), Some("auth"));
+        assert_eq!(forked.title, "Branch 2");
 
         let err = port
             .send_turn(&session.active_thread_id, "hello")
@@ -992,6 +1000,7 @@ done
                 Ok(ThreadSummary {
                     thread_id: "t-1".into(),
                     title: "Main".into(),
+                    custom_name: None,
                     parent_node_id: "n-1".into(),
                     active_leaf_id: "n-1".into(),
                     merged: false,
@@ -1132,10 +1141,17 @@ done
         // would flip has_live_stream to true. So test offline EngineClientPort with a no-stream
         // DaemonEngine wrapper or test create_root/rename/merge before subscribe_events!
         let root2 = port.create_root(Some("Offline Root")).await.expect("create_root");
-        assert_eq!(root2.title, "Offline Root");
+        assert_eq!(root2.custom_name.as_deref(), Some("Offline Root"));
+        assert_eq!(root2.title, "Root 2");
         port.rename_thread(&root2.id, "Renamed Offline Root")
             .await
             .expect("rename");
+        port.rename_thread(&root2.id, "")
+            .await
+            .expect("clear offline rename");
+        port.rename_thread(&root2.id, "Renamed Offline Root")
+            .await
+            .expect("restore offline rename");
         let forked = port
             .fork_branch(&main_id, Some("Offline Branch"))
             .await
@@ -1155,8 +1171,13 @@ done
         )));
         assert!(offline_evs.iter().any(|e| matches!(
             e,
-            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
-                if thread_id == &root2.id && title == "Renamed Offline Root"
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &root2.id && custom_name.as_deref() == Some("Renamed Offline Root")
+        )));
+        assert!(offline_evs.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &root2.id && custom_name.is_none()
         )));
         assert!(offline_evs.iter().any(|e| matches!(
             e,
@@ -1178,6 +1199,7 @@ done
                 Ok(ThreadSummary {
                     thread_id: "t-1".into(),
                     title: "Main".into(),
+                    custom_name: None,
                     parent_node_id: "n-1".into(),
                     active_leaf_id: "n-1".into(),
                     merged: false,
@@ -1242,6 +1264,7 @@ done
                 Ok(ThreadSummary {
                     thread_id: "t-cached".into(),
                     title: "Main".into(),
+                    custom_name: None,
                     parent_node_id: "n-1".into(),
                     active_leaf_id: "n-1".into(),
                     merged: false,

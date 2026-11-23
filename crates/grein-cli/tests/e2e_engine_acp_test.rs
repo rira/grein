@@ -177,9 +177,12 @@ async fn test_e2e_hydration_across_restart_streaming_branch_isolation_and_legacy
 
     let hydrated_threads = reopened.list_threads().await.expect("list threads");
     assert_eq!(hydrated_threads.len(), 3);
-    let titles: Vec<&str> = hydrated_threads.iter().map(|t| t.title.as_str()).collect();
-    assert!(titles.contains(&"branch-a"));
-    assert!(titles.contains(&"branch-b"));
+    let custom_names: Vec<Option<&str>> = hydrated_threads
+        .iter()
+        .map(|t| t.custom_name.as_deref())
+        .collect();
+    assert!(custom_names.contains(&Some("branch-a")));
+    assert!(custom_names.contains(&Some("branch-b")));
 
     let persisted_a = reopened
         .get_thread_transcript(&branch_a.thread_id)
@@ -693,7 +696,8 @@ async fn test_e2e_join_landmark_preservation_and_blank_root_context_invariant() 
         .create_root_thread(Some("Blank Root"))
         .await
         .expect("create_root_thread");
-    assert_eq!(fresh_root.title, "Blank Root");
+    assert_eq!(fresh_root.custom_name.as_deref(), Some("Blank Root"));
+    assert!(fresh_root.title.starts_with("Root "));
     assert!(
         engine
             .get_thread_transcript(&fresh_root.thread_id)

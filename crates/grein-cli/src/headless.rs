@@ -13,6 +13,8 @@ use crate::engine::{DaemonEngine, InProcessEngine};
 pub struct ThreadOutput {
     pub thread_id: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
     pub parent_node_id: String,
     pub active_leaf_id: String,
     pub merged: bool,
@@ -54,6 +56,7 @@ pub async fn collect_threads_output(
         .map(|s| ThreadOutput {
             thread_id: s.thread_id,
             title: s.title,
+            custom_name: s.custom_name,
             parent_node_id: s.parent_node_id,
             active_leaf_id: s.active_leaf_id,
             merged: s.merged,
@@ -80,9 +83,10 @@ pub async fn handle_threads(
             "THREAD ID", "TITLE", "PARENT NODE ID", "STATUS", "MERGED"
         );
         for t in threads {
+            let display_title = t.custom_name.as_deref().unwrap_or(&t.title);
             println!(
                 "{:<36} {:<20} {:<36} {:<10} {:<6}",
-                t.thread_id, t.title, t.parent_node_id, t.status, t.merged
+                t.thread_id, display_title, t.parent_node_id, t.status, t.merged
             );
         }
     }
@@ -209,9 +213,11 @@ mod tests {
         assert_eq!(threads_out.len(), 2);
         assert_eq!(threads_out[0].thread_id, main.thread_id);
         assert_eq!(threads_out[0].title, "Main");
+        assert_eq!(threads_out[0].custom_name, None);
         assert_eq!(threads_out[0].status, "idle");
         assert!(!threads_out[0].merged);
-        assert_eq!(threads_out[1].title, "topic-a");
+        assert_eq!(threads_out[1].custom_name.as_deref(), Some("topic-a"));
+        assert_eq!(threads_out[1].title, "Branch 2");
 
         let status_out = collect_status_output(&StatusArgs {
             json: true,

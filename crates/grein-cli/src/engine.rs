@@ -162,6 +162,8 @@ pub struct ThreadSummary {
     pub thread_id: String,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub custom_name: Option<String>,
     pub parent_node_id: String,
     #[serde(default)]
     pub active_leaf_id: String,
@@ -543,6 +545,12 @@ fn is_internal_root_node(node: &ConversationNode) -> bool {
         && (node.content.is_empty() || node.content == INTERNAL_ROOT_CONTENT)
 }
 
+fn normalize_custom_name(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn thread_to_summary(thread: &Thread, is_first: bool) -> ThreadSummary {
     let title = if !thread.title.trim().is_empty() {
         thread.title.clone()
@@ -556,6 +564,7 @@ fn thread_to_summary(thread: &Thread, is_first: bool) -> ThreadSummary {
     ThreadSummary {
         thread_id: thread.id.0.to_string(),
         title,
+        custom_name: normalize_custom_name(thread.custom_name.as_deref()),
         parent_node_id: thread.parent_node_id.0.to_string(),
         active_leaf_id: thread.active_leaf_id.0.to_string(),
         merged: thread.merged,
@@ -1402,10 +1411,51 @@ impl EngineRuntime {
                 cwd: thread.cwd.clone(),
                 git_branch,
                 git_dirty,
+                custom_name: normalize_custom_name(thread.custom_name.as_deref()),
             });
         }
 
         Ok(meta)
+    }
+
+    fn insert_new_thread_with_anchor(
+        &self,
+        parent_node_id: NodeId,
+        default_title: String,
+        custom_name: Option<String>,
+        parent_thread_id: Option<ThreadId>,
+        kind: ThreadKind,
+        cwd: Option<String>,
+    ) -> Result<Thread, EngineError> {
+        let anchor_title = custom_name.as_deref().unwrap_or(&default_title);
+        let anchor_id = AnchorId::new();
+        let anchor = Anchor {
+            level: 1,
+            title: anchor_title.to_string(),
+            slug: slugify_anchor(anchor_title),
+            line_number: 1,
+        };
+        self.storage
+            .insert_anchor(&anchor_id.0, &anchor)
+            .map_err(storage_err)?;
+
+        let mut thread = Thread::new(
+            ThreadId::new_v7(),
+            parent_node_id,
+            anchor_id,
+            parent_node_id,
+            ThreadStatus::Idle,
+        )
+        .with_kind(kind)
+        .with_title(default_title)
+        .with_custom_name(custom_name);
+        thread.parent_thread_id = parent_thread_id;
+        thread.cwd = cwd;
+        self.storage.insert_thread(&thread).map_err(storage_err)?;
+        self.storage
+            .get_thread(thread.id)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::Storage("created thread missing".to_string()))
     }
 
     fn mark_thread_error(&self, tid: ThreadId, thread_id: &str, message: &str) {
@@ -2356,18 +2406,13 @@ fn spawn_session_listener(
                         }
                         DriverEvent::SessionInfoUpdate { title, .. } => {
                             let trimmed = title.trim();
-                            if !trimmed.is_empty() {
-                                if let Ok(Some(current)) = runtime.storage.get_thread(tid) {
-                                    if (current.title.trim().is_empty()
-                                        || current.title.starts_with("Branch"))
-                                        && runtime.storage.update_thread_title(&tid, trimmed).is_ok()
-                                    {
-                                        runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
-                                            thread_id: thread_id.clone(),
-                                            title: trimmed.to_string(),
-                                        });
-                                    }
-                                }
+                            if !trimmed.is_empty()
+                                && runtime.storage.update_thread_title(&tid, trimmed).is_ok()
+                            {
+                                runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
+                                    thread_id: thread_id.clone(),
+                                    title: trimmed.to_string(),
+                                });
                             }
                         }
                         DriverEvent::UsageUpdate { .. } => {
@@ -3288,46 +3333,21 @@ impl DaemonEngine for InProcessEngine {
                 }
             };
 
-        let resolved_title = match title.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(t) => t.to_string(),
-            None => {
-                if existing_threads.is_empty() {
-                    "Branch".to_string()
-                } else {
-                    format!("Branch {}", existing_threads.len() + 1)
-                }
-            }
+        let explicit_custom = normalize_custom_name(title);
+        let default_title = if existing_threads.is_empty() {
+            "Branch".to_string()
+        } else {
+            format!("Branch {}", existing_threads.len() + 1)
         };
 
-        let anchor_id = AnchorId::new();
-        let anchor = Anchor {
-            level: 1,
-            title: resolved_title.clone(),
-            slug: slugify_anchor(&resolved_title),
-            line_number: 1,
-        };
-        self.runtime
-            .storage
-            .insert_anchor(&anchor_id.0, &anchor)
-            .map_err(storage_err)?;
-        let tid = self
-            .runtime
-            .storage
-            .create_thread_with_kind(
-                parent_node_id,
-                anchor_id,
-                Some(&resolved_title),
-                parent_thread_id,
-                ThreadKind::Agent,
-                parent_cwd.as_deref(),
-            )
-            .map_err(storage_err)?;
-        let created = self
-            .runtime
-            .storage
-            .get_thread(tid)
-            .map_err(storage_err)?
-            .ok_or_else(|| EngineError::Storage("forked thread missing".to_string()))?;
+        let created = self.runtime.insert_new_thread_with_anchor(
+            parent_node_id,
+            default_title,
+            explicit_custom,
+            parent_thread_id,
+            ThreadKind::Agent,
+            parent_cwd,
+        )?;
 
         let turns: Vec<HydratedTurn> = self
             .runtime
@@ -3345,6 +3365,7 @@ impl DaemonEngine for InProcessEngine {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
+                custom_name: summary.custom_name.clone(),
                 turns,
             },
         });
@@ -3356,24 +3377,20 @@ impl DaemonEngine for InProcessEngine {
 
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
         let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-        let resolved_title = match title.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(t) => t.to_string(),
-            None => {
-                let meta_before = self.runtime.compute_thread_metadata()?;
-                let mut n = meta_before
-                    .iter()
-                    .filter(|m| m.parent_thread_id.is_none())
-                    .count()
-                    + 1;
-                while existing_threads
-                    .iter()
-                    .any(|t| t.title == format!("Root {n}"))
-                {
-                    n += 1;
-                }
-                format!("Root {n}")
-            }
-        };
+        let explicit_custom = normalize_custom_name(title);
+        let meta_before = self.runtime.compute_thread_metadata()?;
+        let mut n = meta_before
+            .iter()
+            .filter(|m| m.parent_thread_id.is_none())
+            .count()
+            + 1;
+        while existing_threads
+            .iter()
+            .any(|t| t.title == format!("Root {n}"))
+        {
+            n += 1;
+        }
+        let default_title = format!("Root {n}");
 
         let root_node = ConversationNode::new_root(AuthorRole::System, "");
         self.runtime
@@ -3381,40 +3398,25 @@ impl DaemonEngine for InProcessEngine {
             .insert_node(&root_node)
             .map_err(storage_err)?;
 
-        let anchor_id = AnchorId::new();
-        let anchor = Anchor {
-            level: 1,
-            title: resolved_title.clone(),
-            slug: slugify_anchor(&resolved_title),
-            line_number: 1,
-        };
-        self.runtime
-            .storage
-            .insert_anchor(&anchor_id.0, &anchor)
-            .map_err(storage_err)?;
-
-        let tid = self
-            .runtime
-            .storage
-            .create_thread_with_parent(root_node.id, anchor_id, Some(&resolved_title), None)
-            .map_err(storage_err)?;
+        let created = self.runtime.insert_new_thread_with_anchor(
+            root_node.id,
+            default_title,
+            explicit_custom,
+            None,
+            ThreadKind::Agent,
+            None,
+        )?;
         {
             let mut state = self.runtime.lock()?;
             state.last_node = Some(root_node.id);
         }
-
-        let created = self
-            .runtime
-            .storage
-            .get_thread(tid)
-            .map_err(storage_err)?
-            .ok_or_else(|| EngineError::Storage("created root thread missing".to_string()))?;
 
         let summary = thread_to_summary(&created, false);
         self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
+                custom_name: summary.custom_name.clone(),
                 turns: Vec::new(),
             },
         });
@@ -3430,17 +3432,13 @@ impl DaemonEngine for InProcessEngine {
         title: &str,
     ) -> Result<ThreadSummary, EngineError> {
         let trimmed = title.trim();
-        if trimmed.is_empty() {
-            return Err(EngineError::InvalidParams(
-                "title must not be empty".to_string(),
-            ));
-        }
+        let custom_name = (!trimmed.is_empty()).then_some(trimmed);
 
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         self.runtime
             .storage
-            .update_thread_title(&tid, trimmed)
+            .update_thread_custom_name(&tid, custom_name)
             .map_err(|e| match e {
                 CoreError::ThreadNotFound(_) => EngineError::NotFound(format!("thread {thread_id}")),
                 other => storage_err(other),
@@ -3456,10 +3454,11 @@ impl DaemonEngine for InProcessEngine {
         let is_first = threads.first().is_some_and(|t| t.id == updated.id);
         let summary = thread_to_summary(&updated, is_first);
 
-        self.runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
-            thread_id: summary.thread_id.clone(),
-            title: summary.title.clone(),
-        });
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadCustomNameUpdated {
+                thread_id: summary.thread_id.clone(),
+                custom_name: summary.custom_name.clone(),
+            });
         Ok(summary)
     }
 
@@ -3564,7 +3563,11 @@ impl DaemonEngine for InProcessEngine {
 
         let source_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
         let source_is_first = source_threads.first().is_some_and(|t| t.id == source.id);
-        let source_title = thread_to_summary(&source, source_is_first).title;
+        let source_summary = thread_to_summary(&source, source_is_first);
+        let source_title = source_summary
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| source_summary.title.clone());
         let resolved_summary = match summary.map(str::trim).filter(|s| !s.is_empty()) {
             Some(explicit) => truncate_chars_with_ellipsis(explicit, 400),
             None => {
@@ -4117,11 +4120,7 @@ impl DaemonEngine for InProcessEngine {
         let resolved_cwd = self
             .runtime
             .resolve_terminal_cwd(cwd, parent_thread.as_ref())?;
-        let resolved_title = title
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .unwrap_or("Terminal")
-            .to_string();
+        let explicit_custom = normalize_custom_name(title);
 
         let (parent_node_id, parent_tid_opt) = match parent_thread.as_ref() {
             Some(parent) => (parent.active_leaf_id, Some(parent.id)),
@@ -4135,30 +4134,15 @@ impl DaemonEngine for InProcessEngine {
             }
         };
 
-        let anchor_id = AnchorId::new();
-        let anchor = Anchor {
-            level: 1,
-            title: resolved_title.clone(),
-            slug: slugify_anchor(&resolved_title),
-            line_number: 1,
-        };
-        self.runtime
-            .storage
-            .insert_anchor(&anchor_id.0, &anchor)
-            .map_err(storage_err)?;
-
-        let tid = self
-            .runtime
-            .storage
-            .create_thread_with_kind(
-                parent_node_id,
-                anchor_id,
-                Some(&resolved_title),
-                parent_tid_opt,
-                ThreadKind::Terminal,
-                Some(&resolved_cwd),
-            )
-            .map_err(storage_err)?;
+        let created = self.runtime.insert_new_thread_with_anchor(
+            parent_node_id,
+            "Terminal".to_string(),
+            explicit_custom,
+            parent_tid_opt,
+            ThreadKind::Terminal,
+            Some(resolved_cwd.clone()),
+        )?;
+        let tid = created.id;
         let tid_str = tid.0.to_string();
 
         if let Err(err) = self
@@ -4173,12 +4157,6 @@ impl DaemonEngine for InProcessEngine {
             return Err(err);
         }
 
-        let created = self
-            .runtime
-            .storage
-            .get_thread(tid)
-            .map_err(storage_err)?
-            .ok_or_else(|| EngineError::Storage("created terminal thread missing".to_string()))?;
         let summary = thread_to_summary(&created, false);
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
@@ -4187,6 +4165,7 @@ impl DaemonEngine for InProcessEngine {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
+                custom_name: summary.custom_name.clone(),
                 turns: Vec::new(),
             },
         });
@@ -5321,7 +5300,7 @@ impl DaemonEngine for UnixSocketEngineClient {
         thread_id: &str,
         title: &str,
     ) -> Result<ThreadSummary, EngineError> {
-        self.call_typed(
+        self.call_dedicated_typed(
             "session.rename_thread",
             json!({"thread_id": thread_id, "title": title}),
         )
@@ -6150,7 +6129,8 @@ mod tests {
             .fork_thread_with_title(Some(&main.thread_id), Some("feat-auth"))
             .await
             .expect("fork branch");
-        assert_eq!(forked.title, "feat-auth");
+        assert_eq!(forked.custom_name.as_deref(), Some("feat-auth"));
+        assert_eq!(forked.title, "Branch 2");
         let merged = engine.merge_thread(&forked.thread_id).await.expect("merge");
         assert!(merged.merged);
 
@@ -6160,7 +6140,10 @@ mod tests {
         }
         assert!(events.iter().any(|e| matches!(
             e,
-            TuiEngineEvent::ThreadCreated { thread } if thread.id == forked.thread_id && thread.title == "feat-auth"
+            TuiEngineEvent::ThreadCreated { thread }
+                if thread.id == forked.thread_id
+                    && thread.custom_name.as_deref() == Some("feat-auth")
+                    && thread.title == "Branch 2"
         )));
         assert!(events.iter().any(|e| matches!(
             e,
@@ -6179,7 +6162,8 @@ mod tests {
         assert_eq!(threads[0].title, "Main");
         assert!(!threads[0].merged);
         assert_eq!(threads[1].thread_id, forked.thread_id);
-        assert_eq!(threads[1].title, "feat-auth");
+        assert_eq!(threads[1].custom_name.as_deref(), Some("feat-auth"));
+        assert_eq!(threads[1].title, "Branch 2");
         assert!(threads[1].merged);
 
         let main_turns = reopened
@@ -6394,11 +6378,12 @@ done
             .expect("auto branch exists");
         assert_eq!(updated_auto.title, "Auto Named Branch");
 
-        // Fork explicit named branch -> title is NOT overwritten by session_info_update.
+        // Fork explicit named branch -> custom_name is preserved while ACP updates auto-title.
         let branch_named = engine
             .fork_thread_with_title(Some(&main.thread_id), Some("explicit-title"))
             .await
             .expect("fork named");
+        assert_eq!(branch_named.custom_name.as_deref(), Some("explicit-title"));
         timeout(
             Duration::from_secs(5),
             engine.send_turn_for_thread(&branch_named.thread_id, "branch named prompt"),
@@ -6411,7 +6396,8 @@ done
             .iter()
             .find(|t| t.thread_id == branch_named.thread_id)
             .expect("named branch exists");
-        assert_eq!(preserved.title, "explicit-title");
+        assert_eq!(preserved.custom_name.as_deref(), Some("explicit-title"));
+        assert_eq!(preserved.title, "Auto Named Branch");
 
         // Cancel test on Main
         let engine_cancel = Arc::clone(&engine);
@@ -7172,13 +7158,20 @@ done
                 .expect("open");
         let main = engine.ensure_main_thread().await.expect("main");
 
-        // Rename Main and verify empty title is rejected.
-        assert!(engine.rename_thread(&main.thread_id, "   ").await.is_err());
+        // Rename Main sets custom_name while keeping title untouched; blank clears back to None.
+        let cleared_main = engine
+            .rename_thread(&main.thread_id, "   ")
+            .await
+            .expect("blank rename clears custom_name");
+        assert_eq!(cleared_main.custom_name, None);
+        assert_eq!(cleared_main.title, "Main");
+
         let renamed_main = engine
             .rename_thread(&main.thread_id, "Primary Root")
             .await
             .expect("rename main");
-        assert_eq!(renamed_main.title, "Primary Root");
+        assert_eq!(renamed_main.custom_name.as_deref(), Some("Primary Root"));
+        assert_eq!(renamed_main.title, "Main");
 
         // 3-level empty-branch fork: Primary Root -> Branch 5 (0 turns) -> Branch 6 (0 turns).
         let b5 = engine
@@ -7193,11 +7186,16 @@ done
         // Create second root and rename it.
         let root2 = engine.create_root_thread(None).await.expect("create root2");
         assert_eq!(root2.title, "Root 2");
+        assert_eq!(root2.custom_name, None);
         let renamed_root2 = engine
             .rename_thread(&root2.thread_id, "Secondary Root")
             .await
             .expect("rename root2");
-        assert_eq!(renamed_root2.title, "Secondary Root");
+        assert_eq!(
+            renamed_root2.custom_name.as_deref(),
+            Some("Secondary Root")
+        );
+        assert_eq!(renamed_root2.title, "Root 2");
         let root2_child = engine
             .fork_thread_with_title(Some(&root2.thread_id), Some("Root2 Child"))
             .await
@@ -7208,17 +7206,19 @@ done
             InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
                 .expect("reopen");
         let ensured = reopened.ensure_main_thread().await.expect("ensure_main_thread");
-        assert_eq!(ensured.title, "Primary Root");
+        assert_eq!(ensured.custom_name.as_deref(), Some("Primary Root"));
+        assert_eq!(ensured.title, "Main");
 
         let threads = reopened.list_threads().await.expect("list");
+        let reloaded_root2 = threads
+            .iter()
+            .find(|t| t.thread_id == root2.thread_id)
+            .unwrap();
         assert_eq!(
-            threads
-                .iter()
-                .find(|t| t.thread_id == root2.thread_id)
-                .unwrap()
-                .title,
-            "Secondary Root"
+            reloaded_root2.custom_name.as_deref(),
+            Some("Secondary Root")
         );
+        assert_eq!(reloaded_root2.title, "Root 2");
 
         let meta = reopened.thread_metadata().await.expect("meta");
         let m_main = meta.iter().find(|m| m.thread_id == main.thread_id).unwrap();
@@ -8296,5 +8296,269 @@ done
         assert_eq!(t1_meta.git_dirty, 5);
         assert_eq!(t2_meta.git_branch.as_deref(), Some("feat/sub"));
         assert_eq!(t2_meta.git_dirty, 5);
+    }
+
+    #[tokio::test]
+    async fn test_rename_thread_sets_and_clears_custom_name_without_touching_title() {
+        let engine = InProcessEngine::in_memory().expect("in_memory");
+        let main = engine.ensure_main_thread().await.expect("main");
+        assert_eq!(main.title, "Main");
+        assert_eq!(main.custom_name, None);
+
+        let term = engine
+            .create_terminal(Some(&main.thread_id), None, None, 24, 80)
+            .await
+            .expect("create_terminal");
+        assert_eq!(term.title, "Terminal");
+        assert_eq!(term.custom_name, None);
+
+        let mut rx = engine.subscribe_tui_events();
+
+        let renamed_main = engine
+            .rename_thread(&main.thread_id, "  Terminal  ")
+            .await
+            .expect("rename main");
+        assert_eq!(renamed_main.custom_name.as_deref(), Some("Terminal"));
+        assert_eq!(renamed_main.title, "Main");
+
+        let renamed_term = engine
+            .rename_thread(&term.thread_id, "Dev Shell")
+            .await
+            .expect("rename term");
+        assert_eq!(renamed_term.custom_name.as_deref(), Some("Dev Shell"));
+        assert_eq!(renamed_term.title, "Terminal");
+
+        let meta_after_set = engine.thread_metadata().await.expect("meta after set");
+        assert_eq!(
+            meta_after_set
+                .iter()
+                .find(|m| m.thread_id == main.thread_id)
+                .unwrap()
+                .custom_name
+                .as_deref(),
+            Some("Terminal")
+        );
+        assert_eq!(
+            meta_after_set
+                .iter()
+                .find(|m| m.thread_id == term.thread_id)
+                .unwrap()
+                .custom_name
+                .as_deref(),
+            Some("Dev Shell")
+        );
+
+        let cleared_main = engine
+            .rename_thread(&main.thread_id, "")
+            .await
+            .expect("clear main custom_name");
+        assert_eq!(cleared_main.custom_name, None);
+        assert_eq!(cleared_main.title, "Main");
+
+        let cleared_term = engine
+            .rename_thread(&term.thread_id, "   ")
+            .await
+            .expect("clear term custom_name");
+        assert_eq!(cleared_term.custom_name, None);
+        assert_eq!(cleared_term.title, "Terminal");
+
+        let meta_after_clear = engine.thread_metadata().await.expect("meta after clear");
+        assert_eq!(
+            meta_after_clear
+                .iter()
+                .find(|m| m.thread_id == main.thread_id)
+                .unwrap()
+                .custom_name,
+            None
+        );
+        assert_eq!(
+            meta_after_clear
+                .iter()
+                .find(|m| m.thread_id == term.thread_id)
+                .unwrap()
+                .custom_name,
+            None
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, TuiEngineEvent::ThreadTitleUpdated { .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &main.thread_id && custom_name.as_deref() == Some("Terminal")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &term.thread_id && custom_name.as_deref() == Some("Dev Shell")
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &main.thread_id && custom_name.is_none()
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadCustomNameUpdated { thread_id, custom_name }
+                if thread_id == &term.thread_id && custom_name.is_none()
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_unconditional_acp_session_info_update_updates_titles_and_preserves_custom_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("session_info_unconditional.db");
+
+        let mock_script = r#"#!/bin/sh
+sess_counter=0
+while IFS= read -r line; do
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"mock","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-%s"}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/prompt"'*)
+            sid=${line#*\"sessionId\":\"}
+            sid=${sid%%\"*}
+            info_title=""
+            case "$line" in
+                *"main turn 1"*) info_title="Auth System Overview" ;;
+                *"main turn 2"*) info_title="Refined Auth Architecture" ;;
+                *"branch auto turn"*) info_title="Token Rotation Plan" ;;
+                *"custom branch turn"*) info_title="OAuth PKCE Flow" ;;
+                *"root turn"*) info_title="Root Auto Title" ;;
+            esac
+            if [ -n "$info_title" ]; then
+                printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"session_info_update","title":"%s"}}}\n' "$sid" "$info_title"
+            fi
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}\n' "$sid"
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        let script_path = write_executable_script(temp.path(), "mock_info_update.sh", mock_script);
+        let cfg = AcpBackendConfig {
+            command: script_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        };
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
+                .expect("open");
+        let main = engine.ensure_main_thread().await.expect("main");
+        let branch_auto = engine
+            .fork_thread_with_title(Some(&main.thread_id), None)
+            .await
+            .expect("fork auto");
+        let branch_custom = engine
+            .fork_thread_with_title(Some(&main.thread_id), Some("Auth"))
+            .await
+            .expect("fork custom");
+        let root2 = engine.create_root_thread(None).await.expect("create root2");
+
+        let mut rx = engine.subscribe_tui_events();
+
+        engine
+            .send_turn_for_thread(&main.thread_id, "main turn 1")
+            .await
+            .expect("main turn 1");
+        engine
+            .send_turn_for_thread(&main.thread_id, "main turn 2")
+            .await
+            .expect("main turn 2");
+        engine
+            .send_turn_for_thread(&branch_auto.thread_id, "branch auto turn")
+            .await
+            .expect("branch auto turn");
+        engine
+            .send_turn_for_thread(&branch_custom.thread_id, "custom branch turn")
+            .await
+            .expect("custom branch turn");
+        engine
+            .send_turn_for_thread(&root2.thread_id, "root turn")
+            .await
+            .expect("root turn");
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(120), rx.recv()).await {
+            events.push(ev);
+        }
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &main.thread_id && title == "Auth System Overview"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &main.thread_id && title == "Refined Auth Architecture"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &branch_auto.thread_id && title == "Token Rotation Plan"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &branch_custom.thread_id && title == "OAuth PKCE Flow"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEngineEvent::ThreadTitleUpdated { thread_id, title }
+                if thread_id == &root2.thread_id && title == "Root Auto Title"
+        )));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, TuiEngineEvent::ThreadCustomNameUpdated { .. })));
+
+        let threads = engine.list_threads().await.expect("list");
+        let m_summary = threads.iter().find(|t| t.thread_id == main.thread_id).unwrap();
+        assert_eq!(m_summary.title, "Refined Auth Architecture");
+        assert_eq!(m_summary.custom_name, None);
+
+        let ba_summary = threads
+            .iter()
+            .find(|t| t.thread_id == branch_auto.thread_id)
+            .unwrap();
+        assert_eq!(ba_summary.title, "Token Rotation Plan");
+        assert_eq!(ba_summary.custom_name, None);
+
+        let bc_summary = threads
+            .iter()
+            .find(|t| t.thread_id == branch_custom.thread_id)
+            .unwrap();
+        assert_eq!(bc_summary.title, "OAuth PKCE Flow");
+        assert_eq!(bc_summary.custom_name.as_deref(), Some("Auth"));
+
+        let r2_summary = threads.iter().find(|t| t.thread_id == root2.thread_id).unwrap();
+        assert_eq!(r2_summary.title, "Root Auto Title");
+        assert_eq!(r2_summary.custom_name, None);
+
+        // Reopen DB and verify persisted titles & custom_name.
+        drop(engine);
+        let reopened =
+            InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                .expect("reopen");
+        let persisted = reopened.list_threads().await.expect("persisted");
+        let bc_persisted = persisted
+            .iter()
+            .find(|t| t.thread_id == branch_custom.thread_id)
+            .unwrap();
+        assert_eq!(bc_persisted.title, "OAuth PKCE Flow");
+        assert_eq!(bc_persisted.custom_name.as_deref(), Some("Auth"));
     }
 }

@@ -629,7 +629,8 @@ async fn test_create_terminal_coalesced_events_exit_and_guardrails_without_acp()
         .create_terminal(Some(&main.thread_id), Some("Build Term"), Some("sub"), 24, 120)
         .await
         .expect("create_terminal");
-    assert_eq!(term.title, "Build Term");
+    assert_eq!(term.custom_name.as_deref(), Some("Build Term"));
+    assert_eq!(term.title, "Terminal");
     assert!(!acp_marker.exists(), "create_terminal must never spawn ACP");
 
     // Root terminal creation + invalid cwd rejection.
