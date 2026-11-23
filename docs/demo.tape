@@ -64,9 +64,20 @@ Sleep 700ms
 Alt+l
 Sleep 700ms
 
-# 4. Return to MANAGE (Ctrl+G), confirmed [d]el (d -> y), and switch to Worktrees view (Tab)
+# 4. Return to MANAGE (Ctrl+G), fuzzy-filter Help (? -> /), delete a thread (d -> y), and switch to Worktrees view (Tab)
 Ctrl+G
 Sleep 500ms
+Type "?"
+Sleep 500ms
+Type "/"
+Type "hide"
+Sleep 700ms
+Enter
+Sleep 400ms
+Escape
+Sleep 300ms
+Escape
+Sleep 400ms
 Type "d"
 Sleep 500ms
 Type "y"
@@ -74,13 +85,13 @@ Sleep 600ms
 Tab
 Sleep 1s
 
-# 5. Inspect the feature worktree and its live diff preview
+# 5. Inspect the feature worktree, attached threads, and its live diff preview
 Down
 Sleep 400ms
 Down
 Sleep 1.6s
 
-# 6. Open : command palette and live-preview themes via :theme
+# 6. Open : command palette and live-preview themes across the 16 swatch-tagged presets via :theme
 Type ":"
 Sleep 400ms
 Type "theme"
@@ -88,15 +99,34 @@ Sleep 600ms
 Enter
 Sleep 800ms
 Type "j"
-Sleep 700ms
+Sleep 450ms
 Type "j"
-Sleep 800ms
+Sleep 450ms
+Type "j"
+Sleep 450ms
+Type "j"
+Sleep 450ms
+Type "j"
+Sleep 700ms
 Enter
 Sleep 900ms
 
-# 7. Return to Grein view (Tab), jump to root 1 (gg), and press Enter to enter WRITE in $SHELL
+# 7. Create a [n]ew root agent in the worktree (auto-returns to Grein + WRITE · AGENT) & use Composer word autocomplete
+Type "n"
+Sleep 900ms
+Type "refac"
+Sleep 600ms
 Tab
-Sleep 500ms
+Type " @lib"
+Sleep 600ms
+Tab
+Sleep 700ms
+Ctrl+C
+Sleep 400ms
+
+# 8. Return to MANAGE (Ctrl+G), jump to root 1 (gg), and press Enter to enter WRITE in $SHELL
+Ctrl+G
+Sleep 400ms
 Type "gg"
 Sleep 400ms
 Enter
