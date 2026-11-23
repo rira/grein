@@ -6,6 +6,41 @@
 
 ---
 
+## Installation
+
+### Homebrew (macOS & Linux)
+
+```bash
+# Primary tap
+brew install rira/tap/grein
+
+# Source fallback directly from this repository
+brew tap rira/grein https://github.com/rira/grein && brew install rira/grein/grein
+```
+
+### Nix Flake
+
+```bash
+# Run directly without installing
+nix run github:rira/grein
+
+# Or install into your Nix profile
+nix profile install github:rira/grein
+```
+
+### From Source (Cargo)
+
+```bash
+cargo install --path crates/grein-cli --locked
+```
+
+### Launch Modes
+
+- `grein` opens terminal-first in `$SHELL`.
+- `grein --agent` starts an ACP agent session.
+
+---
+
 ## Architectural Pillars
 
 1. **Pure-Tree DAG Contexts:** Conversations form a Git-like DAG forest of immutable turn nodes organized into independent top-level roots (`ᛉ`) and explicit `parent_thread_id` child branches (`├─` / `└─`), alongside embedded interactive PTY terminal nodes (`>_`). Agent branches fork off structural anchors or active turns, inheriting ancestor turns up to the fork point while isolating sibling branches and separate roots. Terminal contexts inherit their parent's `cwd` (including opt-in `/worktree` directories). Manual `/join` / `/merge` (`m` in tree) commits a concise `DecisionLandmark` directly onto the parent branch (with append-only `[Joined Context]` delivery on active parent sessions, preserving LLM KV caches).
@@ -16,6 +51,8 @@
 ---
 
 ## Compact Keymap & Commands
+
+Launch modes: `grein` opens terminal-first in `$SHELL`; `grein --agent` starts an ACP agent session.
 
 | Scope | Binding / Command | Action |
 | :--- | :--- | :--- |

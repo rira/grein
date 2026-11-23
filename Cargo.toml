@@ -13,3 +13,6 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Richard <rira>"]
 license = "MIT"
+description = "Terminal-native workspace for branching AI coding sessions, git worktrees, and embedded shells"
+homepage = "https://github.com/rira/grein"
+repository = "https://github.com/rira/grein"
