@@ -1,11 +1,15 @@
 class Grein < Formula
-  desc "AI-native engineering platform CLI"
-  homepage "https://github.com/example/grein"
-  url "https://github.com/example/grein/archive/refs/tags/v0.1.0.tar.gz"
+  desc "Terminal-native workspace for branching AI sessions, git worktrees, and embedded shells"
+  homepage "https://github.com/rira/grein"
+  url "https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz"
+  # Update after tagging v0.1.0: curl -sL https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz | sha256sum
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on "rust" => :build
+  depends_on "pkg-config" => :build
+
+  uses_from_macos "sqlite"
 
   def install
     system "cargo", "install", *std_cargo_args(path: "crates/grein-cli")
