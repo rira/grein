@@ -1,6 +1,7 @@
 #![allow(clippy::nonminimal_bool)]
 
 pub mod app;
+pub mod autocomplete;
 pub mod clipboard;
 pub mod composer;
 pub mod diff_card;
