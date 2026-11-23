@@ -15,5 +15,8 @@ pub use blackboard::{
 };
 pub use error::CoreError;
 pub use model::ThreadKind;
-pub use prefs::{default_prefs_db_path, UserPrefsStore};
+pub use prefs::{
+    default_prefs_db_path, ImportReport, SectionPatch, SettingsFormat, SettingsPatch,
+    SettingsSnapshot, UserPrefsStore,
+};
 pub use sync::{build_context_prompt, ContextCompiler, ContextPayload};
