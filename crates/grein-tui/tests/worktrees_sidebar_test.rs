@@ -127,16 +127,19 @@ fn setup_multi_repo_app() -> App {
                     id: "t-main".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-auth".to_string(),
                     title: "Auth".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -179,14 +182,14 @@ fn test_manage_ctrl_t_toggles_views_unhides_zoom_and_leaves_ctrl_t_passthrough_i
     assert_eq!(app.sidebar_view, SidebarView::Grein);
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-    // Ctrl+T in WRITE mode passes straight to Composer/Terminal; Ctrl+G -> MANAGE then Ctrl+T / Tab switches views
+    // Ctrl+T in WRITE and MANAGE does not switch sidebar views; Tab in MANAGE toggles views
     assert!(!app.handle_key_event(ctrl('t')));
     assert_eq!(app.sidebar_view, SidebarView::Grein);
     assert!(app.handle_key_event(ctrl('g')));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
-    // Ctrl+T from MANAGE -> Worktrees view, focuses Tree, queues ListWorktrees
-    assert!(app.handle_key_event(ctrl('t')));
+    // Tab from MANAGE -> Worktrees view, focuses Tree, queues ListWorktrees
+    assert!(app.handle_key_event(key(KeyCode::Tab)));
     assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(!app.sidebar_hidden);
@@ -195,8 +198,8 @@ fn test_manage_ctrl_t_toggles_views_unhides_zoom_and_leaves_ctrl_t_passthrough_i
         Some(AppAction::ListWorktrees)
     ));
 
-    // Ctrl+T again -> returns to Grein view and focuses Tree
-    assert!(app.handle_key_event(ctrl('t')));
+    // Tab again -> returns to Grein view and focuses Tree
+    assert!(app.handle_key_event(key(KeyCode::Tab)));
     assert_eq!(app.sidebar_view, SidebarView::Grein);
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
@@ -236,7 +239,7 @@ fn test_manage_ctrl_t_toggles_views_unhides_zoom_and_leaves_ctrl_t_passthrough_i
         })
     );
 
-    // Ctrl+G enters MANAGE (unhiding sidebar and resizing PTY), then Ctrl+T switches to Worktrees
+    // Ctrl+G enters MANAGE (unhiding sidebar and resizing PTY), then Tab switches to Worktrees
     app.pending_actions.clear();
     assert!(app.handle_key_event(ctrl('g')));
     assert!(!app.sidebar_hidden);
@@ -247,7 +250,7 @@ fn test_manage_ctrl_t_toggles_views_unhides_zoom_and_leaves_ctrl_t_passthrough_i
         .any(|a| matches!(a, AppAction::PtyResize { thread_id, cols, .. } if thread_id == "t-term" && *cols < 110)));
 
     app.pending_actions.clear();
-    assert!(app.handle_key_event(ctrl('t')));
+    assert!(app.handle_key_event(key(KeyCode::Tab)));
     assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(app
@@ -275,7 +278,7 @@ fn test_alt_z_toggles_zoom_globally_without_interfering_with_ctrl_t() {
 
     // Preserve Worktrees view when Alt+Z hides & restores sidebar
     app.set_focus(FocusedPane::Tree);
-    app.handle_key_event(ctrl('t'));
+    app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     assert!(app.handle_key_event(alt('z')));
     assert!(app.sidebar_hidden);
@@ -296,7 +299,7 @@ fn test_alt_z_toggles_zoom_globally_without_interfering_with_ctrl_t() {
 fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete_modal() {
     let mut app = setup_multi_repo_app();
     app.set_focus(FocusedPane::Tree);
-    app.handle_key_event(ctrl('t'));
+    app.handle_key_event(key(KeyCode::Tab));
     app.pending_actions.clear();
 
     let mut terminal = Terminal::new(TestBackend::new(120, 28)).unwrap();
@@ -307,7 +310,7 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
     let status = render_rect(&terminal, Rect::new(0, 27, 120, 1));
     assert!(
         status.contains("MANAGE · WORKTREES")
-            && status.contains("Enter attach · p prune · y copy"),
+            && status.contains("[↵]attach [s]hell [w]orktree [p]rune"),
         "{status}"
     );
     assert!(screen.contains("ᛇ Grein │ ⎇ Worktrees"), "{screen}");
@@ -441,20 +444,19 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         })
     );
     assert_eq!(app.status_notice.as_deref(), Some("Switching worktree..."));
-    // Enter on a worktree attaches and returns to WRITE; Ctrl+G re-enters MANAGE Worktrees for t/w/n/d
+    // Enter on a worktree attaches and returns to WRITE; Ctrl+G re-enters MANAGE Worktrees for s/w/d
     app.handle_key_event(ctrl('g'));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     app.pending_actions.clear();
 
-    app.handle_key_event(key(KeyCode::Char('t')));
+    app.handle_key_event(key(KeyCode::Char('s')));
     assert!(matches!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateTerminal {
             parent_thread_id: Some(ref pid),
-            title: Some(ref title),
             cwd: Some(ref cwd),
             ..
-        }) if pid == "t-auth" && title.contains("feat/auth") && cwd == "/repos/alpha/.grein/worktrees/feat-auth"
+        }) if pid == "t-auth" && cwd == "/repos/alpha/.grein/worktrees/feat-auth"
     ));
 
     app.handle_key_event(key(KeyCode::Char('w')));
@@ -465,12 +467,7 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         })
     );
     app.handle_key_event(key(KeyCode::Char('n')));
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::EnsureThreadWorktree {
-            thread_id: "t-auth".to_string(),
-        })
-    );
+    assert!(app.pending_actions.is_empty(), "'n' must stay clean on Worktrees view");
 
     // Primary deletion guard
     app.worktree_selected_idx = 1; // main (primary)
@@ -481,9 +478,11 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         Some("Cannot delete primary repository worktree")
     );
 
-    // Clean non-primary delete modal: detached@deadbeef (idx 3)
+    // Clean non-primary delete modal: detached@deadbeef (idx 3) via 'd' ('x' ignored)
     app.worktree_selected_idx = 3;
     app.handle_key_event(key(KeyCode::Char('x')));
+    assert!(app.pending_worktree_delete.is_none());
+    app.handle_key_event(key(KeyCode::Char('d')));
     assert_eq!(
         app.pending_worktree_delete,
         Some(PendingWorktreeDelete {
@@ -760,6 +759,7 @@ impl TuiEnginePort for MockWorktreeEngine {
                 id: "t-main".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         })
     }
@@ -875,10 +875,10 @@ async fn test_e2e_runner_worktree_switch_ensure_remove_refresh_list_and_metadata
     })
     .await;
 
-    // 1. Ctrl+G -> MANAGE, Ctrl+T lists worktrees
+    // 1. Ctrl+G -> MANAGE, Tab lists worktrees
     key_tx.send(Event::Key(ctrl('g'))).unwrap();
-    key_tx.send(Event::Key(ctrl('t'))).unwrap();
-    wait_for("list_worktrees on Ctrl+T", || {
+    key_tx.send(Event::Key(key(KeyCode::Tab))).unwrap();
+    wait_for("list_worktrees on Tab", || {
         engine.state.lock().unwrap().list_calls >= 1
     })
     .await;

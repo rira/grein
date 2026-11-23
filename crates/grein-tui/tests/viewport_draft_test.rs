@@ -160,11 +160,13 @@ fn test_global_scroll_shortcuts_from_composer_and_tree_preview() {
         grein_tui::app::ThreadItem {
             id: "trunk".to_string(),
             title: "Trunk".to_string(),
+            custom_name: None,
             anchors: Vec::new(),
         },
         grein_tui::app::ThreadItem {
             id: "preview".to_string(),
             title: "Preview".to_string(),
+            custom_name: None,
             anchors: Vec::new(),
         },
     ];
@@ -176,19 +178,14 @@ fn test_global_scroll_shortcuts_from_composer_and_tree_preview() {
     app.transcript_viewport_mut("preview").set_max_scroll(60);
     app.transcript_viewport_mut("preview").scroll_to_bottom();
 
-    // Composer focused: Alt/Shift+PgUp/PgDn scroll by 10; plain Home/End still operate on Composer line bounds
+    // Composer focused: Alt+K/Alt+J scroll by 10; plain Home/End still operate on Composer line bounds
     app.set_focus(FocusedPane::Composer);
     app.input_buffer = "keep".to_string();
     app.cursor_position = 2;
 
-    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT)));
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT)));
     assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 90);
-    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT)));
-    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
-
-    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)));
-    assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 90);
-    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT)));
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)));
     assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
 
     // Plain Home/End still operate on Composer line bounds
@@ -198,11 +195,11 @@ fn test_global_scroll_shortcuts_from_composer_and_tree_preview() {
     assert_eq!(app.cursor_position, 4);
     assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
 
-    // Tree focused & previewing "preview": PgUp/PgDn scroll targets previewed thread, not trunk
+    // Tree focused & previewing "preview": Ctrl+U/Ctrl+B scroll targets previewed thread, not trunk
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(app.active_thread_id(), "trunk");
-    assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
     assert_eq!(app.transcript_viewport("preview").scroll_offset(), 50);
     assert_eq!(app.transcript_viewport("trunk").scroll_offset(), 100);
 }

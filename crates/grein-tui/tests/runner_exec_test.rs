@@ -116,6 +116,7 @@ impl TuiEnginePort for SqliteBackedEngine {
                 id: tid_entry.value.clone(),
                 title: "persisted".to_string(),
                 turns,
+                              custom_name: None,
             }],
         })
     }
@@ -160,6 +161,7 @@ fn sample_session() -> HydratedSession {
                     content: "world".to_string(),
                 },
             ],
+                          custom_name: None,
         }],
     }
 }
@@ -487,6 +489,7 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_ignores_bla
                 id: "t-2".to_string(),
                 title: "Forked".to_string(),
                 turns: Vec::new(),
+                        custom_name: None,
             },
         },
     );

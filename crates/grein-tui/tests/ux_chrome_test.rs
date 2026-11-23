@@ -54,21 +54,25 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                         content: "### Auth Pipeline\n1. **Token Check**: verifies JWT".to_string(),
                     },
                 ],
+                custom_name: None,
             },
             HydratedThread {
                 id: "t-child".to_string(),
                 title: "Child Context".to_string(),
                 turns: Vec::new(),
+                custom_name: None,
             },
             HydratedThread {
                 id: "t-grandchild".to_string(),
                 title: "Grandchild".to_string(),
                 turns: Vec::new(),
+                custom_name: None,
             },
             HydratedThread {
                 id: "t-sibling".to_string(),
                 title: "Second Child".to_string(),
                 turns: Vec::new(),
+                custom_name: None,
             },
         ],
     };
@@ -86,6 +90,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -96,6 +101,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-grandchild".to_string(),
@@ -106,6 +112,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-sibling".to_string(),
@@ -116,6 +123,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -183,6 +191,7 @@ fn test_tree_vertical_scrolling_keeps_selected_context_visible() {
             id: format!("t-{i}"),
             title: format!("Branch-{i:02}"),
             turns: Vec::new(),
+                     custom_name: None,
         })
         .collect();
     apply_hydrated_session(
@@ -237,6 +246,7 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
                 id: "t-1".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -269,6 +279,7 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
                 id: "t-2".to_string(),
                 title: "Feature".to_string(),
                 turns: Vec::new(),
+                        custom_name: None,
             },
         },
     );
@@ -286,12 +297,14 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
     );
 
     app.handle_key_event(key(KeyCode::Char('x')));
+    assert!(app.pending_thread_delete.is_none());
+    app.handle_key_event(key(KeyCode::Char('d')));
     assert!(app.pending_thread_delete.is_some());
     app.handle_key_event(key(KeyCode::Esc));
     assert!(app.pending_thread_delete.is_none());
     assert!(app.pending_actions.is_empty());
 
-    app.handle_key_event(key(KeyCode::Char('x')));
+    app.handle_key_event(key(KeyCode::Char('d')));
     app.handle_key_event(key(KeyCode::Char('y')));
     assert_eq!(
         app.pending_actions.pop_front(),
@@ -349,11 +362,13 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                         id: "t-1".to_string(),
                         title: "Main".to_string(),
                         turns: Vec::new(),
+                        custom_name: None,
                     },
                     HydratedThread {
                         id: "t-2".to_string(),
                         title: "Side".to_string(),
                         turns: Vec::new(),
+                        custom_name: None,
                     },
                 ],
             })
@@ -385,6 +400,7 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-2".to_string(),
@@ -395,6 +411,7 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ])
         }
@@ -462,6 +479,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     id: "t-root".to_string(),
                     title: "Main Trunk".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
@@ -471,6 +489,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                         role: "User".to_string(),
                         content: "branch local question".to_string(),
                     }],
+                    custom_name: None,
                 },
             ],
         },
@@ -488,6 +507,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -498,6 +518,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -549,11 +570,13 @@ fn test_layout_with_chrome_and_subagent_strip_auto_hide_and_overflow() {
                     id: "t-1".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Other".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -633,6 +656,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
                 id: "t-1".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -651,7 +675,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     assert!(!idle_screen.contains("Enter: Send"));
     assert!(!idle_screen.contains("!cmd: Shell"));
     assert!(idle_screen.contains("WRITE · AGENT"));
-    assert!(idle_screen.contains("Ctrl+G manage · Alt+Z zoom"));
+    assert!(idle_screen.contains("Ctrl+G manage · Alt+Z sidebar"));
     assert!(idle_screen.contains("code · claude-sonnet"));
     assert!(idle_screen.contains("0 subagents"));
 
@@ -667,7 +691,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     assert_eq!(app.tick_count, 1);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let thinking_screen = render_screen(&terminal);
-    assert!(thinking_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"));
+    assert!(thinking_screen.contains("Esc cancel · Ctrl+G manage"));
     assert!(thinking_screen.contains("thinking"));
 
     // ToolActivityUpdated sets tool name, clearing restores streaming
@@ -727,7 +751,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     );
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let done_screen = render_screen(&terminal);
-    assert!(done_screen.contains("Ctrl+G manage · Alt+Z zoom"));
+    assert!(done_screen.contains("Ctrl+G manage · Alt+Z sidebar"));
     assert!(done_screen.contains("idle"));
 }
 
@@ -735,7 +759,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
 fn test_help_modal_triggers_rendering_and_dismissal() {
     let mut app = App::new();
 
-    // '?' in Composer types '?' normally instead of hijacking Composer; F1 works in MANAGE
+    // '?' in Composer types '?' normally instead of hijacking Composer; '?' opens Help in MANAGE
     app.set_focus(FocusedPane::Composer);
     app.handle_key_event(key(KeyCode::Char('?')));
     assert!(!app.show_help_modal);
@@ -758,7 +782,7 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert!(modal_screen.contains("/theme"));
     assert!(modal_screen.contains("/bind"));
     assert!(modal_screen.contains("!cmd"));
-    assert!(modal_screen.contains("Tab / Ctrl+T"));
+    assert!(modal_screen.contains("Tab"));
     assert!(modal_screen.contains("Ctrl+C"));
 
     // Dismiss with Esc without quitting or changing focus
@@ -790,7 +814,7 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert!(!app.show_help_modal);
     assert_eq!(app.composer_input(), "");
 
-    // In MANAGE (Tree): '?' and 'F1' toggle Help modal open/closed, '/' opens Forward Search
+    // In MANAGE (Tree): '?' opens Help modal and Enter closes, '/' opens Forward Search
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Char('/')));
     assert!(!app.show_help_modal);
@@ -809,9 +833,7 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
     app.handle_key_event(key(KeyCode::F(1)));
-    assert!(app.show_help_modal);
-    app.handle_key_event(key(KeyCode::F(1)));
-    assert!(!app.show_help_modal);
+    assert!(!app.show_help_modal, "F1 is unbound; '?' is single Help key");
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
 }
 
@@ -831,6 +853,7 @@ fn test_live_branch_preview_and_rune_lore() {
                         role: "User".to_string(),
                         content: "main branch prompt".to_string(),
                     }],
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-alt".to_string(),
@@ -840,6 +863,7 @@ fn test_live_branch_preview_and_rune_lore() {
                         role: "User".to_string(),
                         content: "feature preview prompt".to_string(),
                     }],
+                    custom_name: None,
                 },
             ],
         },
@@ -898,36 +922,43 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     id: "r1".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "b1".to_string(),
                     title: "Branch A".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "b2".to_string(),
                     title: "Branch B".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "g1".to_string(),
                     title: "Grandchild".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "gg1".to_string(),
                     title: "Great-Grand".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "r2".to_string(),
                     title: "Root 2".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "r2c".to_string(),
                     title: "Root2 Child".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -945,6 +976,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "b1".to_string(),
@@ -955,6 +987,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "b2".to_string(),
@@ -965,6 +998,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "g1".to_string(),
@@ -975,6 +1009,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "gg1".to_string(),
@@ -985,6 +1020,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "r2".to_string(),
@@ -995,6 +1031,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "r2c".to_string(),
@@ -1005,6 +1042,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -1079,11 +1117,13 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
                     id: "t-main".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
                     title: "Side Work".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1104,11 +1144,9 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
         Some(AppAction::CreateRoot { title: None })
     );
 
-    // 'a' in Tree emits CreateRoot { title: None }, while 'n' in Tree does not hijack
+    // 'n' in Tree emits CreateRoot { title: None }
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Char('n')));
-    assert!(app.pending_actions.is_empty());
-    app.handle_key_event(key(KeyCode::Char('a')));
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateRoot { title: None })
@@ -1121,10 +1159,13 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
     assert!(!app.handle_key_event(key(KeyCode::F(2))));
     assert!(app.pending_actions.is_empty());
 
-    // Alt+1..9 remain unbound
+    // Alt+1..9 jump roots without mutating Composer (end back on root 1: t-main)
     for digit in '1'..='9' {
-        assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT)));
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT)));
     }
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)));
+    assert_eq!(app.active_thread_id(), "t-main");
+    assert_eq!(app.composer_input(), "");
 
     // Empty /rename sets usage status_notice without emitting RenameThread
     app.submit_composer_prompt("/rename   ");
@@ -1134,17 +1175,16 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
         Some("Usage: /rename <new title>")
     );
 
-    // 'r' in Tree on unselected child opens inline rename_prompt targeting t-child
+    // 'r' in Tree on unselected child opens inline rename_prompt targeting t-child (starts empty when custom_name is None)
     app.set_focus(FocusedPane::Tree);
     app.tree.select_index(1);
     app.handle_key_event(key(KeyCode::Char('r')));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     let rename = app.rename_prompt.as_ref().expect("inline rename prompt");
     assert_eq!(rename.thread_id, "t-child");
-    assert_eq!(rename.buffer, "Side Work");
+    assert_eq!(rename.buffer, "");
 
-    // Clear buffer with Ctrl+U, type new title, press Enter -> RenameThread for t-child while staying in MANAGE
-    app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    // Type new custom name, press Enter -> RenameThread for t-child while staying in MANAGE
     for ch in "Auth Branch".chars() {
         app.handle_key_event(key(KeyCode::Char(ch)));
     }
@@ -1182,11 +1222,13 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     id: "t-root".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
                     title: "Auth Fix".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1204,6 +1246,7 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -1214,6 +1257,7 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -1307,14 +1351,14 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
     assert!(help_screen.contains("/term"), "{help_screen}");
     assert!(help_screen.contains("/theme"), "{help_screen}");
     assert!(help_screen.contains("/bind"), "{help_screen}");
-    assert!(help_screen.contains("Esc, q, ?, F1, or Enter to close"), "{help_screen}");
+    assert!(help_screen.contains("Esc, q, ?, or Enter to close"), "{help_screen}");
 
     // Also fits cleanly on a standard 80x24 terminal with pinned footer
     let mut small_term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     draw_frame_mut(&mut small_term, &mut app).unwrap();
     let small_help = render_screen(&small_term);
     assert!(
-        small_help.contains("Esc/q/?/F1 Close") || small_help.contains("Esc, q, ?, F1, or Enter to close"),
+        small_help.contains("Esc/q/? Close") || small_help.contains("Esc, q, ?, or Enter to close"),
         "{small_help}"
     );
 

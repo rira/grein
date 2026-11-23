@@ -107,11 +107,13 @@ fn test_dual_mode_layout_hides_composer_for_terminal_and_preserves_agent() {
                     id: "t-agent".to_string(),
                     title: "Agent Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell 1".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -187,26 +189,31 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
                     id: "t-agent".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-sub-agent".to_string(),
                     title: "Auth".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term-live".to_string(),
-                    title: "Shell".to_string(),
+                    title: "Terminal".to_string(),
                     turns: Vec::new(),
+                    custom_name: Some("Shell".to_string()),
                 },
                 HydratedThread {
                     id: "t-term-exit-ok".to_string(),
-                    title: "Logs".to_string(),
+                    title: "Terminal".to_string(),
                     turns: Vec::new(),
+                    custom_name: Some("Logs".to_string()),
                 },
                 HydratedThread {
                     id: "t-term-root-fail".to_string(),
-                    title: "Build".to_string(),
+                    title: "Terminal".to_string(),
                     turns: Vec::new(),
+                    custom_name: Some("Build".to_string()),
                 },
             ],
         },
@@ -282,13 +289,14 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let screen = render_screen(&terminal);
 
-    assert!(screen.contains("ᛉ Main"), "{screen}");
+    assert!(screen.contains("1 ᛉ Main"), "{screen}");
     assert!(screen.contains("├─ Auth"), "{screen}");
     assert!(!screen.contains(">_ Auth"), "{screen}");
-    assert!(screen.contains("├─ >_ Shell"), "{screen}");
-    assert!(screen.contains("└─ >_ Logs ✓ 0"), "{screen}");
-    assert!(screen.contains(">_ Build ✗ 2"), "{screen}");
+    assert!(screen.contains("├─ >_ [Shell] Terminal"), "{screen}");
+    assert!(screen.contains("└─ >_ [Logs] Terminal ✓ 0"), "{screen}");
+    assert!(screen.contains("2 >_ [Build] Terminal ✗ 2"), "{screen}");
     assert!(!screen.contains("ᛉ Build"), "{screen}");
+    assert!(!screen.contains("ᛉ [Build]"), "{screen}");
 }
 
 #[test]
@@ -302,6 +310,7 @@ fn test_live_terminal_rendering_colors_attributes_wide_utf8_and_cursor() {
                 id: "t-term".to_string(),
                 title: "Term".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -436,11 +445,13 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
                     id: "t-agent".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -490,12 +501,14 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let preview_screen = render_screen(&terminal);
-    assert!(preview_screen.contains(">_ Shell · /tmp (Preview)"), "{preview_screen}");
+    assert!(preview_screen.contains(">_ /tmp (Preview)"), "{preview_screen}");
     assert!(preview_screen.contains("● live"), "{preview_screen}");
     assert!(preview_screen.contains("LIVE_PTY_PREVIEW"), "{preview_screen}");
 
-    // 'l' in Tree enters FocusedPane::Terminal on the selected terminal
+    // 'l' and Right on leaf Terminal stay in MANAGE Tree; Enter enters FocusedPane::Terminal
     app.handle_key_event(key(KeyCode::Char('l')));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Enter));
     assert_eq!(app.active_thread_id(), "t-term");
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
@@ -516,6 +529,8 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
     app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.sidebar_view, grein_tui::app::SidebarView::Grein);
     app.handle_key_event(key(KeyCode::Right));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Enter));
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
     // Render frame so pane dimensions are known, then Alt+Z toggles zoom & triggers PtyResize without forwarding \x1bz
@@ -667,13 +682,14 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
                 id: "t-main".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
 
-    // 't' and 'T' in MANAGE Tree spawn child/root terminal; Composer does not hijack 't'
+    // 's' and 'S' in MANAGE Tree spawn child/root terminal; Composer does not hijack 's'
     app.set_focus(FocusedPane::Tree);
-    app.handle_key_event(key(KeyCode::Char('t')));
+    app.handle_key_event(key(KeyCode::Char('s')));
     assert!(matches!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateTerminal {
@@ -683,7 +699,7 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
         }) if pid == "t-main"
     ));
 
-    app.handle_key_event(key(KeyCode::Char('T')));
+    app.handle_key_event(key(KeyCode::Char('S')));
     assert!(matches!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateTerminal {
@@ -756,6 +772,7 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
                 id: "t-term".to_string(),
                 title: "Term".to_string(),
                 turns: Vec::new(),
+                        custom_name: None,
             },
         },
     );
@@ -777,12 +794,12 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
     app.submit_composer_prompt("/copy");
     assert_eq!(app.last_copied_text.as_deref(), Some("hello pty\nline two"));
 
-    // Help modal includes WRITE / MANAGE sections, t / T, Ctrl+G, Ctrl+T, Alt+Z, /term, /wt
+    // Help modal includes WRITE / MANAGE sections, s / S, Ctrl+G, Tab, Alt+Z, /term, /wt
     app.show_help_modal = true;
     let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let help = render_screen(&terminal);
-    for expected in ["WRITE Mode", "MANAGE Mode", "t / T", "Ctrl+G", "Ctrl+T", "Alt+Z", "/term", "/wt"] {
+    for expected in ["WRITE Mode", "MANAGE Mode", "s / S", "Ctrl+G", "Tab", "Alt+Z", "/term", "/wt"] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
 }
@@ -880,6 +897,7 @@ impl TuiEnginePort for MockTerminalEngine {
             id: id.clone(),
             title: title.unwrap_or("Terminal").to_string(),
             turns: Vec::new(),
+                    custom_name: None,
         };
         g.threads.push(t.clone());
         g.meta.push(ThreadMeta {
@@ -961,11 +979,13 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
             id: "t-agent".to_string(),
             title: "Main".to_string(),
             turns: Vec::new(),
+            custom_name: None,
         },
         HydratedThread {
             id: "t-persisted-term".to_string(),
             title: "Persisted Shell".to_string(),
             turns: Vec::new(),
+            custom_name: None,
         },
     ];
     let meta = vec![
@@ -1045,9 +1065,9 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
     })
     .await;
 
-    // 4. Ctrl+G back to Tree, press 't' to spawn new child terminal, then Ctrl+Q quits
+    // 4. Ctrl+G back to Tree, press 's' to spawn new child terminal, then q+y quits
     key_tx.send(Event::Key(ctrl('g'))).unwrap();
-    key_tx.send(Event::Key(key(KeyCode::Char('t')))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('s')))).unwrap();
     wait_for("create_terminal called", || {
         !engine.state.lock().unwrap().created_terminals.is_empty()
     })
@@ -1090,6 +1110,7 @@ async fn test_e2e_startup_on_persisted_terminal_loads_snapshot_and_focuses_termi
         id: "t-term-boot".to_string(),
         title: "Boot Shell".to_string(),
         turns: Vec::new(),
+                           custom_name: None,
     }];
     let meta = vec![ThreadMeta {
         thread_id: "t-term-boot".to_string(),
@@ -1169,11 +1190,13 @@ fn test_key_release_events_are_ignored_while_press_and_repeat_are_handled() {
                     id: "t-1".to_string(),
                     title: "One".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Two".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1261,11 +1284,13 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     id: "t-agent-1".to_string(),
                     title: "Agent 1".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-agent-2".to_string(),
                     title: "Agent 2".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1301,10 +1326,10 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
     assert!(!app.handle_key_event(alt('t')));
     assert!(app.pending_actions.is_empty());
 
-    // 2. In MANAGE Tree with t-agent-1 selected and no child terminal -> Alt+T dispatches CreateTerminal under t-agent-1
+    // 2. In MANAGE Tree with t-agent-1 selected -> 's' dispatches CreateTerminal under t-agent-1
     app.set_focus(FocusedPane::Tree);
     app.tree.select_index(0);
-    assert!(app.handle_key_event(alt('t')));
+    assert!(app.handle_key_event(key(KeyCode::Char('s'))));
     assert!(matches!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateTerminal {
@@ -1315,8 +1340,11 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         }) if pid == "t-agent-1"
     ));
 
-    // 3. In Tree with t-agent-2 selected and no child terminal -> Alt+T targets selected t-agent-2
+    // 3. In Tree with t-agent-2 selected -> 's' targets selected t-agent-2; optional :bind jump_terminal alt+t works
     app.tree.select_index(1);
+    app.keymap
+        .bind(grein_tui::keymap::BindableAction::JumpTerminal, "alt+t")
+        .unwrap();
     assert!(app.handle_key_event(alt('t')));
     assert!(matches!(
         app.pending_actions.pop_front(),
@@ -1329,7 +1357,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
     ));
 
     // 4. With child terminal t-term-1 under t-agent-1 (no snapshot yet):
-    //    Alt+T from MANAGE Tree jumps directly to t-term-1, focuses Terminal, and requests PtySnapshot.
+    //    Bound Alt+T from MANAGE Tree jumps directly to t-term-1, focuses Terminal, and requests PtySnapshot.
     apply_hydrated_session(
         &mut app,
         &HydratedSession {
@@ -1339,16 +1367,19 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
                     id: "t-agent-1".to_string(),
                     title: "Agent 1".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term-1".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-agent-2".to_string(),
                     title: "Agent 2".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1397,7 +1428,8 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         Some(AppAction::PtySnapshot { ref thread_id, .. }) if thread_id == "t-term-1"
     ));
 
-    // 5. Inside FocusedPane::Terminal, Alt+T MUST NOT be intercepted — passes through to PTY
+    // 5. With default keymap inside FocusedPane::Terminal, Alt+T MUST NOT be intercepted — passes through to PTY
+    app.keymap = grein_tui::keymap::Keymap::default();
     app.pending_actions.clear();
     assert!(app.handle_key_event(alt('t')));
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
@@ -1409,7 +1441,10 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         })
     );
 
-    // 6. From Tree hovering on t-term-1 while t-agent-1 is active -> Alt+T switches to t-term-1 & focuses Terminal
+    // 6. From Tree hovering on t-term-1 while t-agent-1 is active -> bound JumpTerminal switches to t-term-1 & focuses Terminal
+    app.keymap
+        .bind(grein_tui::keymap::BindableAction::JumpTerminal, "alt+t")
+        .unwrap();
     app.switch_thread("t-agent-1");
     app.set_focus(FocusedPane::Tree);
     app.tree.select_index(1);
@@ -1435,16 +1470,19 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
                     id: "t-agent-1".to_string(),
                     title: "Agent 1".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-agent-2".to_string(),
                     title: "Agent 2".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1507,7 +1545,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let preview_screen = render_screen(&terminal);
     assert!(
-        preview_screen.contains(">_ Shell · /tmp (Preview)") && preview_screen.contains("● live"),
+        preview_screen.contains(">_ /tmp (Preview)") && preview_screen.contains("● live"),
         "{preview_screen}"
     );
     assert!(
@@ -1515,10 +1553,10 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
         "Terminal preview in Tree must hide Agent Composer:\n{preview_screen}"
     );
 
-    // 3. 't' in Tree attaches child terminal to selected_tree_thread_info().0 (t-agent-2), not active_thread_id
+    // 3. 's' in Tree attaches child terminal to selected_tree_thread_info().0 (t-agent-2), not active_thread_id
     app.handle_key_event(key(KeyCode::Char('j'))); // lands on t-agent-2
     app.pending_actions.clear();
-    app.handle_key_event(key(KeyCode::Char('t')));
+    app.handle_key_event(key(KeyCode::Char('s')));
     assert!(matches!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateTerminal {
@@ -1528,7 +1566,8 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
         }) if pid == "t-agent-2"
     ));
 
-    // 4. In Tree, Esc, Ctrl+G, and Right activate the currently selected node (entering Terminal when Terminal is selected)
+    // 4. In Tree, Esc, Ctrl+G, and Enter activate the currently selected node (entering Terminal when Terminal is selected);
+    //    Right on a leaf Terminal stays in MANAGE Tree.
     app.handle_key_event(key(KeyCode::Char('k'))); // back on t-term
     app.handle_key_event(key(KeyCode::Esc));
     assert_eq!(app.active_thread_id(), "t-term");
@@ -1545,6 +1584,8 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     app.set_focus(FocusedPane::Tree);
     app.tree.select_index(1); // t-term
     app.handle_key_event(key(KeyCode::Right));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Enter));
     assert_eq!(app.active_thread_id(), "t-term");
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
@@ -1657,6 +1698,7 @@ async fn test_pty_write_serialization_fifo_order() {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                                  custom_name: None,
                 }],
             })
         }
@@ -1765,16 +1807,17 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
                 id: "t-main".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
 
-    let shell = grein_tui::app::active_shell_label();
+    let _shell = grein_tui::app::active_shell_label();
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let idle_screen = render_screen(&terminal);
     assert!(
-        idle_screen.contains("WRITE · AGENT") && idle_screen.contains("Ctrl+G manage · Alt+Z zoom"),
+        idle_screen.contains("WRITE · AGENT") && idle_screen.contains("Ctrl+G manage · Alt+Z sidebar"),
         "Idle Composer status bar missing expected hint:\n{idle_screen}"
     );
 
@@ -1783,7 +1826,7 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let busy_screen = render_screen(&terminal);
     assert!(
-        busy_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"),
+        busy_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z sidebar"),
         "Busy Composer status bar missing expected hint:\n{busy_screen}"
     );
 
@@ -1793,13 +1836,13 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
     for expected in [
         "WRITE Mode",
         "MANAGE Mode",
-        &format!(">_ {shell}"),
+        "Alt+H / Alt+L",
         "Ctrl+G",
-        "t / T",
+        "s / S",
         "/term",
-        "Enter/l",
-        "All keys pass straight to >_",
-        "Esc, q, ?, F1, or Enter to close",
+        "→/l, ↵",
+        "Ctrl+F/B, Ctrl+U/D",
+        "Esc, q, ?, or Enter to close",
     ] {
         assert!(
             help_screen.contains(expected),

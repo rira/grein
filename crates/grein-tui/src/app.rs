@@ -405,7 +405,26 @@ pub struct AnchorItem {
 pub struct ThreadItem {
     pub id: String,
     pub title: String,
+    pub custom_name: Option<String>,
     pub anchors: Vec<AnchorItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadDisplayParts {
+    pub custom_name: Option<String>,
+    pub auto_label: String,
+}
+
+impl ThreadDisplayParts {
+    pub fn combined(&self, is_terminal: bool) -> String {
+        match self.custom_name.as_deref() {
+            Some(name) if is_terminal || !is_generic_agent_placeholder(&self.auto_label) => {
+                format!("[{name}] {}", self.auto_label)
+            }
+            Some(name) => format!("[{name}]"),
+            None => self.auto_label.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -461,6 +480,8 @@ pub struct App {
     pub config_picker: Option<ConfigPickerModal>,
     pub sidebar_hidden: bool,
     pub composer_scroll_y: u16,
+    pub last_composer_inner_width: u16,
+    pub composer_desired_col: Option<usize>,
     pub transcript_viewport_height: u16,
     pub status_notice: Option<String>,
     pub pending_rename_thread_id: Option<String>,
@@ -549,6 +570,8 @@ impl Default for App {
             config_picker: None,
             sidebar_hidden: false,
             composer_scroll_y: 0,
+            last_composer_inner_width: 0,
+            composer_desired_col: None,
             transcript_viewport_height: 0,
             status_notice: None,
             pending_rename_thread_id: None,
@@ -612,44 +635,86 @@ pub fn active_shell_label() -> String {
     shell_label_from_env(val.as_deref())
 }
 
-pub fn display_thread_title(thread: &ThreadItem, meta: Option<&ThreadMeta>) -> String {
-    let trimmed = thread.title.trim();
-    if !trimmed.is_empty() && trimmed != "Terminal" {
-        return trimmed.to_string();
+pub fn normalize_custom_name(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn is_numbered_placeholder(title: &str, prefix: &str) -> bool {
+    title
+        .strip_prefix(prefix)
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub fn is_generic_agent_placeholder(title: &str) -> bool {
+    let t = title.trim();
+    t.is_empty()
+        || t == "Main"
+        || t == "Branch"
+        || t == "Root"
+        || t == "Untitled"
+        || is_numbered_placeholder(t, "Branch ")
+        || is_numbered_placeholder(t, "Root ")
+}
+
+fn looks_like_uuid(s: &str) -> bool {
+    let t = s.trim();
+    if t.len() < 8 {
+        return false;
     }
-    if meta.is_some_and(|m| m.kind == grein_core::ThreadKind::Terminal) || trimmed == "Terminal" {
-        if let Some(cwd) = meta.and_then(|m| m.cwd.as_deref()) {
-            let raw = cwd.trim();
-            let clean = raw.trim_end_matches('/');
-            if clean.is_empty() && raw.starts_with('/') {
-                return "/".to_string();
-            }
-            if let Some(name) = std::path::Path::new(clean)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|s| !s.is_empty())
-            {
-                return name.to_string();
-            }
-        }
-        return "Terminal".to_string();
-    }
-    if trimmed.is_empty() {
-        "Untitled".to_string()
+    let hex_digits = t.bytes().filter(|b| b.is_ascii_hexdigit()).count();
+    t.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        && hex_digits >= 8
+        && (t.len() >= 16 || (t.contains('-') && t.len() >= 12))
+}
+
+fn format_worktree_id(slug: &str) -> String {
+    let clean = slug.trim();
+    let stripped = clean.strip_prefix("worktree-").unwrap_or(clean);
+    if looks_like_uuid(stripped) {
+        stripped.chars().take(8).collect()
+    } else if looks_like_uuid(clean) {
+        clean.chars().take(8).collect()
+    } else if stripped.is_empty() {
+        clean.to_string()
     } else {
-        trimmed.to_string()
+        stripped.to_string()
     }
 }
 
-pub fn shorten_terminal_cwd_with_home(cwd: &str, home_dir: Option<&str>) -> String {
-    let trimmed = cwd.trim();
-    if let Some(idx) = trimmed.find("/.grein/worktrees/") {
-        let after = &trimmed[idx + "/.grein/worktrees/".len()..];
+fn extract_worktree_cwd_parts(trimmed: &str) -> Option<(String, &str)> {
+    let marker = if let Some(idx) = trimmed.find("/.grein/worktrees/") {
+        Some(&trimmed[idx + "/.grein/worktrees/".len()..])
+    } else {
+        trimmed.strip_prefix(".grein/worktrees/")
+    };
+    if let Some(after) = marker {
         let wt_part = after.trim_matches('/');
         if !wt_part.is_empty() {
-            return format!("⎇ {wt_part}");
+            let (slug, sub) = match wt_part.split_once('/') {
+                Some((s, rest)) => (s, rest.trim_matches('/')),
+                None => (wt_part, ""),
+            };
+            if !slug.is_empty() {
+                return Some((format_worktree_id(slug), sub));
+            }
         }
     }
+    let clean = trimmed.trim_end_matches('/');
+    if let Some(leaf) = std::path::Path::new(clean)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+    {
+        if leaf.starts_with("worktree-") || looks_like_uuid(leaf) {
+            return Some((format_worktree_id(leaf), ""));
+        }
+    }
+    None
+}
+
+fn abbreviate_home_path(trimmed: &str, home_dir: Option<&str>) -> String {
     if let Some(home) = home_dir.map(str::trim).filter(|h| !h.is_empty()) {
         let home_clean = home.trim_end_matches('/');
         if trimmed == home_clean {
@@ -662,6 +727,146 @@ pub fn shorten_terminal_cwd_with_home(cwd: &str, home_dir: Option<&str>) -> Stri
         }
     }
     trimmed.to_string()
+}
+
+fn middle_elide_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.len() >= 2 {
+            let leaf = segs[segs.len() - 1];
+            let candidate = format!("~/.../{leaf}");
+            if candidate.chars().count() <= max_chars {
+                return candidate;
+            }
+            let keep_leaf = max_chars.saturating_sub(6).max(3);
+            let tail: String = leaf
+                .chars()
+                .rev()
+                .take(keep_leaf)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return format!("~/.../{tail}");
+        }
+    } else if path.starts_with('/') {
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.len() >= 3 {
+            let leaf = segs[segs.len() - 1];
+            let candidate = format!("/{}/.../{leaf}", segs[0]);
+            if candidate.chars().count() <= max_chars {
+                return candidate;
+            }
+            let short_candidate = format!("/.../{leaf}");
+            if short_candidate.chars().count() <= max_chars {
+                return short_candidate;
+            }
+        }
+    }
+    let keep_head = max_chars.saturating_sub(4).min(10);
+    let keep_tail = max_chars.saturating_sub(keep_head + 3);
+    let head: String = path.chars().take(keep_head).collect();
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(keep_tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
+}
+
+pub fn format_terminal_sidebar_cwd_with_home(
+    cwd: &str,
+    home_dir: Option<&str>,
+    elide: bool,
+) -> String {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return "Terminal".to_string();
+    }
+    if let Some((wt_id, sub)) = extract_worktree_cwd_parts(trimmed) {
+        if sub.is_empty() {
+            return format!("worktree: {wt_id}");
+        }
+        let full = format!("worktree: {wt_id}/{sub}");
+        if !elide || full.chars().count() <= 24 {
+            return full;
+        }
+        let leaf = sub
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(sub);
+        let compact = format!("worktree: {wt_id}/.../{leaf}");
+        if compact.chars().count() <= 28 {
+            return compact;
+        }
+        return format!("worktree: {wt_id}/{leaf}");
+    }
+    let abbrev = abbreviate_home_path(trimmed, home_dir);
+    if elide {
+        middle_elide_path(&abbrev, 24)
+    } else {
+        abbrev
+    }
+}
+
+pub fn thread_display_parts_with_home(
+    thread: &ThreadItem,
+    meta: Option<&ThreadMeta>,
+    home_dir: Option<&str>,
+    elide_sidebar: bool,
+) -> ThreadDisplayParts {
+    let custom_name = normalize_custom_name(
+        thread
+            .custom_name
+            .as_deref()
+            .or_else(|| meta.and_then(|m| m.custom_name.as_deref())),
+    );
+    let is_terminal = meta.is_some_and(|m| m.kind == grein_core::ThreadKind::Terminal);
+    let auto_label = if is_terminal {
+        match meta.and_then(|m| m.cwd.as_deref()).map(str::trim).filter(|s| !s.is_empty()) {
+            Some(cwd) => format_terminal_sidebar_cwd_with_home(cwd, home_dir, elide_sidebar),
+            None => "Terminal".to_string(),
+        }
+    } else {
+        let trimmed = thread.title.trim();
+        if trimmed.is_empty() {
+            "Untitled".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    ThreadDisplayParts {
+        custom_name,
+        auto_label,
+    }
+}
+
+pub fn thread_display_parts(thread: &ThreadItem, meta: Option<&ThreadMeta>) -> ThreadDisplayParts {
+    let home = std::env::var("HOME").ok();
+    thread_display_parts_with_home(thread, meta, home.as_deref(), true)
+}
+
+pub fn display_thread_title(thread: &ThreadItem, meta: Option<&ThreadMeta>) -> String {
+    let home = std::env::var("HOME").ok();
+    let is_terminal = meta.is_some_and(|m| m.kind == grein_core::ThreadKind::Terminal);
+    thread_display_parts_with_home(thread, meta, home.as_deref(), true).combined(is_terminal)
+}
+
+pub fn shorten_terminal_cwd_with_home(cwd: &str, home_dir: Option<&str>) -> String {
+    let trimmed = cwd.trim();
+    if let Some((wt_id, sub)) = extract_worktree_cwd_parts(trimmed) {
+        if sub.is_empty() {
+            return format!("⎇ {wt_id}");
+        }
+        return format!("⎇ {wt_id}/{sub}");
+    }
+    abbreviate_home_path(trimmed, home_dir)
 }
 
 pub fn shorten_terminal_cwd(cwd: &str) -> String {
@@ -1107,6 +1312,8 @@ impl App {
 
     fn focus_tree(&mut self) {
         self.pending_rename_thread_id = None;
+        self.rename_prompt = None;
+        self.composer_desired_col = None;
         self.pending_g_prefix = false;
         self.focused_pane = FocusedPane::Tree;
         self.sidebar_hidden = false;
@@ -1116,6 +1323,7 @@ impl App {
 
     fn open_or_jump_to_terminal(&mut self) {
         self.pending_rename_thread_id = None;
+        self.rename_prompt = None;
         let target_id =
             if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
                 self.selected_tree_thread_info().0
@@ -1283,6 +1491,7 @@ impl App {
             let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
             self.input_buffer.insert_str(pos, text);
             self.cursor_position = pos + text.len();
+            self.composer_desired_col = None;
             self.sync_worktree_autocomplete(true);
             self.sync_focus_out();
             return true;
@@ -1376,9 +1585,85 @@ impl App {
         }
     }
 
+    pub fn expand_or_step_child_in_tree(&mut self) -> bool {
+        let Some(curr) = self.tree.selected_index() else {
+            return false;
+        };
+        let sel_id = match self.tree.nodes.get(curr) {
+            Some(crate::ui::tree::TreeNode::Thread(t)) => t.id.clone(),
+            _ => return false,
+        };
+        if self.collapsed_threads.remove(&sel_id) {
+            crate::runner::rebuild_tree_nodes(self);
+            return true;
+        }
+        if let Some(crate::ui::tree::TreeNode::Thread(next_t)) = self.tree.nodes.get(curr + 1) {
+            if self
+                .thread_meta
+                .get(&next_t.id)
+                .and_then(|m| m.parent_thread_id.as_deref())
+                == Some(sel_id.as_str())
+            {
+                let next_id = next_t.id.clone();
+                self.tree.select_index(curr + 1);
+                self.maybe_request_pty_snapshot(&next_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn collapse_all_in_tree(&mut self) {
+        let (sel_id, _) = self.selected_tree_thread_info();
+        let mut cur = sel_id;
+        let mut visited = std::collections::HashSet::new();
+        while visited.insert(cur.clone()) {
+            if let Some(parent_id) = self
+                .thread_meta
+                .get(&cur)
+                .and_then(|m| m.parent_thread_id.as_deref())
+                .filter(|pid| *pid != cur && self.threads.iter().any(|t| t.id == *pid))
+            {
+                cur = parent_id.to_string();
+            } else {
+                break;
+            }
+        }
+        let parent_ids: Vec<String> = self
+            .threads
+            .iter()
+            .filter(|t| self.thread_has_children(&t.id))
+            .map(|t| t.id.clone())
+            .collect();
+        for id in parent_ids {
+            self.collapsed_threads.insert(id);
+        }
+        crate::runner::rebuild_tree_nodes(self);
+        if let Some(idx) = self.tree.nodes.iter().position(|n| {
+            matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == cur)
+        }) {
+            self.tree.select_index(idx);
+            self.maybe_request_pty_snapshot(&cur);
+        }
+    }
+
+    pub fn expand_all_in_tree(&mut self) {
+        let (sel_id, _) = self.selected_tree_thread_info();
+        self.collapsed_threads.clear();
+        crate::runner::rebuild_tree_nodes(self);
+        if let Some(idx) = self.tree.nodes.iter().position(|n| {
+            matches!(n, crate::ui::tree::TreeNode::Thread(t) if t.id == sel_id)
+        }) {
+            self.tree.select_index(idx);
+            self.maybe_request_pty_snapshot(&sel_id);
+        }
+    }
+
     pub fn switch_thread(&mut self, thread_id: impl Into<String>) {
         let target_thread = thread_id.into();
         self.pending_rename_thread_id = None;
+        self.rename_prompt = None;
+        self.composer_desired_col = None;
         self.pending_g_prefix = false;
         if target_thread != self.active_thread_id {
             self.transcript_search.clear();
@@ -1525,6 +1810,9 @@ impl App {
     fn sync_focus_out(&mut self) {
         self.focus = self.focused_pane;
         self.active_focus = self.focused_pane;
+        if self.focused_pane != FocusedPane::Tree {
+            self.rename_prompt = None;
+        }
         self.sync_worktree_autocomplete(false);
     }
 
@@ -1546,6 +1834,7 @@ impl App {
         if pane == FocusedPane::Tree {
             self.focus_tree();
         } else {
+            self.rename_prompt = None;
             self.focused_pane = pane;
             self.sync_focus_out();
         }
@@ -1608,6 +1897,7 @@ impl App {
 
     fn activate_selected_tree_node(&mut self) -> Option<TreeAction> {
         self.pending_rename_thread_id = None;
+        self.rename_prompt = None;
         let Some(idx) = self.tree.selected_index() else {
             self.focused_pane = if self.active_is_terminal() {
                 FocusedPane::Terminal
@@ -1654,6 +1944,7 @@ impl App {
     }
 
     fn toggle_composer_tree_focus(&mut self) {
+        self.rename_prompt = None;
         if matches!(
             self.focused_pane,
             FocusedPane::Composer | FocusedPane::Terminal
@@ -1768,6 +2059,74 @@ impl App {
         self.switch_thread(target_root_id);
     }
 
+    fn effective_parent_id<'a>(
+        &'a self,
+        thread_id: &str,
+        valid_ids: &std::collections::HashSet<&str>,
+    ) -> Option<&'a str> {
+        self.thread_meta
+            .get(thread_id)
+            .and_then(|m| m.parent_thread_id.as_deref())
+            .filter(|pid| *pid != thread_id && valid_ids.contains(pid))
+    }
+
+    pub fn cycle_sibling_thread(&mut self, forward: bool) -> bool {
+        let ordered = compute_ordered_thread_entries(&self.threads, &self.thread_meta);
+        if ordered.len() <= 1 {
+            return false;
+        }
+        let valid_ids: std::collections::HashSet<&str> =
+            self.threads.iter().map(|t| t.id.as_str()).collect();
+        if !valid_ids.contains(self.active_thread_id.as_str()) {
+            return false;
+        }
+        let active_parent = self.effective_parent_id(&self.active_thread_id, &valid_ids);
+        let siblings: Vec<String> = ordered
+            .iter()
+            .map(|e| self.threads[e.index].id.clone())
+            .filter(|id| self.effective_parent_id(id, &valid_ids) == active_parent)
+            .collect();
+        if siblings.len() <= 1 {
+            return false;
+        }
+        let Some(pos) = siblings.iter().position(|id| id == &self.active_thread_id) else {
+            return false;
+        };
+        let next_pos = step_wrapped(pos, siblings.len(), forward);
+        let target_id = siblings[next_pos].clone();
+        self.switch_thread(target_id);
+        true
+    }
+
+    pub fn select_root_by_index(&mut self, one_based: usize) -> bool {
+        if !(1..=9).contains(&one_based) {
+            return false;
+        }
+        let ordered = compute_ordered_thread_entries(&self.threads, &self.thread_meta);
+        let target_id = ordered
+            .into_iter()
+            .filter(|e| e.depth == 0)
+            .nth(one_based - 1)
+            .map(|e| self.threads[e.index].id.clone());
+        let Some(id) = target_id else {
+            return false;
+        };
+        if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Worktrees {
+            self.sidebar_view = SidebarView::Grein;
+        }
+        self.switch_thread(id);
+        true
+    }
+
+    fn active_pty_is_alt_screen(&self) -> bool {
+        self.focused_pane == FocusedPane::Terminal
+            && !self.is_terminal_exited(&self.active_thread_id)
+            && self
+                .pty_screens
+                .get(&self.active_thread_id)
+                .is_some_and(|s| s.alternate_screen)
+    }
+
     fn transcript_scroll_target_id(&self) -> String {
         if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
             self.selected_tree_thread_info().0
@@ -1781,6 +2140,44 @@ impl App {
             (self.transcript_viewport_height as usize / 2).max(1)
         } else {
             10
+        }
+    }
+
+    fn full_page_scroll_lines(&self) -> usize {
+        if self.transcript_viewport_height > 0 {
+            self.transcript_viewport_height as usize
+        } else {
+            20
+        }
+    }
+
+    fn scroll_manage_preview(&mut self, forward: bool, lines: usize) {
+        if self.sidebar_view == SidebarView::Worktrees {
+            if forward {
+                self.worktree_diff_scroll = self
+                    .worktree_diff_scroll
+                    .saturating_add(lines as u16)
+                    .min(self.worktree_diff_max_scroll);
+            } else {
+                self.worktree_diff_scroll = self.worktree_diff_scroll.saturating_sub(lines as u16);
+            }
+            return;
+        }
+        let target_id = self.transcript_scroll_target_id();
+        if self.is_terminal_thread(&target_id) {
+            let pty_step = if lines >= 15 { 10 } else { 5 };
+            let delta = if forward { -pty_step } else { pty_step };
+            self.pending_actions.push_back(AppAction::PtyScroll {
+                thread_id: target_id,
+                delta,
+            });
+        } else {
+            let action = if forward {
+                TranscriptScroll::Down(lines)
+            } else {
+                TranscriptScroll::Up(lines)
+            };
+            self.scroll_target_transcript(action);
         }
     }
 
@@ -2362,24 +2759,33 @@ impl App {
     }
 
     pub fn begin_inline_rename(&mut self) {
-        let (target_id, target_title) =
+        let target_id =
             if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
-                self.selected_tree_thread_info()
+                self.selected_tree_thread_info().0
             } else {
-                let id = self.active_thread_id.clone();
-                let title = self.thread_title_or_empty(&id);
-                (id, title)
+                self.active_thread_id.clone()
             };
         if target_id.is_empty() {
             return;
         }
+        let existing_custom = self
+            .threads
+            .iter()
+            .find(|t| t.id == target_id)
+            .and_then(|t| normalize_custom_name(t.custom_name.as_deref()))
+            .or_else(|| {
+                self.thread_meta
+                    .get(&target_id)
+                    .and_then(|m| normalize_custom_name(m.custom_name.as_deref()))
+            })
+            .unwrap_or_default();
         self.pending_rename_thread_id = None;
         self.palette_active = false;
         self.worktree_filter_active = false;
         self.rename_prompt = Some(RenamePromptState {
             thread_id: target_id,
-            cursor: target_title.len(),
-            buffer: target_title,
+            cursor: existing_custom.len(),
+            buffer: existing_custom,
         });
         self.sync_focus_out();
     }
@@ -2595,14 +3001,16 @@ impl App {
                     && self.focused_pane == FocusedPane::Tree
                 {
                     self.worktree_diff_scroll = self.worktree_diff_scroll.saturating_sub(10);
-                } else if self.active_is_terminal() && self.sidebar_view != SidebarView::Worktrees
-                {
-                    self.pending_actions.push_back(AppAction::PtyScroll {
-                        thread_id: self.active_thread_id.clone(),
-                        delta: 5,
-                    });
                 } else {
-                    self.scroll_target_transcript(TranscriptScroll::Up(10));
+                    let target_id = self.transcript_scroll_target_id();
+                    if self.is_terminal_thread(&target_id) {
+                        self.pending_actions.push_back(AppAction::PtyScroll {
+                            thread_id: target_id,
+                            delta: 5,
+                        });
+                    } else {
+                        self.scroll_target_transcript(TranscriptScroll::Up(10));
+                    }
                 }
             }
             BindableAction::ScrollDown => {
@@ -2613,15 +3021,23 @@ impl App {
                         .worktree_diff_scroll
                         .saturating_add(10)
                         .min(self.worktree_diff_max_scroll);
-                } else if self.active_is_terminal() && self.sidebar_view != SidebarView::Worktrees
-                {
-                    self.pending_actions.push_back(AppAction::PtyScroll {
-                        thread_id: self.active_thread_id.clone(),
-                        delta: -5,
-                    });
                 } else {
-                    self.scroll_target_transcript(TranscriptScroll::Down(10));
+                    let target_id = self.transcript_scroll_target_id();
+                    if self.is_terminal_thread(&target_id) {
+                        self.pending_actions.push_back(AppAction::PtyScroll {
+                            thread_id: target_id,
+                            delta: -5,
+                        });
+                    } else {
+                        self.scroll_target_transcript(TranscriptScroll::Down(10));
+                    }
                 }
+            }
+            BindableAction::PrevSibling => {
+                self.cycle_sibling_thread(false);
+            }
+            BindableAction::NextSibling => {
+                self.cycle_sibling_thread(true);
             }
             BindableAction::JumpTerminal => {
                 self.open_or_jump_to_terminal();
@@ -2664,7 +3080,23 @@ impl App {
         }
     }
 
-    pub fn display_title_for(&self, thread_id: &str, fallback_title: &str) -> String {
+    pub fn display_parts_for_elided(
+        &self,
+        thread_id: &str,
+        fallback_title: &str,
+        elide_sidebar: bool,
+    ) -> ThreadDisplayParts {
+        let home = std::env::var("HOME").ok();
+        self.display_parts_for_with_home(thread_id, fallback_title, home.as_deref(), elide_sidebar)
+    }
+
+    pub fn display_parts_for_with_home(
+        &self,
+        thread_id: &str,
+        fallback_title: &str,
+        home_dir: Option<&str>,
+        elide_sidebar: bool,
+    ) -> ThreadDisplayParts {
         let item = self
             .threads
             .iter()
@@ -2673,6 +3105,7 @@ impl App {
             .unwrap_or_else(|| ThreadItem {
                 id: thread_id.to_string(),
                 title: fallback_title.to_string(),
+                custom_name: None,
                 anchors: Vec::new(),
             });
         let pty_cwd = self.pty_screens.get(thread_id).and_then(|s| s.cwd.clone());
@@ -2681,9 +3114,11 @@ impl App {
             (Some(m), Some(cwd)) if m.cwd.as_deref().is_none_or(|c| c.trim().is_empty()) => {
                 let mut patched = m.clone();
                 patched.cwd = Some(cwd);
-                display_thread_title(&item, Some(&patched))
+                thread_display_parts_with_home(&item, Some(&patched), home_dir, elide_sidebar)
             }
-            (Some(m), _) => display_thread_title(&item, Some(m)),
+            (Some(m), _) => {
+                thread_display_parts_with_home(&item, Some(m), home_dir, elide_sidebar)
+            }
             (None, Some(cwd)) if item.title.trim() == "Terminal" || item.title.trim().is_empty() => {
                 let synth = ThreadMeta {
                     thread_id: thread_id.to_string(),
@@ -2694,11 +3129,18 @@ impl App {
                     cwd: Some(cwd),
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 };
-                display_thread_title(&item, Some(&synth))
+                thread_display_parts_with_home(&item, Some(&synth), home_dir, elide_sidebar)
             }
-            (None, _) => display_thread_title(&item, None),
+            (None, _) => thread_display_parts_with_home(&item, None, home_dir, elide_sidebar),
         }
+    }
+
+    pub fn display_title_for(&self, thread_id: &str, fallback_title: &str) -> String {
+        let parts = self.display_parts_for_elided(thread_id, fallback_title, true);
+        let is_terminal = self.is_terminal_thread(thread_id);
+        parts.combined(is_terminal)
     }
 
     pub fn execute_slash_command(&mut self, trimmed: &str, from_palette: bool) -> bool {
@@ -3151,7 +3593,7 @@ impl App {
         }
         let Some(action) = BindableAction::from_str(action_str) else {
             self.status_notice = Some(format!(
-                "Unknown action '{action_str}'. Try: enter_manage_mode, toggle_zoom, toggle_worktrees, scroll_up, scroll_down, jump_terminal, new_agent, fork_thread, worktree, command_palette, help"
+                "Unknown action '{action_str}'. Try: enter_manage_mode, toggle_zoom, toggle_worktrees, scroll_up, scroll_down, prev_sibling, next_sibling, jump_terminal, new_agent, fork_thread, worktree, command_palette, help"
             ));
             return;
         };
@@ -3415,15 +3857,11 @@ impl App {
             (KeyCode::Enter, false, false) => {
                 let prompt = self.rename_prompt.take().expect("checked");
                 let new_title = prompt.buffer.trim().to_string();
-                if new_title.is_empty() {
-                    self.status_notice = Some("Rename title cannot be empty".to_string());
-                } else {
-                    self.status_notice = None;
-                    self.pending_actions.push_back(AppAction::RenameThread {
-                        thread_id: prompt.thread_id,
-                        title: new_title,
-                    });
-                }
+                self.status_notice = None;
+                self.pending_actions.push_back(AppAction::RenameThread {
+                    thread_id: prompt.thread_id,
+                    title: new_title,
+                });
             }
             (KeyCode::Char('a' | 'A'), true, false) | (KeyCode::Home, false, false) => {
                 prompt.cursor = 0;
@@ -3640,6 +4078,7 @@ impl App {
 
     pub fn toggle_worktrees_sidebar_view(&mut self) {
         self.pending_rename_thread_id = None;
+        self.rename_prompt = None;
         self.pending_g_prefix = false;
         self.worktree_filter_active = false;
         if self.sidebar_hidden {
@@ -3673,6 +4112,7 @@ impl App {
 
     pub fn open_worktrees_sidebar_view(&mut self, filter_query: Option<String>) {
         self.pending_rename_thread_id = None;
+        self.rename_prompt = None;
         self.pending_g_prefix = false;
         self.sidebar_hidden = false;
         self.sidebar_view = SidebarView::Worktrees;
@@ -3737,10 +4177,17 @@ impl App {
 
         match key.code {
             KeyCode::Down if !ctrl && !alt => {
+                self.composer_desired_col = None;
                 self.worktree_autocomplete_idx = (idx + 1) % candidates.len();
                 true
             }
             KeyCode::Up if !ctrl && !alt => {
+                self.composer_desired_col = None;
+                self.worktree_autocomplete_idx = (idx + candidates.len() - 1) % candidates.len();
+                true
+            }
+            KeyCode::BackTab if !ctrl && !alt => {
+                self.composer_desired_col = None;
                 self.worktree_autocomplete_idx = (idx + candidates.len() - 1) % candidates.len();
                 true
             }
@@ -3864,6 +4311,18 @@ impl App {
                 }
                 self.maybe_fetch_selected_worktree_diff(false);
             }
+            KeyCode::Char('H') => {
+                for wt in &self.worktrees {
+                    self.collapsed_worktree_repos.insert(wt.repo_root.clone());
+                }
+                self.clamp_worktree_selection();
+                self.maybe_fetch_selected_worktree_diff(false);
+            }
+            KeyCode::Char('L') => {
+                self.collapsed_worktree_repos.clear();
+                self.clamp_worktree_selection();
+                self.maybe_fetch_selected_worktree_diff(false);
+            }
             KeyCode::Right | KeyCode::Char('l') => {
                 match selected_row {
                     Some(WorktreeRow::RepoHeader {
@@ -3883,21 +4342,7 @@ impl App {
                             self.worktree_selected_idx += 1;
                         }
                     }
-                    Some(WorktreeRow::Entry(entry)) => {
-                        let active_id = self.active_thread_id.clone();
-                        self.status_notice = Some("Switching worktree...".to_string());
-                        self.pending_actions
-                            .push_back(AppAction::SwitchThreadWorktree {
-                                thread_id: active_id,
-                                target_path: entry.path,
-                            });
-                        self.focused_pane = if self.active_is_terminal() {
-                            FocusedPane::Terminal
-                        } else {
-                            FocusedPane::Composer
-                        };
-                    }
-                    None => {}
+                    Some(WorktreeRow::Entry(_)) | None => {}
                 }
                 self.maybe_fetch_selected_worktree_diff(false);
             }
@@ -3936,27 +4381,21 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Char('t') => {
+            KeyCode::Char('s') => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
-                    let (rows, cols) = self.current_terminal_dims_or_default();
-                    let label = worktree_display_label(&entry);
-                    self.status_notice = None;
-                    self.pending_actions.push_back(AppAction::CreateTerminal {
-                        parent_thread_id: Some(self.active_thread_id.clone()),
-                        title: Some(format!("Shell ({label})")),
-                        cwd: Some(entry.path),
-                        rows,
-                        cols,
-                    });
+                    self.dispatch_create_terminal(
+                        Some(self.active_thread_id.clone()),
+                        Some(entry.path),
+                    );
                 }
             }
-            KeyCode::Char('w' | 'a' | 'n') => {
+            KeyCode::Char('w') => {
                 let thread_id = self.active_thread_id.clone();
                 self.status_notice = Some("Allocating worktree...".to_string());
                 self.pending_actions
                     .push_back(AppAction::EnsureThreadWorktree { thread_id });
             }
-            KeyCode::Char('d' | 'x') => {
+            KeyCode::Char('d') => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
                     if entry.is_primary {
                         self.status_notice =
@@ -4071,7 +4510,7 @@ impl App {
                 self.copy_transcript_content(CopyMode::LastReply);
                 None
             }
-            KeyCode::Char('a') if no_ctrl_alt => {
+            KeyCode::Char('n') if no_ctrl_alt => {
                 self.status_notice = None;
                 self.pending_actions
                     .push_back(AppAction::CreateRoot { title: None });
@@ -4089,12 +4528,12 @@ impl App {
                     .push_back(AppAction::EnsureThreadWorktree { thread_id });
                 None
             }
-            KeyCode::Char('t') if no_ctrl_alt => {
+            KeyCode::Char('s') if no_ctrl_alt => {
                 let (parent_thread_id, _) = self.selected_tree_thread_info();
                 self.dispatch_create_terminal(Some(parent_thread_id), None);
                 None
             }
-            KeyCode::Char('T') if no_ctrl_alt => {
+            KeyCode::Char('S') if no_ctrl_alt => {
                 self.dispatch_create_terminal(None, None);
                 None
             }
@@ -4107,13 +4546,21 @@ impl App {
                 self.request_join_thread(source_thread_id, None);
                 None
             }
-            KeyCode::Char('d' | 'x') if no_ctrl_alt => {
+            KeyCode::Char('d') if no_ctrl_alt => {
                 if self.threads.len() <= 1 {
                     self.status_notice = Some("Cannot delete the only context".to_string());
                 } else {
                     let (thread_id, title) = self.selected_tree_thread_info();
                     self.pending_thread_delete = Some(PendingThreadDelete { thread_id, title });
                 }
+                None
+            }
+            KeyCode::Char('H') if no_ctrl_alt => {
+                self.collapse_all_in_tree();
+                None
+            }
+            KeyCode::Char('L') if no_ctrl_alt => {
+                self.expand_all_in_tree();
                 None
             }
             KeyCode::Char(' ') if no_ctrl_alt => {
@@ -4126,13 +4573,8 @@ impl App {
                 None
             }
             KeyCode::Right | KeyCode::Char('l') if no_ctrl_alt => {
-                let (sel_id, _) = self.selected_tree_thread_info();
-                if self.collapsed_threads.remove(&sel_id) {
-                    crate::runner::rebuild_tree_nodes(self);
-                    None
-                } else {
-                    self.activate_selected_tree_node()
-                }
+                let _ = self.expand_or_step_child_in_tree();
+                None
             }
             KeyCode::Enter => self.activate_selected_tree_node(),
             _ => None,
@@ -4148,10 +4590,42 @@ impl App {
         self.cursor_position = start;
     }
 
+    fn move_composer_cursor_vertical(&mut self, delta: isize) -> bool {
+        let max_width = (self.last_composer_inner_width > 0)
+            .then_some(self.last_composer_inner_width as usize);
+        let layout = crate::render::layout_composer_visual_rows(
+            &self.input_buffer,
+            self.cursor_position,
+            max_width,
+        );
+        if layout.rows.is_empty() {
+            return false;
+        }
+        let curr_row = layout.cursor_row as usize;
+        let target_row_isize = curr_row as isize + delta;
+        if target_row_isize < 0 || (target_row_isize as usize) >= layout.rows.len() {
+            return false;
+        }
+        let desired_col = *self
+            .composer_desired_col
+            .get_or_insert(layout.cursor_col as usize);
+        let target_row = &layout.rows[target_row_isize as usize];
+        let best_byte = target_row
+            .stops
+            .iter()
+            .copied()
+            .min_by_key(|&(_, col)| (col.abs_diff(desired_col), usize::from(col > desired_col)))
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.cursor_position);
+        self.cursor_position = clamp_char_boundary(&self.input_buffer, best_byte);
+        true
+    }
+
     fn handle_key_composer(&mut self, key: KeyEvent) -> bool {
         let prev_buf = self.input_buffer.clone();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let is_vertical = matches!(key.code, KeyCode::Up | KeyCode::Down) && !ctrl && !alt;
         let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
 
         let handled = match (key.code, ctrl, alt) {
@@ -4297,8 +4771,13 @@ impl App {
                     false
                 }
             }
+            (KeyCode::Up, false, false) => self.move_composer_cursor_vertical(-1),
+            (KeyCode::Down, false, false) => self.move_composer_cursor_vertical(1),
             _ => false,
         };
+        if !is_vertical && (handled || self.input_buffer != prev_buf) {
+            self.composer_desired_col = None;
+        }
         if handled && self.input_buffer != prev_buf {
             if !matches!(key.code, KeyCode::Enter) {
                 self.status_notice = None;
@@ -4429,7 +4908,7 @@ impl App {
                 }
             };
             match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) if no_ctrl_alt => {
+                KeyCode::Esc | KeyCode::Enter if no_ctrl_alt => {
                     self.show_help_modal = false;
                     self.help_scroll_offset = 0;
                 }
@@ -4456,11 +4935,18 @@ impl App {
                     self.help_scroll_offset =
                         clamp_help(self, self.help_scroll_offset.saturating_add(10));
                 }
+                KeyCode::Char('f' | 'F') if ctrl && !alt => {
+                    self.help_scroll_offset =
+                        clamp_help(self, self.help_scroll_offset.saturating_add(20));
+                }
                 KeyCode::PageUp if no_ctrl_alt => {
                     self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
                 }
                 KeyCode::Char('u' | 'U') if ctrl && !alt => {
                     self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
+                }
+                KeyCode::Char('b' | 'B') if ctrl && !alt => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(20);
                 }
                 KeyCode::Home | KeyCode::Char('g') if no_ctrl_alt => {
                     self.help_scroll_offset = 0;
@@ -4481,9 +4967,26 @@ impl App {
         ) {
             self.pending_g_prefix = false;
             if let Some(action) = self.keymap.match_write_key(key) {
-                self.execute_bindable_action(action);
-                self.sync_focus_out();
-                return true;
+                let pty_alt_passthrough = self.active_pty_is_alt_screen()
+                    && matches!(
+                        action,
+                        BindableAction::ScrollUp
+                            | BindableAction::ScrollDown
+                            | BindableAction::PrevSibling
+                            | BindableAction::NextSibling
+                    );
+                if !pty_alt_passthrough {
+                    self.execute_bindable_action(action);
+                    self.sync_focus_out();
+                    return true;
+                }
+            }
+            if alt && !ctrl {
+                if let KeyCode::Char(c @ '1'..='9') = key.code {
+                    self.select_root_by_index((c as u8 - b'0') as usize);
+                    self.sync_focus_out();
+                    return true;
+                }
             }
 
             if self.focused_pane == FocusedPane::Terminal {
@@ -4537,6 +5040,7 @@ impl App {
                 } else if !self.input_buffer.is_empty() {
                     self.input_buffer.clear();
                     self.cursor_position = 0;
+                    self.composer_desired_col = None;
                     self.worktree_autocomplete_open = false;
                     self.worktree_autocomplete_idx = 0;
                     self.status_notice = Some("Cleared input".to_string());
@@ -4568,10 +5072,6 @@ impl App {
 
         // 3. MANAGE Mode (FocusedPane::Tree)
         if self.focused_pane == FocusedPane::Tree {
-            if alt && !ctrl && matches!(key.code, KeyCode::Char('1'..='9')) {
-                self.sync_focus_out();
-                return false;
-            }
             if self.rename_prompt.is_some() {
                 self.handle_key_rename_prompt(key);
                 self.sync_focus_out();
@@ -4641,18 +5141,14 @@ impl App {
                 return true;
             }
 
-            // Tab / Ctrl+T switches between Grein and Worktrees sidebar views
-            if (no_ctrl_alt && matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
-                || (ctrl && !alt && matches!(key.code, KeyCode::Char('t' | 'T')))
-            {
+            // Tab switches between Grein and Worktrees sidebar views
+            if no_ctrl_alt && key.code == KeyCode::Tab {
                 self.toggle_worktrees_sidebar_view();
                 return true;
             }
 
-            // Help via ?, F1, or legacy g?
-            if (no_ctrl_alt && matches!(key.code, KeyCode::F(1) | KeyCode::Char('?')))
-                || (had_g_prefix && no_ctrl_alt && key.code == KeyCode::Char('?'))
-            {
+            // Help via ?
+            if no_ctrl_alt && key.code == KeyCode::Char('?') {
                 self.help_scroll_offset = 0;
                 self.show_help_modal = true;
                 self.sync_focus_out();
@@ -4675,78 +5171,46 @@ impl App {
                 return true;
             }
 
-            // Check WRITE keymap bindings in MANAGE too (Ctrl+G/Alt+G/F6 exits MANAGE -> WRITE;
-            // Alt+Z toggles zoom; custom global keybinds work symmetrically; ScrollUp/Down scroll preview)
+            // Alt+1..9 jumps directly to depth-0 root 1..9 (AltGr excluded)
+            if alt && !ctrl {
+                if let KeyCode::Char(c @ '1'..='9') = key.code {
+                    self.select_root_by_index((c as u8 - b'0') as usize);
+                    self.sync_focus_out();
+                    return true;
+                }
+            }
+
+            // Check keymap bindings in MANAGE too (Ctrl+G exits MANAGE -> WRITE;
+            // Alt+Z toggles zoom; Alt+H/L cycle siblings; Alt+K/J scroll preview target)
             if let Some(action) = self.keymap.match_write_key(key) {
                 self.execute_bindable_action(action);
                 self.sync_focus_out();
                 return true;
             }
 
-            // Right-pane preview scrolling (PgUp/PgDn/Ctrl+U/Ctrl+D)
+            // Right-pane preview scrolling (Ctrl+U/D half-page, Ctrl+B/F full-page)
             match (key.code, ctrl, alt) {
-                (KeyCode::PageUp, false, false) | (KeyCode::Char('u' | 'U'), true, false) => {
+                (KeyCode::Char('u' | 'U'), true, false) => {
                     let step = self.half_page_scroll_lines();
-                    if self.sidebar_view == SidebarView::Worktrees {
-                        self.worktree_diff_scroll =
-                            self.worktree_diff_scroll.saturating_sub(step as u16);
-                    } else {
-                        let target_id = self.selected_tree_thread_info().0;
-                        if self.is_terminal_thread(&target_id) {
-                            self.pending_actions.push_back(AppAction::PtyScroll {
-                                thread_id: target_id,
-                                delta: 5,
-                            });
-                        } else {
-                            self.scroll_target_transcript(TranscriptScroll::Up(step));
-                        }
-                    }
+                    self.scroll_manage_preview(false, step);
                     self.sync_focus_out();
                     return true;
                 }
-                (KeyCode::PageDown, false, false) | (KeyCode::Char('d' | 'D'), true, false) => {
+                (KeyCode::Char('d' | 'D'), true, false) => {
                     let step = self.half_page_scroll_lines();
-                    if self.sidebar_view == SidebarView::Worktrees {
-                        self.worktree_diff_scroll = self
-                            .worktree_diff_scroll
-                            .saturating_add(step as u16)
-                            .min(self.worktree_diff_max_scroll);
-                    } else {
-                        let target_id = self.selected_tree_thread_info().0;
-                        if self.is_terminal_thread(&target_id) {
-                            self.pending_actions.push_back(AppAction::PtyScroll {
-                                thread_id: target_id,
-                                delta: -5,
-                            });
-                        } else {
-                            self.scroll_target_transcript(TranscriptScroll::Down(step));
-                        }
-                    }
+                    self.scroll_manage_preview(true, step);
                     self.sync_focus_out();
                     return true;
                 }
-                _ => {}
-            }
-
-            // Root switching in MANAGE (Alt+J/K or Alt+Shift+Up/Down)
-            match key.code {
-                KeyCode::Up if alt && shift && !ctrl => {
-                    self.switch_root(false);
+                (KeyCode::Char('b' | 'B'), true, false) => {
+                    let step = self.full_page_scroll_lines();
+                    self.scroll_manage_preview(false, step);
                     self.sync_focus_out();
                     return true;
                 }
-                KeyCode::Down if alt && shift && !ctrl => {
-                    self.switch_root(true);
-                    self.sync_focus_out();
-                    return true;
-                }
-                KeyCode::Char('k' | 'K') if alt && !ctrl => {
-                    self.switch_root(false);
-                    self.sync_focus_out();
-                    return true;
-                }
-                KeyCode::Char('j' | 'J') if alt && !ctrl => {
-                    self.switch_root(true);
+                (KeyCode::Char('f' | 'F'), true, false) => {
+                    let step = self.full_page_scroll_lines();
+                    self.scroll_manage_preview(true, step);
                     self.sync_focus_out();
                     return true;
                 }
@@ -4806,21 +5270,12 @@ impl App {
                     _ => {}
                 }
             }
-            if alt && !ctrl && matches!(key.code, KeyCode::Char('t' | 'T')) {
-                self.open_or_jump_to_terminal();
-                self.sync_focus_out();
-                return true;
-            }
             let _ = self.handle_key_tree_with_prefix(key, had_g_prefix);
             self.sync_focus_out();
             return true;
         }
 
         // 4. Legacy Transcript pane fallback (if unit tests explicitly focus Transcript)
-        if alt && !ctrl && matches!(key.code, KeyCode::Char('1'..='9')) {
-            self.sync_focus_out();
-            return false;
-        }
         if self.transcript_search.editing {
             match (key.code, ctrl, alt) {
                 (KeyCode::Esc, false, false) | (KeyCode::Char('c' | 'C'), true, false) => {
@@ -4845,12 +5300,19 @@ impl App {
             self.sync_focus_out();
             return true;
         }
+        if alt && !ctrl {
+            if let KeyCode::Char(c @ '1'..='9') = key.code {
+                self.select_root_by_index((c as u8 - b'0') as usize);
+                self.sync_focus_out();
+                return true;
+            }
+        }
         if let Some(action) = self.keymap.match_write_key(key) {
             self.execute_bindable_action(action);
             self.sync_focus_out();
             return true;
         }
-        if no_ctrl_alt && matches!(key.code, KeyCode::F(1) | KeyCode::Char('?')) {
+        if no_ctrl_alt && key.code == KeyCode::Char('?') {
             self.help_scroll_offset = 0;
             self.show_help_modal = true;
             self.sync_focus_out();
@@ -4950,36 +5412,43 @@ mod tests {
                 ThreadItem {
                     id: "r1".to_string(),
                     title: "Root 1".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "b1".to_string(),
                     title: "Branch 1A".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "g1".to_string(),
                     title: "Grand 1A1".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "b2".to_string(),
                     title: "Branch 1B".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "r2".to_string(),
                     title: "Root 2".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "r2b".to_string(),
                     title: "Root 2 Branch".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "r3".to_string(),
                     title: "Lone Root 3".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
             ],
@@ -4996,6 +5465,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.thread_meta.insert(
@@ -5009,6 +5479,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.thread_meta.insert(
@@ -5022,6 +5493,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.thread_meta.insert(
@@ -5035,6 +5507,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.thread_meta.insert(
@@ -5048,6 +5521,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.thread_meta.insert(
@@ -5061,6 +5535,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.thread_meta.insert(
@@ -5074,6 +5549,7 @@ mod tests {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                custom_name: None,
             },
         );
         app.sync_anchors();
@@ -5103,12 +5579,16 @@ mod tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-        // Idle Esc in Composer stays in WRITE mode; Ctrl+G / Alt+G / F6 enter MANAGE,
+        // Idle Esc in Composer stays in WRITE mode; Ctrl+G enters MANAGE (F6/Alt+G dropped),
         // and Esc in MANAGE returns to WRITE mode.
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-        app.handle_key_event(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert!(!app.handle_key_event(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT)));
+        assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         assert_eq!(app.focused_pane(), FocusedPane::Tree);
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
@@ -5119,7 +5599,7 @@ mod tests {
         assert_eq!(app.focused_pane(), FocusedPane::Tree);
         assert!(app.pending_actions.is_empty());
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         assert_eq!(app.focused_pane(), FocusedPane::Composer);
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(
@@ -5170,47 +5650,39 @@ mod tests {
     }
 
     #[test]
-    fn test_alt_shift_arrows_and_alt_j_k_switch_roots_with_wrap() {
+    fn test_manage_j_k_and_alt_number_switch_roots_with_altgr_guard() {
         let mut app = multi_root_app();
         app.switch_thread("g1"); // nested grandchild under r1
         app.set_focus(FocusedPane::Tree);
 
-        app.handle_key_event(KeyEvent::new(
-            KeyCode::Down,
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT));
         assert_eq!(app.active_thread_id(), "r2");
         assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
         assert_eq!(app.active_thread_id(), "r3");
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::ALT));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE));
         assert_eq!(app.active_thread_id(), "r1");
 
-        app.handle_key_event(KeyEvent::new(
-            KeyCode::Up,
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        ));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
         assert_eq!(app.active_thread_id(), "r3");
 
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
         assert_eq!(app.active_thread_id(), "r2");
 
-        // Alt+1..9 remain completely unbound in all panes
-        for pane in [
-            FocusedPane::Composer,
-            FocusedPane::Tree,
-            FocusedPane::Transcript,
-        ] {
-            app.set_focus(pane);
-            for digit in '1'..='9' {
-                assert!(!app.handle_key_event(KeyEvent::new(
-                    KeyCode::Char(digit),
-                    KeyModifiers::ALT
-                )));
-            }
-        }
+        // Alt+1..3 jumps to roots 1..3 in both MANAGE and WRITE; AltGr (Ctrl+Alt) never hijacks
+        app.set_focus(FocusedPane::Composer);
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT)));
+        assert_eq!(app.active_thread_id(), "r3");
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)));
+        assert_eq!(app.active_thread_id(), "r1");
+        app.handle_key_event(KeyEvent::new(
+            KeyCode::Char('2'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(app.active_thread_id(), "r1");
+        assert_eq!(app.composer_input(), "2");
     }
 
     #[test]
@@ -5221,17 +5693,13 @@ mod tests {
         app.transcript_viewport_mut("b1").set_max_scroll(80);
         app.transcript_viewport_mut("b1").scroll_to_bottom();
 
-        // From Composer (WRITE): Alt/Shift+PgUp/PgDn scroll active thread r1; plain Home/End move cursor
+        // From Composer (WRITE): Alt+K/Alt+J scroll active thread r1; plain Home/End still operate
         app.set_focus(FocusedPane::Composer);
         app.input_buffer = "draft".to_string();
         app.cursor_position = 2;
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT)));
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT)));
         assert_eq!(app.transcript_viewport("r1").scroll_offset(), 90);
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT)));
-        assert_eq!(app.transcript_viewport("r1").scroll_offset(), 100);
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)));
-        assert_eq!(app.transcript_viewport("r1").scroll_offset(), 90);
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT)));
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)));
         assert_eq!(app.transcript_viewport("r1").scroll_offset(), 100);
 
         assert!(app.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
@@ -5240,11 +5708,15 @@ mod tests {
         assert_eq!(app.cursor_position, 5);
         assert_eq!(app.transcript_viewport("r1").scroll_offset(), 100);
 
-        // From Tree previewing b1 (MANAGE): PgUp/Ctrl+U scroll b1 without disturbing r1
+        // From Tree previewing b1 (MANAGE): Ctrl+U/D half-page and Ctrl+B/F full-page scroll b1
         app.set_focus(FocusedPane::Tree);
         app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.active_thread_id(), "r1");
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        assert_eq!(app.transcript_viewport("b1").scroll_offset(), 70);
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)));
+        assert_eq!(app.transcript_viewport("b1").scroll_offset(), 50);
+        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)));
         assert_eq!(app.transcript_viewport("b1").scroll_offset(), 70);
         assert_eq!(app.transcript_viewport("r1").scroll_offset(), 100);
     }
@@ -5435,11 +5907,13 @@ mod tests {
                 ThreadItem {
                     id: "t-1".to_string(),
                     title: "Root".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
                 ThreadItem {
                     id: "t-2".to_string(),
                     title: "Branch".to_string(),
+                    custom_name: None,
                     anchors: Vec::new(),
                 },
             ],
