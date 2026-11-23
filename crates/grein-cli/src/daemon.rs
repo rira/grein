@@ -540,4 +540,168 @@ mod tests {
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn test_daemon_socket_worktree_rpc_round_trip() {
+        use crate::engine::{DaemonEngine as _, InProcessEngine};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "Grein Test"],
+            vec!["config", "user.email", "test@grein.dev"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("run git setup");
+            assert!(status.success(), "git setup failed: {args:?}");
+        }
+        std::fs::write(repo_dir.join("README.md"), "base line\n").expect("write README");
+        for args in [vec!["add", "."], vec!["commit", "-m", "Initial commit"]] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .expect("run git commit");
+            assert!(status.success(), "git commit failed: {args:?}");
+        }
+        let canonical_repo = std::fs::canonicalize(&repo_dir).expect("canonical repo");
+        let canonical_repo_str = canonical_repo.to_string_lossy().to_string();
+
+        let socket_path = temp.path().join("worktree_rpc.sock");
+        let db_path = temp.path().join("worktree_rpc.db");
+        let engine = std::sync::Arc::new(
+            InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
+                .expect("open engine"),
+        );
+
+        let sock_clone = socket_path.clone();
+        let engine_clone = std::sync::Arc::clone(&engine);
+        let server = tokio::spawn(async move {
+            let _ = run_daemon_with_engine(sock_clone, engine_clone).await;
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client = UnixSocketEngineClient::connect(&socket_path)
+            .await
+            .expect("connect UnixSocketEngineClient");
+        let mut raw_client = connect_to_daemon(&socket_path)
+            .await
+            .expect("connect DaemonClient");
+
+        let main = client.ensure_main_thread().await.expect("ensure main");
+        let branch = client
+            .fork_thread_with_title(Some(&main.thread_id), Some("feat/socket-wt"))
+            .await
+            .expect("fork branch");
+        let wt_path = client
+            .ensure_thread_worktree(&branch.thread_id)
+            .await
+            .expect("ensure_thread_worktree");
+        assert!(std::path::Path::new(&wt_path).join(".git").exists());
+
+        let worktrees = client.list_worktrees().await.expect("list_worktrees");
+        assert!(worktrees.len() >= 2);
+        let primary = worktrees
+            .iter()
+            .find(|w| w.path == canonical_repo_str)
+            .expect("primary entry");
+        assert!(primary.is_primary);
+        assert!(primary.attached_thread_ids.contains(&main.thread_id));
+        assert!(!primary.attached_thread_ids.contains(&branch.thread_id));
+
+        let wt_entry = worktrees
+            .iter()
+            .find(|w| w.path == wt_path)
+            .expect("worktree entry");
+        assert!(wt_entry.is_grein_managed);
+        assert_eq!(wt_entry.attached_thread_ids, vec![branch.thread_id.clone()]);
+
+        let raw_list = raw_client
+            .session_list_worktrees()
+            .await
+            .expect("session_list_worktrees rpc");
+        assert_eq!(
+            raw_list["result"].as_array().expect("result array").len(),
+            worktrees.len()
+        );
+
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("README.md"),
+            "modified via socket\n",
+        )
+        .expect("modify README");
+        let diff_client = client
+            .worktree_diff_preview(&wt_path)
+            .await
+            .expect("worktree_diff_preview");
+        assert!(
+            diff_client.contains("modified via socket"),
+            "unexpected diff preview: {diff_client}"
+        );
+        let diff_rpc = raw_client
+            .session_worktree_diff_preview(&wt_path)
+            .await
+            .expect("session_worktree_diff_preview rpc");
+        assert!(diff_rpc["result"]["diff"]
+            .as_str()
+            .expect("diff string")
+            .contains("modified via socket"));
+
+        let switched_rpc = raw_client
+            .session_switch_thread_worktree(&branch.thread_id, &canonical_repo_str)
+            .await
+            .expect("session_switch_thread_worktree rpc");
+        assert_eq!(switched_rpc["result"]["cwd"], canonical_repo_str);
+
+        let switched_back = client
+            .switch_thread_worktree(&branch.thread_id, &wt_path)
+            .await
+            .expect("switch_thread_worktree back");
+        assert_eq!(switched_back, wt_path);
+
+        let dirty_remove_rpc = raw_client
+            .session_remove_worktree(&wt_path, false)
+            .await
+            .expect("dirty session_remove_worktree rpc");
+        assert_eq!(dirty_remove_rpc["error"]["code"], -32602);
+        assert!(std::path::Path::new(&wt_path).exists());
+
+        client
+            .remove_worktree(&wt_path, true)
+            .await
+            .expect("force remove_worktree");
+        assert!(!std::path::Path::new(&wt_path).exists());
+
+        let after_remove = client.list_worktrees().await.expect("list after remove");
+        assert!(!after_remove.iter().any(|w| w.path == wt_path));
+        let primary_after = after_remove
+            .iter()
+            .find(|w| w.path == canonical_repo_str)
+            .expect("primary after");
+        assert!(primary_after.attached_thread_ids.contains(&branch.thread_id));
+
+        let prune_rpc = raw_client
+            .session_prune_worktrees()
+            .await
+            .expect("session_prune_worktrees rpc");
+        assert!(prune_rpc["result"]["summary"].is_string());
+        let _ = client.prune_worktrees().await.expect("prune_worktrees");
+
+        server.abort();
+    }
 }

@@ -349,3 +349,246 @@ fn test_headless_agents_json_subcommand() {
         "agents output must be JSON array or object: {stdout}"
     );
 }
+
+#[test]
+fn test_doctor_json_subcommand() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let prefs_db = temp_dir.path().join("prefs.db");
+
+    let assert = grein_cmd()
+        .args(["doctor", "--json"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .current_dir(temp_dir.path())
+        .assert()
+        .success();
+
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid utf8");
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --json output must be valid JSON");
+    assert_eq!(report["ok"], true);
+    let checks = report["checks"].as_array().expect("checks array");
+    let names: Vec<&str> = checks
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    for expected in [
+        "git",
+        "shell",
+        "acp_agents",
+        "terminal_env",
+        "workspace_state",
+        "preferences_db",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing doctor check {expected}: {names:?}"
+        );
+    }
+    let git_check = checks
+        .iter()
+        .find(|c| c["name"] == "git")
+        .expect("git check");
+    assert_eq!(git_check["status"], "ok");
+    assert!(
+        !prefs_db.exists(),
+        "doctor must not eagerly create prefs.db when absent"
+    );
+}
+
+#[test]
+fn test_settings_export_import_toml_json_only_null_replace_and_stdio() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let prefs_db = temp_dir.path().join("prefs.db");
+    let initial_toml = temp_dir.path().join("initial.toml");
+    std::fs::write(
+        &initial_toml,
+        "[theme]\nname = \"nord\"\naccent = \"#112233\"\n[keybinding]\nquit = \"q\"\n[ui]\nsidebar_width = \"30\"\n",
+    )
+    .expect("write initial toml");
+
+    grein_cmd()
+        .args(["settings", "import"])
+        .arg(&initial_toml)
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+
+    // Auto-detect JSON export from file extension and filter --only theme.
+    let theme_json = temp_dir.path().join("theme_only.json");
+    grein_cmd()
+        .args(["settings", "export"])
+        .arg(&theme_json)
+        .args(["--only", "theme"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let exported_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&theme_json).expect("read exported json"),
+    )
+    .expect("parse exported json");
+    assert_eq!(exported_json["preferences"]["theme"]["name"], "nord");
+    assert_eq!(exported_json["preferences"]["theme"]["accent"], "#112233");
+    assert!(exported_json["preferences"].get("keybinding").is_none());
+    assert!(exported_json["preferences"].get("ui").is_none());
+
+    // Export --only keybinding to stdout.
+    let kb_assert = grein_cmd()
+        .args(["settings", "export", "-", "--format", "toml", "--only", "keybinding"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let kb_toml = String::from_utf8(kb_assert.get_output().stdout.clone()).expect("utf8");
+    assert!(kb_toml.contains("[keybinding]"));
+    assert!(kb_toml.contains("quit = \"q\""));
+    assert!(!kb_toml.contains("[theme]"));
+
+    // Import JSON via stdin ('-') resetting accent to null while leaving keybinding/ui untouched.
+    let mut child = grein_cmd()
+        .args(["settings", "import", "-"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn settings import stdin");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(br#"{"version":1,"preferences":{"theme":{"accent":null}}}"#)
+            .expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("wait import");
+    assert!(out.status.success());
+
+    let full_assert = grein_cmd()
+        .args(["settings", "export", "--format", "json"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let full_json: serde_json::Value =
+        serde_json::from_slice(&full_assert.get_output().stdout).expect("parse full json");
+    assert_eq!(full_json["preferences"]["theme"]["name"], "nord");
+    assert!(full_json["preferences"]["theme"].get("accent").is_none());
+    assert_eq!(full_json["preferences"]["keybinding"]["quit"], "q");
+    assert_eq!(full_json["preferences"]["ui"]["sidebar_width"], "30");
+
+    // Scoped --only ui --replace replaces only ui section.
+    let ui_toml = temp_dir.path().join("ui.toml");
+    std::fs::write(&ui_toml, "[theme]\nname = \"ignored\"\n[ui]\ncompact = \"true\"\n")
+        .expect("write ui.toml");
+    grein_cmd()
+        .args(["settings", "import"])
+        .arg(&ui_toml)
+        .args(["--only", "ui", "--replace"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+
+    let after_ui_assert = grein_cmd()
+        .args(["settings", "export", "--format", "json"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let after_ui: serde_json::Value =
+        serde_json::from_slice(&after_ui_assert.get_output().stdout).expect("parse json");
+    assert_eq!(after_ui["preferences"]["theme"]["name"], "nord");
+    assert_eq!(after_ui["preferences"]["keybinding"]["quit"], "q");
+    assert!(after_ui["preferences"]["ui"].get("sidebar_width").is_none());
+    assert_eq!(after_ui["preferences"]["ui"]["compact"], "true");
+
+    // Global --replace resets all previous sections.
+    let mut replace_child = grein_cmd()
+        .args(["settings", "import", "-", "--replace"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn global replace");
+    {
+        let stdin = replace_child.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(b"[ui]\ncompact = \"false\"\n")
+            .expect("write stdin");
+    }
+    let rep_out = replace_child.wait_with_output().expect("wait replace");
+    assert!(rep_out.status.success());
+
+    let final_assert = grein_cmd()
+        .args(["settings", "export", "--format", "json"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_assert.get_output().stdout).expect("parse json");
+    assert!(final_json["preferences"].get("theme").is_none());
+    assert!(final_json["preferences"].get("keybinding").is_none());
+    assert_eq!(final_json["preferences"]["ui"]["compact"], "false");
+}
+
+#[test]
+fn test_theme_export_import_preserves_keybindings_and_ui() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let prefs_db = temp_dir.path().join("prefs.db");
+
+    let seed_toml = temp_dir.path().join("seed.toml");
+    std::fs::write(
+        &seed_toml,
+        "[theme]\nname = \"nord\"\naccent = \"#fabd2f\"\n[keybinding]\nquit = \"q\"\n[ui]\nsidebar_width = \"40\"\n",
+    )
+    .expect("write seed");
+    grein_cmd()
+        .args(["settings", "import"])
+        .arg(&seed_toml)
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+
+    let exported_theme_file = temp_dir.path().join("my_theme.json");
+    grein_cmd()
+        .args(["theme", "export"])
+        .arg(&exported_theme_file)
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let theme_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&exported_theme_file).expect("read theme json"),
+    )
+    .expect("parse theme json");
+    assert_eq!(theme_json["preferences"]["theme"]["name"], "nord");
+    assert_eq!(theme_json["preferences"]["theme"]["accent"], "#fabd2f");
+    assert!(theme_json["preferences"]["theme"].get("bg").is_some());
+
+    // Colleague theme file (including unrelated sections must NOT modify keybinding or ui).
+    let mut child = grein_cmd()
+        .args(["theme", "import", "-", "--replace"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn theme import");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        stdin
+            .write_all(
+                b"[theme]\nname = \"catppuccin-mocha\"\naccent = \"#ff5599\"\n[ui]\nsidebar_width = \"999\"\n",
+            )
+            .expect("write colleague theme");
+    }
+    let out = child.wait_with_output().expect("wait theme import");
+    assert!(out.status.success());
+
+    let exported_all = grein_cmd()
+        .args(["settings", "export", "--format", "json"])
+        .env("GREIN_CONFIG_DB", &prefs_db)
+        .assert()
+        .success();
+    let all_json: serde_json::Value =
+        serde_json::from_slice(&exported_all.get_output().stdout).expect("parse all json");
+    assert_eq!(
+        all_json["preferences"]["theme"]["name"],
+        "catppuccin-mocha"
+    );
+    assert_eq!(all_json["preferences"]["theme"]["accent"], "#ff5599");
+    assert_eq!(all_json["preferences"]["keybinding"]["quit"], "q");
+    assert_eq!(all_json["preferences"]["ui"]["sidebar_width"], "40");
+}
