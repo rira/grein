@@ -1,8 +1,27 @@
+mod presets;
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeTone {
+    Dark,
+    Light,
+    Terminal,
+}
+
+impl ThemeTone {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Terminal => "term",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ThemePreset {
@@ -11,6 +30,18 @@ pub enum ThemePreset {
     CatppuccinMocha,
     Nord,
     Ansi,
+    GruvboxDark,
+    RosePine,
+    Kanagawa,
+    Dracula,
+    Everforest,
+    OneDark,
+    SolarizedDark,
+    GitHubDark,
+    Monokai,
+    CatppuccinLatte,
+    GruvboxLight,
+    RosePineDawn,
 }
 
 impl ThemePreset {
@@ -20,6 +51,18 @@ impl ThemePreset {
             ThemePreset::CatppuccinMocha,
             ThemePreset::Nord,
             ThemePreset::Ansi,
+            ThemePreset::GruvboxDark,
+            ThemePreset::RosePine,
+            ThemePreset::Kanagawa,
+            ThemePreset::Dracula,
+            ThemePreset::Everforest,
+            ThemePreset::OneDark,
+            ThemePreset::SolarizedDark,
+            ThemePreset::GitHubDark,
+            ThemePreset::Monokai,
+            ThemePreset::CatppuccinLatte,
+            ThemePreset::GruvboxLight,
+            ThemePreset::RosePineDawn,
         ]
     }
 
@@ -29,6 +72,18 @@ impl ThemePreset {
             Self::CatppuccinMocha => "catppuccin-mocha",
             Self::Nord => "nord",
             Self::Ansi => "ansi",
+            Self::GruvboxDark => "gruvbox-dark",
+            Self::RosePine => "rose-pine",
+            Self::Kanagawa => "kanagawa",
+            Self::Dracula => "dracula",
+            Self::Everforest => "everforest",
+            Self::OneDark => "one-dark",
+            Self::SolarizedDark => "solarized-dark",
+            Self::GitHubDark => "github-dark",
+            Self::Monokai => "monokai",
+            Self::CatppuccinLatte => "catppuccin-latte",
+            Self::GruvboxLight => "gruvbox-light",
+            Self::RosePineDawn => "rose-pine-dawn",
         }
     }
 
@@ -38,18 +93,61 @@ impl ThemePreset {
             Self::CatppuccinMocha => "Catppuccin Mocha",
             Self::Nord => "Nord",
             Self::Ansi => "ANSI",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::RosePine => "Rose Pine",
+            Self::Kanagawa => "Kanagawa",
+            Self::Dracula => "Dracula",
+            Self::Everforest => "Everforest",
+            Self::OneDark => "One Dark",
+            Self::SolarizedDark => "Solarized Dark",
+            Self::GitHubDark => "GitHub Dark",
+            Self::Monokai => "Monokai",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::GruvboxLight => "Gruvbox Light",
+            Self::RosePineDawn => "Rose Pine Dawn",
+        }
+    }
+
+    pub fn tone(&self) -> ThemeTone {
+        match self {
+            Self::Ansi => ThemeTone::Terminal,
+            Self::CatppuccinLatte | Self::GruvboxLight | Self::RosePineDawn => ThemeTone::Light,
+            Self::TokyoNight
+            | Self::CatppuccinMocha
+            | Self::Nord
+            | Self::GruvboxDark
+            | Self::RosePine
+            | Self::Kanagawa
+            | Self::Dracula
+            | Self::Everforest
+            | Self::OneDark
+            | Self::SolarizedDark
+            | Self::GitHubDark
+            | Self::Monokai => ThemeTone::Dark,
         }
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "tokyo-night" | "tokyonight" | "tokyo_night" | "tokyo" => Some(Self::TokyoNight),
             "catppuccin-mocha" | "catppuccin_mocha" | "catppuccin" | "mocha" => {
                 Some(Self::CatppuccinMocha)
             }
             "nord" => Some(Self::Nord),
             "ansi" | "default" | "terminal" => Some(Self::Ansi),
+            "gruvbox-dark" | "gruvbox" | "gruvbox_dark" => Some(Self::GruvboxDark),
+            "rose-pine" | "rose_pine" | "rosepine" | "rosé-pine" => Some(Self::RosePine),
+            "kanagawa" | "kanagawa-wave" => Some(Self::Kanagawa),
+            "dracula" => Some(Self::Dracula),
+            "everforest" | "everforest-dark" => Some(Self::Everforest),
+            "one-dark" | "onedark" | "one_dark" => Some(Self::OneDark),
+            "solarized-dark" | "solarized" | "solarized_dark" => Some(Self::SolarizedDark),
+            "github-dark" | "github" | "github_dark" => Some(Self::GitHubDark),
+            "monokai" | "monokai-pro" => Some(Self::Monokai),
+            "catppuccin-latte" | "latte" | "catppuccin_latte" => Some(Self::CatppuccinLatte),
+            "gruvbox-light" | "gruvbox_light" => Some(Self::GruvboxLight),
+            "rose-pine-dawn" | "rose_pine_dawn" | "dawn" => Some(Self::RosePineDawn),
             _ => None,
         }
     }
@@ -99,112 +197,17 @@ impl Default for ThemePalette {
 
 impl ThemePalette {
     pub fn from_preset(preset: ThemePreset) -> Self {
-        match preset {
-            ThemePreset::TokyoNight => Self {
-                bg: Color::Rgb(0x1a, 0x1b, 0x26),
-                panel_bg: Color::Rgb(0x16, 0x16, 0x1e),
-                status_bar_bg: Color::Rgb(0x1f, 0x23, 0x35),
-                selection_bg: Color::Rgb(0x28, 0x34, 0x57),
-                selection_fg: Color::Rgb(0xc0, 0xca, 0xf5),
-                selection_bar: Color::Rgb(0x7a, 0xa2, 0xf7),
-                border_focused: Color::Rgb(0x7a, 0xa2, 0xf7),
-                border_unfocused: Color::Rgb(0x3b, 0x42, 0x61),
-                text: Color::Rgb(0xc0, 0xca, 0xf5),
-                muted: Color::Rgb(0x56, 0x5f, 0x89),
-                accent: Color::Rgb(0x7d, 0xcf, 0xff),
-                accent_secondary: Color::Rgb(0xbb, 0x9a, 0xf7),
-                user_accent: Color::Rgb(0x9e, 0xce, 0x6a),
-                dirty: Color::Rgb(0xe0, 0xaf, 0x68),
-                success: Color::Rgb(0x9e, 0xce, 0x6a),
-                error: Color::Rgb(0xf7, 0x76, 0x8e),
-                warning: Color::Rgb(0xe0, 0xaf, 0x68),
-                diff_add: Color::Rgb(0x9e, 0xce, 0x6a),
-                diff_del: Color::Rgb(0xf7, 0x76, 0x8e),
-                diff_hunk: Color::Rgb(0x7d, 0xcf, 0xff),
-                pill_write_bg: Color::Rgb(0x7a, 0xa2, 0xf7),
-                pill_write_fg: Color::Rgb(0x15, 0x16, 0x1e),
-                pill_manage_bg: Color::Rgb(0xbb, 0x9a, 0xf7),
-                pill_manage_fg: Color::Rgb(0x15, 0x16, 0x1e),
-            },
-            ThemePreset::CatppuccinMocha => Self {
-                bg: Color::Rgb(0x1e, 0x1e, 0x2e),
-                panel_bg: Color::Rgb(0x18, 0x18, 0x25),
-                status_bar_bg: Color::Rgb(0x11, 0x11, 0x1b),
-                selection_bg: Color::Rgb(0x31, 0x32, 0x44),
-                selection_fg: Color::Rgb(0xcd, 0xd6, 0xf4),
-                selection_bar: Color::Rgb(0x89, 0xb4, 0xfa),
-                border_focused: Color::Rgb(0x89, 0xb4, 0xfa),
-                border_unfocused: Color::Rgb(0x45, 0x47, 0x5a),
-                text: Color::Rgb(0xcd, 0xd6, 0xf4),
-                muted: Color::Rgb(0x6c, 0x70, 0x86),
-                accent: Color::Rgb(0x89, 0xdc, 0xeb),
-                accent_secondary: Color::Rgb(0xcb, 0xa6, 0xf7),
-                user_accent: Color::Rgb(0xa6, 0xe3, 0xa1),
-                dirty: Color::Rgb(0xf9, 0xe2, 0xaf),
-                success: Color::Rgb(0xa6, 0xe3, 0xa1),
-                error: Color::Rgb(0xf3, 0x8b, 0xa8),
-                warning: Color::Rgb(0xf9, 0xe2, 0xaf),
-                diff_add: Color::Rgb(0xa6, 0xe3, 0xa1),
-                diff_del: Color::Rgb(0xf3, 0x8b, 0xa8),
-                diff_hunk: Color::Rgb(0x89, 0xdc, 0xeb),
-                pill_write_bg: Color::Rgb(0x89, 0xb4, 0xfa),
-                pill_write_fg: Color::Rgb(0x11, 0x11, 0x1b),
-                pill_manage_bg: Color::Rgb(0xcb, 0xa6, 0xf7),
-                pill_manage_fg: Color::Rgb(0x11, 0x11, 0x1b),
-            },
-            ThemePreset::Nord => Self {
-                bg: Color::Rgb(0x2e, 0x34, 0x40),
-                panel_bg: Color::Rgb(0x24, 0x29, 0x33),
-                status_bar_bg: Color::Rgb(0x3b, 0x42, 0x52),
-                selection_bg: Color::Rgb(0x43, 0x4c, 0x5e),
-                selection_fg: Color::Rgb(0xec, 0xef, 0xf4),
-                selection_bar: Color::Rgb(0x88, 0xc0, 0xd0),
-                border_focused: Color::Rgb(0x88, 0xc0, 0xd0),
-                border_unfocused: Color::Rgb(0x4c, 0x56, 0x6a),
-                text: Color::Rgb(0xd8, 0xde, 0xe9),
-                muted: Color::Rgb(0x61, 0x6e, 0x88),
-                accent: Color::Rgb(0x88, 0xc0, 0xd0),
-                accent_secondary: Color::Rgb(0xb4, 0x8e, 0xad),
-                user_accent: Color::Rgb(0xa3, 0xbe, 0x8c),
-                dirty: Color::Rgb(0xeb, 0xcb, 0x8b),
-                success: Color::Rgb(0xa3, 0xbe, 0x8c),
-                error: Color::Rgb(0xbf, 0x61, 0x6a),
-                warning: Color::Rgb(0xeb, 0xcb, 0x8b),
-                diff_add: Color::Rgb(0xa3, 0xbe, 0x8c),
-                diff_del: Color::Rgb(0xbf, 0x61, 0x6a),
-                diff_hunk: Color::Rgb(0x81, 0xa1, 0xc1),
-                pill_write_bg: Color::Rgb(0x88, 0xc0, 0xd0),
-                pill_write_fg: Color::Rgb(0x2e, 0x34, 0x40),
-                pill_manage_bg: Color::Rgb(0xb4, 0x8e, 0xad),
-                pill_manage_fg: Color::Rgb(0x2e, 0x34, 0x40),
-            },
-            ThemePreset::Ansi => Self {
-                bg: Color::Reset,
-                panel_bg: Color::Reset,
-                status_bar_bg: Color::Reset,
-                selection_bg: Color::DarkGray,
-                selection_fg: Color::Cyan,
-                selection_bar: Color::Cyan,
-                border_focused: Color::Cyan,
-                border_unfocused: Color::DarkGray,
-                text: Color::Reset,
-                muted: Color::DarkGray,
-                accent: Color::Cyan,
-                accent_secondary: Color::Magenta,
-                user_accent: Color::Green,
-                dirty: Color::Yellow,
-                success: Color::Green,
-                error: Color::Red,
-                warning: Color::Yellow,
-                diff_add: Color::Green,
-                diff_del: Color::Red,
-                diff_hunk: Color::Cyan,
-                pill_write_bg: Color::Cyan,
-                pill_write_fg: Color::Black,
-                pill_manage_bg: Color::Magenta,
-                pill_manage_fg: Color::Black,
-            },
-        }
+        presets::palette_for_preset(preset)
+    }
+
+    pub fn swatch_colors(&self) -> [Color; 5] {
+        [
+            self.accent,
+            self.accent_secondary,
+            self.success,
+            self.warning,
+            self.error,
+        ]
     }
 
     pub fn resolve_preset(
@@ -217,10 +220,7 @@ impl ThemePalette {
             .unwrap_or(ThemePreset::TokyoNight)
     }
 
-    pub fn from_prefs(
-        theme_name: Option<&str>,
-        overrides: &BTreeMap<String, String>,
-    ) -> Self {
+    pub fn from_prefs(theme_name: Option<&str>, overrides: &BTreeMap<String, String>) -> Self {
         let preset = Self::resolve_preset(theme_name, overrides);
         let mut palette = Self::from_preset(preset);
         for (key, value) in overrides {
