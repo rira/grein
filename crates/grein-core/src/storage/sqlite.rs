@@ -473,6 +473,35 @@ impl SqliteStorage {
         Ok(nodes)
     }
 
+    pub fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, CoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.lock()?;
+        let mut stmt =
+            conn.prepare("SELECT content FROM nodes WHERE role = ?1 ORDER BY rowid DESC")?;
+        let mut rows = stmt.query(params![AuthorRole::User.as_str()])?;
+
+        let initial_cap = limit.min(256);
+        let mut prompts = Vec::with_capacity(initial_cap);
+        let mut seen = HashSet::with_capacity(initial_cap);
+        while let Some(row) = rows.next()? {
+            let content: String = row.get(0)?;
+            let trimmed = content.trim();
+            if trimmed.is_empty() || seen.contains(trimmed) {
+                continue;
+            }
+            let prompt = trimmed.to_string();
+            seen.insert(prompt.clone());
+            prompts.push(prompt);
+            if prompts.len() >= limit {
+                break;
+            }
+        }
+        Ok(prompts)
+    }
+
     pub fn get_trunk_path<B: Borrow<Uuid>>(
         &self,
         leaf_id: B,

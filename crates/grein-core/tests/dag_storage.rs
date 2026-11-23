@@ -941,3 +941,106 @@ fn test_update_thread_title_and_custom_name_are_independent(
 
     Ok(())
 }
+
+#[test]
+fn test_list_recent_user_prompts_recency_dedup_blanks_and_limit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+    assert!(storage.list_recent_user_prompts(10)?.is_empty());
+    assert!(storage.list_recent_user_prompts(0)?.is_empty());
+
+    let system = ConversationNode::new_root(AuthorRole::System, "System prompt");
+    storage.insert_node(&system)?;
+
+    let u1 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(system.id),
+        AuthorRole::User,
+        "first prompt".to_string(),
+    );
+    storage.insert_node(&u1)?;
+
+    let a1 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(u1.id),
+        AuthorRole::Assistant,
+        "assistant reply".to_string(),
+    );
+    storage.insert_node(&a1)?;
+
+    let u2 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(a1.id),
+        AuthorRole::User,
+        "second prompt".to_string(),
+    );
+    storage.insert_node(&u2)?;
+
+    let t1 = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(u2.id),
+        AuthorRole::ToolResult,
+        "tool output".to_string(),
+    );
+    storage.insert_node(&t1)?;
+
+    let blank_empty = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(t1.id),
+        AuthorRole::User,
+        "".to_string(),
+    );
+    storage.insert_node(&blank_empty)?;
+
+    let blank_ws = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(blank_empty.id),
+        AuthorRole::User,
+        "   \n\t  ".to_string(),
+    );
+    storage.insert_node(&blank_ws)?;
+
+    let u3_dup_trimmed = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(blank_ws.id),
+        AuthorRole::User,
+        "  first prompt \n".to_string(),
+    );
+    storage.insert_node(&u3_dup_trimmed)?;
+
+    let u4_branch = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(system.id),
+        AuthorRole::User,
+        "third prompt".to_string(),
+    );
+    storage.insert_node(&u4_branch)?;
+
+    let u5_dup = ConversationNode::new(
+        NodeId::new_v7(),
+        Some(u4_branch.id),
+        AuthorRole::User,
+        "third prompt".to_string(),
+    );
+    storage.insert_node(&u5_dup)?;
+
+    assert!(storage.list_recent_user_prompts(0)?.is_empty());
+
+    let all = storage.list_recent_user_prompts(10)?;
+    assert_eq!(
+        all,
+        vec![
+            "third prompt".to_string(),
+            "first prompt".to_string(),
+            "second prompt".to_string(),
+        ]
+    );
+
+    let capped = storage.list_recent_user_prompts(2)?;
+    assert_eq!(
+        capped,
+        vec!["third prompt".to_string(), "first prompt".to_string()]
+    );
+
+    Ok(())
+}
