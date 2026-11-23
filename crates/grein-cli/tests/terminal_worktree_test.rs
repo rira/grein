@@ -230,7 +230,7 @@ done
 
     // Child Terminal created under worktree branch inherits worktree cwd automatically.
     let child_term = engine
-        .create_terminal(Some(&branch.thread_id), None, None, 24, 140)
+        .create_terminal(Some(&branch.thread_id), None, None, 24, 240)
         .await
         .expect("create child terminal");
     assert_eq!(child_term.title, "Terminal");
@@ -255,7 +255,7 @@ done
         .await
         .expect("pty_write");
     let expected_line = format!("TERM_PWD={wt_path}");
-    wait_for_pty_snapshot(&engine, &child_term.thread_id, 24, 140, Duration::from_secs(5), |s| {
+    wait_for_pty_snapshot(&engine, &child_term.thread_id, 24, 240, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|l| l.trim() == expected_line)
     })
     .await;
@@ -289,7 +289,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
         let engine = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
             .expect("open engine");
         let term = engine
-            .create_terminal(None, Some("Root Term"), None, 26, 120)
+            .create_terminal(None, Some("Root Term"), None, 26, 240)
             .await
             .expect("create root terminal");
 
@@ -302,7 +302,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
             .expect("pty_write init");
         let init_prefix = format!("INIT_PWD={} PID=", canonical_repo.to_string_lossy());
         let init_snap =
-            wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+            wait_for_pty_snapshot(&engine, &term.thread_id, 26, 240, Duration::from_secs(5), |s| {
                 s.plain_text()
                     .lines()
                     .any(|l| l.trim().starts_with(&init_prefix))
@@ -355,7 +355,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
                 })) if thread_id == term.thread_id
                     && !snapshot.exited
                     && snapshot.rows == 26
-                    && snapshot.cols == 120 =>
+                    && snapshot.cols == 240 =>
                 {
                     saw_screen = true;
                 }
@@ -394,7 +394,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
             .expect("pty_write in worktree");
         let wt_prefix = format!("WT_TERM_PWD={wt_path} PID=");
         let wt_snap =
-            wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+            wait_for_pty_snapshot(&engine, &term.thread_id, 26, 240, Duration::from_secs(5), |s| {
                 s.plain_text()
                     .lines()
                     .any(|l| l.trim().starts_with(&wt_prefix))
@@ -444,7 +444,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
             .pty_write(&term.thread_id, osc7_cmd.into_bytes())
             .await
             .expect("pty_write sub_wt osc7");
-        wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+        wait_for_pty_snapshot(&engine, &term.thread_id, 26, 240, Duration::from_secs(5), |s| {
             s.plain_text().lines().any(|l| l.trim() == "SUB_WT_READY")
         })
         .await;
@@ -495,7 +495,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
             .await
             .expect("pty_write still alive");
         let alive_line = format!("STILL_ALIVE_PWD={canonical_sub_wt_str} PID={new_pid}");
-        wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+        wait_for_pty_snapshot(&engine, &term.thread_id, 26, 240, Duration::from_secs(5), |s| {
             s.plain_text().lines().any(|l| l.trim() == alive_line)
         })
         .await;
@@ -507,7 +507,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
     let reopened = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
         .expect("reopen");
     let _ = reopened
-        .pty_snapshot(&term_id, 24, 140)
+        .pty_snapshot(&term_id, 24, 240)
         .await
         .expect("lazy pty_snapshot reopened");
     reopened
@@ -523,7 +523,7 @@ async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_a
         .join(&term_id)
         .join("sub_wt");
     let expected_cold = format!("COLD_SUB_PWD={}", expected_sub.to_string_lossy());
-    wait_for_pty_snapshot(&reopened, &term_id, 24, 140, Duration::from_secs(5), |s| {
+    wait_for_pty_snapshot(&reopened, &term_id, 24, 240, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|l| l.trim() == expected_cold)
     })
     .await;
@@ -564,7 +564,7 @@ async fn test_ensure_thread_worktree_on_cold_terminal_updates_cwd_before_lazy_sp
     assert_eq!(wt_path, expected_wt.to_string_lossy());
 
     let _ = reopened
-        .pty_snapshot(&term_id, 24, 140)
+        .pty_snapshot(&term_id, 24, 240)
         .await
         .expect("lazy pty_snapshot");
     reopened
@@ -575,7 +575,7 @@ async fn test_ensure_thread_worktree_on_cold_terminal_updates_cwd_before_lazy_sp
         .await
         .expect("pty_write lazy");
     let expected_line = format!("LAZY_WT_PWD={wt_path}");
-    wait_for_pty_snapshot(&reopened, &term_id, 24, 140, Duration::from_secs(5), |s| {
+    wait_for_pty_snapshot(&reopened, &term_id, 24, 240, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|l| l.trim() == expected_line)
     })
     .await;
@@ -808,11 +808,11 @@ async fn test_cold_reopen_lazy_respawn_and_delete_kills_pty_child() {
     );
 
     let lazy_snap = reopened
-        .pty_snapshot(&term_id, 28, 95)
+        .pty_snapshot(&term_id, 28, 240)
         .await
         .expect("lazy pty_snapshot");
     assert_eq!(lazy_snap.rows, 28);
-    assert_eq!(lazy_snap.cols, 95);
+    assert_eq!(lazy_snap.cols, 240);
     assert!(!lazy_snap.exited);
 
     reopened
@@ -823,7 +823,7 @@ async fn test_cold_reopen_lazy_respawn_and_delete_kills_pty_child() {
         .await
         .expect("pty_write");
     let expected_prefix = format!("LAZY_PWD={} PID=", canonical_work.to_string_lossy());
-    let snap = wait_for_pty_snapshot(&reopened, &term_id, 28, 95, Duration::from_secs(5), |s| {
+    let snap = wait_for_pty_snapshot(&reopened, &term_id, 28, 240, Duration::from_secs(5), |s| {
         s.plain_text()
             .lines()
             .any(|l| l.trim().starts_with(&expected_prefix))
@@ -1362,12 +1362,12 @@ async fn test_pty_restart_replaces_exited_pty_in_persisted_cwd_and_resets_state(
 
     let mut rx = engine.subscribe_tui_events();
     let restarted = engine
-        .pty_restart(&term.thread_id, 30, 110)
+        .pty_restart(&term.thread_id, 30, 240)
         .await
         .expect("pty_restart");
     assert!(!restarted.exited, "pty_restart must reset exited == false");
     assert_eq!(restarted.exit_code, None, "pty_restart must reset exit_code == None");
-    assert_eq!((restarted.rows, restarted.cols), (30, 110));
+    assert_eq!((restarted.rows, restarted.cols), (30, 240));
 
     let mut saw_meta_updated = false;
     let mut saw_screen_updated = false;
@@ -1389,7 +1389,7 @@ async fn test_pty_restart_replaces_exited_pty_in_persisted_cwd_and_resets_state(
                 && !snapshot.exited
                 && snapshot.exit_code.is_none()
                 && snapshot.rows == 30
-                && snapshot.cols == 110 =>
+                && snapshot.cols == 240 =>
             {
                 saw_screen_updated = true;
             }
@@ -1408,7 +1408,7 @@ async fn test_pty_restart_replaces_exited_pty_in_persisted_cwd_and_resets_state(
         .await
         .expect("pty_write after restart");
     let expected_pwd = format!("RESTARTED_PWD={}", canonical_term_dir.to_string_lossy());
-    let live_snap = wait_for_pty_snapshot(&engine, &term.thread_id, 30, 110, Duration::from_secs(5), |s| {
+    let live_snap = wait_for_pty_snapshot(&engine, &term.thread_id, 30, 240, Duration::from_secs(5), |s| {
         !s.exited
             && s.exit_code.is_none()
             && s.plain_text().lines().any(|l| l.trim() == expected_pwd)
@@ -1447,7 +1447,7 @@ async fn test_osc7_live_cwd_persistence_cold_reopen_and_ignores_nonexistent() {
             .expect("open");
         let main = engine.ensure_main_thread().await.expect("main");
         let term = engine
-            .create_terminal(Some(&main.thread_id), Some("OSC7 Term"), None, 24, 140)
+            .create_terminal(Some(&main.thread_id), Some("OSC7 Term"), None, 24, 240)
             .await
             .expect("create_terminal");
 
@@ -1496,7 +1496,7 @@ async fn test_osc7_live_cwd_persistence_cold_reopen_and_ignores_nonexistent() {
             .pty_write(&term.thread_id, b"printf '\\nNO_REDUNDANT_META\\n'\n".to_vec())
             .await
             .expect("pty_write marker");
-        wait_for_pty_snapshot(&engine, &term.thread_id, 24, 140, Duration::from_secs(5), |s| {
+        wait_for_pty_snapshot(&engine, &term.thread_id, 24, 240, Duration::from_secs(5), |s| {
             s.plain_text()
                 .lines()
                 .any(|l| l.trim() == "NO_REDUNDANT_META")
@@ -1520,7 +1520,7 @@ async fn test_osc7_live_cwd_persistence_cold_reopen_and_ignores_nonexistent() {
             .pty_write(&term.thread_id, bad_cmd.into_bytes())
             .await
             .expect("pty_write bad osc7");
-        wait_for_pty_snapshot(&engine, &term.thread_id, 24, 140, Duration::from_secs(5), |s| {
+        wait_for_pty_snapshot(&engine, &term.thread_id, 24, 240, Duration::from_secs(5), |s| {
             s.plain_text().lines().any(|l| l.trim() == "BAD_OSC7_DONE")
         })
         .await;
@@ -1550,7 +1550,7 @@ async fn test_osc7_live_cwd_persistence_cold_reopen_and_ignores_nonexistent() {
     let reopened = InProcessEngine::open_with_config(&db_path, canonical_initial, None)
         .expect("cold reopen");
     let _ = reopened
-        .pty_snapshot(&term_id, 24, 140)
+        .pty_snapshot(&term_id, 24, 240)
         .await
         .expect("lazy pty_snapshot");
     reopened
@@ -1562,7 +1562,7 @@ async fn test_osc7_live_cwd_persistence_cold_reopen_and_ignores_nonexistent() {
         .expect("pty_write after reopen");
 
     let expected_pwd = format!("REOPEN_OSC7_PWD={canonical_sub_str}");
-    wait_for_pty_snapshot(&reopened, &term_id, 24, 140, Duration::from_secs(5), |s| {
+    wait_for_pty_snapshot(&reopened, &term_id, 24, 240, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|l| l.trim() == expected_pwd)
     })
     .await;

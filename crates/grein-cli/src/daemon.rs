@@ -509,12 +509,12 @@ mod tests {
         assert_eq!((restart_snap.rows, restart_snap.cols), (28, 100));
 
         let restart_via_client = client
-            .pty_restart(&term.thread_id, 30, 105)
+            .pty_restart(&term.thread_id, 30, 240)
             .await
             .expect("UnixSocketEngineClient::pty_restart");
         assert!(!restart_via_client.exited);
         assert_eq!(restart_via_client.exit_code, None);
-        assert_eq!((restart_via_client.rows, restart_via_client.cols), (30, 105));
+        assert_eq!((restart_via_client.rows, restart_via_client.cols), (30, 240));
 
         client
             .pty_write(
@@ -527,7 +527,7 @@ mod tests {
         let mut saw_pwd = false;
         for _ in 0..150 {
             let snap = client
-                .pty_snapshot(&term.thread_id, 30, 105)
+                .pty_snapshot(&term.thread_id, 30, 240)
                 .await
                 .expect("pty_snapshot after restart");
             if !snap.exited && snap.plain_text().lines().any(|l| l.trim() == expected_pwd) {

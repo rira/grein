@@ -73,7 +73,7 @@ async fn test_create_terminal_expands_leading_tilde_cwd() {
     let main = engine.ensure_main_thread().await.expect("main");
 
     let home_term = engine
-        .create_terminal(Some(&main.thread_id), Some("Home Term"), Some("~"), 24, 140)
+        .create_terminal(Some(&main.thread_id), Some("Home Term"), Some("~"), 24, 240)
         .await
         .expect("create_terminal ~");
     let sub_term = engine
@@ -82,7 +82,7 @@ async fn test_create_terminal_expands_leading_tilde_cwd() {
             Some("Sub Term"),
             Some("~/projects/demo"),
             24,
-            140,
+            240,
         )
         .await
         .expect("create_terminal ~/projects/demo");
@@ -130,7 +130,7 @@ async fn test_create_terminal_expands_leading_tilde_cwd() {
         &engine,
         &home_term.thread_id,
         24,
-        140,
+        240,
         Duration::from_secs(5),
         |s| s.plain_text().lines().any(|l| l.trim() == expected_home),
     )
@@ -148,7 +148,7 @@ async fn test_create_terminal_expands_leading_tilde_cwd() {
         &engine,
         &sub_term.thread_id,
         24,
-        140,
+        240,
         Duration::from_secs(5),
         |s| s.plain_text().lines().any(|l| l.trim() == expected_sub),
     )
