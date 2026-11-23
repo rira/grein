@@ -20,14 +20,20 @@ use grein_tui::engine_port::{
     AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentSlashCommand,
     HydratedThread, HydratedTurn, PtyCell as TuiPtyCell, PtyColor as TuiPtyColor,
     PtyScreenSnapshot as TuiPtyScreenSnapshot, SubagentSnapshot, SubagentStatus, ThreadMeta,
-    TuiEngineEvent,
+    TuiEngineEvent, WorktreeEntry,
 };
 use grein_workspace::allocator::{ThreadId as WorkspaceThreadId, WorktreeAllocator};
 use grein_workspace::git::{GitError, GitRepository};
 use grein_workspace::git_status::{inspect_git_status, RepoGitStatus};
 use grein_workspace::pty_session::{
-    InteractivePtySession, PtyCell as WsPtyCell, PtyColor as WsPtyColor,
+    live_process_cwd, InteractivePtySession, PtyCell as WsPtyCell, PtyColor as WsPtyColor,
     PtyScreenSnapshot as WsPtyScreenSnapshot,
+};
+use grein_workspace::worktrees::{
+    list_worktrees_across_paths, prune_worktrees as workspace_prune_worktrees,
+    remove_worktree as workspace_remove_worktree, resolve_primary_repo_root,
+    resolve_worktree_toplevel, worktree_diff_preview as workspace_worktree_diff_preview,
+    DiscoveredWorktree,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -323,6 +329,35 @@ pub trait DaemonEngine: Send + Sync {
     async fn ensure_thread_worktree(&self, _thread_id: &str) -> Result<String, EngineError> {
         Err(EngineError::Protocol(
             "ensure_thread_worktree not supported".to_string(),
+        ))
+    }
+    async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
+        Err(EngineError::Protocol(
+            "list_worktrees not supported".to_string(),
+        ))
+    }
+    async fn switch_thread_worktree(
+        &self,
+        _thread_id: &str,
+        _target_path: &str,
+    ) -> Result<String, EngineError> {
+        Err(EngineError::Protocol(
+            "switch_thread_worktree not supported".to_string(),
+        ))
+    }
+    async fn remove_worktree(&self, _path: &str, _force: bool) -> Result<(), EngineError> {
+        Err(EngineError::Protocol(
+            "remove_worktree not supported".to_string(),
+        ))
+    }
+    async fn worktree_diff_preview(&self, _path: &str) -> Result<String, EngineError> {
+        Err(EngineError::Protocol(
+            "worktree_diff_preview not supported".to_string(),
+        ))
+    }
+    async fn prune_worktrees(&self) -> Result<String, EngineError> {
+        Err(EngineError::Protocol(
+            "prune_worktrees not supported".to_string(),
         ))
     }
     async fn pty_scroll(
@@ -1516,6 +1551,7 @@ impl EngineRuntime {
             let Some(session) = session else {
                 continue;
             };
+            let _ = session.poll_os_cwd();
             let raw_snap = session.snapshot();
             let raw_cwd = raw_snap.cwd.clone();
             let snap = pty_snapshot_to_tui(raw_snap);
@@ -1525,36 +1561,8 @@ impl EngineRuntime {
                 thread_id: thread_id.clone(),
                 snapshot: snap,
             });
-            if let Some(raw_dir) = raw_cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                if let Some(tid) = parse_typed_id::<ThreadId>(&thread_id) {
-                    let raw_path = Path::new(raw_dir);
-                    if raw_path.is_dir() {
-                        if let Ok(canonical_path) = std::fs::canonicalize(raw_path) {
-                            if let Some(canonical_dir) = canonical_path.to_str() {
-                                let is_still_current = self
-                                    .active_pty_sessions
-                                    .lock()
-                                    .ok()
-                                    .is_some_and(|map| {
-                                        map.get(&thread_id)
-                                            .is_some_and(|cur| Arc::ptr_eq(cur, &session))
-                                    });
-                                if is_still_current {
-                                    if let Ok(Some(thread)) = self.storage.get_thread(tid) {
-                                        if thread.cwd.as_deref() != Some(canonical_dir)
-                                            && self
-                                                .storage
-                                                .update_thread_cwd(&tid, Some(canonical_dir))
-                                                .is_ok()
-                                        {
-                                            cwd_updated = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if self.sync_pty_cwd_to_storage(&thread_id, &session, raw_cwd.as_deref()) {
+                cwd_updated = true;
             }
             if exited {
                 let newly_exited = self
@@ -1584,6 +1592,52 @@ impl EngineRuntime {
                 self.emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
             }
         }
+    }
+
+    fn sync_pty_cwd_to_storage(
+        &self,
+        thread_id: &str,
+        session: &Arc<InteractivePtySession>,
+        raw_cwd: Option<&str>,
+    ) -> bool {
+        let Some(raw_dir) = raw_cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let Some(tid) = parse_typed_id::<ThreadId>(thread_id) else {
+            return false;
+        };
+        let raw_path = Path::new(raw_dir);
+        if !raw_path.is_dir() {
+            return false;
+        }
+        let Ok(canonical_path) = std::fs::canonicalize(raw_path) else {
+            return false;
+        };
+        let Some(canonical_dir) = canonical_path.to_str() else {
+            return false;
+        };
+        let is_still_current = self
+            .active_pty_sessions
+            .lock()
+            .ok()
+            .is_some_and(|map| {
+                map.get(thread_id)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, session))
+            });
+        if !is_still_current {
+            return false;
+        }
+        if let Ok(Some(thread)) = self.storage.get_thread(tid) {
+            if thread.cwd.as_deref() != Some(canonical_dir)
+                && self
+                    .storage
+                    .update_thread_cwd(&tid, Some(canonical_dir))
+                    .is_ok()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn resolve_thread_cwd(&self, thread: &Thread) -> PathBuf {
@@ -1732,8 +1786,21 @@ impl EngineRuntime {
         });
         let clamped_rows = rows.max(4);
         let clamped_cols = cols.max(10);
+        let tid_env = thread_id.to_string();
+        let is_wt = is_worktree_cwd(&cwd);
         let spawned = tokio::task::spawn_blocking(move || {
-            InteractivePtySession::spawn(&cwd, clamped_rows, clamped_cols, None, on_update)
+            let mut extra_env: Vec<(&str, &str)> = vec![("GREIN_THREAD_ID", &tid_env)];
+            if is_wt {
+                extra_env.push(("GREIN_WORKTREE", "1"));
+            }
+            InteractivePtySession::spawn_with_env(
+                &cwd,
+                clamped_rows,
+                clamped_cols,
+                None,
+                &extra_env,
+                on_update,
+            )
         })
         .await
         .map_err(|e| EngineError::Transport(format!("PTY spawn task panicked: {e}")))?
@@ -1748,6 +1815,102 @@ impl EngineRuntime {
         }
         let _ = self.pty_notify_tx.send(thread_id.to_string());
         Ok(session)
+    }
+
+    async fn reset_thread_acp_session(
+        &self,
+        tid: ThreadId,
+        thread_id: &str,
+    ) -> Result<(), EngineError> {
+        self.storage
+            .update_thread_acp_session_id(&tid, None)
+            .map_err(storage_err)?;
+        let old_session = {
+            let mut state = self.lock()?;
+            state
+                .active_acp_sessions
+                .remove(thread_id)
+                .map(|s| (s.session_id.clone(), s.driver_gen))
+        };
+        if let Some((session_id, driver_gen)) = old_session {
+            let driver_opt = {
+                let guard = self.acp_driver.lock().await;
+                guard
+                    .as_ref()
+                    .filter(|s| s.generation == driver_gen && s.driver.is_running())
+                    .map(|s| Arc::clone(&s.driver))
+            };
+            if let Some(driver) = driver_opt {
+                let _ = tokio::time::timeout(
+                    CLOSE_SESSION_TIMEOUT,
+                    driver.close_session(&session_id),
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_worktree_search_paths(&self, threads: &[Thread]) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push_unique = |p: PathBuf| {
+            if seen.insert(p.clone()) {
+                paths.push(p);
+            }
+        };
+        push_unique(self.cwd.clone());
+        for thread in threads {
+            if let Some(cwd) = thread.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                push_unique(PathBuf::from(cwd));
+            }
+        }
+        if let Ok(sessions) = self.active_pty_sessions.lock() {
+            for session in sessions.values() {
+                if let Some(cwd) = session
+                    .snapshot()
+                    .cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    push_unique(PathBuf::from(cwd));
+                }
+                if let Some(os_cwd) = live_process_cwd(session.child_pid()) {
+                    push_unique(os_cwd);
+                }
+            }
+        }
+        paths
+    }
+
+    fn effective_thread_dir(&self, thread: &Thread) -> PathBuf {
+        let raw = thread
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.cwd.clone());
+        std::fs::canonicalize(&raw).unwrap_or(raw)
+    }
+
+    fn longest_matching_worktree_index(
+        thread_dir: &Path,
+        toplevel: Option<&Path>,
+        discovered: &[DiscoveredWorktree],
+    ) -> Option<usize> {
+        if let Some(top) = toplevel {
+            if let Some(idx) = discovered.iter().position(|wt| wt.path == top) {
+                return Some(idx);
+            }
+        }
+        discovered
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| thread_dir.starts_with(&wt.path))
+            .max_by_key(|(_, wt)| (wt.path.components().count(), wt.path.as_os_str().len()))
+            .map(|(idx, _)| idx)
     }
 
     async fn ensure_pty_session(
@@ -1827,6 +1990,19 @@ impl EngineRuntime {
         }
         Ok((tid, thread))
     }
+}
+
+fn is_worktree_cwd(cwd: &Path) -> bool {
+    if let Some(git_root) = cwd.ancestors().find(|dir| dir.join(".git").exists()) {
+        if git_root.join(".git").is_file() {
+            return true;
+        }
+    }
+    let s = cwd.to_string_lossy();
+    s.contains("/.grein/worktrees/")
+        || s.ends_with("/.grein/worktrees")
+        || s.contains("\\.grein\\worktrees\\")
+        || s.ends_with("\\.grein\\worktrees")
 }
 
 fn finalize_eligible_subagents(
@@ -2682,6 +2858,30 @@ impl InProcessEngine {
 
     pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         DaemonEngine::ensure_thread_worktree(self, thread_id).await
+    }
+
+    pub async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
+        DaemonEngine::list_worktrees(self).await
+    }
+
+    pub async fn switch_thread_worktree(
+        &self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> Result<String, EngineError> {
+        DaemonEngine::switch_thread_worktree(self, thread_id, target_path).await
+    }
+
+    pub async fn remove_worktree(&self, path: &str, force: bool) -> Result<(), EngineError> {
+        DaemonEngine::remove_worktree(self, path, force).await
+    }
+
+    pub async fn worktree_diff_preview(&self, path: &str) -> Result<String, EngineError> {
+        DaemonEngine::worktree_diff_preview(self, path).await
+    }
+
+    pub async fn prune_worktrees(&self) -> Result<String, EngineError> {
+        DaemonEngine::prune_worktrees(self).await
     }
 
     pub async fn pty_scroll(
@@ -4051,8 +4251,10 @@ impl DaemonEngine for InProcessEngine {
             .runtime
             .ensure_pty_session(thread_id, &thread, rows, cols)
             .await?;
+        let s_poll = Arc::clone(&session);
+        let _ = tokio::task::spawn_blocking(move || s_poll.poll_os_cwd()).await;
         let snap = session.snapshot();
-        if !used_pending && rows > 0 && cols > 0 {
+        let final_snap = if !used_pending && rows > 0 && cols > 0 {
             let target_rows = rows.max(4);
             let target_cols = cols.max(10);
             if snap.rows != target_rows || snap.cols != target_cols {
@@ -4061,10 +4263,23 @@ impl DaemonEngine for InProcessEngine {
                     .await
                     .map_err(|e| EngineError::Transport(format!("PTY resize task panicked: {e}")))?
                     .map_err(|e| EngineError::Transport(format!("PTY resize failed: {e}")))?;
-                return Ok(pty_snapshot_to_tui(session.snapshot()));
+                session.snapshot()
+            } else {
+                snap
+            }
+        } else {
+            snap
+        };
+        if self
+            .runtime
+            .sync_pty_cwd_to_storage(thread_id, &session, final_snap.cwd.as_deref())
+        {
+            if let Ok(meta) = self.runtime.compute_thread_metadata() {
+                self.runtime
+                    .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
             }
         }
-        Ok(pty_snapshot_to_tui(snap))
+        Ok(pty_snapshot_to_tui(final_snap))
     }
 
     async fn pty_scroll(
@@ -4126,31 +4341,56 @@ impl DaemonEngine for InProcessEngine {
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
 
-        let repo = GitRepository::discover(&self.runtime.cwd).map_err(|err| match err {
-            GitError::NotFound => EngineError::InvalidParams(format!(
-                "workspace {} is not inside a git repository",
-                self.runtime.cwd.display()
-            )),
-            GitError::CommandFailed(msg) => EngineError::Transport(msg),
-        })?;
-        let expected_dir = repo.root().join(".grein").join("worktrees").join(thread_id);
+        let cur_cwd_opt = thread.cwd.clone();
+        let runtime_cwd = self.runtime.cwd.clone();
+        let tid_owned = thread_id.to_string();
+        let worktree_path = tokio::task::spawn_blocking(move || -> Result<PathBuf, EngineError> {
+            let primary_root = match resolve_primary_repo_root(&runtime_cwd) {
+                Some(root) => root,
+                None => {
+                    let repo = GitRepository::discover(&runtime_cwd).map_err(|err| match err {
+                        GitError::NotFound => EngineError::InvalidParams(format!(
+                            "workspace {} is not inside a git repository",
+                            runtime_cwd.display()
+                        )),
+                        GitError::CommandFailed(msg) => EngineError::Transport(msg),
+                    })?;
+                    std::fs::canonicalize(repo.root()).unwrap_or_else(|_| repo.root().to_path_buf())
+                }
+            };
 
-        let worktree_path = if expected_dir.is_dir() && expected_dir.join(".git").exists() {
-            expected_dir
-        } else {
-            let tid_owned = thread_id.to_string();
-            tokio::task::spawn_blocking(move || {
-                let allocator = WorktreeAllocator::new(repo);
-                let mut session = allocator.open_session(WorkspaceThreadId::from(tid_owned))?;
-                session.transition_to_isolated_worktree()?;
-                Ok::<PathBuf, grein_workspace::allocator::WorkspaceError>(
-                    session.working_directory().to_path_buf(),
-                )
-            })
-            .await
-            .map_err(|e| EngineError::Transport(format!("worktree task panicked: {e}")))?
-            .map_err(|e| EngineError::Transport(format!("failed to create worktree: {e}")))?
-        };
+            let worktrees_base = primary_root.join(".grein").join("worktrees");
+            let canonical_wt_base =
+                std::fs::canonicalize(&worktrees_base).unwrap_or_else(|_| worktrees_base.clone());
+
+            if let Some(cur_cwd) = cur_cwd_opt.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                let cur_path = Path::new(cur_cwd);
+                if cur_path.is_dir() {
+                    if let Some(toplevel) = resolve_worktree_toplevel(cur_path) {
+                        if toplevel.starts_with(&canonical_wt_base) && toplevel.join(".git").exists()
+                        {
+                            return Ok(toplevel);
+                        }
+                    }
+                }
+            }
+
+            let legacy_dir = worktrees_base.join(&tid_owned);
+            if legacy_dir.is_dir() && legacy_dir.join(".git").exists() {
+                return Ok(legacy_dir);
+            }
+
+            let allocator = WorktreeAllocator::new(GitRepository::new(primary_root));
+            let mut session =
+                allocator.open_session_auto_named(WorkspaceThreadId::from(tid_owned));
+            session
+                .transition_to_isolated_worktree()
+                .map_err(|e| EngineError::Transport(format!("failed to create worktree: {e}")))?;
+            Ok(session.working_directory().to_path_buf())
+        })
+        .await
+        .map_err(|e| EngineError::Transport(format!("worktree task panicked: {e}")))??;
 
         let canonical = std::fs::canonicalize(&worktree_path).map_err(|e| {
             EngineError::Transport(format!(
@@ -4161,7 +4401,9 @@ impl DaemonEngine for InProcessEngine {
         let path_str = canonical
             .to_str()
             .map(ToOwned::to_owned)
-            .ok_or_else(|| EngineError::InvalidParams("worktree path is not valid UTF-8".to_string()))?;
+            .ok_or_else(|| {
+                EngineError::InvalidParams("worktree path is not valid UTF-8".to_string())
+            })?;
 
         let already_inside_worktree = thread.cwd.as_deref().is_some_and(|cur| {
             let cur_path = Path::new(cur);
@@ -4189,32 +4431,8 @@ impl DaemonEngine for InProcessEngine {
                     .update_thread_cwd(&tid, Some(&path_str))
                     .map_err(storage_err)?;
                 self.runtime
-                    .storage
-                    .update_thread_acp_session_id(&tid, None)
-                    .map_err(storage_err)?;
-                let old_session = {
-                    let mut state = self.runtime.lock()?;
-                    state
-                        .active_acp_sessions
-                        .remove(thread_id)
-                        .map(|s| (s.session_id.clone(), s.driver_gen))
-                };
-                if let Some((session_id, driver_gen)) = old_session {
-                    let driver_opt = {
-                        let guard = self.runtime.acp_driver.lock().await;
-                        guard
-                            .as_ref()
-                            .filter(|s| s.generation == driver_gen && s.driver.is_running())
-                            .map(|s| Arc::clone(&s.driver))
-                    };
-                    if let Some(driver) = driver_opt {
-                        let _ = tokio::time::timeout(
-                            CLOSE_SESSION_TIMEOUT,
-                            driver.close_session(&session_id),
-                        )
-                        .await;
-                    }
-                }
+                    .reset_thread_acp_session(tid, thread_id)
+                    .await?;
             }
         }
 
@@ -4222,6 +4440,321 @@ impl DaemonEngine for InProcessEngine {
         self.runtime
             .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
         Ok(path_str)
+    }
+
+    async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
+        let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
+        let search_paths = self.runtime.collect_worktree_search_paths(&threads);
+        let preferred_hint = self.runtime.cwd.clone();
+        let thread_dirs: Vec<(String, PathBuf)> = threads
+            .iter()
+            .map(|t| (t.id.0.to_string(), self.runtime.effective_thread_dir(t)))
+            .collect();
+
+        tokio::task::spawn_blocking(move || {
+            let discovered = list_worktrees_across_paths(&search_paths, Some(&preferred_hint));
+            let mut attached: Vec<Vec<String>> = vec![Vec::new(); discovered.len()];
+            let mut toplevel_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+
+            for (tid_str, t_dir) in thread_dirs {
+                let toplevel = toplevel_cache
+                    .entry(t_dir.clone())
+                    .or_insert_with(|| resolve_worktree_toplevel(&t_dir))
+                    .as_deref();
+                if let Some(idx) =
+                    EngineRuntime::longest_matching_worktree_index(&t_dir, toplevel, &discovered)
+                {
+                    attached[idx].push(tid_str);
+                }
+            }
+
+            discovered
+                .into_iter()
+                .zip(attached)
+                .map(|(wt, attached_thread_ids)| WorktreeEntry {
+                    repo_root: wt.repo_root.to_string_lossy().into_owned(),
+                    repo_name: wt.repo_name,
+                    path: wt.path.to_string_lossy().into_owned(),
+                    branch: wt.branch,
+                    head_short: wt.head_short,
+                    is_primary: wt.is_primary,
+                    is_detached: wt.is_detached,
+                    is_grein_managed: wt.is_grein_managed,
+                    dirty_count: wt.dirty_count,
+                    attached_thread_ids,
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| EngineError::Transport(format!("list_worktrees task panicked: {e}")))
+    }
+
+    async fn switch_thread_worktree(
+        &self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> Result<String, EngineError> {
+        let trimmed_target = target_path.trim();
+        if trimmed_target.is_empty() {
+            return Err(EngineError::InvalidParams(
+                "target worktree path must not be empty".to_string(),
+            ));
+        }
+
+        let tid: ThreadId = parse_typed_id(thread_id)
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        let _initial = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+
+        let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
+        let thread = self
+            .runtime
+            .storage
+            .get_thread(tid)
+            .map_err(storage_err)?
+            .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+
+        let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
+        let search_paths = self.runtime.collect_worktree_search_paths(&threads);
+        let preferred_hint = self.runtime.cwd.clone();
+        let raw_target = PathBuf::from(trimmed_target);
+        let cur_cwd = thread
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+
+        let (canonical_target, changed) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, bool), EngineError> {
+            let canonical_target = std::fs::canonicalize(&raw_target).map_err(|_| {
+                EngineError::InvalidParams(format!(
+                    "target worktree path does not exist: {}",
+                    raw_target.display()
+                ))
+            })?;
+            if !canonical_target.is_dir() {
+                return Err(EngineError::InvalidParams(format!(
+                    "target worktree path is not a directory: {}",
+                    canonical_target.display()
+                )));
+            }
+            let discovered = list_worktrees_across_paths(&search_paths, Some(&preferred_hint));
+            if !discovered.iter().any(|wt| wt.path == canonical_target) {
+                return Err(EngineError::InvalidParams(format!(
+                    "path is not a registered worktree: {}",
+                    canonical_target.display()
+                )));
+            }
+
+            let cur_toplevel = cur_cwd
+                .as_deref()
+                .and_then(|c| resolve_worktree_toplevel(Path::new(c)));
+            let changed = cur_toplevel.as_ref() != Some(&canonical_target);
+            Ok((canonical_target, changed))
+        })
+        .await
+        .map_err(|e| EngineError::Transport(format!("switch_thread_worktree task panicked: {e}")))??;
+
+        let target_str = canonical_target
+            .to_str()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                EngineError::InvalidParams("worktree path is not valid UTF-8".to_string())
+            })?;
+
+        if changed {
+            if thread.kind == ThreadKind::Terminal {
+                let old_dims = self.runtime.teardown_active_pty(thread_id, false).await?;
+                self.runtime
+                    .storage
+                    .update_thread_cwd(&tid, Some(&target_str))
+                    .map_err(storage_err)?;
+                if let Some((rows, cols)) = old_dims {
+                    let _ = self
+                        .runtime
+                        .respawn_terminal_pty(
+                            tid,
+                            thread_id,
+                            PathBuf::from(&target_str),
+                            rows,
+                            cols,
+                        )
+                        .await?;
+                }
+            } else {
+                self.runtime
+                    .storage
+                    .update_thread_cwd(&tid, Some(&target_str))
+                    .map_err(storage_err)?;
+                self.runtime
+                    .reset_thread_acp_session(tid, thread_id)
+                    .await?;
+            }
+        }
+
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        Ok(target_str)
+    }
+
+    async fn remove_worktree(&self, path: &str, force: bool) -> Result<(), EngineError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(EngineError::InvalidParams(
+                "worktree path must not be empty".to_string(),
+            ));
+        }
+
+        let raw_target = PathBuf::from(trimmed);
+        let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
+        let search_paths = self.runtime.collect_worktree_search_paths(&threads);
+        let preferred_hint = self.runtime.cwd.clone();
+
+        let (entry, attached_thread_ids) = tokio::task::spawn_blocking(
+            move || -> Result<(DiscoveredWorktree, Vec<String>), EngineError> {
+                let canonical_target = std::fs::canonicalize(&raw_target).map_err(|_| {
+                    EngineError::InvalidParams(format!(
+                        "unknown or missing worktree path: {}",
+                        raw_target.display()
+                    ))
+                })?;
+                let discovered = list_worktrees_across_paths(&search_paths, Some(&preferred_hint));
+                let Some(target_idx) =
+                    discovered.iter().position(|wt| wt.path == canonical_target)
+                else {
+                    return Err(EngineError::InvalidParams(format!(
+                        "path is not a registered worktree: {}",
+                        canonical_target.display()
+                    )));
+                };
+                let entry = discovered[target_idx].clone();
+                if entry.is_primary {
+                    return Err(EngineError::InvalidParams(
+                        "cannot remove primary repository worktree".to_string(),
+                    ));
+                }
+                if !force
+                    && inspect_git_status(&canonical_target).is_some_and(|st| st.dirty_count > 0)
+                {
+                    return Err(EngineError::InvalidParams(format!(
+                        "worktree {} has uncommitted changes; pass force=true to remove",
+                        canonical_target.display()
+                    )));
+                }
+
+                let mut attached = Vec::new();
+                for thread in &threads {
+                    let Some(raw_cwd) = thread
+                        .cwd
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let raw_path = PathBuf::from(raw_cwd);
+                    let canon_cwd = std::fs::canonicalize(&raw_path).unwrap_or(raw_path);
+                    let toplevel = resolve_worktree_toplevel(&canon_cwd);
+                    let matched_idx = EngineRuntime::longest_matching_worktree_index(
+                        &canon_cwd,
+                        toplevel.as_deref(),
+                        &discovered,
+                    );
+                    if matched_idx == Some(target_idx)
+                        || (matched_idx.is_none() && canon_cwd.starts_with(&canonical_target))
+                    {
+                        attached.push(thread.id.0.to_string());
+                    }
+                }
+                attached.sort();
+                attached.dedup();
+                Ok((entry, attached))
+            },
+        )
+        .await
+        .map_err(|e| EngineError::Transport(format!("remove_worktree task panicked: {e}")))??;
+
+        let mut turn_guards = Vec::with_capacity(attached_thread_ids.len());
+        for tid_str in &attached_thread_ids {
+            turn_guards.push(self.runtime.acquire_thread_turn_lock(tid_str).await?);
+        }
+
+        let repo_root_str = entry.repo_root.to_string_lossy().into_owned();
+        let mut torn_down_ptys: Vec<(ThreadId, String, (u16, u16))> = Vec::new();
+        for tid_str in &attached_thread_ids {
+            let Some(tid) = parse_typed_id::<ThreadId>(tid_str) else {
+                continue;
+            };
+            let Some(thread) = self.runtime.storage.get_thread(tid).map_err(storage_err)? else {
+                continue;
+            };
+            if thread.kind == ThreadKind::Terminal {
+                let old_dims = self.runtime.teardown_active_pty(tid_str, false).await?;
+                self.runtime
+                    .storage
+                    .update_thread_cwd(&tid, Some(&repo_root_str))
+                    .map_err(storage_err)?;
+                if let Some(dims) = old_dims {
+                    torn_down_ptys.push((tid, tid_str.clone(), dims));
+                }
+            } else {
+                self.runtime.reset_thread_acp_session(tid, tid_str).await?;
+                self.runtime
+                    .storage
+                    .update_thread_cwd(&tid, Some(&repo_root_str))
+                    .map_err(storage_err)?;
+            }
+        }
+
+        let repo_root_for_rm = entry.repo_root.clone();
+        let target_for_rm = entry.path.clone();
+        tokio::task::spawn_blocking(move || {
+            workspace_remove_worktree(&repo_root_for_rm, &target_for_rm, force, false)
+        })
+        .await
+        .map_err(|e| EngineError::Transport(format!("remove_worktree task panicked: {e}")))?
+        .map_err(|e| EngineError::InvalidParams(format!("failed to remove worktree: {e}")))?;
+
+        for (tid, tid_str, (rows, cols)) in torn_down_ptys {
+            let _ = self
+                .runtime
+                .respawn_terminal_pty(tid, &tid_str, entry.repo_root.clone(), rows, cols)
+                .await?;
+        }
+
+        drop(turn_guards);
+        let meta = self.runtime.compute_thread_metadata()?;
+        self.runtime
+            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+        Ok(())
+    }
+
+    async fn worktree_diff_preview(&self, path: &str) -> Result<String, EngineError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(EngineError::InvalidParams(
+                "worktree path must not be empty".to_string(),
+            ));
+        }
+        let target = PathBuf::from(trimmed);
+        tokio::task::spawn_blocking(move || workspace_worktree_diff_preview(&target, 400))
+            .await
+            .map_err(|e| {
+                EngineError::Transport(format!("worktree_diff_preview task panicked: {e}"))
+            })
+    }
+
+    async fn prune_worktrees(&self) -> Result<String, EngineError> {
+        let repo_hint = self.runtime.cwd.clone();
+        tokio::task::spawn_blocking(move || workspace_prune_worktrees(&repo_hint))
+            .await
+            .map_err(|e| EngineError::Transport(format!("prune_worktrees task panicked: {e}")))?
+            .map_err(|e| EngineError::InvalidParams(format!("failed to prune worktrees: {e}")))
     }
 }
 
@@ -4383,6 +4916,39 @@ async fn route(
             let cwd = engine.ensure_thread_worktree(thread_id).await?;
             json!({"cwd": cwd})
         }
+        "session.list_worktrees" | "list_worktrees" => to_json(&engine.list_worktrees().await?)?,
+        "session.switch_thread_worktree" | "switch_thread_worktree" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let target_path = params
+                .get("target_path")
+                .or_else(|| params.get("path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    EngineError::InvalidParams("missing string param `target_path`".to_string())
+                })?;
+            let cwd = engine
+                .switch_thread_worktree(thread_id, target_path)
+                .await?;
+            json!({"cwd": cwd})
+        }
+        "session.remove_worktree" | "remove_worktree" => {
+            let path = required_str(params, "path")?;
+            let force = params
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            engine.remove_worktree(path, force).await?;
+            json!({"ok": true})
+        }
+        "session.worktree_diff_preview" | "worktree_diff_preview" => {
+            let path = required_str(params, "path")?;
+            let diff = engine.worktree_diff_preview(path).await?;
+            json!({"diff": diff})
+        }
+        "session.prune_worktrees" | "prune_worktrees" => {
+            let summary = engine.prune_worktrees().await?;
+            json!({"summary": summary})
+        }
         "session.pty_scroll" | "pty_scroll" => {
             let thread_id = required_str(params, "thread_id")?;
             let delta = parse_req_isize(params, "delta")?;
@@ -4477,12 +5043,29 @@ impl UnixSocketEngineClient {
         matches!(
             method,
             "session.create_terminal"
+                | "create_terminal"
                 | "session.pty_write"
+                | "pty_write"
                 | "session.pty_resize"
+                | "pty_resize"
                 | "session.pty_snapshot"
+                | "pty_snapshot"
                 | "session.pty_scroll"
+                | "pty_scroll"
                 | "session.pty_restart"
+                | "pty_restart"
                 | "session.ensure_thread_worktree"
+                | "ensure_thread_worktree"
+                | "session.list_worktrees"
+                | "list_worktrees"
+                | "session.switch_thread_worktree"
+                | "switch_thread_worktree"
+                | "session.remove_worktree"
+                | "remove_worktree"
+                | "session.worktree_diff_preview"
+                | "worktree_diff_preview"
+                | "session.prune_worktrees"
+                | "prune_worktrees"
         )
     }
 
@@ -4629,6 +5212,30 @@ impl UnixSocketEngineClient {
 
     pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         DaemonEngine::ensure_thread_worktree(self, thread_id).await
+    }
+
+    pub async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
+        DaemonEngine::list_worktrees(self).await
+    }
+
+    pub async fn switch_thread_worktree(
+        &self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> Result<String, EngineError> {
+        DaemonEngine::switch_thread_worktree(self, thread_id, target_path).await
+    }
+
+    pub async fn remove_worktree(&self, path: &str, force: bool) -> Result<(), EngineError> {
+        DaemonEngine::remove_worktree(self, path, force).await
+    }
+
+    pub async fn worktree_diff_preview(&self, path: &str) -> Result<String, EngineError> {
+        DaemonEngine::worktree_diff_preview(self, path).await
+    }
+
+    pub async fn prune_worktrees(&self) -> Result<String, EngineError> {
+        DaemonEngine::prune_worktrees(self).await
     }
 
     pub async fn pty_scroll(
@@ -4966,6 +5573,57 @@ impl DaemonEngine for UnixSocketEngineClient {
             .ok_or_else(|| EngineError::Protocol("response missing cwd".into()))
     }
 
+    async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
+        self.call_dedicated_typed("session.list_worktrees", json!({}))
+            .await
+    }
+
+    async fn switch_thread_worktree(
+        &self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> Result<String, EngineError> {
+        let val = self
+            .call_dedicated(
+                "session.switch_thread_worktree",
+                json!({"thread_id": thread_id, "target_path": target_path}),
+            )
+            .await?;
+        val.get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| EngineError::Protocol("response missing cwd".into()))
+    }
+
+    async fn remove_worktree(&self, path: &str, force: bool) -> Result<(), EngineError> {
+        self.call_dedicated(
+            "session.remove_worktree",
+            json!({"path": path, "force": force}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn worktree_diff_preview(&self, path: &str) -> Result<String, EngineError> {
+        let val = self
+            .call_dedicated("session.worktree_diff_preview", json!({"path": path}))
+            .await?;
+        val.get("diff")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| EngineError::Protocol("response missing diff".into()))
+    }
+
+    async fn prune_worktrees(&self) -> Result<String, EngineError> {
+        let val = self
+            .call_dedicated("session.prune_worktrees", json!({}))
+            .await?;
+        val.get("summary")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| EngineError::Protocol("response missing summary".into()))
+    }
+
     async fn pty_scroll(
         &self,
         thread_id: &str,
@@ -5261,6 +5919,49 @@ impl DaemonEngine for EngineClient {
                 DaemonEngine::ensure_thread_worktree(e.as_ref(), thread_id).await
             }
             Self::Socket(e) => DaemonEngine::ensure_thread_worktree(e, thread_id).await,
+        }
+    }
+
+    async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::list_worktrees(e.as_ref()).await,
+            Self::Socket(e) => DaemonEngine::list_worktrees(e).await,
+        }
+    }
+
+    async fn switch_thread_worktree(
+        &self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> Result<String, EngineError> {
+        match self {
+            Self::InProcess(e) => {
+                DaemonEngine::switch_thread_worktree(e.as_ref(), thread_id, target_path).await
+            }
+            Self::Socket(e) => {
+                DaemonEngine::switch_thread_worktree(e, thread_id, target_path).await
+            }
+        }
+    }
+
+    async fn remove_worktree(&self, path: &str, force: bool) -> Result<(), EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::remove_worktree(e.as_ref(), path, force).await,
+            Self::Socket(e) => DaemonEngine::remove_worktree(e, path, force).await,
+        }
+    }
+
+    async fn worktree_diff_preview(&self, path: &str) -> Result<String, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::worktree_diff_preview(e.as_ref(), path).await,
+            Self::Socket(e) => DaemonEngine::worktree_diff_preview(e, path).await,
+        }
+    }
+
+    async fn prune_worktrees(&self) -> Result<String, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::prune_worktrees(e.as_ref()).await,
+            Self::Socket(e) => DaemonEngine::prune_worktrees(e).await,
         }
     }
 
@@ -7314,6 +8015,26 @@ done
             .ensure_thread_worktree("t-1")
             .await
             .expect_err("ensure_thread_worktree should fail");
+        let err_list_wt = client
+            .list_worktrees()
+            .await
+            .expect_err("list_worktrees should fail");
+        let err_switch_wt = client
+            .switch_thread_worktree("t-1", "/tmp/wt")
+            .await
+            .expect_err("switch_thread_worktree should fail");
+        let err_remove_wt = client
+            .remove_worktree("/tmp/wt", false)
+            .await
+            .expect_err("remove_worktree should fail");
+        let err_diff_wt = client
+            .worktree_diff_preview("/tmp/wt")
+            .await
+            .expect_err("worktree_diff_preview should fail");
+        let err_prune_wt = client
+            .prune_worktrees()
+            .await
+            .expect_err("prune_worktrees should fail");
         let err_scroll = client
             .pty_scroll("t-1", 5)
             .await
@@ -7329,6 +8050,11 @@ done
             ("pty_resize", err_resize),
             ("pty_snapshot", err_snap),
             ("ensure_thread_worktree", err_wt),
+            ("list_worktrees", err_list_wt),
+            ("switch_thread_worktree", err_switch_wt),
+            ("remove_worktree", err_remove_wt),
+            ("worktree_diff_preview", err_diff_wt),
+            ("prune_worktrees", err_prune_wt),
             ("pty_scroll", err_scroll),
             ("pty_restart", err_restart),
         ] {

@@ -5,29 +5,16 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use grein_cli::args::{AttachArgs, Command, DaemonArgs};
+use grein_cli::args::{AttachArgs, Cli, Command, DaemonArgs};
 use grein_cli::engine::{
     truncate_chars_with_ellipsis, DaemonEngine, InProcessEngine, PermissionDecisionPayload,
     UnixSocketEngineClient,
 };
 use grein_tui::engine_port::{
     AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, PtyScreenSnapshot,
-    ThreadMeta, TuiEngineEvent, TuiEnginePort,
+    ThreadMeta, TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot, WorktreeEntry,
 };
 use tokio::sync::{mpsc, Mutex};
-
-#[derive(Debug, Parser, Clone, PartialEq, Eq)]
-#[command(name = "grein", version, about = "Grein autonomous engineering CLI")]
-struct Cli {
-    #[arg(
-        long,
-        global = true,
-        help = "Start a fresh session in an ACP agent branch instead of a terminal"
-    )]
-    pub agent: bool,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialSessionMode {
@@ -560,6 +547,94 @@ where
         Ok(cwd)
     }
 
+    async fn list_worktrees(&self) -> io::Result<Vec<WorktreeEntry>> {
+        self.client.list_worktrees().await.map_err(to_io)
+    }
+
+    async fn switch_thread_worktree(
+        &self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> io::Result<String> {
+        let cwd = self
+            .client
+            .switch_thread_worktree(thread_id, target_path)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(cwd)
+    }
+
+    async fn remove_worktree(&self, path: &str, force: bool) -> io::Result<()> {
+        self.client
+            .remove_worktree(path, force)
+            .await
+            .map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(())
+    }
+
+    async fn worktree_diff_preview(&self, path: &str) -> io::Result<String> {
+        self.client.worktree_diff_preview(path).await.map_err(to_io)
+    }
+
+    async fn prune_worktrees(&self) -> io::Result<String> {
+        let summary = self.client.prune_worktrees().await.map_err(to_io)?;
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        Ok(summary)
+    }
+
+    async fn load_preferences(&self) -> io::Result<UserPreferencesSnapshot> {
+        let Some(path) = grein_core::default_prefs_db_path() else {
+            return Ok(UserPreferencesSnapshot::default());
+        };
+        if !path.exists() {
+            return Ok(UserPreferencesSnapshot::default());
+        }
+        let store = grein_core::UserPrefsStore::open(&path).map_err(to_io)?;
+        Ok(UserPreferencesSnapshot {
+            theme: store.theme().map_err(to_io)?,
+            theme_overrides: store.theme_prefs().map_err(to_io)?,
+            keybindings: store.keybindings().map_err(to_io)?,
+            ui: store.ui_prefs().map_err(to_io)?,
+        })
+    }
+
+    async fn save_theme_preference(&self, theme: &str) -> io::Result<()> {
+        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
+            store.clear_theme_prefs().map_err(to_io)?;
+            store.set_theme(theme).map_err(to_io)?;
+        }
+        Ok(())
+    }
+
+    async fn save_keybinding_preference(&self, action: &str, binding: &str) -> io::Result<()> {
+        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
+            store.set_keybinding(action, binding).map_err(to_io)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_keybinding_preference(&self, action: &str) -> io::Result<()> {
+        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
+            let _ = store.remove_keybinding(action).map_err(to_io)?;
+        }
+        Ok(())
+    }
+
+    async fn save_ui_preference(&self, key: &str, value: &str) -> io::Result<()> {
+        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
+            store.set_ui_pref(key, value).map_err(to_io)?;
+        }
+        Ok(())
+    }
+
     async fn pty_scroll(&self, thread_id: &str, delta: isize) -> io::Result<PtyScreenSnapshot> {
         let snapshot = self
             .client
@@ -692,6 +767,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Some(Command::Agents(args)) => {
             grein_cli::headless::handle_agents(&args).await?;
+        }
+        Some(Command::Doctor(args)) => {
+            grein_cli::doctor::handle_doctor(&args)?;
+        }
+        Some(Command::Settings(args)) => {
+            grein_cli::settings_cmd::handle_settings(&args)?;
+        }
+        Some(Command::Theme(args)) => {
+            grein_cli::settings_cmd::handle_theme(&args)?;
         }
     }
 
@@ -1641,6 +1725,242 @@ done
                     })
             )),
             "live stream terminal-first hydration must deliver ThreadMetadataUpdated: {events:?}"
+        );
+    }
+
+    static PREFS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|&k| (k, std::env::var_os(k)))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (k, val) in self.saved.drain(..) {
+                match val {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_doctor_settings_and_theme_subcommands() {
+        let doc = Cli::try_parse_from(["grein", "doctor", "--json"]).expect("parse doctor");
+        assert_eq!(
+            doc.command,
+            Some(Command::Doctor(grein_cli::args::DoctorArgs { json: true }))
+        );
+
+        let set_exp = Cli::try_parse_from([
+            "grein",
+            "settings",
+            "export",
+            "out.json",
+            "--only",
+            "theme,ui",
+        ])
+        .expect("parse settings export");
+        match set_exp.command {
+            Some(Command::Settings(s)) => match s.command {
+                grein_cli::args::SettingsCommand::Export(args) => {
+                    assert_eq!(args.file.as_deref(), Some(std::path::Path::new("out.json")));
+                    assert_eq!(args.format, None);
+                    assert_eq!(args.only, vec!["theme".to_string(), "ui".to_string()]);
+                }
+                other => panic!("unexpected settings command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let set_imp = Cli::try_parse_from([
+            "grein",
+            "settings",
+            "import",
+            "-",
+            "--format",
+            "json",
+            "--replace",
+        ])
+        .expect("parse settings import");
+        match set_imp.command {
+            Some(Command::Settings(s)) => match s.command {
+                grein_cli::args::SettingsCommand::Import(args) => {
+                    assert_eq!(args.file, std::path::PathBuf::from("-"));
+                    assert_eq!(args.format, grein_cli::args::InputFormatArg::Json);
+                    assert!(args.replace);
+                }
+                other => panic!("unexpected settings command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let theme_exp = Cli::try_parse_from(["grein", "theme", "export", "--format", "toml"])
+            .expect("parse theme export");
+        match theme_exp.command {
+            Some(Command::Theme(t)) => match t.command {
+                grein_cli::args::ThemeCommand::Export(args) => {
+                    assert_eq!(args.file, None);
+                    assert_eq!(args.format, Some(grein_cli::args::OutputFormatArg::Toml));
+                }
+                other => panic!("unexpected theme command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let theme_imp =
+            Cli::try_parse_from(["grein", "theme", "import", "colleague.toml", "--replace"])
+                .expect("parse theme import");
+        match theme_imp.command {
+            Some(Command::Theme(t)) => match t.command {
+                grein_cli::args::ThemeCommand::Import(args) => {
+                    assert_eq!(args.file, std::path::PathBuf::from("colleague.toml"));
+                    assert_eq!(args.format, grein_cli::args::InputFormatArg::Auto);
+                    assert!(args.replace);
+                }
+                other => panic!("unexpected theme command: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_global_preferences_round_trip() {
+        let _lock = PREFS_ENV_LOCK.lock().await;
+        let _guard = EnvVarGuard::capture(&["GREIN_CONFIG_DB", "XDG_CONFIG_HOME", "HOME"]);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefs_db = temp.path().join("nested").join("prefs.db");
+        std::env::set_var("GREIN_CONFIG_DB", &prefs_db);
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        let session_db = temp.path().join("session.db");
+        let engine =
+            InProcessEngine::open_with_config(&session_db, temp.path().to_path_buf(), None)
+                .expect("open engine");
+        let port = EngineClientPort::new(engine);
+
+        let initial = port.load_preferences().await.expect("initial load_preferences");
+        assert_eq!(initial, UserPreferencesSnapshot::default());
+        assert!(
+            !prefs_db.exists(),
+            "load_preferences must not eagerly create prefs DB when absent"
+        );
+
+        port.save_ui_preference("sidebar_width", "36")
+            .await
+            .expect("save ui pref");
+        port.save_keybinding_preference("quit", "q")
+            .await
+            .expect("save keybinding quit");
+        port.save_keybinding_preference("focus_next", "Tab")
+            .await
+            .expect("save keybinding focus_next");
+        port.save_theme_preference("nord")
+            .await
+            .expect("save theme nord");
+
+        grein_core::UserPrefsStore::open(&prefs_db)
+            .expect("open store")
+            .set_theme_pref("accent", "#abcdef")
+            .expect("set accent");
+
+        let hydrated = port.load_preferences().await.expect("load hydrated prefs");
+        assert_eq!(hydrated.theme.as_deref(), Some("nord"));
+        assert_eq!(
+            hydrated.theme_overrides.get("accent").map(String::as_str),
+            Some("#abcdef")
+        );
+        assert_eq!(
+            hydrated.keybindings.get("quit").map(String::as_str),
+            Some("q")
+        );
+        assert_eq!(
+            hydrated.keybindings.get("focus_next").map(String::as_str),
+            Some("Tab")
+        );
+        assert_eq!(
+            hydrated.ui.get("sidebar_width").map(String::as_str),
+            Some("36")
+        );
+
+        // Switching theme clears previous custom theme overrides cleanly.
+        port.save_theme_preference("dracula")
+            .await
+            .expect("save theme dracula");
+        port.remove_keybinding_preference("quit")
+            .await
+            .expect("remove keybinding quit");
+
+        let updated = port.load_preferences().await.expect("load updated prefs");
+        assert_eq!(updated.theme.as_deref(), Some("dracula"));
+        assert!(
+            !updated.theme_overrides.contains_key("accent"),
+            "save_theme_preference must clear prior theme color overrides: {:?}",
+            updated.theme_overrides
+        );
+        assert!(!updated.keybindings.contains_key("quit"));
+        assert_eq!(
+            updated.keybindings.get("focus_next").map(String::as_str),
+            Some("Tab")
+        );
+        assert_eq!(
+            updated.ui.get("sidebar_width").map(String::as_str),
+            Some("36")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_preferences_handle_unset_and_unwritable_home_safely() {
+        let _lock = PREFS_ENV_LOCK.lock().await;
+        let _guard = EnvVarGuard::capture(&["GREIN_CONFIG_DB", "XDG_CONFIG_HOME", "HOME"]);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_db = temp.path().join("session.db");
+        let engine =
+            InProcessEngine::open_with_config(&session_db, temp.path().to_path_buf(), None)
+                .expect("open engine");
+        let port = EngineClientPort::new(engine);
+
+        std::env::remove_var("GREIN_CONFIG_DB");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("HOME");
+
+        assert_eq!(
+            port.load_preferences().await.expect("load with unset env"),
+            UserPreferencesSnapshot::default()
+        );
+        port.save_theme_preference("nord")
+            .await
+            .expect("save_theme_preference with None path");
+        port.save_keybinding_preference("quit", "q")
+            .await
+            .expect("save_keybinding_preference with None path");
+        port.remove_keybinding_preference("quit")
+            .await
+            .expect("remove_keybinding_preference with None path");
+        port.save_ui_preference("sidebar_width", "32")
+            .await
+            .expect("save_ui_preference with None path");
+
+        // Simulates Nix homeless-shelter read-only HOME when prefs.db does not exist.
+        std::env::set_var("HOME", "/nonexistent/grein-homeless-shelter");
+        assert_eq!(
+            port.load_preferences()
+                .await
+                .expect("load with nonexistent HOME"),
+            UserPreferencesSnapshot::default()
         );
     }
 }

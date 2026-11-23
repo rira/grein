@@ -260,6 +260,46 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn session_list_worktrees(&mut self) -> Result<Value, std::io::Error> {
+        self.json_rpc("session.list_worktrees", json!({})).await
+    }
+
+    pub async fn session_switch_thread_worktree(
+        &mut self,
+        thread_id: &str,
+        target_path: &str,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.switch_thread_worktree",
+            json!({"thread_id": thread_id, "target_path": target_path}),
+        )
+        .await
+    }
+
+    pub async fn session_remove_worktree(
+        &mut self,
+        path: &str,
+        force: bool,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.remove_worktree",
+            json!({"path": path, "force": force}),
+        )
+        .await
+    }
+
+    pub async fn session_worktree_diff_preview(
+        &mut self,
+        path: &str,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc("session.worktree_diff_preview", json!({"path": path}))
+            .await
+    }
+
+    pub async fn session_prune_worktrees(&mut self) -> Result<Value, std::io::Error> {
+        self.json_rpc("session.prune_worktrees", json!({})).await
+    }
+
     pub async fn session_pty_scroll(
         &mut self,
         thread_id: &str,

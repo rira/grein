@@ -260,20 +260,31 @@ done
     })
     .await;
 
-    // Terminal threads can also allocate their own dedicated worktree.
+    // A child terminal already inside branch's worktree reuses that isolated worktree idempotently.
     let child_wt_path = engine
         .ensure_thread_worktree(&child_term.thread_id)
         .await
-        .expect("ensure_thread_worktree on terminal must succeed");
-    let expected_child_wt = std::fs::canonicalize(
+        .expect("ensure_thread_worktree on child terminal inside worktree must reuse cleanly");
+    assert_eq!(child_wt_path, wt_path);
+
+    // Terminal threads created on the primary repo root can allocate their own dedicated worktree.
+    let main_term = engine
+        .create_terminal(Some(&main.thread_id), None, None, 24, 240)
+        .await
+        .expect("create main terminal");
+    let main_term_wt_path = engine
+        .ensure_thread_worktree(&main_term.thread_id)
+        .await
+        .expect("ensure_thread_worktree on main terminal must succeed");
+    let expected_main_term_wt = std::fs::canonicalize(
         canonical_repo
             .join(".grein")
             .join("worktrees")
-            .join(&child_term.thread_id),
+            .join(&main_term.thread_id),
     )
-    .expect("canonical child terminal worktree");
-    assert_eq!(child_wt_path, expected_child_wt.to_string_lossy());
-    assert!(expected_child_wt.join(".git").exists());
+    .expect("canonical main terminal worktree");
+    assert_eq!(main_term_wt_path, expected_main_term_wt.to_string_lossy());
+    assert!(expected_main_term_wt.join(".git").exists());
 }
 
 #[tokio::test]
@@ -1641,4 +1652,706 @@ async fn test_worktree_git_status_metadata_clean_and_dirty() {
     assert_eq!(branch_dirty.git_dirty, 1);
     assert_eq!(term_dirty.git_branch.as_deref(), Some(expected_wt_branch.as_str()));
     assert_eq!(term_dirty.git_dirty, 1);
+}
+
+fn git_in_dir(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {:?} in {} failed: {}",
+        args,
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn test_option1_branch_named_worktree_collision_idempotency_and_main_fallback() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    // 1. Custom branch feat/auth -> .grein/worktrees/feat-auth & feat/auth-wt, collision -> -2
+    let feat_repo = temp.path().join("feat_repo");
+    std::fs::create_dir_all(&feat_repo).expect("mkdir feat_repo");
+    init_test_git_repo(&feat_repo);
+    git_in_dir(&feat_repo, &["checkout", "-b", "feat/auth"]);
+    let canonical_feat = std::fs::canonicalize(&feat_repo).expect("canonical feat_repo");
+
+    let feat_engine = InProcessEngine::open_with_config(
+        &temp.path().join("feat.db"),
+        canonical_feat.clone(),
+        None,
+    )
+    .expect("open feat_engine");
+    let feat_main = feat_engine.ensure_main_thread().await.expect("main");
+    let b1 = feat_engine
+        .fork_thread_with_title(Some(&feat_main.thread_id), Some("one"))
+        .await
+        .expect("fork b1");
+    let wt1 = feat_engine
+        .ensure_thread_worktree(&b1.thread_id)
+        .await
+        .expect("wt1");
+    let expected_wt1 = std::fs::canonicalize(canonical_feat.join(".grein/worktrees/feat-auth"))
+        .expect("canonical wt1");
+    assert_eq!(wt1, expected_wt1.to_string_lossy());
+    assert_eq!(
+        git_in_dir(&expected_wt1, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/auth-wt"
+    );
+
+    // Calling again on the same thread is idempotent.
+    let wt1_again = feat_engine
+        .ensure_thread_worktree(&b1.thread_id)
+        .await
+        .expect("wt1 idempotent");
+    assert_eq!(wt1_again, wt1);
+
+    // A child thread inheriting b1's worktree cwd also reuses wt1 rather than nesting worktrees.
+    let b1_child = feat_engine
+        .fork_thread_with_title(Some(&b1.thread_id), Some("child"))
+        .await
+        .expect("fork child inside wt1");
+    let wt1_child = feat_engine
+        .ensure_thread_worktree(&b1_child.thread_id)
+        .await
+        .expect("wt1 child idempotent");
+    assert_eq!(wt1_child, wt1);
+
+    // Second independent branch from main collides with feat-auth and gets -2 suffix.
+    let b2 = feat_engine
+        .fork_thread_with_title(Some(&feat_main.thread_id), Some("two"))
+        .await
+        .expect("fork b2");
+    let wt2 = feat_engine
+        .ensure_thread_worktree(&b2.thread_id)
+        .await
+        .expect("wt2");
+    let expected_wt2 = std::fs::canonicalize(canonical_feat.join(".grein/worktrees/feat-auth-2"))
+        .expect("canonical wt2");
+    assert_eq!(wt2, expected_wt2.to_string_lossy());
+    assert_eq!(
+        git_in_dir(&expected_wt2, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/auth-wt-2"
+    );
+
+    // 2. Default main/master and detached HEAD fall back to <thread_id> & worktree-<thread_id>.
+    let default_repo = temp.path().join("default_repo");
+    std::fs::create_dir_all(&default_repo).expect("mkdir default_repo");
+    init_test_git_repo(&default_repo);
+    let canonical_default = std::fs::canonicalize(&default_repo).expect("canonical default_repo");
+
+    let def_engine = InProcessEngine::open_with_config(
+        &temp.path().join("def.db"),
+        canonical_default.clone(),
+        None,
+    )
+    .expect("open def_engine");
+    let def_main = def_engine.ensure_main_thread().await.expect("def main");
+    let on_default = def_engine
+        .fork_thread_with_title(Some(&def_main.thread_id), Some("on-default"))
+        .await
+        .expect("fork on default");
+    let wt_def = def_engine
+        .ensure_thread_worktree(&on_default.thread_id)
+        .await
+        .expect("wt_def");
+    let expected_def = std::fs::canonicalize(
+        canonical_default
+            .join(".grein/worktrees")
+            .join(&on_default.thread_id),
+    )
+    .expect("canonical wt_def");
+    assert_eq!(wt_def, expected_def.to_string_lossy());
+    assert_eq!(
+        git_in_dir(&expected_def, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("worktree-{}", on_default.thread_id)
+    );
+
+    git_in_dir(&canonical_default, &["checkout", "--detach", "HEAD"]);
+    let detached = def_engine
+        .fork_thread_with_title(Some(&def_main.thread_id), Some("detached"))
+        .await
+        .expect("fork detached");
+    let wt_det = def_engine
+        .ensure_thread_worktree(&detached.thread_id)
+        .await
+        .expect("wt_det");
+    let expected_det = std::fs::canonicalize(
+        canonical_default
+            .join(".grein/worktrees")
+            .join(&detached.thread_id),
+    )
+    .expect("canonical wt_det");
+    assert_eq!(wt_det, expected_det.to_string_lossy());
+    assert_eq!(
+        git_in_dir(&expected_det, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("worktree-{}", detached.thread_id)
+    );
+}
+
+#[tokio::test]
+async fn test_list_worktrees_across_repos_and_longest_prefix_attachment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_a = temp.path().join("repo_a");
+    let repo_b = temp.path().join("repo_b");
+    std::fs::create_dir_all(&repo_a).expect("mkdir repo_a");
+    std::fs::create_dir_all(&repo_b).expect("mkdir repo_b");
+    init_test_git_repo(&repo_a);
+    init_test_git_repo(&repo_b);
+    git_in_dir(&repo_a, &["checkout", "-b", "feat/list-test"]);
+
+    let canon_a = std::fs::canonicalize(&repo_a).expect("canon_a");
+    let canon_b = std::fs::canonicalize(&repo_b).expect("canon_b");
+
+    let engine = InProcessEngine::open_with_config(
+        &temp.path().join("multi.db"),
+        canon_a.clone(),
+        None,
+    )
+    .expect("open engine");
+    let main_a = engine.ensure_main_thread().await.expect("main_a");
+    let branch_a = engine
+        .fork_thread_with_title(Some(&main_a.thread_id), Some("branch_a"))
+        .await
+        .expect("branch_a");
+    let wt_a = engine
+        .ensure_thread_worktree(&branch_a.thread_id)
+        .await
+        .expect("wt_a");
+    let term_b = engine
+        .create_terminal(
+            Some(&main_a.thread_id),
+            Some("Repo B Term"),
+            Some(&canon_b.to_string_lossy()),
+            24,
+            80,
+        )
+        .await
+        .expect("term_b");
+
+    let worktrees = engine.list_worktrees().await.expect("list_worktrees");
+    let entry_prim_a = worktrees
+        .iter()
+        .find(|w| w.path == canon_a.to_string_lossy())
+        .expect("primary repo_a");
+    let entry_wt_a = worktrees
+        .iter()
+        .find(|w| w.path == wt_a)
+        .expect("linked worktree a");
+    let entry_prim_b = worktrees
+        .iter()
+        .find(|w| w.path == canon_b.to_string_lossy())
+        .expect("primary repo_b");
+
+    assert!(entry_prim_a.is_primary);
+    assert!(!entry_prim_a.is_grein_managed);
+    assert!(entry_prim_a.attached_thread_ids.contains(&main_a.thread_id));
+    assert!(
+        !entry_prim_a.attached_thread_ids.contains(&branch_a.thread_id),
+        "thread inside .grein/worktrees/... must NOT attach to primary: {:?}",
+        entry_prim_a.attached_thread_ids
+    );
+
+    assert!(!entry_wt_a.is_primary);
+    assert!(entry_wt_a.is_grein_managed);
+    assert_eq!(entry_wt_a.attached_thread_ids, vec![branch_a.thread_id]);
+
+    assert!(entry_prim_b.is_primary);
+    assert!(entry_prim_b.attached_thread_ids.contains(&term_b.thread_id));
+}
+
+#[tokio::test]
+async fn test_switch_thread_worktree_terminal_agent_noop_and_validation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    let outside_dir = temp.path().join("outside");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    std::fs::create_dir_all(&outside_dir).expect("mkdir outside");
+    init_test_git_repo(&repo_root);
+    git_in_dir(&repo_root, &["checkout", "-b", "feat/switch"]);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let canonical_repo_str = canonical_repo.to_string_lossy().to_string();
+
+    let capture_path = temp.path().join("switch_acp_capture.jsonl");
+    let mock_script = format!(
+        r#"#!/bin/sh
+export GREIN_CAPTURE={capture:?}
+sess_counter=0
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$GREIN_CAPTURE"
+    rest=${{line#*\"id\":}}; id=${{rest%%,*}}; id=${{id%%\}}*}}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentInfo":{{"name":"mock","version":"1.0"}},"authMethods":[],"agentCapabilities":{{}}}}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"sess-%s"}}}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/close"'*)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+            ;;
+        *'"method":"session/prompt"'*)
+            printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-%s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"ok"}}}}}}}}\n' "$sess_counter"
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id"
+            ;;
+    esac
+done
+"#,
+        capture = capture_path.to_string_lossy()
+    );
+    let script_path = write_executable_script(temp.path(), "mock_switch_acp.sh", &mock_script);
+    let cfg = AcpBackendConfig {
+        command: script_path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        auth_method: None,
+        cwd: canonical_repo.clone(),
+    };
+
+    let engine = InProcessEngine::open_with_config(
+        &temp.path().join("switch.db"),
+        canonical_repo.clone(),
+        Some(cfg),
+    )
+    .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let agent_branch = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("agent-branch"))
+        .await
+        .expect("fork agent branch");
+    let wt_path = engine
+        .ensure_thread_worktree(&agent_branch.thread_id)
+        .await
+        .expect("ensure_thread_worktree");
+
+    engine
+        .send_turn_for_thread(&agent_branch.thread_id, "turn in worktree")
+        .await
+        .expect("agent turn in worktree");
+
+    let term = engine
+        .create_terminal(
+            Some(&agent_branch.thread_id),
+            Some("Switch Term"),
+            None,
+            24,
+            240,
+        )
+        .await
+        .expect("create term in wt");
+
+    // Reject unregistered and nonexistent paths.
+    let err_missing = engine
+        .switch_thread_worktree(&term.thread_id, "/nonexistent/path/grein_nope")
+        .await
+        .expect_err("nonexistent path must fail");
+    assert!(matches!(err_missing, EngineError::InvalidParams(_)));
+
+    let err_outside = engine
+        .switch_thread_worktree(&term.thread_id, &outside_dir.to_string_lossy())
+        .await
+        .expect_err("unregistered outside dir must fail");
+    assert!(matches!(err_outside, EngineError::InvalidParams(_)));
+
+    // Same-worktree subdir no-op must preserve running PTY process.
+    let wt_subdir = Path::new(&wt_path).join("nested_sub");
+    std::fs::create_dir_all(&wt_subdir).expect("mkdir nested_sub");
+    let sub_term = engine
+        .create_terminal(
+            Some(&agent_branch.thread_id),
+            Some("Subdir Term"),
+            Some(&wt_subdir.to_string_lossy()),
+            24,
+            240,
+        )
+        .await
+        .expect("create sub_term");
+    sub_term_pid_check(&engine, &sub_term.thread_id, &wt_path).await;
+
+    // Switch Terminal back to primary repo root -> PTY respawns in canonical_repo.
+    let switched_term = engine
+        .switch_thread_worktree(&term.thread_id, &canonical_repo_str)
+        .await
+        .expect("switch term to primary");
+    assert_eq!(switched_term, canonical_repo_str);
+    engine
+        .pty_write(
+            &term.thread_id,
+            b"printf '\\nSWITCHED_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+        )
+        .await
+        .expect("pty_write switched");
+    let expected_term_pwd = format!("SWITCHED_PWD={canonical_repo_str}");
+    wait_for_pty_snapshot(&engine, &term.thread_id, 24, 240, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == expected_term_pwd)
+    })
+    .await;
+
+    // Switch Agent thread back to primary repo root -> resets ACP session and updates cwd.
+    let switched_agent = engine
+        .switch_thread_worktree(&agent_branch.thread_id, &canonical_repo_str)
+        .await
+        .expect("switch agent to primary");
+    assert_eq!(switched_agent, canonical_repo_str);
+    let capture = std::fs::read_to_string(&capture_path).expect("read capture");
+    assert!(
+        capture.contains(r#""method":"session/close""#),
+        "switching Agent worktree must close active ACP session: {capture}"
+    );
+    let agent_row = engine
+        .thread_metadata()
+        .await
+        .expect("thread_metadata")
+        .into_iter()
+        .find(|t| t.thread_id == agent_branch.thread_id)
+        .expect("agent meta");
+    assert_eq!(agent_row.cwd.as_deref(), Some(canonical_repo_str.as_str()));
+    engine
+        .send_turn_for_thread(&agent_branch.thread_id, "turn after switch")
+        .await
+        .expect("turn after switch");
+    let capture_after = std::fs::read_to_string(&capture_path).expect("read capture after");
+    assert!(
+        capture_after.contains(&format!("\"cwd\":\"{canonical_repo_str}\"")),
+        "new ACP session after switch must open in target primary cwd: {capture_after}"
+    );
+}
+
+async fn sub_term_pid_check(engine: &InProcessEngine, thread_id: &str, wt_path: &str) {
+    engine
+        .pty_write(thread_id, b"printf '\\nNOOP_PID=%s\\n' \"$$\"\n".to_vec())
+        .await
+        .expect("write pid");
+    let snap = wait_for_pty_snapshot(engine, thread_id, 24, 240, Duration::from_secs(5), |s| {
+        s.plain_text()
+            .lines()
+            .any(|l| l.trim().starts_with("NOOP_PID="))
+    })
+    .await;
+    let pid: u32 = snap
+        .plain_text()
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("NOOP_PID="))
+        .expect("pid line")
+        .trim()
+        .parse()
+        .expect("parse pid");
+
+    let returned = engine
+        .switch_thread_worktree(thread_id, wt_path)
+        .await
+        .expect("same-worktree no-op");
+    assert_eq!(returned, wt_path);
+    assert!(
+        is_process_alive(pid),
+        "same-worktree no-op must not kill active PTY pid {pid}"
+    );
+}
+
+#[tokio::test]
+async fn test_remove_worktree_guards_cleanup_respawn_diff_and_prune() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    init_test_git_repo(&repo_root);
+    git_in_dir(&repo_root, &["checkout", "-b", "feat/cleanup"]);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let canonical_repo_str = canonical_repo.to_string_lossy().to_string();
+
+    let capture_path = temp.path().join("remove_acp_capture.jsonl");
+    let mock_script = format!(
+        r#"#!/bin/sh
+export GREIN_CAPTURE={capture:?}
+sess_counter=0
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$GREIN_CAPTURE"
+    rest=${{line#*\"id\":}}; id=${{rest%%,*}}; id=${{id%%\}}*}}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentInfo":{{"name":"mock","version":"1.0"}},"authMethods":[],"agentCapabilities":{{}}}}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"sess-%s"}}}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/close"'*)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+            ;;
+        *'"method":"session/prompt"'*)
+            printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-%s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"ok"}}}}}}}}\n' "$sess_counter"
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id"
+            ;;
+    esac
+done
+"#,
+        capture = capture_path.to_string_lossy()
+    );
+    let script_path = write_executable_script(temp.path(), "mock_remove_acp.sh", &mock_script);
+    let cfg = AcpBackendConfig {
+        command: script_path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        auth_method: None,
+        cwd: canonical_repo.clone(),
+    };
+
+    let engine = InProcessEngine::open_with_config(
+        &temp.path().join("remove.db"),
+        canonical_repo.clone(),
+        Some(cfg),
+    )
+    .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let branch = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("cleanup-branch"))
+        .await
+        .expect("fork branch");
+    let wt_path = engine
+        .ensure_thread_worktree(&branch.thread_id)
+        .await
+        .expect("ensure_thread_worktree");
+
+    engine
+        .send_turn_for_thread(&branch.thread_id, "turn before remove")
+        .await
+        .expect("turn before remove");
+
+    let term = engine
+        .create_terminal(Some(&branch.thread_id), Some("Cleanup Term"), None, 24, 240)
+        .await
+        .expect("create term");
+    term_write_and_wait_pid(&engine, &term.thread_id).await;
+
+    // Reject removing primary repo even with force = true.
+    let err_primary = engine
+        .remove_worktree(&canonical_repo_str, true)
+        .await
+        .expect_err("cannot remove primary worktree");
+    assert!(matches!(err_primary, EngineError::InvalidParams(_)));
+
+    // Dirty the worktree and verify diff preview + non-forced rejection without disturbing threads.
+    std::fs::write(
+        Path::new(&wt_path).join("README.md"),
+        "dirty edit for diff preview\n",
+    )
+    .expect("dirty README");
+
+    let diff = engine
+        .worktree_diff_preview(&wt_path)
+        .await
+        .expect("worktree_diff_preview");
+    assert!(
+        diff.contains("dirty edit for diff preview"),
+        "unexpected diff preview: {diff}"
+    );
+
+    let err_dirty = engine
+        .remove_worktree(&wt_path, false)
+        .await
+        .expect_err("dirty worktree without force must fail");
+    assert!(matches!(err_dirty, EngineError::InvalidParams(_)));
+    assert!(Path::new(&wt_path).exists());
+
+    // Capture shell pid before non-forced check disrupted anything, and make sure force=true works.
+    engine
+        .remove_worktree(&wt_path, true)
+        .await
+        .expect("force remove_worktree");
+    assert!(!Path::new(&wt_path).exists());
+
+    // Git branch ref is preserved for reuse.
+    let branch_ref = git_in_dir(
+        &canonical_repo,
+        &["show-ref", "--verify", "refs/heads/feat/cleanup-wt"],
+    );
+    assert!(!branch_ref.is_empty());
+
+    let meta_after = engine.thread_metadata().await.expect("thread_metadata");
+    let branch_row = meta_after
+        .iter()
+        .find(|t| t.thread_id == branch.thread_id)
+        .expect("branch meta");
+    let term_row = meta_after
+        .iter()
+        .find(|t| t.thread_id == term.thread_id)
+        .expect("term meta");
+    assert_eq!(branch_row.cwd.as_deref(), Some(canonical_repo_str.as_str()));
+    assert_eq!(term_row.cwd.as_deref(), Some(canonical_repo_str.as_str()));
+
+    let capture = std::fs::read_to_string(&capture_path).expect("read capture");
+    assert!(capture.contains(r#""method":"session/close""#));
+
+    engine
+        .send_turn_for_thread(&branch.thread_id, "turn after remove")
+        .await
+        .expect("turn after remove");
+    let capture_after = std::fs::read_to_string(&capture_path).expect("read capture after");
+    assert!(
+        capture_after.contains(&format!("\"cwd\":\"{canonical_repo_str}\"")),
+        "post-remove ACP turn must open fresh session in primary repo root: {capture_after}"
+    );
+
+    // Torn-down PTY respawned into primary repo root with GREIN_WORKTREE cleared.
+    engine
+        .pty_write(
+            &term.thread_id,
+            b"printf '\\nAFTER_RM_PWD=%s;WT=%s\\n' \"$(pwd)\" \"${GREIN_WORKTREE:-unset}\"\n".to_vec(),
+        )
+        .await
+        .expect("pty_write after remove");
+    let expected_after = format!("AFTER_RM_PWD={canonical_repo_str};WT=unset");
+    wait_for_pty_snapshot(&engine, &term.thread_id, 24, 240, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == expected_after)
+    })
+    .await;
+
+    // Test prune_worktrees cleans stale missing directories.
+    let stale_dir = temp.path().join("stale_wt");
+    git_in_dir(
+        &canonical_repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "stale-branch",
+            &stale_dir.to_string_lossy(),
+        ],
+    );
+    std::fs::remove_dir_all(&stale_dir).expect("delete stale dir manually");
+    let _prune_out = engine.prune_worktrees().await.expect("prune_worktrees");
+    let listed = engine.list_worktrees().await.expect("list after prune");
+    let canon_stale = stale_dir.to_string_lossy().to_string();
+    assert!(!listed.iter().any(|w| w.path == canon_stale));
+}
+
+async fn term_write_and_wait_pid(engine: &InProcessEngine, thread_id: &str) {
+    engine
+        .pty_write(thread_id, b"printf '\\nRM_READY=%s\\n' \"$$\"\n".to_vec())
+        .await
+        .expect("write ready");
+    wait_for_pty_snapshot(engine, thread_id, 24, 240, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim().starts_with("RM_READY="))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_pty_env_vars_and_poll_os_cwd_fallback_on_plain_cd() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    let sub_dir = repo_root.join("plain_cd_sub");
+    std::fs::create_dir_all(&sub_dir).expect("mkdir sub_dir");
+    init_test_git_repo(&repo_root);
+    git_in_dir(&repo_root, &["checkout", "-b", "feat/pty-env"]);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let canonical_sub = std::fs::canonicalize(&sub_dir).expect("canonical sub_dir");
+    let canonical_sub_str = canonical_sub.to_string_lossy().to_string();
+
+    let engine = InProcessEngine::open_with_config(
+        &temp.path().join("pty_env.db"),
+        canonical_repo.clone(),
+        None,
+    )
+    .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("main");
+
+    // Root terminal (non-worktree): GREIN_THREAD_ID set, GREIN_WORKTREE unset.
+    let root_term = engine
+        .create_terminal(Some(&main.thread_id), Some("Root Term"), None, 24, 240)
+        .await
+        .expect("create root_term");
+    root_term_write_env(&engine, &root_term.thread_id, "unset").await;
+
+    // Plain `cd` without OSC 7 triggers poll_os_cwd fallback and updates SQLite + metadata event.
+    let mut rx = engine.subscribe_tui_events();
+    let cd_cmd = format!("cd \"{canonical_sub_str}\" && printf '\\nCD_PLAIN_DONE\\n'\n");
+    engine
+        .pty_write(&root_term.thread_id, cd_cmd.into_bytes())
+        .await
+        .expect("write plain cd");
+    wait_for_pty_snapshot(&engine, &root_term.thread_id, 24, 240, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == "CD_PLAIN_DONE")
+    })
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = engine
+            .pty_snapshot(&root_term.thread_id, 24, 240)
+            .await
+            .expect("poll pty_snapshot");
+        let row = engine
+            .thread_metadata()
+            .await
+            .expect("thread_metadata")
+            .into_iter()
+            .find(|t| t.thread_id == root_term.thread_id)
+            .expect("root_term meta");
+        if row.cwd.as_deref() == Some(canonical_sub_str.as_str()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for poll_os_cwd to persist cwd={}, current={:?}",
+            canonical_sub_str,
+            row.cwd
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let mut saw_meta_event = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(200), rx.recv()).await {
+        if matches!(
+            ev,
+            TuiEngineEvent::ThreadMetadataUpdated { ref meta }
+                if meta.iter().any(|m| {
+                    m.thread_id == root_term.thread_id
+                        && m.cwd.as_deref() == Some(canonical_sub_str.as_str())
+                })
+        ) {
+            saw_meta_event = true;
+            break;
+        }
+    }
+    assert!(
+        saw_meta_event,
+        "poll_os_cwd cwd change must emit ThreadMetadataUpdated"
+    );
+
+    // Worktree terminal: GREIN_THREAD_ID set, GREIN_WORKTREE=1.
+    let branch = engine
+        .fork_thread_with_title(Some(&main.thread_id), Some("wt-env"))
+        .await
+        .expect("fork branch");
+    let _wt_path = engine
+        .ensure_thread_worktree(&branch.thread_id)
+        .await
+        .expect("ensure_thread_worktree");
+    let wt_term = engine
+        .create_terminal(Some(&branch.thread_id), Some("WT Env Term"), None, 24, 240)
+        .await
+        .expect("create wt_term");
+    root_term_write_env(&engine, &wt_term.thread_id, "1").await;
+}
+
+async fn root_term_write_env(engine: &InProcessEngine, thread_id: &str, expected_wt: &str) {
+    engine
+        .pty_write(
+            thread_id,
+            b"printf '\\nGREIN_ENV=%s|%s\\n' \"$GREIN_THREAD_ID\" \"${GREIN_WORKTREE:-unset}\"\n"
+                .to_vec(),
+        )
+        .await
+        .expect("pty_write env");
+    let expected = format!("GREIN_ENV={thread_id}|{expected_wt}");
+    wait_for_pty_snapshot(engine, thread_id, 24, 240, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == expected)
+    })
+    .await;
 }
