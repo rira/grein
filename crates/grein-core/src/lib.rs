@@ -5,6 +5,7 @@ pub mod blackboard;
 pub mod dag;
 pub mod error;
 pub mod model;
+pub mod prefs;
 pub mod storage;
 pub mod sync;
 
@@ -14,4 +15,5 @@ pub use blackboard::{
 };
 pub use error::CoreError;
 pub use model::ThreadKind;
+pub use prefs::{default_prefs_db_path, UserPrefsStore};
 pub use sync::{build_context_prompt, ContextCompiler, ContextPayload};
