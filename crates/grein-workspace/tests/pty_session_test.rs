@@ -1,7 +1,9 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use grein_workspace::pty_session::{InteractivePtySession, PtyCell, PtyColor, PtyScreenSnapshot};
+use grein_workspace::pty_session::{
+    live_process_cwd, InteractivePtySession, PtyCell, PtyColor, PtyScreenSnapshot,
+};
 
 struct UpdateSignal {
     counter: Mutex<u64>,
@@ -780,6 +782,165 @@ fn test_pty_child_resets_signal_mask_and_dispositions() {
             .lines()
             .any(|line| line.trim() == "SIG_AFTER_CTRL_C")
     });
+}
+
+#[test]
+fn test_spawn_and_spawn_with_env_inject_grein_and_custom_vars() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Default spawn injects GREIN=1
+    let signal_default = UpdateSignal::new();
+    let session_default = InteractivePtySession::spawn(
+        dir.path(),
+        24,
+        160,
+        Some("/bin/sh"),
+        signal_default.callback(),
+    )
+    .expect("spawn default pty session");
+
+    session_default
+        .write_bytes(b"printf '\\nDEF_GREIN=%s\\n' \"${GREIN:-UNSET}\"\n")
+        .expect("print default GREIN");
+    signal_default.wait_for(&session_default, Duration::from_secs(5), |s| {
+        s.plain_text()
+            .lines()
+            .any(|line| line.trim() == "DEF_GREIN=1")
+    });
+
+    // spawn_with_env injects GREIN=1 plus custom pairs
+    let signal_custom = UpdateSignal::new();
+    let session_custom = InteractivePtySession::spawn_with_env(
+        dir.path(),
+        24,
+        160,
+        Some("/bin/sh"),
+        &[
+            ("GREIN_THREAD_ID", "thread-99"),
+            ("GREIN_WORKTREE", "/tmp/worktree-99"),
+        ],
+        signal_custom.callback(),
+    )
+    .expect("spawn_with_env pty session");
+
+    session_custom
+        .write_bytes(
+            b"printf '\\nCUSTOM=%s|%s|%s\\n' \"${GREIN:-UNSET}\" \"${GREIN_THREAD_ID:-UNSET}\" \"${GREIN_WORKTREE:-UNSET}\"\n",
+        )
+        .expect("print custom env vars");
+    signal_custom.wait_for(&session_custom, Duration::from_secs(5), |s| {
+        s.plain_text()
+            .lines()
+            .any(|line| line.trim() == "CUSTOM=1|thread-99|/tmp/worktree-99")
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_live_process_cwd_reads_proc_and_handles_missing_pid() {
+    let current = std::fs::canonicalize(std::env::current_dir().expect("current_dir"))
+        .expect("canonicalize current_dir");
+    let live = live_process_cwd(std::process::id()).expect("live_process_cwd for self");
+    assert_eq!(std::fs::canonicalize(live).expect("canon live"), current);
+    assert_eq!(live_process_cwd(u32::MAX), None);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_poll_os_cwd_fallback_detects_cd_without_osc7() {
+    let dir1 = tempfile::tempdir().expect("tempdir 1");
+    let dir2 = tempfile::tempdir().expect("tempdir 2");
+    let canon_dir2 = std::fs::canonicalize(dir2.path())
+        .expect("canonicalize dir2")
+        .to_string_lossy()
+        .into_owned();
+
+    let signal = UpdateSignal::new();
+    let session =
+        InteractivePtySession::spawn(dir1.path(), 24, 160, Some("/bin/sh"), signal.callback())
+            .expect("spawn pty session");
+
+    assert_eq!(session.snapshot().cwd, None);
+    assert_eq!(session.poll_os_cwd(), None);
+
+    let cd_cmd = format!("cd '{}' && printf '\\nCD_DONE_OK\\n'\n", dir2.path().display());
+    session.write_bytes(cd_cmd.as_bytes()).expect("write cd");
+    signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.plain_text()
+            .lines()
+            .any(|line| line.trim() == "CD_DONE_OK")
+    });
+
+    assert_eq!(
+        session.snapshot().cwd,
+        None,
+        "snapshot().cwd should still be None without OSC 7 before poll_os_cwd"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let polled = loop {
+        if let Some(cwd) = session.poll_os_cwd() {
+            break cwd;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for poll_os_cwd to detect cd to {canon_dir2}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert_eq!(polled, canon_dir2);
+    assert_eq!(session.snapshot().cwd.as_deref(), Some(canon_dir2.as_str()));
+    assert_eq!(session.poll_os_cwd(), None);
+
+    session.write_bytes(b"exit 0\n").expect("exit shell");
+    signal.wait_for(&session, Duration::from_secs(5), |s| s.exited);
+    assert_eq!(session.poll_os_cwd(), None);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_poll_os_cwd_preserves_osc7_until_actual_cd() {
+    let dir1 = tempfile::tempdir().expect("tempdir 1");
+    let dir2 = tempfile::tempdir().expect("tempdir 2");
+    let canon_dir2 = std::fs::canonicalize(dir2.path())
+        .expect("canonicalize dir2")
+        .to_string_lossy()
+        .into_owned();
+
+    let signal = UpdateSignal::new();
+    let session =
+        InteractivePtySession::spawn(dir1.path(), 24, 160, Some("/bin/sh"), signal.callback())
+            .expect("spawn pty session");
+
+    session
+        .write_bytes(b"printf '\\033]7;file:///tmp/osc7-virtual\\007\\n'\n")
+        .expect("emit osc7");
+    signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.cwd.as_deref() == Some("/tmp/osc7-virtual")
+    });
+    assert_eq!(session.poll_os_cwd(), None);
+    assert_eq!(
+        session.snapshot().cwd.as_deref(),
+        Some("/tmp/osc7-virtual")
+    );
+
+    let cd_cmd = format!("cd '{}' && printf '\\nREAL_CD\\n'\n", dir2.path().display());
+    session.write_bytes(cd_cmd.as_bytes()).expect("write cd");
+    signal.wait_for(&session, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|line| line.trim() == "REAL_CD")
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let polled = loop {
+        if let Some(cwd) = session.poll_os_cwd() {
+            break cwd;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for poll_os_cwd");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(polled, canon_dir2);
+    assert_eq!(session.snapshot().cwd.as_deref(), Some(canon_dir2.as_str()));
 }
 
 fn find_colored_emoji_cell(snapshot: &PtyScreenSnapshot) -> Option<(usize, usize)> {

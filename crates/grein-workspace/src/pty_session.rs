@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -19,9 +19,9 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
-use std::path::PathBuf;
-#[cfg(unix)]
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 
 const DEFAULT_SCROLLBACK_LEN: usize = 1000;
 const READ_CHUNK_SIZE: usize = 4096;
@@ -142,6 +142,7 @@ struct PtyState {
     scroll_top: u16,
     scroll_bottom: u16,
     current_cwd: Option<String>,
+    last_os_cwd: Option<String>,
     exited: bool,
     exit_code: Option<i32>,
 }
@@ -155,6 +156,7 @@ impl PtyState {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             current_cwd: None,
+            last_os_cwd: None,
             exited: false,
             exit_code: None,
         }
@@ -287,6 +289,38 @@ impl ChildProcess {
     }
 }
 
+/// Reads the current working directory of an OS process ID when supported.
+pub fn live_process_cwd(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let pid_str = pid.to_string();
+        let output = Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-p", &pid_str, "-Fn"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix('n'))
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Interactive PTY-backed terminal session with an in-memory VT100 screen parser.
 pub struct InteractivePtySession {
     #[cfg(unix)]
@@ -318,16 +352,28 @@ impl InteractivePtySession {
         cwd: &Path,
         rows: u16,
         cols: u16,
-        shell_override: Option<&str>,
+        shell: Option<&str>,
+        on_update: Arc<dyn Fn() + Send + Sync>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_env(cwd, rows, cols, shell, &[], on_update)
+    }
+
+    /// Spawns an interactive shell in a new PTY session rooted at `cwd` with extra environment variables.
+    pub fn spawn_with_env(
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        shell: Option<&str>,
+        extra_env: &[(&str, &str)],
         on_update: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            Self::spawn_unix(cwd, rows, cols, shell_override, on_update)
+            Self::spawn_unix(cwd, rows, cols, shell, extra_env, on_update)
         }
         #[cfg(not(unix))]
         {
-            let _ = (cwd, rows, cols, shell_override, on_update);
+            let _ = (cwd, rows, cols, shell, extra_env, on_update);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "InteractivePtySession is only supported on Unix platforms",
@@ -341,6 +387,7 @@ impl InteractivePtySession {
         rows: u16,
         cols: u16,
         shell_override: Option<&str>,
+        extra_env: &[(&str, &str)],
         on_update: Arc<dyn Fn() + Send + Sync>,
     ) -> io::Result<Self> {
         let rows = rows.max(1);
@@ -352,7 +399,7 @@ impl InteractivePtySession {
         let (wake_read_fd, wake_write_fd) = create_wake_pipe()?;
 
         let slave_raw_fd = slave_fd.as_raw_fd();
-        let mut cmd = build_pty_command(&shell, cwd);
+        let mut cmd = build_pty_command(&shell, cwd, extra_env);
 
         unsafe {
             cmd.pre_exec(move || {
@@ -391,7 +438,11 @@ impl InteractivePtySession {
 
         let master = Arc::new(master_fd);
         let write_lock = Arc::new(Mutex::new(()));
-        let state = Arc::new(Mutex::new(PtyState::new(rows, cols)));
+        let mut pty_state = PtyState::new(rows, cols);
+        pty_state.last_os_cwd = std::fs::canonicalize(cwd)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        let state = Arc::new(Mutex::new(pty_state));
         let child_proc = Arc::new(Mutex::new(ChildProcess {
             pid: pid_t,
             reaped: false,
@@ -551,6 +602,31 @@ impl InteractivePtySession {
     /// Returns the OS process ID of the spawned shell child process.
     pub fn child_pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Polls the child process OS working directory as a fallback when OSC 7 is unavailable.
+    pub fn poll_os_cwd(&self) -> Option<String> {
+        {
+            let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard.exited {
+                return None;
+            }
+        }
+
+        let raw_cwd = live_process_cwd(self.pid)?;
+        let canon = std::fs::canonicalize(raw_cwd).ok()?;
+        if !canon.is_dir() {
+            return None;
+        }
+        let canon_str = canon.to_string_lossy().into_owned();
+
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.exited || guard.last_os_cwd.as_deref() == Some(canon_str.as_str()) {
+            return None;
+        }
+        guard.last_os_cwd = Some(canon_str.clone());
+        guard.current_cwd = Some(canon_str.clone());
+        Some(canon_str)
     }
 }
 
@@ -1093,13 +1169,17 @@ fn resolve_shell(shell_override: Option<&str>) -> String {
 }
 
 #[cfg(unix)]
-fn build_pty_command(shell: &str, cwd: &Path) -> Command {
+fn build_pty_command(shell: &str, cwd: &Path, extra_env: &[(&str, &str)]) -> Command {
     let mut cmd = Command::new(shell);
     cmd.current_dir(cwd)
         .env("TERM", "xterm-256color")
-        .env("COLORTERM", "truecolor");
+        .env("COLORTERM", "truecolor")
+        .env("GREIN", "1");
     for &var in SCRUBBED_TERMINAL_ENV_VARS {
         cmd.env_remove(var);
+    }
+    for &(key, value) in extra_env {
+        cmd.env(key, value);
     }
     cmd
 }
@@ -1907,7 +1987,7 @@ mod tests {
         use std::collections::HashMap;
         use std::ffi::OsStr;
 
-        let cmd = build_pty_command("/bin/sh", Path::new("/tmp"));
+        let cmd = build_pty_command("/bin/sh", Path::new("/tmp"), &[("GREIN_THREAD_ID", "t1")]);
         let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.get_envs().collect();
 
         assert_eq!(
@@ -1917,6 +1997,11 @@ mod tests {
         assert_eq!(
             envs.get(OsStr::new("COLORTERM")),
             Some(&Some(OsStr::new("truecolor")))
+        );
+        assert_eq!(envs.get(OsStr::new("GREIN")), Some(&Some(OsStr::new("1"))));
+        assert_eq!(
+            envs.get(OsStr::new("GREIN_THREAD_ID")),
+            Some(&Some(OsStr::new("t1")))
         );
         for &var in SCRUBBED_TERMINAL_ENV_VARS {
             assert_eq!(

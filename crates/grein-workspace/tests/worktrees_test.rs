@@ -7,9 +7,9 @@ use std::process::Command;
 use grein_workspace::allocator::{ThreadId, WorkspaceError, WorktreeAllocator, WorktreeMode};
 use grein_workspace::git::GitRepository;
 use grein_workspace::worktrees::{
-    current_branch_name, list_repo_worktrees, list_worktrees_across_paths, remove_worktree,
-    resolve_primary_repo_root, resolve_worktree_toplevel, sanitize_worktree_dir_slug,
-    DiscoveredWorktree,
+    current_branch_name, list_repo_worktrees, list_worktrees_across_paths, prune_worktrees,
+    remove_worktree, resolve_primary_repo_root, resolve_worktree_toplevel,
+    sanitize_worktree_dir_slug, worktree_diff_preview, DiscoveredWorktree,
 };
 use tempfile::TempDir;
 
@@ -554,4 +554,158 @@ fn open_session_auto_named_skips_when_dir_exists_and_primary_wt_branch_not_grein
         .expect("remove detached grein worktree");
     assert_eq!(removed, None);
     assert!(!detached_grein.exists());
+}
+
+#[test]
+fn worktree_diff_preview_handles_missing_clean_dirty_unborn_and_truncation() {
+    let plain = TempDir::new().expect("plain temp dir");
+    let missing = plain.path().join("does-not-exist");
+    assert_eq!(
+        worktree_diff_preview(&missing, 50),
+        "Worktree directory not found\n"
+    );
+
+    let repo = init_repo_with_branch("feat/preview");
+    let clean_preview = worktree_diff_preview(repo.path(), 50);
+    assert!(
+        clean_preview.starts_with("## feat/preview\n"),
+        "expected branch header, got:\n{clean_preview}"
+    );
+    assert!(
+        clean_preview.contains("Clean working tree (no uncommitted changes)"),
+        "expected clean message, got:\n{clean_preview}"
+    );
+
+    fs::write(repo.path().join("README.md"), "base\nupdated line\n").expect("modify README");
+    fs::write(repo.path().join("untracked.txt"), "hello\n").expect("write untracked");
+
+    let dirty_preview = worktree_diff_preview(repo.path(), 100);
+    assert!(
+        dirty_preview.contains("## feat/preview"),
+        "missing branch header:\n{dirty_preview}"
+    );
+    assert!(
+        dirty_preview.contains(" M README.md"),
+        "missing modified status line:\n{dirty_preview}"
+    );
+    assert!(
+        dirty_preview.contains("?? untracked.txt"),
+        "missing untracked status line:\n{dirty_preview}"
+    );
+    assert!(
+        dirty_preview.contains("1 file changed"),
+        "missing --stat summary:\n{dirty_preview}"
+    );
+    assert!(
+        dirty_preview.contains("+updated line"),
+        "missing unified diff addition:\n{dirty_preview}"
+    );
+    assert!(
+        !dirty_preview.contains('\x1b'),
+        "diff preview must not contain ANSI color escapes:\n{dirty_preview}"
+    );
+
+    let full_line_count = dirty_preview.lines().count();
+    assert!(full_line_count > 3, "expected >3 lines in dirty preview");
+
+    let truncated = worktree_diff_preview(repo.path(), 3);
+    let expected_remaining = full_line_count - 3;
+    let expected_suffix = format!("\n... ({expected_remaining} more lines truncated)\n");
+    assert!(
+        truncated.ends_with(&expected_suffix),
+        "expected truncation suffix `{expected_suffix:?}` in:\n{truncated}"
+    );
+    let trunc_lines: Vec<&str> = truncated.lines().collect();
+    assert_eq!(trunc_lines.len(), 4);
+
+    let zero_clamped = worktree_diff_preview(repo.path(), 0);
+    let expected_zero_suffix = format!("\n... ({} more lines truncated)\n", full_line_count - 1);
+    assert!(
+        zero_clamped.ends_with(&expected_zero_suffix),
+        "expected max_lines=0 to clamp to 1 line, got:\n{zero_clamped}"
+    );
+
+    // Unborn HEAD repository
+    let unborn = TempDir::new().expect("unborn temp dir");
+    run_git(unborn.path(), &["init", "-b", "main"]);
+    let unborn_clean = worktree_diff_preview(unborn.path(), 50);
+    assert!(
+        unborn_clean.contains("Clean working tree (no uncommitted changes)"),
+        "expected clean unborn message, got:\n{unborn_clean}"
+    );
+
+    fs::write(unborn.path().join("staged.txt"), "staged content\n").expect("write staged");
+    run_git(unborn.path(), &["add", "staged.txt"]);
+    let unborn_staged = worktree_diff_preview(unborn.path(), 50);
+    assert!(
+        unborn_staged.contains("A  staged.txt"),
+        "expected staged entry in unborn preview:\n{unborn_staged}"
+    );
+    assert!(
+        unborn_staged.contains("+staged content"),
+        "expected cached unified diff in unborn preview:\n{unborn_staged}"
+    );
+}
+
+#[test]
+fn prune_worktrees_removes_stale_registrations_and_handles_clean_and_invalid_repos() {
+    let plain = TempDir::new().expect("plain temp dir");
+    let err = prune_worktrees(plain.path()).expect_err("non-git dir must fail");
+    assert!(matches!(err, WorkspaceError::GitError(_)));
+
+    let repo = init_repo_with_branch("main");
+    let clean_msg = prune_worktrees(repo.path()).expect("prune clean repo");
+    assert_eq!(clean_msg, "Worktrees clean (nothing to prune)");
+
+    let wt_parent = TempDir::new().expect("wt parent");
+    let live_wt = wt_parent.path().join("live-wt");
+    let stale_wt = wt_parent.path().join("stale-wt");
+    run_git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "topic/live",
+            live_wt.to_str().expect("utf8"),
+        ],
+    );
+    run_git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "topic/stale",
+            stale_wt.to_str().expect("utf8"),
+        ],
+    );
+
+    fs::remove_dir_all(&stale_wt).expect("manually remove stale worktree dir");
+
+    let porcelain_before = run_git(repo.path(), &["worktree", "list", "--porcelain"]);
+    assert!(
+        porcelain_before.contains("stale-wt"),
+        "expected stale-wt registered before prune:\n{porcelain_before}"
+    );
+
+    // Invoke via linked live_wt to verify primary root resolution
+    let prune_msg = prune_worktrees(&live_wt).expect("prune stale worktree");
+    assert!(
+        !prune_msg.is_empty() && prune_msg != "Worktrees clean (nothing to prune)",
+        "expected non-empty prune output, got: {prune_msg:?}"
+    );
+
+    let porcelain_after = run_git(repo.path(), &["worktree", "list", "--porcelain"]);
+    assert!(
+        !porcelain_after.contains("stale-wt"),
+        "stale-wt registration should be pruned:\n{porcelain_after}"
+    );
+    assert!(
+        porcelain_after.contains("live-wt"),
+        "live-wt must remain registered:\n{porcelain_after}"
+    );
+
+    let second_msg = prune_worktrees(repo.path()).expect("second prune should be clean");
+    assert_eq!(second_msg, "Worktrees clean (nothing to prune)");
 }

@@ -242,6 +242,90 @@ pub fn remove_worktree(
     Ok(None)
 }
 
+pub fn worktree_diff_preview(path: &Path, max_lines: usize) -> String {
+    if !path.is_dir() {
+        return "Worktree directory not found\n".to_string();
+    }
+
+    let Some(status_out) = run_git_readonly(path, &["status", "--short", "--branch"]) else {
+        return "Not a git worktree\n".to_string();
+    };
+    let status_trimmed = status_out.trim_end_matches(['\r', '\n']);
+    let has_status_entries = status_trimmed
+        .lines()
+        .any(|line| !line.starts_with("## ") && !line.trim().is_empty());
+
+    let has_head = run_git_readonly(path, &["rev-parse", "--verify", "HEAD"]).is_some();
+    let (stat_out, diff_out) = if has_head {
+        (
+            run_git_readonly(path, &["diff", "--stat", "HEAD"]).unwrap_or_default(),
+            run_git_readonly(path, &["diff", "--no-color", "HEAD"]).unwrap_or_default(),
+        )
+    } else {
+        (
+            run_git_readonly(path, &["diff", "--cached", "--stat"]).unwrap_or_default(),
+            run_git_readonly(path, &["diff", "--cached", "--no-color"]).unwrap_or_default(),
+        )
+    };
+    let stat_trimmed = stat_out.trim_end_matches(['\r', '\n']);
+    let diff_trimmed = diff_out.trim_end_matches(['\r', '\n']);
+
+    let mut preview = String::new();
+    if !status_trimmed.is_empty() {
+        preview.push_str(status_trimmed);
+        preview.push('\n');
+    }
+
+    if !has_status_entries && diff_trimmed.is_empty() {
+        preview.push_str("\nClean working tree (no uncommitted changes)\n");
+    } else {
+        if !stat_trimmed.is_empty() {
+            preview.push('\n');
+            preview.push_str(stat_trimmed);
+            preview.push('\n');
+        }
+        if !diff_trimmed.is_empty() {
+            preview.push('\n');
+            preview.push_str(diff_trimmed);
+            preview.push('\n');
+        }
+    }
+
+    let limit = max_lines.max(1);
+    let lines: Vec<&str> = preview.lines().collect();
+    if lines.len() > limit {
+        let remaining = lines.len() - limit;
+        let mut truncated = lines[..limit].join("\n");
+        truncated.push_str(&format!("\n... ({remaining} more lines truncated)\n"));
+        return truncated;
+    }
+
+    preview
+}
+
+pub fn prune_worktrees(repo_hint: &Path) -> Result<String, WorkspaceError> {
+    let primary_root = resolve_primary_repo_root(repo_hint).ok_or_else(|| {
+        WorkspaceError::GitError(format!("Not a git repository: {}", repo_hint.display()))
+    })?;
+
+    let args = [
+        OsStr::new("worktree"),
+        OsStr::new("prune"),
+        OsStr::new("--verbose"),
+    ];
+    let output = run_git_mutating_output(&primary_root, &args)?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let combined = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "Worktrees clean (nothing to prune)".to_string(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    };
+    Ok(combined)
+}
+
 fn parse_porcelain_blocks(stdout: &str) -> Vec<RawWorktreeBlock> {
     let mut blocks = Vec::new();
     let mut current = RawWorktreeBlock::default();
@@ -330,6 +414,13 @@ fn run_git_readonly(path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn run_git_mutating(repo_root: &Path, args: &[&OsStr]) -> Result<(), WorkspaceError> {
+    run_git_mutating_output(repo_root, args).map(|_| ())
+}
+
+fn run_git_mutating_output(
+    repo_root: &Path,
+    args: &[&OsStr],
+) -> Result<std::process::Output, WorkspaceError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -339,7 +430,7 @@ fn run_git_mutating(repo_root: &Path, args: &[&OsStr]) -> Result<(), WorkspaceEr
         .output()?;
 
     if output.status.success() {
-        return Ok(());
+        return Ok(output);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
