@@ -7,3 +7,4 @@ pub mod pty_session;
 pub mod shadow;
 pub mod shell;
 pub mod teardown;
+pub mod worktrees;

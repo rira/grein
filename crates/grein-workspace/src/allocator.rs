@@ -1,9 +1,10 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::git::{GitRepository, MergeResult};
 use crate::teardown::{TeardownAction, TeardownOutcome};
@@ -68,6 +69,82 @@ impl WorktreeAllocator {
             mode: WorktreeMode::SharedRead,
         })
     }
+
+    pub fn open_session_auto_named(&self, thread_id: ThreadId) -> WorktreeSession {
+        let primary_root = crate::worktrees::resolve_primary_repo_root(self.repo.root())
+            .unwrap_or_else(|| self.repo.root().to_path_buf());
+
+        let (worktree_dir, branch_name) =
+            match crate::worktrees::current_branch_name(self.repo.root()) {
+                Some(branch) if branch != "main" && branch != "master" => {
+                    let slug = crate::worktrees::sanitize_worktree_dir_slug(&branch);
+                    let base_branch = format!("{branch}-wt");
+                    let registered_paths: HashSet<PathBuf> =
+                        crate::worktrees::list_repo_worktrees(&primary_root)
+                            .into_iter()
+                            .map(|wt| wt.path)
+                            .collect();
+
+                    let mut n = 1usize;
+                    loop {
+                        let dir_name = if n == 1 {
+                            slug.clone()
+                        } else {
+                            format!("{slug}-{n}")
+                        };
+                        let candidate_branch = if n == 1 {
+                            base_branch.clone()
+                        } else {
+                            format!("{base_branch}-{n}")
+                        };
+                        let candidate_path =
+                            primary_root.join(".grein").join("worktrees").join(&dir_name);
+
+                        let is_registered = registered_paths.contains(&candidate_path)
+                            || fs::canonicalize(&candidate_path)
+                                .map(|c| registered_paths.contains(&c))
+                                .unwrap_or(false);
+
+                        if !candidate_path.exists()
+                            && !is_registered
+                            && !branch_ref_exists(&primary_root, &candidate_branch)
+                        {
+                            break (candidate_path, candidate_branch);
+                        }
+                        n += 1;
+                    }
+                }
+                _ => (
+                    primary_root
+                        .join(".grein")
+                        .join("worktrees")
+                        .join(thread_id.as_str()),
+                    format!("worktree-{}", thread_id.as_str()),
+                ),
+            };
+
+        WorktreeSession {
+            repo: GitRepository::new(primary_root),
+            thread_id,
+            worktree_dir,
+            branch_name,
+            mode: WorktreeMode::SharedRead,
+        }
+    }
+}
+
+fn branch_ref_exists(repo_root: &Path, branch_name: &str) -> bool {
+    let ref_name = format!("refs/heads/{branch_name}");
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show-ref", "--verify", "--quiet", &ref_name])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -94,12 +171,23 @@ impl WorktreeSession {
         }
     }
 
+    pub fn branch_name(&self) -> &str {
+        &self.branch_name
+    }
+
+    pub fn worktree_dir(&self) -> &Path {
+        &self.worktree_dir
+    }
+
     /// Resolves the git info exclude file, preferring `git rev-parse --git-path`.
     fn exclude_file_path(&self) -> PathBuf {
         let root = self.repo.root();
         let resolved = Command::new("git")
             .current_dir(root)
             .args(["rev-parse", "--git-path", "info/exclude"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -214,6 +302,8 @@ impl WorktreeSession {
                 worktree_path_str,
                 "HEAD",
             ])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
             .output()?;
 
         if !output.status.success() {
