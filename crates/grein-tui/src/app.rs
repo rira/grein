@@ -5045,8 +5045,9 @@ impl App {
                     self.worktree_autocomplete_idx = 0;
                     self.status_notice = Some("Cleared input".to_string());
                 } else {
+                    let manage_hint = self.keymap.display_for(BindableAction::EnterManageMode);
                     self.status_notice =
-                        Some("Use Ctrl+G then q (or /quit) to exit".to_string());
+                        Some(format!("Use {manage_hint} then q (or /quit) to exit"));
                 }
                 self.sync_focus_out();
                 return true;

@@ -2004,6 +2004,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
     let next_sib = km.display_for(BindableAction::NextSibling);
     let scroll_label = format!("{scroll_up} / {scroll_down}");
     let sib_label = format!("{prev_sib} / {next_sib}");
+    let manage_scroll_desc = format!("Full/half-page preview; {scroll_up}/{scroll_down} scroll");
 
     let sections: [(&str, Vec<(String, String)>); 4] = [
         (
@@ -2048,12 +2049,9 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
                     "h/←/Space, H/L, J/K".to_string(),
                     "Fold / fold-or-expand all / switch root".to_string(),
                 ),
+                ("Ctrl+F/B, Ctrl+U/D".to_string(), manage_scroll_desc),
                 (
-                    "Ctrl+F/B, Ctrl+U/D".to_string(),
-                    "Full/half-page preview; Alt+K/J scroll".to_string(),
-                ),
-                (
-                    "gg / G, 1..9 / Alt+1..9".to_string(),
+                    "gg / G, Alt+1..9".to_string(),
                     "Top / bottom item; jump to root 1..9".to_string(),
                 ),
                 (
