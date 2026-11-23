@@ -32,25 +32,55 @@ Enter
 Sleep 1.5s
 Show
 
-# 1. Terminal-first WRITE mode in live $SHELL (GREIN=1)
+# 1. Terminal-first WRITE mode in live $SHELL (GREIN=1) and Vim-first scrollback (Alt+K / Alt+J)
 Sleep 800ms
-Type 'echo "GREIN=$GREIN"'
+Type 'echo "GREIN=$GREIN" && seq 1 20'
 Enter
 Sleep 1.2s
+Alt+k
+Sleep 700ms
+Alt+j
+Sleep 700ms
 
-# 2. Switch to MANAGE mode (Ctrl+G) and toggle to Worktrees view (Tab)
+# 2. Enter MANAGE mode (Ctrl+G), create [n]ew root agent (n) and spawn child [s]hell (s)
 Ctrl+G
+Sleep 600ms
+Type "n"
+Sleep 900ms
+Ctrl+G
+Sleep 500ms
+Type "s"
+Sleep 900ms
+Ctrl+G
+Sleep 500ms
+Type "k"
+Sleep 400ms
+Type "s"
+Sleep 900ms
+
+# 3. Cycle sibling threads in WRITE mode (Alt+H / Alt+L)
+Alt+h
+Sleep 700ms
+Alt+l
+Sleep 700ms
+
+# 4. Return to MANAGE (Ctrl+G), confirmed [d]el (d -> y), and switch to Worktrees view (Tab)
+Ctrl+G
+Sleep 500ms
+Type "d"
+Sleep 500ms
+Type "y"
 Sleep 600ms
 Tab
 Sleep 1s
 
-# 3. Inspect the feature worktree and its live diff preview
+# 5. Inspect the feature worktree and its live diff preview
 Down
 Sleep 400ms
 Down
 Sleep 1.6s
 
-# 4. Open : command palette and live-preview themes via :theme
+# 6. Open : command palette and live-preview themes via :theme
 Type ":"
 Sleep 400ms
 Type "theme"
@@ -64,10 +94,12 @@ Sleep 800ms
 Enter
 Sleep 900ms
 
-# 5. Return to Grein view and re-enter WRITE mode in $SHELL
+# 7. Return to Grein view (Tab), jump to root 1 (gg), and press Enter to enter WRITE in $SHELL
 Tab
 Sleep 500ms
-Ctrl+G
+Type "gg"
+Sleep 400ms
+Enter
 Sleep 700ms
 Type 'git status -sb'
 Enter
