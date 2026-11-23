@@ -1,11 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use thiserror::Error;
 
 use crate::engine_port::{
     AgentConfigChoice, AgentConfigOption, AgentSlashCommand, PtyScreenSnapshot, SubagentSnapshot,
-    ThreadMeta,
+    ThreadMeta, WorktreeEntry,
 };
 use crate::runner::{compute_ordered_thread_entries, OrderedThreadEntry};
 use crate::transcript::{
@@ -43,6 +43,39 @@ pub enum FocusDirection {
 pub struct PendingPermission {
     pub request_id: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarView {
+    #[default]
+    Grein,
+    Worktrees,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWorktreeDelete {
+    pub path: String,
+    pub label: String,
+    pub dirty_count: usize,
+    pub attached_count: usize,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeRow {
+    RepoHeader {
+        repo_root: String,
+        repo_name: String,
+        count: usize,
+        collapsed: bool,
+    },
+    Entry(WorktreeEntry),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeAutocompleteItem {
+    CreateNew,
+    Existing(WorktreeEntry),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +176,15 @@ pub enum AppAction {
     },
     EnsureThreadWorktree {
         thread_id: String,
+    },
+    ListWorktrees,
+    SwitchThreadWorktree {
+        thread_id: String,
+        target_path: String,
+    },
+    RemoveWorktree {
+        path: String,
+        force: bool,
     },
 }
 
@@ -299,6 +341,17 @@ pub struct App {
     pub collapsed_threads: BTreeSet<String>,
     pub tree_has_children: BTreeSet<String>,
     pub tree_hidden_counts: BTreeMap<String, usize>,
+    pub sidebar_view: SidebarView,
+    pub worktrees: Vec<WorktreeEntry>,
+    pub worktree_selected_idx: usize,
+    pub worktree_scroll_offset: usize,
+    pub collapsed_worktree_repos: HashSet<String>,
+    pub worktree_filter_active: bool,
+    pub worktree_filter_query: String,
+    pub pending_worktree_delete: Option<PendingWorktreeDelete>,
+    pub worktree_autocomplete_open: bool,
+    pub worktree_autocomplete_idx: usize,
+    pub worktree_list_in_flight: bool,
 }
 
 pub type AppState = App;
@@ -357,6 +410,17 @@ impl Default for App {
             collapsed_threads: BTreeSet::new(),
             tree_has_children: BTreeSet::new(),
             tree_hidden_counts: BTreeMap::new(),
+            sidebar_view: SidebarView::Grein,
+            worktrees: Vec::new(),
+            worktree_selected_idx: 0,
+            worktree_scroll_offset: 0,
+            collapsed_worktree_repos: HashSet::new(),
+            worktree_filter_active: false,
+            worktree_filter_query: String::new(),
+            pending_worktree_delete: None,
+            worktree_autocomplete_open: false,
+            worktree_autocomplete_idx: 0,
+            worktree_list_in_flight: false,
         }
     }
 }
@@ -589,6 +653,85 @@ fn extract_last_assistant_md(md: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+pub fn worktree_display_label(entry: &WorktreeEntry) -> String {
+    if let Some(branch) = entry
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        branch.to_string()
+    } else if let Some(sha) = entry
+        .head_short
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        format!("detached@{sha}")
+    } else if entry.is_detached {
+        "detached@HEAD".to_string()
+    } else {
+        std::path::Path::new(&entry.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&entry.path)
+            .to_string()
+    }
+}
+
+pub(crate) fn parse_worktree_autocomplete_query(input: &str) -> Option<&str> {
+    if input.contains('\n') || input.contains('\r') {
+        return None;
+    }
+    if input.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("/wt ")) {
+        return Some(&input[4..]);
+    }
+    if input
+        .get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case("/worktree "))
+    {
+        return Some(&input[10..]);
+    }
+    None
+}
+
+fn worktree_matches_sidebar_filter(entry: &WorktreeEntry, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    entry.repo_name.to_ascii_lowercase().contains(query_lower)
+        || entry
+            .branch
+            .as_deref()
+            .is_some_and(|b| b.to_ascii_lowercase().contains(query_lower))
+        || entry.path.to_ascii_lowercase().contains(query_lower)
+        || entry
+            .head_short
+            .as_deref()
+            .is_some_and(|h| h.to_ascii_lowercase().contains(query_lower))
+}
+
+pub(crate) fn worktree_matches_autocomplete(entry: &WorktreeEntry, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    let basename = std::path::Path::new(&entry.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    entry
+        .branch
+        .as_deref()
+        .is_some_and(|b| b.to_ascii_lowercase().contains(query_lower))
+        || basename.to_ascii_lowercase().contains(query_lower)
+        || entry.repo_name.to_ascii_lowercase().contains(query_lower)
+        || entry.path.to_ascii_lowercase().contains(query_lower)
+}
+
+fn normalized_path_components(path: &str) -> Vec<std::path::Component<'_>> {
+    std::path::Path::new(path.trim()).components().collect()
+}
+
 impl App {
     pub fn new() -> Self {
         Self::default()
@@ -676,11 +819,12 @@ impl App {
 
     fn open_or_jump_to_terminal(&mut self) {
         self.pending_rename_thread_id = None;
-        let target_id = if self.focused_pane == FocusedPane::Tree {
-            self.selected_tree_thread_info().0
-        } else {
-            self.active_thread_id.clone()
-        };
+        let target_id =
+            if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
+                self.selected_tree_thread_info().0
+            } else {
+                self.active_thread_id.clone()
+            };
         if let Some(term_id) = self.find_existing_terminal_for(&target_id) {
             if term_id != self.active_thread_id {
                 self.switch_thread(&term_id);
@@ -793,8 +937,11 @@ impl App {
         });
     }
 
-    fn has_active_modal(&self) -> bool {
-        self.pending_permission.is_some() || self.config_picker.is_some() || self.show_help_modal
+    pub(crate) fn has_active_modal(&self) -> bool {
+        self.pending_permission.is_some()
+            || self.pending_worktree_delete.is_some()
+            || self.config_picker.is_some()
+            || self.show_help_modal
     }
 
     pub fn handle_paste_event(&mut self, text: &str) -> bool {
@@ -824,6 +971,7 @@ impl App {
             let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
             self.input_buffer.insert_str(pos, text);
             self.cursor_position = pos + text.len();
+            self.sync_worktree_autocomplete(true);
             self.sync_focus_out();
             return true;
         }
@@ -950,6 +1098,7 @@ impl App {
         self.sync_anchors();
         self.select_active_thread_in_tree();
         self.sync_focus_for_active_thread();
+        self.sync_worktree_autocomplete(true);
         self.maybe_request_pty_snapshot(&active_id);
         self.maybe_queue_terminal_resize();
     }
@@ -1064,6 +1213,7 @@ impl App {
     fn sync_focus_out(&mut self) {
         self.focus = self.focused_pane;
         self.active_focus = self.focused_pane;
+        self.sync_worktree_autocomplete(false);
     }
 
     pub fn focused_pane(&self) -> FocusedPane {
@@ -1198,7 +1348,17 @@ impl App {
         ) {
             self.focus_tree();
         } else if self.focused_pane == FocusedPane::Tree {
-            let _ = self.activate_selected_tree_node();
+            if self.sidebar_view == SidebarView::Worktrees {
+                self.worktree_filter_active = false;
+                self.focused_pane = if self.active_is_terminal() {
+                    FocusedPane::Terminal
+                } else {
+                    FocusedPane::Composer
+                };
+                self.sync_focus_out();
+            } else {
+                let _ = self.activate_selected_tree_node();
+            }
         } else if self.active_is_terminal() {
             self.focused_pane = FocusedPane::Terminal;
             self.sync_focus_out();
@@ -1297,7 +1457,7 @@ impl App {
     }
 
     fn transcript_scroll_target_id(&self) -> String {
-        if self.focused_pane == FocusedPane::Tree {
+        if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
             self.selected_tree_thread_info().0
         } else {
             self.active_thread_id.clone()
@@ -1746,6 +1906,18 @@ impl App {
         }
 
         if over_tree_pane {
+            if self.sidebar_view == SidebarView::Worktrees {
+                let row_count = self.visible_worktree_rows().len();
+                if row_count > 0 {
+                    if is_up {
+                        self.worktree_selected_idx = self.worktree_selected_idx.saturating_sub(1);
+                    } else if self.worktree_selected_idx + 1 < row_count {
+                        self.worktree_selected_idx += 1;
+                    }
+                }
+                self.sync_focus_out();
+                return true;
+            }
             let target_id = self.selected_tree_thread_info().0;
             if self.is_terminal_thread(&target_id)
                 && self.last_frame_area.is_some()
@@ -1856,18 +2028,474 @@ impl App {
     }
 
     fn begin_rename_prefill(&mut self) {
-        let (target_id, target_title) = if self.focused_pane == FocusedPane::Tree {
-            self.selected_tree_thread_info()
-        } else {
-            let id = self.active_thread_id.clone();
-            let title = self.thread_title_or_empty(&id);
-            (id, title)
-        };
+        let (target_id, target_title) =
+            if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
+                self.selected_tree_thread_info()
+            } else {
+                let id = self.active_thread_id.clone();
+                let title = self.thread_title_or_empty(&id);
+                (id, title)
+            };
         self.pending_rename_thread_id = Some(target_id);
         self.input_buffer = format!("/rename {target_title}");
         self.cursor_position = self.input_buffer.len();
         self.focused_pane = FocusedPane::Composer;
+        self.sync_worktree_autocomplete(true);
         self.sync_focus_out();
+    }
+
+    pub fn active_worktree_path(&self) -> Option<String> {
+        let active_id = self.active_thread_id();
+        let cwd = self
+            .pty_screens
+            .get(active_id)
+            .and_then(|s| s.cwd.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.thread_meta
+                    .get(active_id)
+                    .and_then(|m| m.cwd.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+        if let Some(cwd) = cwd {
+            let cwd_comps = normalized_path_components(cwd);
+            if cwd_comps.is_empty() {
+                return None;
+            }
+            return self
+                .worktrees
+                .iter()
+                .filter_map(|w| {
+                    let w_comps = normalized_path_components(&w.path);
+                    if !w_comps.is_empty() && cwd_comps.starts_with(&w_comps) {
+                        Some((
+                            (w_comps.len(), w.path.trim_end_matches('/').len()),
+                            w.path.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .max_by_key(|(score, _)| *score)
+                .map(|(_, path)| path);
+        }
+        self.worktrees
+            .iter()
+            .find(|w| w.attached_thread_ids.iter().any(|id| id == active_id))
+            .map(|w| w.path.clone())
+    }
+
+    pub fn active_worktree_repo_root(&self) -> Option<String> {
+        if let Some(active_path) = self.active_worktree_path() {
+            if let Some(entry) = self.worktrees.iter().find(|w| w.path == active_path) {
+                return Some(entry.repo_root.clone());
+            }
+        }
+        let active_id = self.active_thread_id();
+        self.worktrees
+            .iter()
+            .find(|w| w.attached_thread_ids.iter().any(|id| id == active_id))
+            .map(|w| w.repo_root.clone())
+    }
+
+    pub fn visible_worktree_rows(&self) -> Vec<WorktreeRow> {
+        let q = self.worktree_filter_query.trim().to_ascii_lowercase();
+        let mut groups: Vec<(String, String, Vec<WorktreeEntry>)> = Vec::new();
+        for entry in &self.worktrees {
+            if let Some(last) = groups.last_mut() {
+                if last.0 == entry.repo_root {
+                    last.2.push(entry.clone());
+                    continue;
+                }
+            }
+            groups.push((
+                entry.repo_root.clone(),
+                entry.repo_name.clone(),
+                vec![entry.clone()],
+            ));
+        }
+
+        let mut rows = Vec::new();
+        for (repo_root, repo_name, entries) in groups {
+            let repo_matches = !q.is_empty() && repo_name.to_ascii_lowercase().contains(&q);
+            let filtered: Vec<WorktreeEntry> = if q.is_empty() || repo_matches {
+                entries
+            } else {
+                entries
+                    .into_iter()
+                    .filter(|e| worktree_matches_sidebar_filter(e, &q))
+                    .collect()
+            };
+            if filtered.is_empty() {
+                continue;
+            }
+            let collapsed = self.collapsed_worktree_repos.contains(&repo_root);
+            rows.push(WorktreeRow::RepoHeader {
+                repo_root,
+                repo_name,
+                count: filtered.len(),
+                collapsed,
+            });
+            if !collapsed {
+                for entry in filtered {
+                    rows.push(WorktreeRow::Entry(entry));
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn clamp_worktree_selection(&mut self) {
+        let count = self.visible_worktree_rows().len();
+        if count == 0 {
+            self.worktree_selected_idx = 0;
+            self.worktree_scroll_offset = 0;
+        } else {
+            self.worktree_selected_idx = self.worktree_selected_idx.min(count - 1);
+        }
+    }
+
+    pub fn worktree_autocomplete_candidates(&self) -> Vec<WorktreeAutocompleteItem> {
+        let query = parse_worktree_autocomplete_query(&self.input_buffer)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let active_repo = self.active_worktree_repo_root();
+        let mut active_entries = Vec::new();
+        let mut other_entries = Vec::new();
+        for entry in &self.worktrees {
+            if !query.is_empty() && !worktree_matches_autocomplete(entry, &query) {
+                continue;
+            }
+            if active_repo.as_deref() == Some(entry.repo_root.as_str()) {
+                active_entries.push(WorktreeAutocompleteItem::Existing(entry.clone()));
+            } else {
+                other_entries.push(WorktreeAutocompleteItem::Existing(entry.clone()));
+            }
+        }
+        let mut out = Vec::with_capacity(active_entries.len() + other_entries.len() + 1);
+        if query.is_empty() {
+            out.push(WorktreeAutocompleteItem::CreateNew);
+            out.extend(active_entries);
+            out.extend(other_entries);
+        } else {
+            out.extend(active_entries);
+            out.extend(other_entries);
+            out.push(WorktreeAutocompleteItem::CreateNew);
+        }
+        out
+    }
+
+    pub fn sync_worktree_autocomplete(&mut self, buffer_changed: bool) {
+        let eligible = self.focused_pane == FocusedPane::Composer
+            && !self.has_active_modal()
+            && parse_worktree_autocomplete_query(&self.input_buffer).is_some();
+        if !eligible {
+            self.worktree_autocomplete_open = false;
+            self.worktree_autocomplete_idx = 0;
+            return;
+        }
+        if buffer_changed {
+            let was_open = self.worktree_autocomplete_open;
+            self.worktree_autocomplete_open = true;
+            self.worktree_autocomplete_idx = 0;
+            if !was_open && !self.worktree_list_in_flight {
+                self.worktree_list_in_flight = true;
+                self.pending_actions.push_back(AppAction::ListWorktrees);
+            }
+        }
+        let count = self.worktree_autocomplete_candidates().len();
+        if count == 0 {
+            self.worktree_autocomplete_idx = 0;
+        } else {
+            self.worktree_autocomplete_idx = self.worktree_autocomplete_idx.min(count - 1);
+        }
+    }
+
+    pub fn toggle_worktrees_sidebar_view(&mut self) {
+        self.pending_rename_thread_id = None;
+        self.pending_g_prefix = false;
+        self.worktree_filter_active = false;
+        if self.sidebar_hidden {
+            self.sidebar_hidden = false;
+            self.sidebar_view = SidebarView::Worktrees;
+            self.focused_pane = FocusedPane::Tree;
+            self.clamp_worktree_selection();
+            self.worktree_list_in_flight = true;
+            self.pending_actions.push_back(AppAction::ListWorktrees);
+            self.sync_focus_out();
+            self.maybe_queue_terminal_resize();
+            return;
+        }
+        match self.sidebar_view {
+            SidebarView::Grein => {
+                self.sidebar_view = SidebarView::Worktrees;
+                self.focused_pane = FocusedPane::Tree;
+                self.clamp_worktree_selection();
+                self.worktree_list_in_flight = true;
+                self.pending_actions.push_back(AppAction::ListWorktrees);
+            }
+            SidebarView::Worktrees => {
+                self.sidebar_view = SidebarView::Grein;
+                self.focused_pane = FocusedPane::Tree;
+            }
+        }
+        self.sync_focus_out();
+    }
+
+    pub fn open_worktrees_sidebar_view(&mut self, filter_query: Option<String>) {
+        self.pending_rename_thread_id = None;
+        self.pending_g_prefix = false;
+        self.sidebar_hidden = false;
+        self.sidebar_view = SidebarView::Worktrees;
+        self.worktree_filter_active = false;
+        self.worktree_filter_query = filter_query.unwrap_or_default();
+        self.worktree_selected_idx = 0;
+        self.worktree_scroll_offset = 0;
+        self.clamp_worktree_selection();
+        self.focused_pane = FocusedPane::Tree;
+        self.worktree_list_in_flight = true;
+        self.pending_actions.push_back(AppAction::ListWorktrees);
+        self.sync_focus_out();
+        self.maybe_queue_terminal_resize();
+    }
+
+    pub fn resolve_worktree_query_target(&self, query: &str) -> Option<String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(exact) = self.worktrees.iter().find(|w| w.path == trimmed) {
+            return Some(exact.path.clone());
+        }
+        let q_lower = trimmed.to_ascii_lowercase();
+        let matches: Vec<&WorktreeEntry> = self
+            .worktrees
+            .iter()
+            .filter(|w| worktree_matches_autocomplete(w, &q_lower))
+            .collect();
+        if matches.len() == 1 {
+            Some(matches[0].path.clone())
+        } else {
+            None
+        }
+    }
+
+    fn toggle_worktree_repo_fold(&mut self, repo_root: &str) {
+        if !self.collapsed_worktree_repos.insert(repo_root.to_string()) {
+            self.collapsed_worktree_repos.remove(repo_root);
+        }
+        self.clamp_worktree_selection();
+        let rows = self.visible_worktree_rows();
+        if let Some(hdr_idx) = rows.iter().position(|r| {
+            matches!(r, WorktreeRow::RepoHeader { repo_root: rr, .. } if rr == repo_root)
+        }) {
+            if self.collapsed_worktree_repos.contains(repo_root) {
+                self.worktree_selected_idx = hdr_idx;
+            }
+        }
+    }
+
+    fn handle_key_worktree_autocomplete(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let candidates = self.worktree_autocomplete_candidates();
+        if candidates.is_empty() {
+            return false;
+        }
+        let idx = self.worktree_autocomplete_idx.min(candidates.len() - 1);
+
+        match key.code {
+            KeyCode::Down if !ctrl && !alt => {
+                self.worktree_autocomplete_idx = (idx + 1) % candidates.len();
+                true
+            }
+            KeyCode::Up if !ctrl && !alt => {
+                self.worktree_autocomplete_idx = (idx + candidates.len() - 1) % candidates.len();
+                true
+            }
+            KeyCode::Tab if !ctrl && !alt && !shift => {
+                match &candidates[idx] {
+                    WorktreeAutocompleteItem::CreateNew => {
+                        self.input_buffer = "/worktree".to_string();
+                    }
+                    WorktreeAutocompleteItem::Existing(entry) => {
+                        self.input_buffer = format!("/worktree {}", entry.path);
+                    }
+                }
+                self.cursor_position = self.input_buffer.len();
+                self.worktree_autocomplete_open = false;
+                self.worktree_autocomplete_idx = 0;
+                true
+            }
+            KeyCode::Enter if !ctrl && !alt && !shift => {
+                let selected = candidates[idx].clone();
+                self.input_buffer.clear();
+                self.cursor_position = 0;
+                self.worktree_autocomplete_open = false;
+                self.worktree_autocomplete_idx = 0;
+                let active_id = self.active_thread_id.clone();
+                match selected {
+                    WorktreeAutocompleteItem::CreateNew => {
+                        self.status_notice = Some("Allocating worktree...".to_string());
+                        self.pending_actions
+                            .push_back(AppAction::EnsureThreadWorktree {
+                                thread_id: active_id,
+                            });
+                    }
+                    WorktreeAutocompleteItem::Existing(entry) => {
+                        self.status_notice = Some("Switching worktree...".to_string());
+                        self.pending_actions
+                            .push_back(AppAction::SwitchThreadWorktree {
+                                thread_id: active_id,
+                                target_path: entry.path,
+                            });
+                    }
+                }
+                true
+            }
+            KeyCode::Esc if !ctrl && !alt => {
+                self.worktree_autocomplete_open = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_key_worktrees_tree(&mut self, key: KeyEvent) {
+        let no_ctrl_alt = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !no_ctrl_alt {
+            return;
+        }
+
+        let rows = self.visible_worktree_rows();
+        let selected_row = rows.get(self.worktree_selected_idx).cloned();
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !rows.is_empty() && self.worktree_selected_idx + 1 < rows.len() {
+                    self.worktree_selected_idx += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.worktree_selected_idx = self.worktree_selected_idx.saturating_sub(1);
+            }
+            KeyCode::Char('g') => {
+                self.pending_g_prefix = true;
+            }
+            KeyCode::Char(' ') => match selected_row {
+                Some(WorktreeRow::RepoHeader { repo_root, .. }) => {
+                    self.toggle_worktree_repo_fold(&repo_root);
+                }
+                Some(WorktreeRow::Entry(entry)) => {
+                    self.toggle_worktree_repo_fold(&entry.repo_root);
+                }
+                None => {}
+            },
+            KeyCode::Left | KeyCode::Char('h') => match selected_row {
+                Some(WorktreeRow::RepoHeader {
+                    repo_root,
+                    collapsed,
+                    ..
+                }) => {
+                    if !collapsed {
+                        self.collapsed_worktree_repos.insert(repo_root);
+                        self.clamp_worktree_selection();
+                    }
+                }
+                Some(WorktreeRow::Entry(entry)) => {
+                    if let Some(hdr_idx) = rows.iter().position(|r| {
+                        matches!(r, WorktreeRow::RepoHeader { repo_root, .. } if *repo_root == entry.repo_root)
+                    }) {
+                        self.worktree_selected_idx = hdr_idx;
+                    }
+                }
+                None => {}
+            },
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(WorktreeRow::RepoHeader {
+                    repo_root,
+                    collapsed,
+                    ..
+                }) = selected_row
+                {
+                    if collapsed {
+                        self.collapsed_worktree_repos.remove(&repo_root);
+                        self.clamp_worktree_selection();
+                    } else if self.worktree_selected_idx + 1 < rows.len()
+                        && matches!(rows.get(self.worktree_selected_idx + 1), Some(WorktreeRow::Entry(_)))
+                    {
+                        self.worktree_selected_idx += 1;
+                    }
+                }
+            }
+            KeyCode::Char('r') => {
+                self.status_notice = Some("Refreshing worktrees...".to_string());
+                self.worktree_list_in_flight = true;
+                self.pending_actions.push_back(AppAction::ListWorktrees);
+            }
+            KeyCode::Enter => match selected_row {
+                Some(WorktreeRow::RepoHeader { repo_root, .. }) => {
+                    self.toggle_worktree_repo_fold(&repo_root);
+                }
+                Some(WorktreeRow::Entry(entry)) => {
+                    let active_id = self.active_thread_id.clone();
+                    self.status_notice = Some("Switching worktree...".to_string());
+                    self.pending_actions
+                        .push_back(AppAction::SwitchThreadWorktree {
+                            thread_id: active_id,
+                            target_path: entry.path,
+                        });
+                }
+                None => {}
+            },
+            KeyCode::Char('t') => {
+                if let Some(WorktreeRow::Entry(entry)) = selected_row {
+                    let (rows, cols) = self.current_terminal_dims_or_default();
+                    let label = worktree_display_label(&entry);
+                    self.status_notice = None;
+                    self.pending_actions.push_back(AppAction::CreateTerminal {
+                        parent_thread_id: Some(self.active_thread_id.clone()),
+                        title: Some(format!("Shell ({label})")),
+                        cwd: Some(entry.path),
+                        rows,
+                        cols,
+                    });
+                }
+            }
+            KeyCode::Char('w' | 'n') => {
+                let thread_id = self.active_thread_id.clone();
+                self.status_notice = Some("Allocating worktree...".to_string());
+                self.pending_actions
+                    .push_back(AppAction::EnsureThreadWorktree { thread_id });
+            }
+            KeyCode::Char('d' | 'x') => {
+                if let Some(WorktreeRow::Entry(entry)) = selected_row {
+                    if entry.is_primary {
+                        self.status_notice =
+                            Some("Cannot delete primary repository worktree".to_string());
+                    } else {
+                        let label = worktree_display_label(&entry);
+                        self.pending_worktree_delete = Some(PendingWorktreeDelete {
+                            path: entry.path,
+                            label,
+                            dirty_count: entry.dirty_count,
+                            attached_count: entry.attached_thread_ids.len(),
+                            force: entry.dirty_count > 0,
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('z') => {
+                self.toggle_sidebar_zoom();
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_key_tree(&mut self, key: KeyEvent) -> Option<TreeAction> {
@@ -2027,11 +2655,12 @@ impl App {
     }
 
     fn handle_key_composer(&mut self, key: KeyEvent) -> bool {
+        let prev_buf = self.input_buffer.clone();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
 
-        match (key.code, ctrl, alt) {
+        let handled = match (key.code, ctrl, alt) {
             (KeyCode::Enter, _, _) => {
                 if key
                     .modifiers
@@ -2167,7 +2796,11 @@ impl App {
                 }
             }
             _ => false,
+        };
+        if handled && self.input_buffer != prev_buf {
+            self.sync_worktree_autocomplete(true);
         }
+        handled
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
@@ -2223,6 +2856,28 @@ impl App {
             return true;
         }
 
+        if let Some(pending) = self.pending_worktree_delete.clone() {
+            self.pending_g_prefix = false;
+            let no_ctrl_alt = !ctrl && !alt;
+            match key.code {
+                KeyCode::Char('y' | 'Y') if no_ctrl_alt => {
+                    self.pending_worktree_delete = None;
+                    self.status_notice = Some(format!("Deleting worktree {}...", pending.label));
+                    self.pending_actions.push_back(AppAction::RemoveWorktree {
+                        path: pending.path,
+                        force: pending.force,
+                    });
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc if no_ctrl_alt => {
+                    self.pending_worktree_delete = None;
+                    self.status_notice = Some("Delete worktree cancelled".to_string());
+                }
+                _ => {}
+            }
+            self.sync_focus_out();
+            return true;
+        }
+
         if self.config_picker.is_some() {
             self.pending_g_prefix = false;
             self.handle_key_config_picker(key);
@@ -2263,13 +2918,20 @@ impl App {
             return true;
         }
 
+        if ctrl && !alt && matches!(key.code, KeyCode::Char('t' | 'T')) {
+            self.toggle_worktrees_sidebar_view();
+            return true;
+        }
+
+        if alt && !ctrl && matches!(key.code, KeyCode::Char('z' | 'Z')) {
+            self.pending_g_prefix = false;
+            self.toggle_sidebar_zoom();
+            self.sync_focus_out();
+            return true;
+        }
+
         if self.focused_pane == FocusedPane::Terminal {
             self.pending_g_prefix = false;
-            if ctrl && !alt && matches!(key.code, KeyCode::Char('t' | 'T')) {
-                self.toggle_sidebar_zoom();
-                self.sync_focus_out();
-                return true;
-            }
             if self.is_terminal_exited(&self.active_thread_id) {
                 if key.code == KeyCode::Esc && !ctrl && !alt {
                     self.focus_tree();
@@ -2367,6 +3029,45 @@ impl App {
             return true;
         }
 
+        if self.focused_pane == FocusedPane::Tree
+            && self.sidebar_view == SidebarView::Worktrees
+            && self.worktree_filter_active
+        {
+            match key.code {
+                KeyCode::Esc if !ctrl && !alt => {
+                    self.worktree_filter_active = false;
+                    self.worktree_filter_query.clear();
+                    self.clamp_worktree_selection();
+                }
+                KeyCode::Enter | KeyCode::Down | KeyCode::Up if !ctrl && !alt => {
+                    self.worktree_filter_active = false;
+                    self.clamp_worktree_selection();
+                }
+                KeyCode::Backspace if !ctrl && !alt => {
+                    self.worktree_filter_query.pop();
+                    self.clamp_worktree_selection();
+                }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    self.worktree_filter_query.push(c);
+                    self.clamp_worktree_selection();
+                }
+                _ => {}
+            }
+            self.sync_focus_out();
+            return true;
+        }
+
+        if self.focused_pane == FocusedPane::Tree
+            && self.sidebar_view == SidebarView::Worktrees
+            && !ctrl
+            && !alt
+            && key.code == KeyCode::Char('/')
+        {
+            self.worktree_filter_active = true;
+            self.sync_focus_out();
+            return true;
+        }
+
         if matches!(self.focused_pane, FocusedPane::Tree | FocusedPane::Transcript) && !ctrl && !alt
         {
             match key.code {
@@ -2458,10 +3159,22 @@ impl App {
             _ => {}
         }
 
+        if !self.has_active_modal()
+            && self.focused_pane == FocusedPane::Composer
+            && self.worktree_autocomplete_open
+            && self.handle_key_worktree_autocomplete(key)
+        {
+            self.sync_focus_out();
+            return true;
+        }
+
         // Global Branch cycling within active root: Tab / Shift+Tab / BackTab
         match key.code {
             KeyCode::Tab if !ctrl && !alt => {
-                if self.focused_pane == FocusedPane::Tree && !shift {
+                if self.focused_pane == FocusedPane::Tree
+                    && self.sidebar_view == SidebarView::Grein
+                    && !shift
+                {
                     let (sel_id, _) = self.selected_tree_thread_info();
                     if self.is_terminal_thread(&sel_id) {
                         self.switch_thread(&sel_id);
@@ -2510,11 +3223,6 @@ impl App {
                 }
                 KeyCode::Char('o' | 'O') => {
                     self.toggle_transcript_cards();
-                    self.sync_focus_out();
-                    return true;
-                }
-                KeyCode::Char('t' | 'T') => {
-                    self.toggle_sidebar_zoom();
                     self.sync_focus_out();
                     return true;
                 }
@@ -2571,7 +3279,21 @@ impl App {
                 return true;
             }
             if self.focused_pane == FocusedPane::Tree {
-                let _ = self.activate_selected_tree_node();
+                if self.sidebar_view == SidebarView::Worktrees {
+                    if !self.worktree_filter_query.is_empty() {
+                        self.worktree_filter_query.clear();
+                        self.clamp_worktree_selection();
+                    } else {
+                        self.focused_pane = if self.active_is_terminal() {
+                            FocusedPane::Terminal
+                        } else {
+                            FocusedPane::Composer
+                        };
+                    }
+                    self.sync_focus_out();
+                } else {
+                    let _ = self.activate_selected_tree_node();
+                }
                 return true;
             }
         }
@@ -2648,7 +3370,11 @@ impl App {
             }
             _ => {
                 if self.focused_pane == FocusedPane::Tree {
-                    let _ = self.handle_key_tree(key);
+                    if self.sidebar_view == SidebarView::Worktrees {
+                        self.handle_key_worktrees_tree(key);
+                    } else {
+                        let _ = self.handle_key_tree(key);
+                    }
                     if key.code == KeyCode::Char('g') && !ctrl && !alt && had_g_prefix {
                         self.pending_g_prefix = false;
                     }

@@ -44,6 +44,20 @@ pub struct ThreadMeta {
     pub git_dirty: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeEntry {
+    pub repo_root: String,
+    pub repo_name: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub head_short: Option<String>,
+    pub is_primary: bool,
+    pub is_detached: bool,
+    pub is_grein_managed: bool,
+    pub dirty_count: usize,
+    pub attached_thread_ids: Vec<String>,
+}
+
 /// Terminal foreground/background color captured from VT100 emulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PtyColor {
@@ -405,6 +419,28 @@ pub trait TuiEnginePort: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "ensure_thread_worktree not supported",
+        ))
+    }
+
+    async fn list_worktrees(&self) -> io::Result<Vec<WorktreeEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn switch_thread_worktree(
+        &self,
+        _thread_id: &str,
+        _target_path: &str,
+    ) -> io::Result<String> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "switch_thread_worktree not supported",
+        ))
+    }
+
+    async fn remove_worktree(&self, _path: &str, _force: bool) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remove_worktree not supported",
         ))
     }
 

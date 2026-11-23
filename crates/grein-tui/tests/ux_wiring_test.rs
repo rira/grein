@@ -956,9 +956,9 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
         },
     );
 
-    // Toggle sidebar_hidden via Ctrl+T, /zoom, and Tree 'z'
+    // Toggle sidebar_hidden via Alt+Z, /zoom, and Tree 'z'
     assert!(!app.sidebar_hidden);
-    assert!(app.handle_key_event(ctrl('t')));
+    assert!(app.handle_key_event(alt('z')));
     assert!(app.sidebar_hidden);
 
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -1150,6 +1150,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
         "Composer & Slash Commands",
         "Ctrl+J",
         "Ctrl+T",
+        "Alt+Z",
         "Ctrl+O",
         "Ctrl+B",
         "Ctrl+F",

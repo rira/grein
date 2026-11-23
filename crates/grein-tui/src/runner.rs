@@ -25,11 +25,11 @@ use tokio::sync::mpsc;
 
 use crate::app::{
     find_config_option, match_config_choice, AnchorItem, App, AppAction, CopyMode, FocusedPane,
-    PendingPermission, ThreadItem, TreeAction, TuiError,
+    PendingPermission, SidebarView, ThreadItem, TreeAction, TuiError,
 };
 use crate::engine_port::{
     AgentOptionsSnapshot, AgentSlashCommand, HydratedSession, PtyScreenSnapshot, ThreadMeta,
-    TuiEngineEvent, TuiEnginePort,
+    TuiEngineEvent, TuiEnginePort, WorktreeEntry,
 };
 use crate::transcript::{ThreadTranscript, TranscriptBlock};
 
@@ -639,6 +639,8 @@ impl App {
     }
 
     pub fn submit_composer_prompt(&mut self, prompt: impl Into<String>) {
+        self.worktree_autocomplete_open = false;
+        self.worktree_autocomplete_idx = 0;
         let prompt = prompt.into();
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
@@ -833,13 +835,32 @@ impl App {
                 self.dispatch_create_terminal(Some(active_id), cwd);
                 return;
             }
-            "/worktree" => {
-                let active_id = self.active_thread_id.clone();
-                self.status_notice = Some("Allocating worktree...".to_string());
-                self.pending_actions
-                    .push_back(AppAction::EnsureThreadWorktree {
-                        thread_id: active_id,
-                    });
+            "/worktrees" => {
+                self.open_worktrees_sidebar_view(None);
+                return;
+            }
+            "/worktree" | "/wt" => {
+                if rest.is_empty() {
+                    let active_id = self.active_thread_id.clone();
+                    self.status_notice = Some("Allocating worktree...".to_string());
+                    self.pending_actions
+                        .push_back(AppAction::EnsureThreadWorktree {
+                            thread_id: active_id,
+                        });
+                } else {
+                    let query = parse_term_cwd(rest).unwrap_or_else(|| rest.to_string());
+                    if let Some(target_path) = self.resolve_worktree_query_target(&query) {
+                        let active_id = self.active_thread_id.clone();
+                        self.status_notice = Some("Switching worktree...".to_string());
+                        self.pending_actions
+                            .push_back(AppAction::SwitchThreadWorktree {
+                                thread_id: active_id,
+                                target_path,
+                            });
+                    } else {
+                        self.open_worktrees_sidebar_view(Some(query));
+                    }
+                }
                 return;
             }
             "/quit" => {
@@ -1198,6 +1219,17 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.pty_exit_codes.clear();
     app.last_pty_sizes.clear();
     app.config_picker = None;
+    app.pending_worktree_delete = None;
+    app.worktree_autocomplete_open = false;
+    app.worktree_autocomplete_idx = 0;
+    app.worktree_list_in_flight = false;
+    app.worktree_filter_active = false;
+    app.worktree_filter_query.clear();
+    app.worktrees.clear();
+    app.worktree_selected_idx = 0;
+    app.worktree_scroll_offset = 0;
+    app.collapsed_worktree_repos.clear();
+    app.sidebar_view = SidebarView::Grein;
     app.help_scroll_offset = 0;
     app.status_notice = None;
     app.pending_rename_thread_id = None;
@@ -1807,6 +1839,30 @@ enum RunnerLocalEvent {
         thread_id: String,
         path: String,
     },
+    WorktreesListed(Vec<WorktreeEntry>),
+    WorktreesListFailed(String),
+    WorktreeSwitched {
+        thread_id: String,
+        path: String,
+    },
+    WorktreeRemoved {
+        path: String,
+    },
+}
+
+async fn refresh_worktrees_and_metadata(
+    engine: &dyn TuiEnginePort,
+    local_ev_tx: &mpsc::UnboundedSender<RunnerLocalEvent>,
+) {
+    match engine.list_worktrees().await {
+        Ok(entries) => {
+            let _ = local_ev_tx.send(RunnerLocalEvent::WorktreesListed(entries));
+        }
+        Err(err) => {
+            let _ = local_ev_tx.send(RunnerLocalEvent::WorktreesListFailed(err.to_string()));
+        }
+    }
+    poll_metadata_to_local(engine, local_ev_tx).await;
 }
 
 async fn poll_metadata_to_local(
@@ -2186,11 +2242,61 @@ fn dispatch_action(
                     Ok(path) => {
                         let _ = local_ev_tx
                             .send(RunnerLocalEvent::WorktreeReady { thread_id, path });
-                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                        refresh_worktrees_and_metadata(engine.as_ref(), &local_ev_tx).await;
                     }
                     Err(err) => {
                         let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
                             "Worktree failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::ListWorktrees => {
+            tokio::spawn(async move {
+                match engine.list_worktrees().await {
+                    Ok(entries) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::WorktreesListed(entries));
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx
+                            .send(RunnerLocalEvent::WorktreesListFailed(err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::SwitchThreadWorktree {
+            thread_id,
+            target_path,
+        } => {
+            tokio::spawn(async move {
+                match engine
+                    .switch_thread_worktree(&thread_id, &target_path)
+                    .await
+                {
+                    Ok(path) => {
+                        let _ = local_ev_tx
+                            .send(RunnerLocalEvent::WorktreeSwitched { thread_id, path });
+                        refresh_worktrees_and_metadata(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Worktree switch failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::RemoveWorktree { path, force } => {
+            tokio::spawn(async move {
+                match engine.remove_worktree(&path, force).await {
+                    Ok(()) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::WorktreeRemoved { path });
+                        refresh_worktrees_and_metadata(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Delete worktree failed: {err}"
                         )));
                     }
                 }
@@ -2407,6 +2513,30 @@ pub async fn run_with_engine_events<B: Backend>(
                             meta.cwd = Some(path.clone());
                         }
                         app.status_notice = Some(format!("Worktree ready: {path}"));
+                    }
+                    RunnerLocalEvent::WorktreesListed(entries) => {
+                        app.worktree_list_in_flight = false;
+                        app.worktrees = entries;
+                        app.clamp_worktree_selection();
+                        app.sync_worktree_autocomplete(false);
+                        if app.status_notice.as_deref() == Some("Refreshing worktrees...") {
+                            app.status_notice = None;
+                        }
+                    }
+                    RunnerLocalEvent::WorktreesListFailed(err) => {
+                        app.worktree_list_in_flight = false;
+                        app.status_notice = Some(format!("List worktrees failed: {err}"));
+                    }
+                    RunnerLocalEvent::WorktreeSwitched { thread_id, path } => {
+                        if let Some(meta) = app.thread_meta.get_mut(&thread_id) {
+                            meta.cwd = Some(path.clone());
+                        }
+                        app.status_notice = Some(format!("Switched worktree: {path}"));
+                    }
+                    RunnerLocalEvent::WorktreeRemoved { path } => {
+                        app.worktrees.retain(|w| w.path != path);
+                        app.clamp_worktree_selection();
+                        app.status_notice = Some(format!("Deleted worktree: {path}"));
                     }
                     RunnerLocalEvent::OpenConfigPicker {
                         snapshot,

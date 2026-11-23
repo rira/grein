@@ -514,11 +514,11 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
     app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
-    // Render frame so pane dimensions are known, then Ctrl+T toggles zoom & triggers PtyResize without forwarding \x14
+    // Render frame so pane dimensions are known, then Alt+Z toggles zoom & triggers PtyResize without forwarding \x1bz
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     app.pending_actions.clear();
     assert!(!app.sidebar_hidden);
-    app.handle_key_event(ctrl('t'));
+    app.handle_key_event(alt('z'));
     assert!(app.sidebar_hidden);
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
     assert_eq!(
@@ -763,12 +763,12 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
     app.submit_composer_prompt("/copy");
     assert_eq!(app.last_copied_text.as_deref(), Some("hello pty\nline two"));
 
-    // Help modal includes t, T, Ctrl+G, Ctrl+T, /term [path], /worktree
+    // Help modal includes t, T, Ctrl+G, Ctrl+T, Alt+Z, /term [path], /worktree
     app.show_help_modal = true;
     let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let help = render_screen(&terminal);
-    for expected in ["t / T", "Ctrl+G", "Ctrl+T", "/term [path]", "/worktree"] {
+    for expected in ["t / T", "Ctrl+G", "Ctrl+T", "Alt+Z", "/term [path]", "/worktree"] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
 }
@@ -1019,7 +1019,7 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
     key_tx
         .send(Event::Paste("pwd".to_string()))
         .unwrap();
-    key_tx.send(Event::Key(ctrl('t'))).unwrap();
+    key_tx.send(Event::Key(alt('z'))).unwrap();
     wait_for("zoom resize sent", || {
         engine
             .state
@@ -1065,7 +1065,7 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
     assert!(!g
         .pty_writes
         .iter()
-        .any(|(_, b)| b == b"\x07" || b == b"\x14" || b == b"\x11"));
+        .any(|(_, b)| b == b"\x07" || b == b"\x14" || b == b"\x1bz" || b == b"\x11"));
 }
 
 #[tokio::test]

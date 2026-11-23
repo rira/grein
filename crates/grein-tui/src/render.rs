@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::app::{AppState, ConfigPickerModal, PaneFocus};
+use crate::app::{
+    worktree_display_label, AppState, ConfigPickerModal, PaneFocus, PendingWorktreeDelete,
+    SidebarView, WorktreeAutocompleteItem, WorktreeRow,
+};
 use crate::engine_port::{PtyCell, PtyColor, SubagentSnapshot, SubagentStatus};
 use crate::layout::{compute_layout_with_options, subagent_strip_height};
 use crate::runner::{compute_ordered_thread_entries_with_folds, compute_ordered_thread_indices};
@@ -295,11 +298,264 @@ fn render_thread_row(
     }
 }
 
+fn render_sidebar_title(state: &AppState) -> Line<'static> {
+    let active_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let (grein_style, wt_style) = match state.sidebar_view {
+        SidebarView::Grein => (active_style, dim_style),
+        SidebarView::Worktrees => (dim_style, active_style),
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled("ᛇ Grein", grein_style),
+        Span::styled(" │ ", dim_style),
+        Span::styled("⎇ Worktrees", wt_style),
+    ];
+    if state.sidebar_view == SidebarView::Worktrees && !state.worktree_filter_query.is_empty() {
+        spans.push(Span::styled(
+            format!(" /{}", state.worktree_filter_query),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+fn render_worktree_row(
+    row: &WorktreeRow,
+    is_selected: bool,
+    active_worktree_path: Option<&str>,
+) -> Line<'static> {
+    match row {
+        WorktreeRow::RepoHeader {
+            repo_name,
+            count,
+            collapsed,
+            ..
+        } => {
+            let arrow = if *collapsed { "▸" } else { "▾" };
+            let text = format!("{arrow} {repo_name} ({count})");
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            Line::from(Span::styled(text, style))
+        }
+        WorktreeRow::Entry(entry) => {
+            let is_active = active_worktree_path == Some(entry.path.as_str());
+            let label = worktree_display_label(entry);
+            if is_selected {
+                let sel_style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+                let mut spans = vec![Span::styled("  ", sel_style)];
+                if is_active {
+                    spans.push(Span::styled(
+                        "● ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                    ));
+                } else {
+                    spans.push(Span::styled("  ", sel_style));
+                }
+                spans.push(Span::styled(label, sel_style));
+                if entry.is_primary {
+                    spans.push(Span::styled(
+                        " (primary)",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::REVERSED),
+                    ));
+                }
+                if entry.dirty_count > 0 {
+                    spans.push(Span::styled(
+                        format!(" *{}", entry.dirty_count),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::REVERSED),
+                    ));
+                }
+                if !entry.attached_thread_ids.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" [{}]", entry.attached_thread_ids.len()),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::REVERSED),
+                    ));
+                }
+                Line::from(spans)
+            } else {
+                let label_style = if is_active {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let mut spans = vec![Span::raw("  ")];
+                if is_active {
+                    spans.push(Span::styled(
+                        "● ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(label, label_style));
+                if entry.is_primary {
+                    spans.push(Span::styled(
+                        " (primary)",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                if entry.dirty_count > 0 {
+                    spans.push(Span::styled(
+                        format!(" *{}", entry.dirty_count),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                if !entry.attached_thread_ids.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" [{}]", entry.attached_thread_ids.len()),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                Line::from(spans)
+            }
+        }
+    }
+}
+
+fn render_worktrees_view(
+    f: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    tree_focused: bool,
+) -> (usize, Option<Position>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style(tree_focused))
+        .title(render_sidebar_title(state));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return (state.worktree_scroll_offset, None);
+    }
+
+    let show_filter_bar = state.worktree_filter_active || !state.worktree_filter_query.is_empty();
+    let filter_h = u16::from(show_filter_bar && inner.height >= 2);
+    let mut filter_cursor = None;
+
+    if filter_h == 1 {
+        let hint = if state.worktree_filter_active {
+            " (Enter/Esc)"
+        } else {
+            " (Esc clear)"
+        };
+        let filter_line = Line::from(vec![
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(state.worktree_filter_query.clone()),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(
+            Paragraph::new(filter_line),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        if state.worktree_filter_active
+            && tree_focused
+            && !state.has_active_modal()
+            && !state.transcript_search.editing
+        {
+            let q_w = Span::raw(&state.worktree_filter_query).width() as u16;
+            let cursor_x = inner.x + (1 + q_w).min(inner.width.saturating_sub(1));
+            filter_cursor = Some(Position::new(cursor_x, inner.y));
+        }
+    }
+
+    let list_area = Rect::new(
+        inner.x,
+        inner.y + filter_h,
+        inner.width,
+        inner.height.saturating_sub(filter_h),
+    );
+    let rows = state.visible_worktree_rows();
+    let active_path = state.active_worktree_path();
+    let (lines, selected_line_idx) = if rows.is_empty() {
+        let msg = if state.worktree_list_in_flight {
+            "  Loading worktrees..."
+        } else if !state.worktree_filter_query.is_empty() {
+            "  No matching worktrees"
+        } else {
+            "  No git worktrees found"
+        };
+        (
+            vec![Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            ))],
+            None,
+        )
+    } else {
+        let sel = state.worktree_selected_idx.min(rows.len() - 1);
+        let built = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| render_worktree_row(row, idx == sel, active_path.as_deref()))
+            .collect();
+        (built, Some(sel))
+    };
+
+    let scroll_offset = compute_tree_scroll_offset(
+        state.worktree_scroll_offset.min(u16::MAX as usize) as u16,
+        selected_line_idx,
+        lines.len(),
+        list_area.height,
+    );
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll_offset, 0)),
+        list_area,
+    );
+    (scroll_offset as usize, filter_cursor)
+}
+
 pub fn render_tree_view(f: &mut Frame, area: Rect, state: &AppState) {
     let _ = render_tree_view_inner(f, area, state);
 }
 
-fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
+struct TreeRenderResult {
+    tree_scroll: u16,
+    worktree_scroll: usize,
+    filter_cursor: Option<Position>,
+}
+
+fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> TreeRenderResult {
+    let tree_focused = state.active_focus == PaneFocus::Tree
+        || state.focused_pane == PaneFocus::Tree
+        || state.focus == PaneFocus::Tree;
+
+    if state.sidebar_view == SidebarView::Worktrees {
+        let (worktree_scroll, filter_cursor) = render_worktrees_view(f, area, state, tree_focused);
+        return TreeRenderResult {
+            tree_scroll: state.tree.scroll_offset,
+            worktree_scroll,
+            filter_cursor,
+        };
+    }
+
     let mut lines = Vec::new();
     let selected = state.tree.selected_index();
     let mut selected_line_idx: Option<usize> = None;
@@ -390,18 +646,19 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> u16 {
         inner_height,
     );
 
-    let tree_focused = state.active_focus == PaneFocus::Tree
-        || state.focused_pane == PaneFocus::Tree
-        || state.focus == PaneFocus::Tree;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style(tree_focused))
-        .title(" ᛇ Grein ");
+        .title(render_sidebar_title(state));
     let paragraph = Paragraph::new(lines)
         .block(block)
         .scroll((scroll_offset, 0));
     f.render_widget(paragraph, area);
-    scroll_offset
+    TreeRenderResult {
+        tree_scroll: scroll_offset,
+        worktree_scroll: state.worktree_scroll_offset,
+        filter_cursor: None,
+    }
 }
 
 /// Renders the application state into the terminal frame.
@@ -423,6 +680,7 @@ struct RenderMetrics {
     thread_id: String,
     max_scroll: u16,
     tree_scroll: u16,
+    worktree_scroll: usize,
     transcript_inner_height: u16,
     composer_scroll_y: u16,
     help_scroll_offset: u16,
@@ -438,6 +696,7 @@ pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
         .transcript_viewport_mut(&metrics.thread_id)
         .set_max_scroll(metrics.max_scroll as usize);
     state.tree.scroll_offset = metrics.tree_scroll;
+    state.worktree_scroll_offset = metrics.worktree_scroll;
     state.transcript_viewport_height = metrics.transcript_inner_height;
     state.composer_scroll_y = metrics.composer_scroll_y;
     state.last_frame_area = Some(metrics.frame_area);
@@ -764,8 +1023,10 @@ fn render_status_bar(
         let left_hint = if active_is_terminal && terminal_focused {
             if state.terminal_exit_code(active_id).is_some() {
                 "exited · Enter restart · Esc/Ctrl+G tree".to_string()
-            } else {
+            } else if state.status_notice.is_some() {
                 "Ctrl+G for tree".to_string()
+            } else {
+                "Ctrl+G for tree · Ctrl+T wt · Alt+Z zoom".to_string()
             }
         } else if is_busy {
             format!(
@@ -773,10 +1034,23 @@ fn render_status_bar(
                 crate::app::active_shell_label()
             )
         } else if state.focused_pane == PaneFocus::Tree {
-            "t/T term · a agent · w worktree · / search · F1 help".to_string()
-        } else {
+            match state.sidebar_view {
+                SidebarView::Grein => {
+                    "t/T term · a agent · w worktree · / search · F1 help".to_string()
+                }
+                SidebarView::Worktrees => {
+                    "Enter attach · t term · w/n new · d/x del · / filter · Ctrl+T tree"
+                        .to_string()
+                }
+            }
+        } else if state.status_notice.is_some() {
             format!(
                 "Ctrl+G tree · Alt+T {} · F1 help",
+                crate::app::active_shell_label()
+            )
+        } else {
+            format!(
+                "Ctrl+G tree · Alt+T {} · F1 help · Ctrl+T wt · Alt+Z zoom",
                 crate::app::active_shell_label()
             )
         };
@@ -1037,8 +1311,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                 ),
                 ("Ctrl+N / Alt+N, Alt+R / F2", shell_desc),
                 (
-                    "Ctrl+T / Ctrl+O / Alt+Y",
-                    "Zoom / tool cards / copy (Ctrl+C/Ctrl+Q)".to_string(),
+                    "Ctrl+T / Alt+Z / Ctrl+O",
+                    "⎇ Worktrees / Zoom / cards (Alt+Y, Ctrl+C)".to_string(),
                 ),
             ],
         ),
@@ -1092,7 +1366,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                 ),
                 (
                     "/model, /mode, /thinking",
-                    "Pick model/mode/thinking (/effort)".to_string(),
+                    "Pick model/mode (/effort), /wt, /worktrees".to_string(),
                 ),
                 (
                     "/commands, /copy, /zoom",
@@ -1291,9 +1565,7 @@ fn render_terminal_pane(
             && preview_title.is_none()
             && !snap.hide_cursor
             && !snap.exited
-            && state.pending_permission.is_none()
-            && state.config_picker.is_none()
-            && !state.show_help_modal
+            && !state.has_active_modal()
             && !state.transcript_search.editing
         {
             let cursor_x = inner.x + snap.cursor_col.min(inner.width.saturating_sub(1));
@@ -1424,13 +1696,209 @@ fn recompute_search_for_render(
     Some(fresh)
 }
 
+fn render_worktree_delete_modal(f: &mut Frame, area: Rect, pending: &PendingWorktreeDelete) {
+    let popup_width = area.width.saturating_sub(8).clamp(28, 72).min(area.width);
+    let mut lines = Vec::new();
+    lines.push(Line::raw(""));
+    if pending.dirty_count > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Dirty ({} files)! Force delete {}? [y/N]",
+                pending.dirty_count, pending.label
+            ),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("Delete worktree {}? [y/N]", pending.label),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("Path: {}", pending.path),
+        Style::default().fg(Color::DarkGray),
+    )));
+    if pending.attached_count > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} attached thread(s) will reset to repo root",
+                pending.attached_count
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "[y] Delete  [n/Esc] Cancel",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let popup_height = (lines.len() as u16 + 3)
+        .max(8)
+        .min(area.height.max(1));
+    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+    let border_color = if pending.dirty_count > 0 {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let block = Block::default()
+        .title(" Delete Worktree ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        );
+    let widget = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(widget, popup_area);
+}
+
+fn render_worktree_autocomplete_popup(f: &mut Frame, composer_area: Rect, state: &AppState) {
+    if composer_area.y < 3 || composer_area.width < 20 {
+        return;
+    }
+    let candidates = state.worktree_autocomplete_candidates();
+    if candidates.is_empty() {
+        return;
+    }
+    let max_visible = candidates.len().min(8);
+    let popup_height = (max_visible as u16 + 2).min(composer_area.y);
+    if popup_height < 3 {
+        return;
+    }
+    let popup_y = composer_area.y.saturating_sub(popup_height);
+    let popup_area = Rect::new(composer_area.x, popup_y, composer_area.width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(" Worktrees (Tab complete · Enter attach) ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let selected = state.worktree_autocomplete_idx.min(candidates.len() - 1);
+    let scroll = compute_tree_scroll_offset(0, Some(selected), candidates.len(), inner.height);
+    let lines: Vec<Line<'static>> = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let is_selected = idx == selected;
+            let sel_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            match item {
+                WorktreeAutocompleteItem::CreateNew => {
+                    if is_selected {
+                        Line::from(vec![
+                            Span::styled(" ▶ + New isolated worktree", sel_style),
+                            Span::styled(
+                                " — create branch worktree",
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::REVERSED),
+                            ),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::styled(
+                                "   + New isolated worktree",
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                " — create branch worktree",
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ])
+                    }
+                }
+                WorktreeAutocompleteItem::Existing(entry) => {
+                    let branch = worktree_display_label(entry);
+                    let primary_tag = if entry.is_primary { " (primary)" } else { "" };
+                    if is_selected {
+                        let mut spans = vec![Span::styled(
+                            format!(" ▶ {} │ {branch}{primary_tag}", entry.repo_name),
+                            sel_style,
+                        )];
+                        if entry.dirty_count > 0 {
+                            spans.push(Span::styled(" │ ", sel_style));
+                            spans.push(Span::styled(
+                                format!("*{}", entry.dirty_count),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                            ));
+                        }
+                        if !entry.attached_thread_ids.is_empty() {
+                            spans.push(Span::styled(
+                                format!(" [{}]", entry.attached_thread_ids.len()),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::REVERSED),
+                            ));
+                        }
+                        Line::from(spans)
+                    } else {
+                        let mut spans = vec![
+                            Span::raw("   "),
+                            Span::styled(
+                                entry.repo_name.clone(),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(format!("{branch}{primary_tag}")),
+                        ];
+                        if entry.dirty_count > 0 {
+                            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                            spans.push(Span::styled(
+                                format!("*{}", entry.dirty_count),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                        if !entry.attached_thread_ids.is_empty() {
+                            spans.push(Span::styled(
+                                format!(" [{}]", entry.attached_thread_ids.len()),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        Line::from(spans)
+                    }
+                }
+            }
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+}
+
 fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let active_id = state.active_thread_id();
     let active_is_terminal = state.is_terminal_thread(active_id);
     let tree_focused = state.active_focus == PaneFocus::Tree
         || state.focused_pane == PaneFocus::Tree
         || state.focus == PaneFocus::Tree;
-    let preview = if tree_focused && !state.sidebar_hidden {
+    let preview = if tree_focused && !state.sidebar_hidden && state.sidebar_view == SidebarView::Grein {
         selected_tree_thread(state).filter(|(sel_id, _)| *sel_id != active_id)
     } else {
         None
@@ -1492,8 +1960,12 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             || state.focused_pane == PaneFocus::Composer
             || state.focus == PaneFocus::Composer);
 
-    let tree_scroll = if state.sidebar_hidden {
-        state.tree.scroll_offset
+    let tree_result = if state.sidebar_hidden {
+        TreeRenderResult {
+            tree_scroll: state.tree.scroll_offset,
+            worktree_scroll: state.worktree_scroll_offset,
+            filter_cursor: None,
+        }
     } else {
         render_tree_view_inner(f, layout.tree_area, state)
     };
@@ -1595,9 +2067,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         f.render_widget(composer_widget, layout.composer_area);
 
         if composer_focused
-            && state.pending_permission.is_none()
-            && state.config_picker.is_none()
-            && !state.show_help_modal
+            && !state.has_active_modal()
             && !state.transcript_search.editing
         {
             let visible_row = composer_layout.cursor_row.saturating_sub(composer_scroll_y);
@@ -1610,6 +2080,10 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
                 + 1
                 + visible_row.min(inner_height.saturating_sub(1));
             f.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
+
+        if composer_focused && state.worktree_autocomplete_open && !state.has_active_modal() {
+            render_worktree_autocomplete_popup(f, layout.composer_area, state);
         }
     }
 
@@ -1629,9 +2103,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     );
 
     if effective_search.editing
-        && state.pending_permission.is_none()
-        && state.config_picker.is_none()
-        && !state.show_help_modal
+        && !state.has_active_modal()
         && layout.status_bar_area.width > 1
         && layout.status_bar_area.height > 0
     {
@@ -1639,6 +2111,10 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         let cursor_x = layout.status_bar_area.x
             + (1 + query_w).min(layout.status_bar_area.width.saturating_sub(1));
         f.set_cursor_position(Position::new(cursor_x, layout.status_bar_area.y));
+    } else if let Some(filter_pos) = tree_result.filter_cursor {
+        if !state.has_active_modal() {
+            f.set_cursor_position(filter_pos);
+        }
     }
 
     let mut rendered_help_scroll = state.help_scroll_offset;
@@ -1674,6 +2150,8 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             .block(popup_block)
             .wrap(Wrap { trim: false });
         f.render_widget(popup_widget, popup_area);
+    } else if let Some(ref pending) = state.pending_worktree_delete {
+        render_worktree_delete_modal(f, f.area(), pending);
     } else if let Some(ref picker) = state.config_picker {
         render_config_picker_modal(f, f.area(), picker);
     } else if state.show_help_modal {
@@ -1683,7 +2161,8 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     RenderMetrics {
         thread_id: display_thread_id.to_string(),
         max_scroll: max_scroll_u16,
-        tree_scroll,
+        tree_scroll: tree_result.tree_scroll,
+        worktree_scroll: tree_result.worktree_scroll,
         transcript_inner_height,
         composer_scroll_y,
         help_scroll_offset: rendered_help_scroll,
