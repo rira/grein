@@ -1953,10 +1953,22 @@ impl App {
                 self.copy_transcript_content(CopyMode::LastReply);
                 None
             }
-            KeyCode::Char('n') if no_ctrl_alt => {
+            KeyCode::Char('a' | 'n') if no_ctrl_alt => {
                 self.status_notice = None;
                 self.pending_actions
                     .push_back(AppAction::CreateRoot { title: None });
+                None
+            }
+            KeyCode::Char('w') if no_ctrl_alt => {
+                let (sel_id, _) = self.selected_tree_thread_info();
+                let thread_id = if sel_id.is_empty() {
+                    self.active_thread_id.clone()
+                } else {
+                    sel_id
+                };
+                self.status_notice = Some("Allocating worktree...".to_string());
+                self.pending_actions
+                    .push_back(AppAction::EnsureThreadWorktree { thread_id });
                 None
             }
             KeyCode::Char('t') if no_ctrl_alt => {

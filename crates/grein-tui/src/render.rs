@@ -772,6 +772,8 @@ fn render_status_bar(
                 "Esc cancel · Ctrl+G tree · Alt+T {}",
                 crate::app::active_shell_label()
             )
+        } else if state.focused_pane == PaneFocus::Tree {
+            "t/T term · a agent · w worktree · / search · F1 help".to_string()
         } else {
             format!(
                 "Ctrl+G tree · Alt+T {} · F1 help",
@@ -1053,11 +1055,11 @@ fn render_help_modal(f: &mut Frame, area: Rect, requested_scroll: u16) -> u16 {
                 ),
                 (
                     "n / r / m (ᛇ Grein)",
-                    "New root/rename/join (f fork, d/x close)".to_string(),
+                    "a/n new Agent root, rename/join, f/d/x".to_string(),
                 ),
                 (
-                    "t / T, z / y / q (ᛇ Grein)",
-                    "Child/root >_ term, zoom / copy / quit".to_string(),
+                    "t / T, w, z/y/q (ᛇ Grein)",
+                    ">_ term, worktree (Agent/>_), zoom/copy/q".to_string(),
                 ),
             ],
         ),

@@ -58,7 +58,7 @@ Each branch head (`Thread`) tracks explicit tree lineage and lifecycle state:
 To provide rapid branching without cluttering the interface with trivial step-by-step checklists, the parser applies structural heuristics:
 1. **Markdown Headings:** All `#`, `##`, `###`, `####` elements are automatically registered as Primary Anchors.
 2. **Titled Numbered Lists:** Numbered items matching `^([0-9]+)\.\s+(\*\*[^*]+\*\*|[^:\n]+:|^[\n]{20,})` are registered as Secondary Anchors (e.g. `1. **Database Schema**:` or `1. API Gateway Routing:`). Trivial short items (e.g. `1. Run tests`, `2. Commit code`) are filtered out to prevent anchor spam.
-3. **Manual Branch Forking & Blank Roots:** Users can fork a child branch from the active context via `Ctrl+N`, `/fork`, `/branch`, or `/grein`, or create a blank independent root context (`parent_thread_id = None`) via `Alt+N`, `/root`, `/new`, or `n` in `ᛇ Grein`.
+3. **Manual Branch Forking & Blank Roots:** Users can fork a child branch from the active context via `Ctrl+N`, `/fork`, `/branch`, or `/grein`, or create a blank independent root context (`parent_thread_id = None`) via `Alt+N`, `/root`, `/new`, or `a` / `n` in `ᛇ Grein`.
 
 #### Branch Context Resolution
 When a prompt is dispatched for Thread $K$ branching from Anchor $A$ at Turn $N$:
@@ -145,7 +145,7 @@ Rather than mutating a global shared Blackboard across unrelated tasks, **grein*
    * Branches inherit ancestor turns along `Root -> parent_node_id`, while sibling branches remain completely invisible to one another during context compilation.
    * Global Blackboard working memory is not injected into prompts, avoiding prompt prefix invalidation and cross-talk.
 2. **Independent Blank Roots & In-Place Renaming:**
-   * Create a blank top-level root (`parent_thread_id = None`) at any time via `/root [title]`, `/new [title]`, `Alt+N`, or `n` in `ᛇ Grein`. Each root starts a fresh DAG tree with zero shared context from other roots.
+   * Create a blank top-level root (`parent_thread_id = None`) at any time via `/root [title]`, `/new [title]`, `Alt+N`, or `a` / `n` in `ᛇ Grein`. Each root starts a fresh DAG tree with zero shared context from other roots.
    * Rename the active or selected context via `/rename <title>`, `Alt+R`, `F2`, or `r` in `ᛇ Grein`.
 3. **Manual Branch Join (`/join`, `/merge`, `m` in `ᛇ Grein`):**
    * When a branch finishes an investigation or sub-task, the user manually joins it into its parent branch (resolved via `parent_thread_id`, or an explicit target) using `/join [summary]`, `/merge [summary]`, or `m` on the selected branch in `ᛇ Grein`.
@@ -290,7 +290,8 @@ All conversation DAG nodes, thread lineage metadata, and anchors are stored tran
 * `anchors` & `node_anchors`: Extracted structural anchors linked to turn nodes.
 * `blackboard_entries`: **Legacy compatibility table** retained read-compatible in the schema for safe migration and opening of older `.grein/session.db` files; **unused by pure-tree context compilation**.
 
-#### 3. State Hydration on Launch
+#### 3. State Hydration & Startup Modes on Launch
+* By default (`grein`), fresh sessions launch **terminal-first** directly into a live `>_` `$SHELL` PTY (`FocusedPane::Terminal`). Passing `grein --agent` starts directly in ACP Agent mode (`FocusedPane::Composer`), and pressing `a` in `ᛇ Grein` creates a new Agent root at any time.
 * Launching `grein` in a repository immediately resumes the active session, restoring all roots, branches (`parent_thread_id` hierarchy), `[joined]` status, unmerged worktrees, and input drafts.
 * If a previous run was abruptly killed (e.g. terminal crash), the SQLite WAL journal recovers state cleanly and cleans up orphaned PIDs.
 
@@ -324,6 +325,7 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 
 #### Left Column (`34%` width): `ᛇ Grein` Context Tree Sidebar
 * Displays the full multi-root mixed Agent + Terminal forest: top-level Agent roots marked with `ᛉ`, Terminal nodes marked with `>_` (plus `[exit N]` / `[exited]` badge when terminated), and child branches nested depth-first via `parent_thread_id` with Unicode box-drawing connectors (`├─`, `└─`, `│`).
+* **Tree Actions:** Create a new Agent root (`a` / `n`), spawn child/root terminals (`t` / `T`), fork (`f`), allocate an isolated git worktree on either Agent or `>_` Terminal nodes (`w`), rename (`r`), join (`m`), or close (`d` / `x`).
 * **Tree Folding (`Space`, `h`/`←`, `l`/`→`):** Subtrees with children can be collapsed (`▸ <label> (+N)` showing hidden descendant count) via `Space` or `h`/`←` (on an already-folded or leaf node, `h`/`←` jumps selection to `parent_thread_id`), and unfolded in-place via `Space` or `l`/`→` (while `l`/`→` on an unfolded node or `Enter` activates it). Switching or jumping to a hidden thread (`Tab`, `Alt+T`, `ThreadCreated`) automatically unfolds all collapsed ancestors.
 * Real-time status glyphs (`●` streaming/executing/thinking, `⚠` permission required or error) and `[joined]` suffix on merged branches.
 * **Live Preview on Browse:** Moving the cursor (`↑`/`↓`, `j`/`k`) in `ᛇ Grein` immediately previews that context's transcript (`Transcript (Preview: <title>)`) or live VT100 terminal screen (`Terminal (Preview: <title>)`, fetching `pty_snapshot` if missing and hiding the Agent `Composer`) while keeping focus in `ᛇ Grein` until confirmed with `Enter`, `l`, `→` (`Right`), `Esc`, `Ctrl+G`, or `Tab` (on a terminal node).
@@ -339,7 +341,7 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 #### Bottom Area: `Composer`, Optional `Subagents` Strip & Status Bar
 * **`Composer`:** Soft-wraps single and multi-line drafts to inner cell width, auto-grows from 3 to 10 lines following the active cursor row, preserves an independent input draft per context, supports full Readline editing/kill-ring shortcuts (`Ctrl+A`/`E`, `Ctrl+B`/`←`/`→`, `Alt+B`/`F`), `!cmd` PTY shell execution, and slash commands including interactive `/model`, `/mode`, `/thinking` (`/effort`), `/commands`, and terminal aliases (`/term`, `/terminal`, `/zsh`, `/sh`, `/shell`, `/bash`).
 * **`Subagents` Strip:** Auto-hiding panel below `Composer` (renders only when subagents are active on the focused context, up to 5 rows + `+N more` overflow) showing live subagent type, role, model, activity, and elapsed time.
-* **1-Line Status Bar:** Left side displays `Ctrl+G tree · Alt+T <shell> · F1 help` (using `$SHELL` basename, fallback `sh`), `Esc cancel · Ctrl+G tree · Alt+T <shell>` while streaming/executing, `Ctrl+G for tree` (plus `[scroll -N]` when scrolled) in live `Terminal`, `exited · Enter restart · Esc/Ctrl+G tree` in an exited `Terminal`, or the active search prompt `/{query} [N/M]` / `?{query} [N/M]`, plus status notices; right side displays optional worktree `⎇ <branch>` / `⎇ <branch>*` badge, `<mode> · <short_cwd|model> · <live_status> · <N subagents>`.
+* **1-Line Status Bar:** Left side displays `Ctrl+G tree · Alt+T <shell> · F1 help` in `Composer`/`Transcript` (using `$SHELL` basename, fallback `sh`), `t/T term · a agent · w worktree · / search · F1 help` when `ᛇ Grein` is focused (idle), `Esc cancel · Ctrl+G tree · Alt+T <shell>` while streaming/executing, `Ctrl+G for tree` (plus `[scroll -N]` when scrolled) in live `Terminal`, `exited · Enter restart · Esc/Ctrl+G tree` in an exited `Terminal`, or the active search prompt `/{query} [N/M]` / `?{query} [N/M]`, plus status notices; right side displays optional worktree `⎇ <branch>` / `⎇ <branch>*` badge, `<mode> · <short_cwd|model> · <live_status> · <N subagents>`.
 
 ---
 
@@ -384,8 +386,9 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | `g` / `G` | Jump active/previewed `Transcript` to top / bottom |
 | `Enter` | Activate selected branch/root (or anchor) and focus `Composer` (or `Terminal` for `>_` nodes) |
 | `t` / `T` | Open a child terminal under the selected context (`t`, inherits `cwd`) or a blank root terminal (`T`) |
+| `a` / `n` | Create a new blank independent Agent root context (when search is inactive) |
+| `w` | Allocate/attach an isolated git worktree (`/worktree`) on the selected Agent or `>_` Terminal context |
 | `f` | Fork a new child branch off the selected context |
-| `n` | Create a new blank independent root context (when search is inactive) |
 | `r` | Prefill `/rename <title>` for the selected context and focus `Composer` |
 | `m` | Manually join (`/join`) the selected branch into its parent branch |
 | `d` / `x` | Close/delete the selected context (when >1 context exists) |
@@ -416,7 +419,7 @@ The interface uses a **pure 2-column responsive layout** powered by Ratatui—wi
 | :--- | :--- |
 | `!cmd` | Execute shell command in a PTY under the active context (`$ cmd (exit N)` with ANSI rendering) |
 | `/term [path]` (`/terminal`, `/zsh`, `/sh`, `/shell`, `/bash`) | Spawn an interactive child PTY terminal (inheriting active context's `cwd` or overriding with `[path]`, case-insensitive) and focus `Terminal` |
-| `/worktree` | Opt-in allocate/attach an isolated git worktree `cwd` for the active thread (inherited by child terminals) |
+| `/worktree` | Opt-in allocate/attach an isolated git worktree `cwd` for the active Agent or `>_` Terminal thread (inherited by child terminals; also bound to `w` in `ᛇ Grein`) |
 | `/fork [title]`, `/branch [title]`, `/grein [title]` | Fork a new child branch off the active context (`parent_thread_id`) |
 | `/root [title]`, `/new [title]` | Create a new blank independent root context |
 | `/rename <name>` | Rename the active or selected context |
@@ -470,7 +473,7 @@ To give instant situational awareness across all active roots and branches witho
 * **Process Execution Model:** Native OS subprocess runner (`tokio::process::Command`) and PTY shell runner with `cwd` scoped to the dedicated worktree directory. Environment sanitization with explicit `PATH` pass-through. Zero container requirement (no Docker, no Podman).
 * **Distribution Target:** Single static or self-contained binary packaged for Homebrew (`brew install`), Nix (`nix profile install` / Flake), and Cargo (`cargo install`).
 * **Deployment Topology (Single Binary, Dual Mode):**
-  * **Default (Standalone):** `grein` (or `grein standalone`) launches TUI and embeds the daemon engine internally within Tokio tasks. Zero socket setup required.
+  * **Default (Standalone):** `grein` (or `grein standalone`) launches TUI terminal-first in a live `>_` `$SHELL` and embeds the daemon engine internally within Tokio tasks (`grein --agent` starts in ACP Agent mode). Zero socket setup required.
   * **Headless / Multi-Client:** `grein daemon` runs headless in the background; `grein attach` connects over a local Unix domain socket (`.grein/daemon.sock`).
   * **Headless Inspection Subcommands:** `grein threads`, `grein status`, and `grein agents --json` for scriptable and CLI introspection.
 

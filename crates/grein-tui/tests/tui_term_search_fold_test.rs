@@ -1093,3 +1093,159 @@ fn test_worktree_git_status_badge_clean_dirty_and_none() {
     assert!(term_status.contains("⎇ feat/dirty*"), "{term_status}");
     assert!(term_status.contains("wt-dirty"), "{term_status}");
 }
+
+#[test]
+fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
+    let mut app = App::new();
+    apply_hydrated_session(
+        &mut app,
+        &HydratedSession {
+            active_thread_id: "t-agent".to_string(),
+            threads: vec![
+                HydratedThread {
+                    id: "t-agent".to_string(),
+                    title: "Main Agent".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-agent-2".to_string(),
+                    title: "Side Agent".to_string(),
+                    turns: Vec::new(),
+                },
+                HydratedThread {
+                    id: "t-term".to_string(),
+                    title: "Shell".to_string(),
+                    turns: Vec::new(),
+                },
+            ],
+        },
+    );
+    apply_engine_event(
+        &mut app,
+        TuiEngineEvent::ThreadMetadataUpdated {
+            meta: vec![
+                meta_entry("t-agent", None, ThreadKind::Agent, None, None, 0),
+                meta_entry("t-agent-2", Some("t-agent"), ThreadKind::Agent, None, None, 0),
+                meta_entry("t-term", Some("t-agent"), ThreadKind::Terminal, None, None, 0),
+            ],
+        },
+    );
+
+    let expected_shell = active_shell_label();
+    let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+
+    // 1. Tree focus displays Tree-specific action hint on idle Agent and Terminal threads
+    app.set_focus(FocusedPane::Tree);
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
+    assert!(
+        tree_status.contains("t/T term · a agent · w worktree · / search · F1 help"),
+        "Tree status bar must render Tree action hints:\n{tree_status}"
+    );
+
+    // Busy agent still keeps Esc cancel hint even when Tree is focused
+    app.thread_statuses
+        .insert("t-agent".to_string(), "streaming".to_string());
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let busy_tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
+    assert!(
+        busy_tree_status.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {expected_shell}")),
+        "Busy agent must keep Esc cancel hint:\n{busy_tree_status}"
+    );
+    app.thread_statuses.insert("t-agent".to_string(), "idle".to_string());
+
+    // Terminal active while Tree focused renders Tree hint; Terminal focused renders "Ctrl+G for tree"
+    app.set_focus(FocusedPane::Composer);
+    app.switch_thread("t-term");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let term_focused_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
+    assert!(
+        term_focused_status.contains("Ctrl+G for tree"),
+        "{term_focused_status}"
+    );
+
+    app.set_focus(FocusedPane::Tree);
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    let term_tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
+    assert!(
+        term_tree_status.contains("t/T term · a agent · w worktree · / search · F1 help"),
+        "Tree status bar must show Tree action hints even when active thread is Terminal:\n{term_tree_status}"
+    );
+
+    // 2. 'a' in Tree emits AppAction::CreateRoot { title: None } without modifying Composer
+    app.switch_thread("t-agent");
+    app.set_focus(FocusedPane::Tree);
+    app.pending_actions.clear();
+    assert!(app.handle_key_event(key(KeyCode::Char('a'))));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateRoot { title: None })
+    );
+    assert_eq!(app.composer_input(), "");
+
+    app.handle_key_event(ctrl('a'));
+    app.handle_key_event(alt(KeyCode::Char('a')));
+    assert!(
+        app.pending_actions.is_empty(),
+        "Ctrl+a / Alt+a in Tree must not trigger CreateRoot"
+    );
+
+    // 3. 'w' in Tree emits AppAction::EnsureThreadWorktree for selected Agent or >_ Terminal
+    app.tree.select_index(1); // t-agent-2 (Agent)
+    assert!(app.handle_key_event(key(KeyCode::Char('w'))));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::EnsureThreadWorktree {
+            thread_id: "t-agent-2".to_string(),
+        })
+    );
+
+    app.tree.select_index(2); // t-term (Terminal)
+    assert!(app.handle_key_event(key(KeyCode::Char('w'))));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::EnsureThreadWorktree {
+            thread_id: "t-term".to_string(),
+        })
+    );
+
+    app.handle_key_event(ctrl('w'));
+    app.handle_key_event(alt(KeyCode::Char('w')));
+    assert!(
+        app.pending_actions.is_empty(),
+        "Ctrl+w / Alt+w in Tree must not trigger EnsureThreadWorktree"
+    );
+
+    // Fallback to active_thread_id when tree selection is absent
+    app.tree = grein_tui::ui::tree::TreeState::default();
+    assert!(app.handle_key_event(key(KeyCode::Char('w'))));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::EnsureThreadWorktree {
+            thread_id: "t-agent".to_string(),
+        })
+    );
+
+    // 4. Help modal documents 'a' and 'w' cleanly without overflow at 110x30 and scrolls on 80x12
+    app.show_help_modal = true;
+    app.help_scroll_offset = 5;
+    draw_frame_mut(&mut terminal, &mut app).unwrap();
+    assert_eq!(
+        app.help_scroll_offset, 0,
+        "Help modal body must fit within 110x30 without vertical scroll overflow"
+    );
+    let help = render_screen(&terminal);
+    for expected in [
+        "a/n new Agent root",
+        "t / T, w, z/y/q (ᛇ Grein)",
+        "worktree (Agent/>_)",
+        "Press Esc, q, ?, or Enter to close",
+    ] {
+        assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
+    }
+    assert!(
+        !help.contains("(↑/↓/j/k scroll)"),
+        "Help modal must fit cleanly in 110x30 without overflow scroll prompt:\n{help}"
+    );
+}
