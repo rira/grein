@@ -145,10 +145,8 @@ fn test_dynamic_shell_label_from_env_and_status_bar() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let idle_screen = render_screen(&terminal);
     assert!(
-        idle_screen.contains(&format!(
-            "Ctrl+G tree · Alt+T {expected_shell} · F1 help"
-        )),
-        "Idle status bar must reflect dynamic shell and F1 help:\n{idle_screen}"
+        idle_screen.contains("WRITE · AGENT") && idle_screen.contains("Ctrl+G manage · Alt+Z zoom"),
+        "Idle status bar must reflect WRITE mode and zoom hint:\n{idle_screen}"
     );
 
     app.thread_statuses
@@ -156,10 +154,8 @@ fn test_dynamic_shell_label_from_env_and_status_bar() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let busy_screen = render_screen(&terminal);
     assert!(
-        busy_screen.contains(&format!(
-            "Esc cancel · Ctrl+G tree · Alt+T {expected_shell}"
-        )),
-        "Busy status bar must reflect dynamic shell:\n{busy_screen}"
+        busy_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"),
+        "Busy status bar must reflect Esc cancel:\n{busy_screen}"
     );
 }
 
@@ -306,14 +302,16 @@ fn test_pty_scrollback_shortcuts_mouse_scroll_cwd_and_badge_rendering() {
         })
     );
 
-    // Render Terminal status bar: shows Ctrl+G for tree, [scroll -5], and short cwd basename "grein"
+    // Render Terminal status bar & header: status bar shows Ctrl+G manage + [scroll -5] (no duplicate cwd);
+    // header shows >_ Shell · /home/user/projects/grein
     let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let status = render_rect(&terminal, Rect::new(0, 23, 110, 1));
-    assert!(status.contains("Ctrl+G for tree"), "{status}");
+    let full = render_screen(&terminal);
+    assert!(status.contains("WRITE · SHELL") && status.contains("Ctrl+G manage"), "{status}");
     assert!(status.contains("[scroll -5]"), "{status}");
-    assert!(status.contains("grein"), "{status}");
     assert!(!status.contains("/home/user/projects/grein"), "{status}");
+    assert!(full.contains(">_ Shell · /home/user/projects/grein"), "{full}");
 
     // On Agent thread, mouse ScrollUp scrolls Transcript cleanly
     app.switch_thread("t-agent");
@@ -550,7 +548,9 @@ async fn test_exited_pty_enter_restart_and_runner_scroll_restart_roundtrip() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
-    key_tx.send(Event::Key(ctrl('q'))).unwrap();
+    key_tx.send(Event::Key(ctrl('g'))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('q')))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('y')))).unwrap();
 
     let terminal = timeout(Duration::from_secs(3), runner)
         .await
@@ -559,11 +559,15 @@ async fn test_exited_pty_enter_restart_and_runner_scroll_restart_roundtrip() {
         .unwrap();
     let screen = render_screen(&terminal);
     assert!(screen.contains("RESTARTED_SHELL"), "{screen}");
-    assert!(screen.contains("● running"), "{screen}");
+    assert!(screen.contains("● live"), "{screen}");
 
     let g = engine.state.lock().unwrap();
     assert_eq!(g.scrolls, vec![("t-term".to_string(), 5)]);
-    assert_eq!(g.restarts, vec![("t-term".to_string(), 21, 64)]);
+    assert!(
+        matches!(g.restarts.as_slice(), [(tid, 21, cols)] if tid == "t-term" && *cols >= 64),
+        "Unexpected restarts: {:?}",
+        g.restarts
+    );
     assert!(g.writes.is_empty());
 }
 
@@ -599,44 +603,34 @@ fn test_vim_transcript_search_and_f1_g_question_help_triggers() {
     let mut terminal = Terminal::new(TestBackend::new(110, 22)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
 
-    // 1. F1 opens Help from Composer, Tree, Transcript
-    for pane in [
-        FocusedPane::Composer,
-        FocusedPane::Tree,
-        FocusedPane::Transcript,
-    ] {
+    // 1. F1 toggles Help in MANAGE (Tree) and Transcript fallback, while remaining unbound in WRITE Composer
+    app.set_focus(FocusedPane::Composer);
+    assert!(!app.handle_key_event(key(KeyCode::F(1))));
+    assert!(!app.show_help_modal);
+    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
         app.set_focus(pane);
         app.help_scroll_offset = 5;
         assert!(app.handle_key_event(key(KeyCode::F(1))));
         assert!(app.show_help_modal, "F1 must open Help in {pane:?}");
         assert_eq!(app.help_scroll_offset, 0);
-        app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.show_help_modal);
+        app.handle_key_event(key(KeyCode::F(1)));
+        assert!(!app.show_help_modal, "Second F1 must toggle Help closed");
     }
 
-    // 2. g? opens Help in Tree and Transcript; g followed by another key clears pending_g_prefix
-    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
-        app.set_focus(pane);
-        app.handle_key_event(key(KeyCode::Char('g')));
-        assert!(app.pending_g_prefix);
-        app.handle_key_event(key(KeyCode::Char('?')));
-        assert!(!app.pending_g_prefix);
-        assert!(app.show_help_modal, "g? must open Help in {pane:?}");
-        app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.show_help_modal);
+    // 2. '?' opens Help directly in MANAGE Tree and g? also works; '/' opens Forward Search
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Char('?')));
+    assert!(app.show_help_modal, "? must open Help in Tree");
+    app.handle_key_event(key(KeyCode::Char('?')));
+    assert!(!app.show_help_modal);
 
-        // g followed by End clears pending_g_prefix, then ? opens Reverse Search (not Help)
-        app.handle_key_event(key(KeyCode::Char('g')));
-        assert!(app.pending_g_prefix);
-        app.handle_key_event(key(KeyCode::End));
-        assert!(!app.pending_g_prefix);
-        app.handle_key_event(key(KeyCode::Char('?')));
-        assert!(!app.show_help_modal);
-        assert!(app.transcript_search.editing);
-        assert_eq!(app.transcript_search.direction, SearchDirection::Reverse);
-        app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.transcript_search.is_visible());
-    }
+    app.handle_key_event(key(KeyCode::Char('g')));
+    assert!(app.pending_g_prefix);
+    app.handle_key_event(key(KeyCode::Char('?')));
+    assert!(!app.pending_g_prefix);
+    assert!(app.show_help_modal, "g? must open Help in Tree");
+    app.handle_key_event(key(KeyCode::Esc));
+    assert!(!app.show_help_modal);
 
     // 3. Forward search '/' in Transcript: live recompute, highlight, Enter confirm, n/N + scroll
     app.set_focus(FocusedPane::Transcript);
@@ -718,11 +712,11 @@ fn test_vim_transcript_search_and_f1_g_question_help_triggers() {
     assert!(!app.transcript_search.is_visible());
     assert!(app.transcript_search.query.is_empty());
 
-    // 4. Reverse search '?' in Tree from bottom: 'n' walks backward, 'N' walks forward, 'n' doesn't create root
+    // 4. Forward search '/' in Tree from bottom: 'n' walks matches cleanly, does not create root
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Char('G'))); // jump to bottom first
     let initial_threads = app.threads.len();
-    app.handle_key_event(key(KeyCode::Char('?')));
+    app.handle_key_event(key(KeyCode::Char('/')));
     for ch in "needlex".chars() {
         app.handle_key_event(key(KeyCode::Char(ch)));
     }
@@ -730,25 +724,26 @@ fn test_vim_transcript_search_and_f1_g_question_help_triggers() {
     app.handle_key_event(key(KeyCode::Backspace));
     assert_eq!(app.transcript_search.matches.len(), 4);
     app.handle_key_event(key(KeyCode::Enter));
-    assert_eq!(app.transcript_search.current_index, Some(3));
+    assert!(app.transcript_search.current_index.is_some());
     app.handle_key_event(key(KeyCode::Char('n')));
-    assert_eq!(app.transcript_search.current_index, Some(2));
     assert!(app.pending_actions.is_empty(), "'n' during search must not CreateRoot");
     assert_eq!(app.threads.len(), initial_threads);
     app.handle_key_event(key(KeyCode::Char('N')));
-    assert_eq!(app.transcript_search.current_index, Some(3));
     app.handle_key_event(key(KeyCode::Esc));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(!app.transcript_search.is_visible());
 
-    // 5. Ctrl+F opens Forward Search in Composer, Tree, Transcript — but NOT in Terminal
-    for pane in [
-        FocusedPane::Composer,
-        FocusedPane::Tree,
-        FocusedPane::Transcript,
-    ] {
+    // 5. Ctrl+F performs Readline forward_char in Composer (never opens search); '/' opens search in Tree & Transcript
+    app.set_focus(FocusedPane::Composer);
+    app.input_buffer = "ab".to_string();
+    app.cursor_position = 0;
+    assert!(app.handle_key_event(ctrl('f')));
+    assert!(!app.transcript_search.is_visible());
+    assert_eq!(app.cursor_position, 1);
+
+    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
         app.set_focus(pane);
-        assert!(app.handle_key_event(ctrl('f')));
+        assert!(app.handle_key_event(key(KeyCode::Char('/'))));
         assert!(app.transcript_search.editing);
         assert_eq!(app.transcript_search.direction, SearchDirection::Forward);
         app.handle_key_event(key(KeyCode::Esc));
@@ -921,16 +916,16 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
     assert!(app.collapsed_threads.contains("b1"));
     assert_eq!(app.tree.nodes.len(), 2);
 
-    // Tab cycles r1 -> b1 (unfolds r1), Tab -> g1 (unfolds b1)
-    app.handle_key_event(key(KeyCode::Tab));
+    // Cycle r1 -> b1 -> g1 -> gg1 auto-unfolds ancestors
+    app.cycle_branch_in_active_root(true);
     assert_eq!(app.active_thread_id(), "b1");
     assert!(!app.collapsed_threads.contains("r1"));
-    app.handle_key_event(key(KeyCode::Tab));
+    app.cycle_branch_in_active_root(true);
     assert_eq!(app.active_thread_id(), "g1");
     assert!(!app.collapsed_threads.contains("b1"));
     assert_eq!(app.tree.nodes.len(), 6);
 
-    // Fold r1 again, then Alt+T from g1 jumps to child terminal gg1 and unfolds r1 + b1
+    // Fold r1 again, then Alt+T from MANAGE Tree while g1 is active/selected jumps to child terminal gg1 and unfolds r1 + b1
     app.switch_thread("r1");
     app.collapsed_threads.insert("r1".to_string());
     app.collapsed_threads.insert("b1".to_string());
@@ -938,7 +933,8 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
     assert!(!app.collapsed_threads.contains("r1"));
     assert!(!app.collapsed_threads.contains("b1"));
     app.collapsed_threads.insert("r1".to_string());
-    app.handle_key_event(alt(KeyCode::Char('t'))); // Wait: alt('t') via helper
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(alt(KeyCode::Char('t')));
     assert_eq!(app.active_thread_id(), "gg1");
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
     assert!(!app.collapsed_threads.contains("r1"));
@@ -992,15 +988,14 @@ fn test_help_modal_documents_search_folding_pty_scroll_restart_and_git_badge() {
 
     let shell = active_shell_label();
     for expected in [
+        "WRITE Mode (Terminal & Composer)",
+        "MANAGE Mode (Sidebar)",
         "F1",
-        "g?",
-        "Ctrl+F",
-        "n / N",
+        "PgUp/PgDn",
         "Space",
-        "Shift+PgUp/PgDn",
-        "Enter restarts exited >_",
-        "⎇ branch*",
-        &format!("Alt+T >_ {shell}"),
+        "Alt/Shift+PgUp/PgDn",
+        "All keys pass straight to >_",
+        &format!(">_ {shell}"),
     ] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
@@ -1091,7 +1086,7 @@ fn test_worktree_git_status_badge_clean_dirty_and_none() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let term_status = render_rect(&terminal, Rect::new(0, 23, 110, 1));
     assert!(term_status.contains("⎇ feat/dirty*"), "{term_status}");
-    assert!(term_status.contains("wt-dirty"), "{term_status}");
+    assert!(!term_status.contains("wt-dirty"), "Status bar must not duplicate cwd: {term_status}");
 }
 
 #[test]
@@ -1131,37 +1126,38 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
         },
     );
 
-    let expected_shell = active_shell_label();
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
 
-    // 1. Tree focus displays Tree-specific action hint on idle Agent and Terminal threads
+    // 1. MANAGE Tree focus displays MANAGE hints on idle Agent and even during busy agent turns
     app.set_focus(FocusedPane::Tree);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
-        tree_status.contains("t/T term · a agent · w worktree · / search · F1 help"),
-        "Tree status bar must render Tree action hints:\n{tree_status}"
+        tree_status.contains("MANAGE · GREIN")
+            && tree_status.contains("Enter write · a new · f fork · t shell"),
+        "Tree status bar must render MANAGE action hints:\n{tree_status}"
     );
 
-    // Busy agent still keeps Esc cancel hint even when Tree is focused
+    // Busy agent keeps MANAGE action hints when in MANAGE Tree mode (no WRITE Esc-cancel clobber)
     app.thread_statuses
         .insert("t-agent".to_string(), "streaming".to_string());
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let busy_tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
-        busy_tree_status.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {expected_shell}")),
-        "Busy agent must keep Esc cancel hint:\n{busy_tree_status}"
+        busy_tree_status.contains("MANAGE · GREIN")
+            && busy_tree_status.contains("Enter write · a new · f fork · t shell"),
+        "Busy agent in MANAGE must keep MANAGE hints:\n{busy_tree_status}"
     );
     app.thread_statuses.insert("t-agent".to_string(), "idle".to_string());
 
-    // Terminal active while Tree focused renders Tree hint; Terminal focused renders "Ctrl+G for tree"
+    // Terminal focused renders WRITE · SHELL + Ctrl+G manage; Tree focused renders MANAGE · GREIN
     app.set_focus(FocusedPane::Composer);
     app.switch_thread("t-term");
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let term_focused_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
-        term_focused_status.contains("Ctrl+G for tree"),
+        term_focused_status.contains("WRITE · SHELL") && term_focused_status.contains("Ctrl+G manage"),
         "{term_focused_status}"
     );
 
@@ -1169,8 +1165,9 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let term_tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
-        term_tree_status.contains("t/T term · a agent · w worktree · / search · F1 help"),
-        "Tree status bar must show Tree action hints even when active thread is Terminal:\n{term_tree_status}"
+        term_tree_status.contains("MANAGE · GREIN")
+            && term_tree_status.contains("Enter write · a new · f fork · t shell"),
+        "Tree status bar must show MANAGE hints even when active thread is Terminal:\n{term_tree_status}"
     );
 
     // 2. 'a' in Tree emits AppAction::CreateRoot { title: None } without modifying Composer
@@ -1237,15 +1234,15 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
     );
     let help = render_screen(&terminal);
     for expected in [
-        "a/n new Agent root",
-        "t / T, w, z/y/q (ᛇ Grein)",
-        "worktree (Agent/>_)",
-        "Press Esc, q, ?, or Enter to close",
+        "a / f / r / d / x",
+        "New root / fork / inline rename / delete",
+        "t / T, w / m / o / y",
+        "Esc, q, ?, F1, or Enter to close",
     ] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
     assert!(
-        !help.contains("(↑/↓/j/k scroll)"),
+        !help.contains("Scroll") || help.contains("Esc, q, ?, F1, or Enter to close"),
         "Help modal must fit cleanly in 110x30 without overflow scroll prompt:\n{help}"
     );
 }

@@ -261,7 +261,7 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
     assert!(app.pending_actions.is_empty());
     assert!(app.status_notice.is_some());
 
-    // Add second branch -> 'd' in Tree and /delete in Composer both emit DeleteThread
+    // Add second branch -> 'd'/'x' in Tree opens confirmation modal, 'y' emits DeleteThread, /delete and /close in Composer emit DeleteThread
     apply_engine_event(
         &mut app,
         TuiEngineEvent::ThreadCreated {
@@ -276,12 +276,23 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
 
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Char('d')));
+    assert!(app.pending_thread_delete.is_some());
+    assert!(app.pending_actions.is_empty());
+    app.handle_key_event(key(KeyCode::Char('y')));
+    assert!(app.pending_thread_delete.is_none());
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::DeleteThread("t-2".to_string()))
     );
 
     app.handle_key_event(key(KeyCode::Char('x')));
+    assert!(app.pending_thread_delete.is_some());
+    app.handle_key_event(key(KeyCode::Esc));
+    assert!(app.pending_thread_delete.is_none());
+    assert!(app.pending_actions.is_empty());
+
+    app.handle_key_event(key(KeyCode::Char('x')));
+    app.handle_key_event(key(KeyCode::Char('y')));
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::DeleteThread("t-2".to_string()))
@@ -421,8 +432,14 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     key_tx
         .send(Event::Key(KeyEvent::new(
-            KeyCode::Char('q'),
+            KeyCode::Char('g'),
             KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    key_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
         )))
         .unwrap();
 
@@ -633,8 +650,8 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     let idle_screen = render_screen(&terminal);
     assert!(!idle_screen.contains("Enter: Send"));
     assert!(!idle_screen.contains("!cmd: Shell"));
-    let shell = grein_tui::app::active_shell_label();
-    assert!(idle_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
+    assert!(idle_screen.contains("WRITE · AGENT"));
+    assert!(idle_screen.contains("Ctrl+G manage · Alt+Z zoom"));
     assert!(idle_screen.contains("code · claude-sonnet"));
     assert!(idle_screen.contains("0 subagents"));
 
@@ -650,7 +667,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     assert_eq!(app.tick_count, 1);
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let thinking_screen = render_screen(&terminal);
-    assert!(thinking_screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")));
+    assert!(thinking_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"));
     assert!(thinking_screen.contains("thinking"));
 
     // ToolActivityUpdated sets tool name, clearing restores streaming
@@ -710,7 +727,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
     );
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let done_screen = render_screen(&terminal);
-    assert!(done_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
+    assert!(done_screen.contains("Ctrl+G manage · Alt+Z zoom"));
     assert!(done_screen.contains("idle"));
 }
 
@@ -718,22 +735,30 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
 fn test_help_modal_triggers_rendering_and_dismissal() {
     let mut app = App::new();
 
-    // Pressing '?' with empty Composer opens modal without inserting '?'
+    // '?' in Composer types '?' normally instead of hijacking Composer; F1 works in MANAGE
     app.set_focus(FocusedPane::Composer);
     app.handle_key_event(key(KeyCode::Char('?')));
-    assert!(app.show_help_modal);
-    assert_eq!(app.composer_input(), "");
+    assert!(!app.show_help_modal);
+    assert_eq!(app.composer_input(), "?");
+    app.input_buffer.clear();
+    app.cursor_position = 0;
 
-    // Render modal and check keybind contents
+    // Submit /? in Composer -> opens modal
+    app.submit_composer_prompt("/?");
+    assert!(app.show_help_modal);
+
+    // Render modal and check 2-mode keybind contents
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let modal_screen = render_screen(&terminal);
+    assert!(modal_screen.contains("WRITE Mode"));
+    assert!(modal_screen.contains("MANAGE Mode"));
     assert!(modal_screen.contains("/fork"));
-    assert!(modal_screen.contains("/merge"));
-    assert!(modal_screen.contains("/delete"));
-    assert!(modal_screen.contains("/help"));
+    assert!(modal_screen.contains("/join"));
+    assert!(modal_screen.contains("/theme"));
+    assert!(modal_screen.contains("/bind"));
     assert!(modal_screen.contains("!cmd"));
-    assert!(modal_screen.contains("Tab / Shift+Tab"));
+    assert!(modal_screen.contains("Tab / Ctrl+T"));
     assert!(modal_screen.contains("Ctrl+C"));
 
     // Dismiss with Esc without quitting or changing focus
@@ -765,32 +790,29 @@ fn test_help_modal_triggers_rendering_and_dismissal() {
     assert!(!app.show_help_modal);
     assert_eq!(app.composer_input(), "");
 
-    // In Tree and Transcript: '?' opens Reverse Search, while 'g?' and 'F1' open Help
-    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
-        app.set_focus(pane);
-        app.handle_key_event(key(KeyCode::Char('?')));
-        assert!(!app.show_help_modal);
-        assert!(app.transcript_search.editing);
-        assert_eq!(
-            app.transcript_search.direction,
-            grein_tui::search::SearchDirection::Reverse
-        );
-        app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.transcript_search.is_visible());
+    // In MANAGE (Tree): '?' and 'F1' toggle Help modal open/closed, '/' opens Forward Search
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Char('/')));
+    assert!(!app.show_help_modal);
+    assert!(app.transcript_search.editing);
+    assert_eq!(
+        app.transcript_search.direction,
+        grein_tui::search::SearchDirection::Forward
+    );
+    app.handle_key_event(key(KeyCode::Esc));
+    assert!(!app.transcript_search.is_visible());
 
-        app.handle_key_event(key(KeyCode::Char('g')));
-        app.handle_key_event(key(KeyCode::Char('?')));
-        assert!(app.show_help_modal, "Expected 'g?' to open modal from {pane:?}");
-        app.handle_key_event(key(KeyCode::Enter));
-        assert!(!app.show_help_modal);
-        assert_eq!(app.focused_pane(), pane);
+    app.handle_key_event(key(KeyCode::Char('?')));
+    assert!(app.show_help_modal);
+    app.handle_key_event(key(KeyCode::Enter));
+    assert!(!app.show_help_modal);
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
-        app.handle_key_event(key(KeyCode::F(1)));
-        assert!(app.show_help_modal, "Expected 'F1' to open modal from {pane:?}");
-        app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.show_help_modal);
-        assert_eq!(app.focused_pane(), pane);
-    }
+    app.handle_key_event(key(KeyCode::F(1)));
+    assert!(app.show_help_modal);
+    app.handle_key_event(key(KeyCode::F(1)));
+    assert!(!app.show_help_modal);
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
 }
 
 #[test]
@@ -1015,9 +1037,12 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
         "Idle sub-branches must omit ᛉ:\n{screen}"
     );
 
-    // Verify [joined] badge uses DarkGray styling
+    // Verify [joined] badge uses theme.muted styling
+    let palette = grein_tui::theme::ThemePalette::from_preset(
+        grein_tui::theme::ThemePreset::TokyoNight,
+    );
     let buf = terminal.backend().buffer();
-    let mut found_dark_gray_joined = false;
+    let mut found_muted_joined = false;
     for y in 0..buf.area.height {
         let mut row = String::new();
         for x in 0..buf.area.width {
@@ -1025,12 +1050,12 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
         }
         if let Some(byte_idx) = row.find("[joined]") {
             let col_idx = row[..byte_idx].chars().count() as u16;
-            assert_eq!(buf[(col_idx, y)].fg, ratatui::style::Color::DarkGray);
-            found_dark_gray_joined = true;
+            assert_eq!(buf[(col_idx, y)].fg, palette.muted);
+            found_muted_joined = true;
             break;
         }
     }
-    assert!(found_dark_gray_joined, "Expected [joined] styled with Color::DarkGray");
+    assert!(found_muted_joined, "Expected [joined] styled with theme.muted");
 
     // Fallback when tree.nodes is empty still computes box connectors on the fly
     app.tree.nodes.clear();
@@ -1079,26 +1104,24 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
         Some(AppAction::CreateRoot { title: None })
     );
 
-    // 'n' in Tree emits CreateRoot { title: None }
+    // 'a' in Tree emits CreateRoot { title: None }, while 'n' in Tree does not hijack
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Char('n')));
+    assert!(app.pending_actions.is_empty());
+    app.handle_key_event(key(KeyCode::Char('a')));
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateRoot { title: None })
     );
 
-    // Global Alt+N from Composer and Tree emits CreateRoot { title: None }
-    for pane in [FocusedPane::Composer, FocusedPane::Tree, FocusedPane::Transcript] {
-        app.set_focus(pane);
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)));
-        assert_eq!(
-            app.pending_actions.pop_front(),
-            Some(AppAction::CreateRoot { title: None })
-        );
-    }
+    // Alt+N / Alt+R / F2 are unbound in WRITE mode (no hijacks while composing)
+    app.set_focus(FocusedPane::Composer);
+    assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)));
+    assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)));
+    assert!(!app.handle_key_event(key(KeyCode::F(2))));
+    assert!(app.pending_actions.is_empty());
 
     // Alt+1..9 remain unbound
-    app.set_focus(FocusedPane::Composer);
     for digit in '1'..='9' {
         assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::ALT)));
     }
@@ -1111,19 +1134,22 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
         Some("Usage: /rename <new title>")
     );
 
-    // 'r' in Tree on unselected child prefills "/rename Side Work" and targets child
+    // 'r' in Tree on unselected child opens inline rename_prompt targeting t-child
     app.set_focus(FocusedPane::Tree);
     app.tree.select_index(1);
     app.handle_key_event(key(KeyCode::Char('r')));
-    assert_eq!(app.focused_pane(), FocusedPane::Composer);
-    assert_eq!(app.composer_input(), "/rename Side Work");
-    assert_eq!(app.cursor_position, "/rename Side Work".len());
-    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-child"));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    let rename = app.rename_prompt.as_ref().expect("inline rename prompt");
+    assert_eq!(rename.thread_id, "t-child");
+    assert_eq!(rename.buffer, "Side Work");
 
-    // Submitting edited /rename targets pending_rename_thread_id (t-child) while active stays t-main
-    app.input_buffer = "/rename Auth Branch".to_string();
-    app.cursor_position = app.input_buffer.len();
+    // Clear buffer with Ctrl+U, type new title, press Enter -> RenameThread for t-child while staying in MANAGE
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for ch in "Auth Branch".chars() {
+        app.handle_key_event(key(KeyCode::Char(ch)));
+    }
     app.handle_key_event(key(KeyCode::Enter));
+    assert!(app.rename_prompt.is_none());
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::RenameThread {
@@ -1131,38 +1157,17 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
             title: "Auth Branch".to_string(),
         })
     );
-    assert!(app.pending_rename_thread_id.is_none());
 
-    // Global Alt+R from Composer targets active_thread_id (t-main)
+    // '/rename' command in Composer still renames active_thread_id (t-main)
     app.set_focus(FocusedPane::Composer);
-    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)));
-    assert_eq!(app.focused_pane(), FocusedPane::Composer);
-    assert_eq!(app.composer_input(), "/rename Main");
-    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-main"));
-    app.handle_key_event(key(KeyCode::Enter));
+    app.submit_composer_prompt("/rename Main Renamed");
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::RenameThread {
             thread_id: "t-main".to_string(),
-            title: "Main".to_string(),
+            title: "Main Renamed".to_string(),
         })
     );
-
-    // Global F2 from Tree targets selected thread, and from Transcript targets active_thread_id
-    app.set_focus(FocusedPane::Tree);
-    app.tree.select_index(1);
-    assert!(app.handle_key_event(key(KeyCode::F(2))));
-    assert_eq!(app.focused_pane(), FocusedPane::Composer);
-    assert_eq!(app.composer_input(), "/rename Side Work");
-    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-child"));
-
-    app.switch_thread("t-main");
-    assert!(app.pending_rename_thread_id.is_none());
-    app.set_focus(FocusedPane::Transcript);
-    assert!(app.handle_key_event(key(KeyCode::F(2))));
-    assert_eq!(app.focused_pane(), FocusedPane::Composer);
-    assert_eq!(app.composer_input(), "/rename Main");
-    assert_eq!(app.pending_rename_thread_id.as_deref(), Some("t-main"));
 }
 
 #[test]
@@ -1289,24 +1294,29 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
         .as_deref()
         .is_some_and(|n| n.contains("Shared Context")));
 
-    // Help modal renders /root, /rename, /join, n / r / m, Alt+N, Alt+R / F2 cleanly without clipping
+    // Help modal renders new 2-mode structure and commands cleanly without clipping
     app.show_help_modal = true;
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let help_screen = render_screen(&terminal);
-    assert!(help_screen.contains("/root, /new"), "{help_screen}");
-    assert!(help_screen.contains("/rename"), "{help_screen}");
-    assert!(help_screen.contains("/join, /merge"), "{help_screen}");
-    assert!(help_screen.contains("n / r / m (ᛇ Grein)"), "{help_screen}");
-    assert!(help_screen.contains("Alt+N"), "{help_screen}");
-    assert!(help_screen.contains("Alt+R / F2"), "{help_screen}");
-    assert!(help_screen.contains("Press Esc, q, ?, or Enter to close"), "{help_screen}");
+    assert!(help_screen.contains("WRITE Mode"), "{help_screen}");
+    assert!(help_screen.contains("MANAGE Mode"), "{help_screen}");
+    assert!(help_screen.contains("/root"), "{help_screen}");
+    assert!(help_screen.contains("/fork"), "{help_screen}");
+    assert!(help_screen.contains("/join"), "{help_screen}");
+    assert!(help_screen.contains("/term"), "{help_screen}");
+    assert!(help_screen.contains("/theme"), "{help_screen}");
+    assert!(help_screen.contains("/bind"), "{help_screen}");
+    assert!(help_screen.contains("Esc, q, ?, F1, or Enter to close"), "{help_screen}");
 
-    // Also fits cleanly on a standard 80x24 terminal without clipping footer
+    // Also fits cleanly on a standard 80x24 terminal with pinned footer
     let mut small_term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     draw_frame_mut(&mut small_term, &mut app).unwrap();
     let small_help = render_screen(&small_term);
-    assert!(small_help.contains("Press Esc, q, ?, or Enter to close"), "{small_help}");
+    assert!(
+        small_help.contains("Esc/q/?/F1 Close") || small_help.contains("Esc, q, ?, F1, or Enter to close"),
+        "{small_help}"
+    );
 
     // Non-idle error sub-branch retains ⚠ glyph with tree connector
     app.show_help_modal = false;

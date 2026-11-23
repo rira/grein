@@ -286,10 +286,8 @@ fn test_tree_rendering_terminal_prefix_glyph_and_exit_marker() {
     assert!(screen.contains("├─ Auth"), "{screen}");
     assert!(!screen.contains(">_ Auth"), "{screen}");
     assert!(screen.contains("├─ >_ Shell"), "{screen}");
-    assert!(screen.contains("└─ >_ Logs"), "{screen}");
-    assert!(screen.contains("exit 0"), "{screen}");
-    assert!(screen.contains(">_ Build"), "{screen}");
-    assert!(screen.contains("exit 2"), "{screen}");
+    assert!(screen.contains("└─ >_ Logs ✓ 0"), "{screen}");
+    assert!(screen.contains(">_ Build ✗ 2"), "{screen}");
     assert!(!screen.contains("ᛉ Build"), "{screen}");
 }
 
@@ -492,7 +490,8 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let preview_screen = render_screen(&terminal);
-    assert!(preview_screen.contains("Terminal (Preview: Shell)"), "{preview_screen}");
+    assert!(preview_screen.contains(">_ Shell · /tmp (Preview)"), "{preview_screen}");
+    assert!(preview_screen.contains("● live"), "{preview_screen}");
     assert!(preview_screen.contains("LIVE_PTY_PREVIEW"), "{preview_screen}");
 
     // 'l' in Tree enters FocusedPane::Terminal on the selected terminal
@@ -506,12 +505,17 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(app.pending_actions.is_empty());
 
-    // Enter (and Tab) from Tree enters FocusedPane::Terminal
+    // Enter from Tree enters FocusedPane::Terminal; Tab in MANAGE switches to Worktrees view
     app.handle_key_event(key(KeyCode::Enter));
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
     app.handle_key_event(ctrl('g'));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.sidebar_view, grein_tui::app::SidebarView::Worktrees);
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Tab));
+    assert_eq!(app.sidebar_view, grein_tui::app::SidebarView::Grein);
+    app.handle_key_event(key(KeyCode::Right));
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
     // Render frame so pane dimensions are known, then Alt+Z toggles zoom & triggers PtyResize without forwarding \x1bz
@@ -616,8 +620,9 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
         request_id: "perm-term-2".to_string(),
         description: "Allow read?".to_string(),
     });
+    // Modal priority blocks Ctrl+G from jumping out while permission prompt is open (and does NOT send \x07 to PTY)
     app.handle_key_event(ctrl('g'));
-    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
     assert!(app.pending_actions.is_empty());
     app.handle_key_event(key(KeyCode::Char('n')));
     assert_eq!(
@@ -627,13 +632,28 @@ fn test_terminal_focus_ergonomics_tree_preview_and_key_passthrough() {
             approved: false,
         })
     );
+    // After resolving modal, Ctrl+G enters MANAGE Tree cleanly
+    app.handle_key_event(ctrl('g'));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
-    // Ctrl+Q quits cleanly without forwarding \x11
+    // Ctrl+Q passes straight to PTY (\x11) in WRITE mode; Ctrl+G then 'q' opens quit confirm, 'y' quits cleanly
     app.set_focus(FocusedPane::Terminal);
     app.pending_actions.clear();
     app.handle_key_event(ctrl('q'));
+    assert!(!app.should_quit());
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::PtyWrite {
+            thread_id: "t-term".to_string(),
+            bytes: vec![0x11],
+        })
+    );
+    app.handle_key_event(ctrl('g'));
+    app.handle_key_event(key(KeyCode::Char('q')));
+    assert!(app.pending_quit_confirm.is_some());
+    assert!(!app.should_quit());
+    app.handle_key_event(key(KeyCode::Char('y')));
     assert!(app.should_quit());
-    assert!(app.pending_actions.is_empty());
 }
 
 #[test]
@@ -651,29 +671,27 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
         },
     );
 
-    // 't' and 'T' in Tree and Transcript
-    for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
-        app.set_focus(pane);
-        app.handle_key_event(key(KeyCode::Char('t')));
-        assert!(matches!(
-            app.pending_actions.pop_front(),
-            Some(AppAction::CreateTerminal {
-                parent_thread_id: Some(ref pid),
-                cwd: None,
-                ..
-            }) if pid == "t-main"
-        ));
+    // 't' and 'T' in MANAGE Tree spawn child/root terminal; Composer does not hijack 't'
+    app.set_focus(FocusedPane::Tree);
+    app.handle_key_event(key(KeyCode::Char('t')));
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateTerminal {
+            parent_thread_id: Some(ref pid),
+            cwd: None,
+            ..
+        }) if pid == "t-main"
+    ));
 
-        app.handle_key_event(key(KeyCode::Char('T')));
-        assert!(matches!(
-            app.pending_actions.pop_front(),
-            Some(AppAction::CreateTerminal {
-                parent_thread_id: None,
-                cwd: None,
-                ..
-            })
-        ));
-    }
+    app.handle_key_event(key(KeyCode::Char('T')));
+    assert!(matches!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateTerminal {
+            parent_thread_id: None,
+            cwd: None,
+            ..
+        })
+    ));
 
     // /term [path] and /worktree in Composer
     app.set_focus(FocusedPane::Composer);
@@ -756,19 +774,15 @@ fn test_terminal_hotkeys_slash_commands_worktree_and_clipboard_copy() {
     assert_eq!(app.last_copied_text.as_deref(), Some("hello pty\nline two"));
 
     app.last_copied_text = None;
-    app.handle_key_event(alt('y'));
-    assert_eq!(app.last_copied_text.as_deref(), Some("hello pty\nline two"));
-
-    app.last_copied_text = None;
     app.submit_composer_prompt("/copy");
     assert_eq!(app.last_copied_text.as_deref(), Some("hello pty\nline two"));
 
-    // Help modal includes t, T, Ctrl+G, Ctrl+T, Alt+Z, /term [path], /worktree
+    // Help modal includes WRITE / MANAGE sections, t / T, Ctrl+G, Ctrl+T, Alt+Z, /term, /wt
     app.show_help_modal = true;
     let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let help = render_screen(&terminal);
-    for expected in ["t / T", "Ctrl+G", "Ctrl+T", "Alt+Z", "/term [path]", "/worktree"] {
+    for expected in ["WRITE Mode", "MANAGE Mode", "t / T", "Ctrl+G", "Ctrl+T", "Alt+Z", "/term", "/wt"] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
 }
@@ -1039,7 +1053,9 @@ async fn test_e2e_cold_reopen_terminal_create_passthrough_zoom_resize_and_worktr
     })
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    key_tx.send(Event::Key(ctrl('q'))).unwrap();
+    key_tx.send(Event::Key(ctrl('g'))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('q')))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('y')))).unwrap();
 
     let terminal = timeout(Duration::from_secs(3), runner)
         .await
@@ -1113,7 +1129,9 @@ async fn test_e2e_startup_on_persisted_terminal_loads_snapshot_and_focuses_termi
     })
     .await;
 
-    key_tx.send(Event::Key(ctrl('q'))).unwrap();
+    key_tx.send(Event::Key(ctrl('g'))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('q')))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('y')))).unwrap();
     let terminal = timeout(Duration::from_secs(3), runner)
         .await
         .unwrap()
@@ -1161,27 +1179,27 @@ fn test_key_release_events_are_ignored_while_press_and_repeat_are_handled() {
         },
     );
 
-    // Esc Press then Esc Release must stay in Tree (not double-toggle back to Composer)
+    // Ctrl+G Press then Ctrl+G Release toggles Composer -> Tree once (ignores Release)
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
     app.handle_key_event(key_with_kind(
-        KeyCode::Esc,
-        KeyModifiers::NONE,
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL,
         KeyEventKind::Press,
     ));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(!app.handle_key_event(key_with_kind(
-        KeyCode::Esc,
-        KeyModifiers::NONE,
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL,
         KeyEventKind::Release,
     )));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
 
-    // Ctrl+G Press then Ctrl+G Release via runner::handle_event must stay in Composer
+    // Esc Press then Esc Release in Tree returns to Composer without re-triggering
     handle_event(
         &mut app,
         Event::Key(key_with_kind(
-            KeyCode::Char('g'),
-            KeyModifiers::CONTROL,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
             KeyEventKind::Press,
         )),
     )
@@ -1190,8 +1208,8 @@ fn test_key_release_events_are_ignored_while_press_and_repeat_are_handled() {
     handle_event(
         &mut app,
         Event::Key(key_with_kind(
-            KeyCode::Char('g'),
-            KeyModifiers::CONTROL,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
             KeyEventKind::Release,
         )),
     )
@@ -1278,8 +1296,14 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         },
     );
 
-    // 1. In Composer with no child terminal -> Alt+T dispatches CreateTerminal under active thread
+    // 1. In WRITE Composer -> Alt+T is NOT intercepted by default (stays in Composer)
     app.set_focus(FocusedPane::Composer);
+    assert!(!app.handle_key_event(alt('t')));
+    assert!(app.pending_actions.is_empty());
+
+    // 2. In MANAGE Tree with t-agent-1 selected and no child terminal -> Alt+T dispatches CreateTerminal under t-agent-1
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(0);
     assert!(app.handle_key_event(alt('t')));
     assert!(matches!(
         app.pending_actions.pop_front(),
@@ -1291,8 +1315,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         }) if pid == "t-agent-1"
     ));
 
-    // 2. In Tree with t-agent-2 selected and no child terminal -> Alt+T targets selected t-agent-2
-    app.set_focus(FocusedPane::Tree);
+    // 3. In Tree with t-agent-2 selected and no child terminal -> Alt+T targets selected t-agent-2
     app.tree.select_index(1);
     assert!(app.handle_key_event(alt('t')));
     assert!(matches!(
@@ -1305,8 +1328,8 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         }) if pid == "t-agent-2"
     ));
 
-    // 3. With child terminal t-term-1 under t-agent-1 (no snapshot yet):
-    //    Alt+T from Transcript jumps directly to t-term-1, focuses Terminal, and requests PtySnapshot.
+    // 4. With child terminal t-term-1 under t-agent-1 (no snapshot yet):
+    //    Alt+T from MANAGE Tree jumps directly to t-term-1, focuses Terminal, and requests PtySnapshot.
     apply_hydrated_session(
         &mut app,
         &HydratedSession {
@@ -1365,7 +1388,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         },
     );
     app.pending_actions.clear();
-    app.set_focus(FocusedPane::Transcript);
+    app.set_focus(FocusedPane::Tree);
     assert!(app.handle_key_event(alt('t')));
     assert_eq!(app.active_thread_id(), "t-term-1");
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
@@ -1374,7 +1397,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         Some(AppAction::PtySnapshot { ref thread_id, .. }) if thread_id == "t-term-1"
     ));
 
-    // 4. Inside FocusedPane::Terminal, Alt+T MUST NOT be intercepted — passes through to PTY
+    // 5. Inside FocusedPane::Terminal, Alt+T MUST NOT be intercepted — passes through to PTY
     app.pending_actions.clear();
     assert!(app.handle_key_event(alt('t')));
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
@@ -1386,7 +1409,7 @@ fn test_alt_t_opens_or_jumps_to_terminal_and_passes_through_inside_terminal() {
         })
     );
 
-    // 5. From Tree hovering on t-term-1 while t-agent-1 is active -> Alt+T switches to t-term-1 & focuses Terminal
+    // 6. From Tree hovering on t-term-1 while t-agent-1 is active -> Alt+T switches to t-term-1 & focuses Terminal
     app.switch_thread("t-agent-1");
     app.set_focus(FocusedPane::Tree);
     app.tree.select_index(1);
@@ -1461,15 +1484,12 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
         },
     );
 
-    // 1. Zoomed in Composer -> Esc and Ctrl+G both auto-unhide sidebar when focusing Tree
+    // 1. Idle Esc stays in WRITE Composer; Ctrl+G auto-unhides sidebar when entering MANAGE Tree
     app.set_focus(FocusedPane::Composer);
     app.sidebar_hidden = true;
     app.handle_key_event(key(KeyCode::Esc));
-    assert_eq!(app.focused_pane(), FocusedPane::Tree);
-    assert!(!app.sidebar_hidden, "Esc into Tree must unhide sidebar");
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-    app.set_focus(FocusedPane::Composer);
-    app.sidebar_hidden = true;
     app.handle_key_event(ctrl('g'));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(!app.sidebar_hidden, "Ctrl+G into Tree must unhide sidebar");
@@ -1487,7 +1507,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let preview_screen = render_screen(&terminal);
     assert!(
-        preview_screen.contains("Terminal (Preview: Shell)"),
+        preview_screen.contains(">_ Shell · /tmp (Preview)") && preview_screen.contains("● live"),
         "{preview_screen}"
     );
     assert!(
@@ -1529,7 +1549,7 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
     // 5. Exited PTY in FocusedPane::Terminal:
-    //    - Status bar shows "exited · Enter restart · Esc/Ctrl+G tree"
+    //    - Status bar shows "exited · Enter restart · Esc/Ctrl+G manage"
     //    - Further keys / paste do NOT emit PtyWrite
     //    - Esc escapes back to FocusedPane::Tree and unhides sidebar if zoomed
     apply_engine_event(
@@ -1549,8 +1569,8 @@ fn test_tree_escape_ctrl_g_right_t_attach_sidebar_unhide_preview_and_exited_pty(
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let exited_screen = render_screen(&terminal);
     assert!(
-        exited_screen.contains("exited · Enter restart · Esc/Ctrl+G tree"),
-        "Exited terminal status bar must guide user back to Tree:\n{exited_screen}"
+        exited_screen.contains("exited · Enter restart · Esc/Ctrl+G manage"),
+        "Exited terminal status bar must guide user back to MANAGE:\n{exited_screen}"
     );
 
     app.pending_actions.clear();
@@ -1722,7 +1742,9 @@ async fn test_pty_write_serialization_fifo_order() {
     })
     .await;
 
-    key_tx.send(Event::Key(ctrl('q'))).unwrap();
+    key_tx.send(Event::Key(ctrl('g'))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('q')))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('y')))).unwrap();
     let _terminal = timeout(Duration::from_secs(3), runner)
         .await
         .unwrap()
@@ -1752,7 +1774,7 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let idle_screen = render_screen(&terminal);
     assert!(
-        idle_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")),
+        idle_screen.contains("WRITE · AGENT") && idle_screen.contains("Ctrl+G manage · Alt+Z zoom"),
         "Idle Composer status bar missing expected hint:\n{idle_screen}"
     );
 
@@ -1761,7 +1783,7 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let busy_screen = render_screen(&terminal);
     assert!(
-        busy_screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")),
+        busy_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"),
         "Busy Composer status bar missing expected hint:\n{busy_screen}"
     );
 
@@ -1769,15 +1791,15 @@ fn test_composer_status_bar_and_help_modal_document_terminal_shortcuts() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let help_screen = render_screen(&terminal);
     for expected in [
-        "Alt+T",
+        "WRITE Mode",
+        "MANAGE Mode",
+        &format!(">_ {shell}"),
         "Ctrl+G",
         "t / T",
-        "/term [path]",
-        "/zsh",
-        "/terminal",
-        "Right",
-        "exited",
-        "Press Esc, q, ?, or Enter to close",
+        "/term",
+        "Enter/l",
+        "All keys pass straight to >_",
+        "Esc, q, ?, F1, or Enter to close",
     ] {
         assert!(
             help_screen.contains(expected),

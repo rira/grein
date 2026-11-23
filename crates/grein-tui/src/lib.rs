@@ -8,6 +8,7 @@ pub mod editor;
 pub mod engine_port;
 pub mod events;
 pub mod focus;
+pub mod keymap;
 pub mod layout;
 pub mod markdown;
 pub mod pager;
@@ -19,6 +20,7 @@ pub mod search;
 pub mod state;
 pub mod status;
 pub mod syntax;
+pub mod theme;
 pub mod transcript;
 pub mod ui;
 pub mod views;
@@ -28,10 +30,14 @@ use std::sync::Arc;
 
 pub use app::{
     AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, FocusDirection, FocusPane,
-    FocusedPane, PaneFocus, PendingPermission, ThreadItem, TreeAction, TuiComponent, TuiError,
+    FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm, PendingThreadDelete,
+    RenamePromptState, SidebarLayoutConfig, SidebarMode, ThreadItem, TreeAction, TuiComponent,
+    TuiError,
 };
-pub use engine_port::TuiEnginePort;
+pub use engine_port::{TuiEnginePort, UserPreferencesSnapshot};
+pub use keymap::{BindableAction, KeyChord, Keymap};
 pub use runner::{draw_frame, draw_frame_mut, handle_event, handle_key_event, TerminalGuard};
+pub use theme::{ThemePalette, ThemePickerModal, ThemePreset};
 pub use transcript::{TranscriptMessage, TranscriptPane};
 
 pub async fn run_with_engine(engine: Arc<dyn TuiEnginePort>) -> std::io::Result<()> {

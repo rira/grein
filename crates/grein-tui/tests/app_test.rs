@@ -16,7 +16,11 @@ fn default_focus_starts_on_composer_and_toggles_cleanly_with_tree() {
     app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
+    // Idle Esc stays in WRITE mode; F6 / Alt+G / Ctrl+G enter MANAGE, and Esc in MANAGE returns to WRITE
     app.handle_key_event(key(KeyCode::Esc));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
+
+    app.handle_key_event(key(KeyCode::F(6)));
     assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 
     app.handle_key_event(key(KeyCode::Esc));
@@ -24,7 +28,7 @@ fn default_focus_starts_on_composer_and_toggles_cleanly_with_tree() {
 }
 
 #[test]
-fn tab_and_backtab_preserve_focus_when_cycling_branches() {
+fn tab_preserves_composer_focus_and_switches_sidebar_views_in_manage() {
     let mut app = App::default();
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
@@ -61,7 +65,7 @@ fn character_input_routes_to_composer_only_when_composer_focused() {
 }
 
 #[test]
-fn quit_key_stops_app_only_outside_composer_focus_and_ctrl_q_quits_anywhere() {
+fn quit_key_stops_app_only_in_manage_and_ctrl_q_does_not_hijack_composer() {
     let mut app = App::default();
     app.set_focused_pane(FocusPane::Composer);
 
@@ -70,7 +74,7 @@ fn quit_key_stops_app_only_outside_composer_focus_and_ctrl_q_quits_anywhere() {
     assert_eq!(app.composer_input(), "q");
 
     app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-    assert!(!app.is_running());
+    assert!(app.is_running());
 
     let mut app2 = App::default();
     app2.set_focused_pane(FocusPane::Sidebar);

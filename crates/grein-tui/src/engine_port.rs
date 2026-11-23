@@ -1,7 +1,16 @@
+use std::collections::BTreeMap;
 use std::io;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserPreferencesSnapshot {
+    pub theme: Option<String>,
+    pub theme_overrides: BTreeMap<String, String>,
+    pub keybindings: BTreeMap<String, String>,
+    pub ui: BTreeMap<String, String>,
+}
 
 /// A single hydrated conversation turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,5 +470,36 @@ pub trait TuiEnginePort: Send + Sync {
             io::ErrorKind::Unsupported,
             "pty_restart not supported",
         ))
+    }
+
+    async fn worktree_diff_preview(&self, _path: &str) -> io::Result<String> {
+        Ok(String::new())
+    }
+
+    async fn prune_worktrees(&self) -> io::Result<String> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "prune_worktrees is not supported",
+        ))
+    }
+
+    async fn load_preferences(&self) -> io::Result<UserPreferencesSnapshot> {
+        Ok(UserPreferencesSnapshot::default())
+    }
+
+    async fn save_theme_preference(&self, _theme: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn save_keybinding_preference(&self, _action: &str, _binding: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn remove_keybinding_preference(&self, _action: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn save_ui_preference(&self, _key: &str, _value: &str) -> io::Result<()> {
+        Ok(())
     }
 }

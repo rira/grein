@@ -24,7 +24,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::app::{
-    find_config_option, match_config_choice, AnchorItem, App, AppAction, CopyMode, FocusedPane,
+    find_config_option, match_config_choice, AnchorItem, App, AppAction, FocusedPane,
     PendingPermission, SidebarView, ThreadItem, TreeAction, TuiError,
 };
 use crate::engine_port::{
@@ -535,46 +535,6 @@ fn build_blocks_from_turns(turns: &[crate::engine_port::HydratedTurn]) -> Thread
     blocks
 }
 
-fn parse_config_arg(rest: &str) -> (bool, String) {
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
-        return (false, String::new());
-    }
-    if let Some(after) = trimmed.strip_prefix("--default") {
-        if after.is_empty() || after.starts_with(char::is_whitespace) {
-            return (true, after.trim().to_string());
-        }
-    }
-    if let Some(before) = trimmed.strip_suffix("--default") {
-        if before.ends_with(char::is_whitespace) {
-            return (true, before.trim().to_string());
-        }
-    }
-    let mut split = trimmed.splitn(2, char::is_whitespace);
-    if let (Some(first), Some(second)) = (split.next(), split.next()) {
-        if first.eq_ignore_ascii_case("default") && !second.trim().is_empty() {
-            return (true, second.trim().to_string());
-        }
-    }
-    (false, trimmed.to_string())
-}
-
-fn parse_term_cwd(rest: &str) -> Option<String> {
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let unquoted = if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        trimmed[1..trimmed.len() - 1].trim()
-    } else {
-        trimmed
-    };
-    (!unquoted.is_empty()).then(|| unquoted.to_string())
-}
-
 fn format_tool_result(tool_name: &str, output: &str) -> String {
     let trimmed = output.trim_end_matches(['\r', '\n']);
     if trimmed.trim().is_empty() {
@@ -675,199 +635,8 @@ impl App {
             return;
         }
 
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let head = parts.next().unwrap_or("");
-        let head_lower = head.to_ascii_lowercase();
-        let rest = parts.next().unwrap_or("").trim();
-
-        if head_lower != "/rename" && !matches!(head_lower.as_str(), "/?" | "/help") {
-            self.pending_rename_thread_id = None;
-        }
-
-        match head_lower.as_str() {
-            "/?" | "/help" => {
-                self.help_scroll_offset = 0;
-                self.show_help_modal = true;
-                return;
-            }
-            "/zoom" => {
-                self.toggle_sidebar_zoom();
-                return;
-            }
-            "/copy" => {
-                match rest {
-                    "" => self.copy_transcript_content(CopyMode::LastReply),
-                    "code" => self.copy_transcript_content(CopyMode::CodeBlock),
-                    "all" => self.copy_transcript_content(CopyMode::All),
-                    _ => {
-                        self.status_notice = Some("Usage: /copy [code|all]".to_string());
-                    }
-                }
-                return;
-            }
-            "/commands" => {
-                let active_id = self.active_thread_id.clone();
-                if let Some(cmds) = self.thread_commands.get(&active_id).cloned() {
-                    if !cmds.is_empty() {
-                        self.record_agent_commands_note(&active_id, &cmds);
-                        return;
-                    }
-                }
-                self.status_notice = Some("Fetching agent commands...".to_string());
-                self.pending_actions
-                    .push_back(AppAction::FetchAgentCommands {
-                        thread_id: active_id,
-                    });
-                return;
-            }
-            "/model" | "/mode" | "/thinking" | "/effort" => {
-                let target_config_id = match head_lower.as_str() {
-                    "/model" => "model",
-                    "/mode" => "mode",
-                    _ => "thought_level",
-                };
-                let (set_default, query) = parse_config_arg(rest);
-                let active_id = self.active_thread_id.clone();
-                if query.is_empty() {
-                    self.pending_actions
-                        .push_back(AppAction::OpenConfigPicker {
-                            thread_id: active_id,
-                            config_id: target_config_id.to_string(),
-                        });
-                    return;
-                }
-                if let Some(opt) = self
-                    .thread_config_options
-                    .get(&active_id)
-                    .and_then(|opts| find_config_option(opts, target_config_id))
-                    .cloned()
-                {
-                    if opt.options.is_empty() {
-                        self.pending_actions.push_back(AppAction::SetAgentConfig {
-                            thread_id: active_id,
-                            config_id: opt.id,
-                            value: query,
-                            set_default,
-                        });
-                    } else if let Some(choice) = match_config_choice(&opt.options, &query) {
-                        self.pending_actions.push_back(AppAction::SetAgentConfig {
-                            thread_id: active_id,
-                            config_id: opt.id,
-                            value: choice.value.clone(),
-                            set_default,
-                        });
-                    } else {
-                        self.status_notice =
-                            Some(format!("No {} option matching '{query}'", opt.name));
-                    }
-                } else {
-                    self.pending_actions
-                        .push_back(AppAction::ApplyAgentConfigQuery {
-                            thread_id: active_id,
-                            config_id: target_config_id.to_string(),
-                            query,
-                            set_default,
-                        });
-                }
-                return;
-            }
-            "/delete" | "/close" => {
-                let target_id = if rest.is_empty() {
-                    Some(self.active_thread_id.clone())
-                } else {
-                    self.threads
-                        .iter()
-                        .find(|t| t.id == rest || t.title == rest)
-                        .map(|t| t.id.clone())
-                };
-                if let Some(id) = target_id {
-                    self.request_delete_thread(id);
-                } else {
-                    self.status_notice = Some(format!("Unknown context: {rest}"));
-                }
-                return;
-            }
-            "/branch" | "/fork" | "/grein" => {
-                let title = if rest.is_empty() {
-                    None
-                } else {
-                    Some(rest.to_string())
-                };
-                self.pending_actions.push_back(AppAction::ForkBranch {
-                    source_thread_id: self.active_thread_id.clone(),
-                    title,
-                });
-                return;
-            }
-            "/root" | "/new" => {
-                let title = (!rest.is_empty()).then(|| rest.to_string());
-                self.status_notice = None;
-                self.pending_actions
-                    .push_back(AppAction::CreateRoot { title });
-                return;
-            }
-            "/rename" => {
-                if rest.is_empty() {
-                    self.status_notice = Some("Usage: /rename <new title>".to_string());
-                } else {
-                    let thread_id = self
-                        .pending_rename_thread_id
-                        .take()
-                        .unwrap_or_else(|| self.active_thread_id.clone());
-                    self.status_notice = None;
-                    self.pending_actions.push_back(AppAction::RenameThread {
-                        thread_id,
-                        title: rest.to_string(),
-                    });
-                    self.sync_focus_for_active_thread();
-                }
-                return;
-            }
-            "/join" | "/merge" => {
-                let source_thread_id = self.active_thread_id.clone();
-                let summary = (!rest.is_empty()).then(|| rest.to_string());
-                self.request_join_thread(source_thread_id, summary);
-                return;
-            }
-            "/term" | "/terminal" | "/zsh" | "/sh" | "/shell" | "/bash" => {
-                let cwd = parse_term_cwd(rest);
-                let active_id = self.active_thread_id.clone();
-                self.dispatch_create_terminal(Some(active_id), cwd);
-                return;
-            }
-            "/worktrees" => {
-                self.open_worktrees_sidebar_view(None);
-                return;
-            }
-            "/worktree" | "/wt" => {
-                if rest.is_empty() {
-                    let active_id = self.active_thread_id.clone();
-                    self.status_notice = Some("Allocating worktree...".to_string());
-                    self.pending_actions
-                        .push_back(AppAction::EnsureThreadWorktree {
-                            thread_id: active_id,
-                        });
-                } else {
-                    let query = parse_term_cwd(rest).unwrap_or_else(|| rest.to_string());
-                    if let Some(target_path) = self.resolve_worktree_query_target(&query) {
-                        let active_id = self.active_thread_id.clone();
-                        self.status_notice = Some("Switching worktree...".to_string());
-                        self.pending_actions
-                            .push_back(AppAction::SwitchThreadWorktree {
-                                thread_id: active_id,
-                                target_path,
-                            });
-                    } else {
-                        self.open_worktrees_sidebar_view(Some(query));
-                    }
-                }
-                return;
-            }
-            "/quit" => {
-                self.should_quit = true;
-                return;
-            }
-            _ => {}
+        if trimmed.starts_with('/') && self.execute_slash_command(trimmed, false) {
+            return;
         }
 
         ensure_paragraph_break(&mut self.active_transcript_md);
@@ -1219,7 +988,15 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.pty_exit_codes.clear();
     app.last_pty_sizes.clear();
     app.config_picker = None;
+    app.theme_picker = None;
     app.pending_worktree_delete = None;
+    app.pending_thread_delete = None;
+    app.pending_quit_confirm = None;
+    app.rename_prompt = None;
+    app.palette_active = false;
+    app.palette_input.clear();
+    app.palette_cursor = 0;
+    app.palette_match_idx = 0;
     app.worktree_autocomplete_open = false;
     app.worktree_autocomplete_idx = 0;
     app.worktree_list_in_flight = false;
@@ -1228,9 +1005,15 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.worktrees.clear();
     app.worktree_selected_idx = 0;
     app.worktree_scroll_offset = 0;
+    app.worktree_diff_path = None;
+    app.worktree_diff_preview.clear();
+    app.worktree_diff_scroll = 0;
+    app.worktree_diff_max_scroll = 0;
+    app.worktree_diff_in_flight = None;
     app.collapsed_worktree_repos.clear();
     app.sidebar_view = SidebarView::Grein;
     app.help_scroll_offset = 0;
+    app.help_max_scroll = 0;
     app.status_notice = None;
     app.pending_rename_thread_id = None;
     app.transcript_search.clear();
@@ -1848,6 +1631,15 @@ enum RunnerLocalEvent {
     WorktreeRemoved {
         path: String,
     },
+    WorktreeDiffLoaded {
+        path: String,
+        diff: String,
+    },
+    WorktreeDiffFailed {
+        path: String,
+        err: String,
+    },
+    WorktreesPruned(String),
 }
 
 async fn refresh_worktrees_and_metadata(
@@ -2302,6 +2094,73 @@ fn dispatch_action(
                 }
             });
         }
+        AppAction::FetchWorktreeDiff { path } => {
+            tokio::spawn(async move {
+                match engine.worktree_diff_preview(&path).await {
+                    Ok(diff) => {
+                        let _ = local_ev_tx
+                            .send(RunnerLocalEvent::WorktreeDiffLoaded { path, diff });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::WorktreeDiffFailed {
+                            path,
+                            err: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+        AppAction::PruneWorktrees => {
+            tokio::spawn(async move {
+                match engine.prune_worktrees().await {
+                    Ok(summary) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::WorktreesPruned(summary));
+                        refresh_worktrees_and_metadata(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Prune worktrees failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::SaveThemePreference { theme } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.save_theme_preference(&theme).await {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Save theme failed: {err}"
+                    )));
+                }
+            });
+        }
+        AppAction::SaveKeybindingPreference { action, binding } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.save_keybinding_preference(&action, &binding).await {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Save keybinding failed: {err}"
+                    )));
+                }
+            });
+        }
+        AppAction::RemoveKeybindingPreference { action } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.remove_keybinding_preference(&action).await {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Remove keybinding failed: {err}"
+                    )));
+                }
+            });
+        }
+        AppAction::SaveUiPreference { key, value } => {
+            tokio::spawn(async move {
+                if let Err(err) = engine.save_ui_preference(&key, &value).await {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Save UI preference failed: {err}"
+                    )));
+                }
+            });
+        }
         AppAction::Scrolled { .. } | AppAction::None => {}
     }
 }
@@ -2415,6 +2274,14 @@ pub async fn run_with_engine_events<B: Backend>(
     let mut engine_events = engine.subscribe_events().await?;
     let session = engine.hydrate_session().await?;
     apply_hydrated_session(&mut app, &session);
+    match engine.load_preferences().await {
+        Ok(prefs) => {
+            app.apply_preferences(&prefs);
+        }
+        Err(err) => {
+            app.status_notice = Some(format!("Preferences load failed: {err}"));
+        }
+    }
     match engine.thread_metadata().await {
         Ok(meta) => {
             if !meta.is_empty() {
@@ -2519,6 +2386,7 @@ pub async fn run_with_engine_events<B: Backend>(
                         app.worktrees = entries;
                         app.clamp_worktree_selection();
                         app.sync_worktree_autocomplete(false);
+                        app.maybe_fetch_selected_worktree_diff(false);
                         if app.status_notice.as_deref() == Some("Refreshing worktrees...") {
                             app.status_notice = None;
                         }
@@ -2536,7 +2404,40 @@ pub async fn run_with_engine_events<B: Backend>(
                     RunnerLocalEvent::WorktreeRemoved { path } => {
                         app.worktrees.retain(|w| w.path != path);
                         app.clamp_worktree_selection();
+                        if app.worktree_diff_path.as_deref() == Some(path.as_str()) {
+                            app.worktree_diff_path = None;
+                            app.worktree_diff_preview.clear();
+                            app.worktree_diff_scroll = 0;
+                            app.worktree_diff_max_scroll = 0;
+                        }
+                        app.maybe_fetch_selected_worktree_diff(false);
                         app.status_notice = Some(format!("Deleted worktree: {path}"));
+                    }
+                    RunnerLocalEvent::WorktreeDiffLoaded { path, diff } => {
+                        if app.worktree_diff_in_flight.as_deref() == Some(path.as_str()) {
+                            app.worktree_diff_in_flight = None;
+                        }
+                        if app.worktree_diff_path.as_deref() == Some(path.as_str()) {
+                            app.worktree_diff_preview = diff;
+                            app.worktree_diff_scroll = 0;
+                            app.worktree_diff_max_scroll = 0;
+                        }
+                    }
+                    RunnerLocalEvent::WorktreeDiffFailed { path, err } => {
+                        if app.worktree_diff_in_flight.as_deref() == Some(path.as_str()) {
+                            app.worktree_diff_in_flight = None;
+                        }
+                        if app.worktree_diff_path.as_deref() == Some(path.as_str()) {
+                            app.worktree_diff_preview = format!("Diff unavailable: {err}");
+                        }
+                    }
+                    RunnerLocalEvent::WorktreesPruned(summary) => {
+                        let msg = if summary.trim().is_empty() {
+                            "Pruned stale worktrees".to_string()
+                        } else {
+                            summary
+                        };
+                        app.status_notice = Some(msg);
                     }
                     RunnerLocalEvent::OpenConfigPicker {
                         snapshot,

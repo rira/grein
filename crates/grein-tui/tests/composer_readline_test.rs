@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use grein_tui::app::{
-    line_end, line_start, next_word_boundary, prev_word_boundary, App, AppAction, FocusedPane,
+    line_end, line_start, next_word_boundary, prev_word_boundary, App, FocusedPane,
 };
 use grein_tui::runner::draw_frame_mut;
 use ratatui::backend::TestBackend;
@@ -326,15 +326,17 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
     assert_eq!(app.input_buffer, "keep this draft");
     assert_eq!(app.cursor_position, 4);
 
-    // Ctrl+N still emits ForkBranch when Composer is focused
-    assert!(app.handle_key_event(ctrl('n')));
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::ForkBranch {
-            source_thread_id: app.active_thread_id.clone(),
-            title: None,
-        })
-    );
+    // Ctrl+N does not hijack Composer in WRITE mode
+    assert!(!app.handle_key_event(ctrl('n')));
+    assert!(app.pending_actions.is_empty());
+
+    // Ctrl+F moves cursor forward cleanly (Readline symmetry with Ctrl+B)
+    app.cursor_position = 0;
+    assert!(app.handle_key_event(ctrl('f')));
+    assert_eq!(app.cursor_position, 1);
+    assert!(app.handle_key_event(ctrl('b')));
+    assert_eq!(app.cursor_position, 0);
+    app.cursor_position = 4;
 
     // Ctrl+J still inserts newline in Composer
     assert!(app.handle_key_event(ctrl('j')));
@@ -375,31 +377,27 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
         assert_eq!(app.kill_ring, "preserved");
     }
 
-    // Ctrl+F opens Forward Search without mutating Composer draft/cursor; Esc clears it
-    assert!(app.handle_key_event(ctrl('f')));
+    // '/' in MANAGE opens Forward Search without mutating Composer draft/cursor; Esc clears it
+    app.set_focus(FocusedPane::Tree);
+    assert!(app.handle_key_event(key(KeyCode::Char('/'), KeyModifiers::NONE)));
     assert!(app.transcript_search.editing);
     assert_eq!(app.input_buffer, "keep\n this draft");
     assert_eq!(app.cursor_position, 5);
     app.handle_key_event(key(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!app.transcript_search.is_visible());
 
-    // '?' Help Modal displays Readline shortcuts without clipping
-    app.set_focus(FocusedPane::Composer);
-    app.input_buffer.clear();
-    app.cursor_position = 0;
+    // '?' in MANAGE opens Help Modal displaying Readline & 2-mode shortcuts without clipping
     assert!(app.handle_key_event(key(KeyCode::Char('?'), KeyModifiers::NONE)));
     assert!(app.show_help_modal);
 
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let screen = render_screen(&terminal);
-    assert!(screen.contains("Ctrl+A"), "Missing Ctrl+A in help:\n{screen}");
-    assert!(screen.contains("Ctrl+E"), "Missing Ctrl+E in help:\n{screen}");
-    assert!(screen.contains("Ctrl+K"), "Missing Ctrl+K in help:\n{screen}");
-    assert!(screen.contains("Ctrl+Y"), "Missing Ctrl+Y in help:\n{screen}");
-    assert!(screen.contains("Alt+"), "Missing Alt+ word hint in help:\n{screen}");
+    assert!(screen.contains("WRITE Mode"), "Missing WRITE Mode in help:\n{screen}");
+    assert!(screen.contains("MANAGE Mode"), "Missing MANAGE Mode in help:\n{screen}");
+    assert!(screen.contains("Ctrl+A/E/B/F/W/U/K/Y"), "Missing Readline in help:\n{screen}");
     assert!(
-        screen.contains("Press Esc, q, ?, or Enter to close"),
+        screen.contains("Esc/q/?/F1 Close") || screen.contains("Esc, q, ?, F1, or Enter to close"),
         "Help modal footer clipped:\n{screen}"
     );
 }

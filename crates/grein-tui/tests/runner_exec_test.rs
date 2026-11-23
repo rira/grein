@@ -435,11 +435,16 @@ async fn test_engine_port_default_methods_and_nonblocking_event_loop() {
         .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    for ch in "/quit".chars() {
+        key_tx
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
     key_tx
-        .send(Event::Key(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::CONTROL,
-        )))
+        .send(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
         .unwrap();
 
     let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), runner_handle)

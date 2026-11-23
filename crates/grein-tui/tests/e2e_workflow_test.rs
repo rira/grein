@@ -487,12 +487,14 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     })
     .await;
 
-    // 4. Branching via Ctrl+N and /branch bugfix
-    send_key(&key_tx, KeyCode::Char('n'), KeyModifiers::CONTROL);
-    wait_for("ctrl+n branch created", || {
+    // 4. Branching via MANAGE 'f' (Ctrl+G -> f -> Enter) and /branch bugfix
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('f'), KeyModifiers::NONE);
+    wait_for("tree fork branch created", || {
         engine.state.lock().unwrap().threads.len() == 2
     })
     .await;
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     send_text(&key_tx, "/branch bugfix");
@@ -563,9 +565,9 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 6b. Tree Esc + Up + Enter switches back to Trunk, submits turn, then switches back to bugfix.
+    // 6b. Ctrl+G -> MANAGE Tree + Up + Enter switches back to Trunk, submits turn, then switches back to bugfix.
     // Context-only Tree lists only thread branches: t-trunk (0), t-branch-1 (1), t-branch-2 (2).
-    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     for _ in 0..6 {
         send_key(&key_tx, KeyCode::Up, KeyModifiers::NONE);
     }
@@ -586,7 +588,7 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     // Move Down back to t-branch-2 (index 2).
-    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     for _ in 0..8 {
         send_key(&key_tx, KeyCode::Down, KeyModifiers::NONE);
     }
@@ -606,11 +608,12 @@ async fn test_e2e_run_with_engine_full_interactive_workflow() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 7. Quit cleanly via Ctrl+Q and inspect rendered terminal buffer
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    // 7. Quit cleanly via Ctrl+G then q and inspect rendered terminal buffer
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal = timeout(Duration::from_secs(3), runner_handle)
         .await
-        .expect("event loop should exit on Ctrl+Q")
+        .expect("event loop should exit on Ctrl+G then q")
         .unwrap()
         .unwrap();
 
@@ -731,10 +734,15 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_per
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     assert!(render_to_string(&terminal).contains("$ echo hi (exit 0)"));
 
-    // 4. Branching via Ctrl+N and /branch bugfix + Tree Enter switching & transcript isolation
+    // 4. Branching via MANAGE 'f' and /branch bugfix + Tree Enter switching & transcript isolation
     handle_event(
         &mut app,
-        Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+        Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+    )
+    .unwrap();
+    handle_event(
+        &mut app,
+        Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
     )
     .unwrap();
     assert_eq!(
@@ -747,6 +755,11 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_per
     let b1 = engine.fork_branch("t-trunk", None).await.unwrap();
     apply_engine_event(&mut app, TuiEngineEvent::ThreadCreated { thread: b1.clone() });
     assert_eq!(app.active_thread_id(), b1.id);
+    handle_event(
+        &mut app,
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    )
+    .unwrap();
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
     app.input_buffer = "/branch bugfix".to_string();
@@ -784,10 +797,10 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_per
     assert!(app.active_transcript_md.contains("BUGFIX_ISOLATED"));
     assert!(!app.active_transcript_md.contains("Tokens concatenate smoothly"));
 
-    // Switch back to Trunk via Esc (idle Composer -> Tree) + Up navigation + Enter
+    // Switch back to Trunk via Ctrl+G (Composer -> Tree) + Up navigation + Enter
     handle_event(
         &mut app,
-        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
     )
     .unwrap();
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
@@ -818,10 +831,10 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_per
     assert!(app.active_transcript_md.contains("Tokens concatenate smoothly"));
     assert!(!app.active_transcript_md.contains("BUGFIX_ISOLATED"));
 
-    // Switch back to bugfix branch via Tree Enter and confirm isolation in both directions
+    // Switch back to bugfix branch via Ctrl+G -> Tree Enter and confirm isolation in both directions
     handle_event(
         &mut app,
-        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
     )
     .unwrap();
     for _ in 0..app.tree.nodes.len() {
@@ -922,6 +935,34 @@ async fn test_e2e_stepped_workflow_composer_streaming_branch_isolation_shell_per
     );
 }
 
+fn rendered_layout(
+    terminal: &Terminal<TestBackend>,
+    area: Rect,
+    strip_h: u16,
+) -> grein_tui::layout::ChromeLayout {
+    let mut layout = compute_layout_with_chrome(area, strip_h);
+    let buf = terminal.backend().buffer();
+    if area.height > 0 && area.width > 2 {
+        if let Some(end_x) = (0..area.width).find(|&x| buf[(x, area.y)].symbol() == "╮") {
+            let sw = end_x + 1;
+            let right_w = area.width.saturating_sub(sw);
+            let right_x = area.x + sw;
+            layout.tree_area.width = sw;
+            layout.transcript_area.x = right_x;
+            layout.transcript_area.width = right_w;
+            if layout.composer_area.width > 0 {
+                layout.composer_area.x = right_x;
+                layout.composer_area.width = right_w;
+            }
+            if let Some(ref mut sa) = layout.subagent_strip_area {
+                sa.x = right_x;
+                sa.width = right_w;
+            }
+        }
+    }
+    layout
+}
+
 #[tokio::test]
 async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
     let threads = vec![
@@ -1008,14 +1049,15 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal = timeout(Duration::from_secs(3), runner_handle)
         .await
         .expect("runner exit")
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 140, 32), 0);
+    let layout = rendered_layout(&terminal, Rect::new(0, 0, 140, 32), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
 
@@ -1115,19 +1157,19 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
         engine_a.state.lock().unwrap().event_tx.is_some()
     })
     .await;
-    send_key(&key_tx_a, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx_a, KeyCode::Char('g'), KeyModifiers::CONTROL);
     for _ in 0..13 {
         send_key(&key_tx_a, KeyCode::Down, KeyModifiers::NONE);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    send_key(&key_tx_a, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx_a, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal_a = timeout(Duration::from_secs(3), handle_a)
         .await
         .expect("runner A exit")
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 100, 10), 0);
+    let layout = rendered_layout(&terminal_a, Rect::new(0, 0, 100, 10), 0);
     let tree_down = render_rect_to_string(&terminal_a, layout.tree_area);
     assert!(
         tree_down.contains("Branch-13"),
@@ -1153,19 +1195,20 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
         engine_b.state.lock().unwrap().event_tx.is_some()
     })
     .await;
-    send_key(&key_tx_b, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx_b, KeyCode::Char('g'), KeyModifiers::CONTROL);
     for _ in 0..13 {
         send_key(&key_tx_b, KeyCode::Up, KeyModifiers::NONE);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    send_key(&key_tx_b, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx_b, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal_b = timeout(Duration::from_secs(3), handle_b)
         .await
         .expect("runner B exit")
         .unwrap()
         .unwrap();
 
-    let tree_up = render_rect_to_string(&terminal_b, layout.tree_area);
+    let layout_b = rendered_layout(&terminal_b, Rect::new(0, 0, 100, 10), 0);
+    let tree_up = render_rect_to_string(&terminal_b, layout_b.tree_area);
     assert!(
         tree_up.contains("Branch-00"),
         "Up scrolling must restore Branch-00 into view:\n{tree_up}"
@@ -1263,17 +1306,19 @@ async fn test_e2e_fork_grein_close_delete_tree_x_d_and_sole_thread_guard() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 4. Close/delete remaining forks via Tree 'x' and 'd'
-    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    // 4. Close/delete remaining forks via MANAGE Tree 'x'/'d' + 'y' confirm
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Char('x'), KeyModifiers::NONE);
-    wait_for("Tree x deleted t-branch-2", || {
+    send_key(&key_tx, KeyCode::Char('y'), KeyModifiers::NONE);
+    wait_for("Tree x+y deleted t-branch-2", || {
         engine.deleted_threads().contains(&"t-branch-2".to_string())
     })
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     send_key(&key_tx, KeyCode::Char('d'), KeyModifiers::NONE);
-    wait_for("Tree d deleted t-branch-1", || {
+    send_key(&key_tx, KeyCode::Char('y'), KeyModifiers::NONE);
+    wait_for("Tree d+y deleted t-branch-1", || {
         engine.deleted_threads().contains(&"t-branch-1".to_string())
     })
     .await;
@@ -1285,9 +1330,9 @@ async fn test_e2e_fork_grein_close_delete_tree_x_d_and_sole_thread_guard() {
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     send_text(&key_tx, "/close");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(70)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    drop(key_tx);
     let terminal = timeout(Duration::from_secs(3), handle)
         .await
         .expect("runner exit")
@@ -1300,7 +1345,7 @@ async fn test_e2e_fork_grein_close_delete_tree_x_d_and_sole_thread_guard() {
     );
     assert_eq!(engine.threads_count(), 1);
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 30), 0);
+    let layout = rendered_layout(&terminal, Rect::new(0, 0, 120, 30), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
 
@@ -1350,14 +1395,15 @@ async fn test_e2e_transcript_fork_banner_on_branch_vs_omitted_on_root() {
     wait_for("branch turn completed", || engine.completed_turns_count() >= 2).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    send_key(&key_tx_a, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx_a, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx_a, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal_branch = timeout(Duration::from_secs(3), handle_a)
         .await
         .expect("runner A exit")
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 140, 28), 0);
+    let layout = rendered_layout(&terminal_branch, Rect::new(0, 0, 140, 28), 0);
     let branch_transcript = render_rect_to_string(&terminal_branch, layout.transcript_area);
     assert!(
         branch_transcript
@@ -1379,12 +1425,13 @@ async fn test_e2e_transcript_fork_banner_on_branch_vs_omitted_on_root() {
         engine.state.lock().unwrap().event_tx.is_some()
     })
     .await;
-    send_key(&key_tx_b, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx_b, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx_b, KeyCode::Up, KeyModifiers::NONE);
     send_key(&key_tx_b, KeyCode::Enter, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    send_key(&key_tx_b, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx_b, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx_b, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal_root = timeout(Duration::from_secs(3), handle_b)
         .await
         .expect("runner B exit")
@@ -1421,19 +1468,19 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
         mode: Some("code".to_string()),
     });
     tokio::time::sleep(Duration::from_millis(60)).await;
-    send_key(&key_tx_a, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx_a, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx_a, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal_idle = timeout(Duration::from_secs(3), handle_a)
         .await
         .expect("runner A exit")
         .unwrap()
         .unwrap();
 
-    let shell = grein_tui::app::active_shell_label();
-    let idle_layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 32), 0);
+    let idle_layout = rendered_layout(&terminal_idle, Rect::new(0, 0, 120, 32), 0);
     let idle_full = render_to_string(&terminal_idle);
     let idle_status = render_rect_to_string(&terminal_idle, idle_layout.status_bar_area);
     assert!(!idle_full.contains("Subagents"));
-    assert!(idle_status.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
+    assert!(idle_status.contains("MANAGE · GREIN"));
     assert!(idle_status.contains("code · claude-sonnet"));
     assert!(idle_status.contains("✓ idle"));
     assert!(idle_status.contains("0 subagents"));
@@ -1493,15 +1540,20 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
         });
     }
     tokio::time::sleep(Duration::from_millis(70)).await;
-    send_key(&key_tx_b, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx_b, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx_b, KeyCode::Char('q'), KeyModifiers::NONE);
+    send_key(&key_tx_b, KeyCode::Char('y'), KeyModifiers::NONE);
     let terminal_busy = timeout(Duration::from_secs(3), handle_b)
         .await
         .expect("runner B exit")
         .unwrap()
         .unwrap();
 
-    let busy_layout =
-        compute_layout_with_chrome(Rect::new(0, 0, 120, 32), subagent_strip_height(7));
+    let busy_layout = rendered_layout(
+        &terminal_busy,
+        Rect::new(0, 0, 120, 32),
+        subagent_strip_height(7),
+    );
     let strip_area = busy_layout
         .subagent_strip_area
         .expect("subagent strip area must be allocated");
@@ -1520,7 +1572,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     assert!(strip_text.contains("Agent(research: Worker 1)"));
     assert!(strip_text.contains("gemini-2.5-pro"));
     assert!(strip_text.contains("+2 more"));
-    assert!(busy_status.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")));
+    assert!(busy_status.contains("MANAGE · GREIN"));
     assert!(busy_status.contains("tool: read_file"));
     assert!(busy_status.contains("7 subagents"));
 
@@ -1548,7 +1600,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     draw_frame_mut(&mut stepped_terminal, &mut app).unwrap();
     let thought_screen = render_to_string(&stepped_terminal);
     assert!(thought_screen.contains("thinking: inspecting logs"));
-    assert!(thought_screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}")));
+    assert!(thought_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"));
 
     apply_engine_event(
         &mut app,
@@ -1584,14 +1636,14 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     draw_frame_mut(&mut stepped_terminal, &mut app).unwrap();
     let cleared_screen = render_to_string(&stepped_terminal);
     assert!(!cleared_screen.contains("Subagents"));
-    assert!(cleared_screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help")));
+    assert!(cleared_screen.contains("Ctrl+G manage · Alt+Z zoom"));
     assert!(cleared_screen.contains("0 subagents"));
 }
 
 #[tokio::test]
 async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
-    // 1. Empty Composer '?' opens centered Help modal & Composer bottom border stays minimal
-    for trigger in ["?", "/?", "/help"] {
+    // 1. /?, /help in Composer and '?' in MANAGE open centered Help modal & Composer bottom border stays minimal
+    for trigger in ["manage?", "/?", "/help"] {
         let engine = MockLiveEngine::new_with_trunk("t-trunk", "Main");
         let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
         let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
@@ -1606,19 +1658,22 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
         })
         .await;
 
-        send_text(&key_tx, trigger);
-        if trigger != "?" {
+        if trigger == "manage?" {
+            send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+            send_key(&key_tx, KeyCode::Char('?'), KeyModifiers::NONE);
+        } else {
+            send_text(&key_tx, trigger);
             send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(key_tx);
         let terminal = timeout(Duration::from_secs(3), handle)
             .await
             .expect("runner exit")
             .unwrap()
             .unwrap();
 
-        let layout = compute_layout_with_chrome(Rect::new(0, 0, 110, 30), 0);
+        let layout = rendered_layout(&terminal, Rect::new(0, 0, 110, 30), 0);
         let composer_bottom_row = render_rect_to_string(
             &terminal,
             Rect::new(
@@ -1632,29 +1687,27 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
             composer_bottom_row
                 .trim_end_matches('\n')
                 .chars()
-                .all(|ch| matches!(ch, '└' | '─' | '┘')),
+                .all(|ch| matches!(ch, '╰' | '─' | '╯')),
             "Composer bottom border must not contain keybind legend ({trigger}): {composer_bottom_row:?}"
         );
 
-        let centered_modal_rect = Rect::new(18, 3, 74, 24);
-        let modal_text = render_rect_to_string(&terminal, centered_modal_rect);
+        let full_text = render_to_string(&terminal);
         assert!(
-            modal_text.contains("Keybindings & Commands"),
-            "Help modal must render centered for trigger {trigger}:\n{modal_text}"
+            full_text.contains("Keybindings & Commands"),
+            "Help modal must render for trigger {trigger}:\n{full_text}"
         );
-        assert!(modal_text.contains("/fork, /grein"));
-        assert!(modal_text.contains("/root, /new"));
-        assert!(modal_text.contains("/rename"));
-        assert!(modal_text.contains("/join, /merge"));
-        assert!(modal_text.contains("/close, /delete"));
-        assert!(modal_text.contains("/?, /help, ?"));
-        assert!(modal_text.contains("Alt+N"));
-        assert!(modal_text.contains("Alt+R / F2"));
-        assert!(modal_text.contains("Press Esc, q, ?, or Enter to close"));
+        assert!(full_text.contains("WRITE Mode (Terminal & Composer)"));
+        assert!(full_text.contains("MANAGE Mode (Sidebar)"));
+        assert!(full_text.contains("/fork"));
+        assert!(full_text.contains("/root"));
+        assert!(full_text.contains("/join"));
+        assert!(full_text.contains("/theme"));
+        assert!(full_text.contains("/bind"));
+        assert!(full_text.contains("Esc, q, ?, F1, or Enter to close"));
         assert!(engine.recorded_turns().is_empty());
     }
 
-    // 2. Full dismissal (Esc, q, ?, Enter) and mid-sentence '?' typing in one E2E run
+    // 2. Full dismissal (Esc, q, ?, Enter) and literal '?' typing in Composer in one E2E run
     let engine = MockLiveEngine::new_with_trunk("t-trunk", "Main");
     let engine_dyn: Arc<dyn TuiEnginePort> = engine.clone();
     let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
@@ -1669,8 +1722,10 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
     })
     .await;
 
-    // Open with '?', dismiss with Esc
+    // Open in MANAGE with '?', dismiss with Esc, return to Composer
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Char('?'), KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
 
     // Mid-sentence '?' inserts '?' normally and submits turn "why?"
@@ -1711,7 +1766,8 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal = timeout(Duration::from_secs(3), handle)
         .await
         .expect("runner exit")
@@ -1847,19 +1903,19 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Switch back to t-root via Tree so status bar displays t-root's early-model metadata too
-    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Up, KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    drop(key_tx);
     let terminal = timeout(Duration::from_secs(3), handle)
         .await
         .expect("runner exit")
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 26), 0);
+    let layout = rendered_layout(&terminal, Rect::new(0, 0, 120, 26), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
 
@@ -1894,16 +1950,16 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
     })
     .await;
 
-    // 1. Fork child from Main and rename it via Alt+R
+    // 1. Fork child from Main and rename it inline in MANAGE (Ctrl+G -> 'r')
     send_text(&key_tx, "/branch temp-name");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("child forked", || engine.threads_count() == 2).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    send_key(&key_tx, KeyCode::Char('r'), KeyModifiers::ALT);
-    // Ctrl+U clears "/rename temp-name", then enter new /rename command
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('r'), KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Char('u'), KeyModifiers::CONTROL);
-    send_text(&key_tx, "/rename Auth Spike");
+    send_text(&key_tx, "Auth Spike");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("child renamed", || {
         engine
@@ -1916,7 +1972,8 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
     })
     .await;
 
-    // 2. Join child into Main via /join with summary
+    // 2. Join child into Main via MANAGE 'm' or /join with summary
+    send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     send_text(&key_tx, "/join Token rotation verified");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("child marked merged", || {
@@ -1931,14 +1988,16 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 3. Create new root via Alt+N, then rename it via F2
-    send_key(&key_tx, KeyCode::Char('n'), KeyModifiers::ALT);
+    // 3. Create new root via MANAGE 'a', then rename it inline with 'r'
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('a'), KeyModifiers::NONE);
     wait_for("new root created", || engine.threads_count() == 3).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    send_key(&key_tx, KeyCode::F(2), KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('r'), KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Char('u'), KeyModifiers::CONTROL);
-    send_text(&key_tx, "/rename Docs Root");
+    send_text(&key_tx, "Docs Root");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("new root renamed", || {
         engine
@@ -1952,21 +2011,21 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
     .await;
 
     // 4. Switch to Main in Tree so its transcript (with Joined note) renders on screen
-    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     for _ in 0..4 {
         send_key(&key_tx, KeyCode::Up, KeyModifiers::NONE);
     }
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal = timeout(Duration::from_secs(3), handle)
         .await
         .expect("runner exit")
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 130, 30), 0);
+    let layout = rendered_layout(&terminal, Rect::new(0, 0, 130, 30), 0);
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
 
@@ -2110,25 +2169,22 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 1. Alt+1..9 remain unbound; Alt+Home scrolls active r1 to top from Composer
+    // 1. Alt+1..9 remain unbound; Alt+PgUp scrolls active r1 up from Composer
     for digit in '1'..='9' {
         send_key(&key_tx, KeyCode::Char(digit), KeyModifiers::ALT);
     }
-    send_key(&key_tx, KeyCode::Home, KeyModifiers::ALT);
+    send_key(&key_tx, KeyCode::PageUp, KeyModifiers::ALT);
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 2. Tab cycles r1 -> b1 -> b2, then Shift+Tab -> b1 -> r1; Alt+J -> r2 -> r3
-    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
-    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
+    // 2. In MANAGE (Ctrl+G), Alt+J switches r1 -> r2 -> r3, Alt+K -> r2, Alt+Shift+Up -> r1; Esc enters WRITE
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Char('j'), KeyModifiers::ALT);
-    // Now on r2; Alt+J moves to r3 (lone root), Tab stays on r3
     send_key(&key_tx, KeyCode::Char('j'), KeyModifiers::ALT);
-    send_key(&key_tx, KeyCode::Tab, KeyModifiers::NONE);
-    // Alt+K wraps back to r2, Alt+Shift+Up returns to r1
     send_key(&key_tx, KeyCode::Char('k'), KeyModifiers::ALT);
     send_key(&key_tx, KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT);
+    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
 
-    // 3. Ctrl+G toggles Composer -> Tree during SLOW_TURN without cancelling, Esc cancels turn
+    // 3. Ctrl+G toggles Composer -> Tree during SLOW_TURN without cancelling; Ctrl+G back to WRITE + Esc cancels turn
     send_text(&key_tx, "SLOW_TURN");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("slow turn started on r1", || {
@@ -2141,6 +2197,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
         engine.cancelled_threads().is_empty(),
         "Ctrl+G must toggle focus without cancelling streaming turn"
     );
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     wait_for("Esc cancelled r1 turn", || {
         engine.cancelled_threads().contains(&"r1".to_string())
@@ -2149,26 +2206,29 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     wait_for("slow turn finished", || engine.completed_turns_count() >= 1).await;
 
     // 4. Attempting Tree 'm' and Composer /join on root r1 sets notice without merging
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Char('m'), KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
     send_text(&key_tx, "/join");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
 
-    // 5. Enter Tree, preview b1, scroll preview transcript to top via Alt+Home so line 01 renders
-    send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
+    // 5. Enter Tree, preview b1, scroll preview transcript to top via Ctrl+U steps so line 01 renders
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Down, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(30)).await;
-    send_key(&key_tx, KeyCode::Home, KeyModifiers::ALT);
+    for _ in 0..8 {
+        send_key(&key_tx, KeyCode::PageUp, KeyModifiers::NONE);
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    drop(key_tx);
     let terminal = timeout(Duration::from_secs(3), handle)
         .await
         .expect("runner exit")
         .unwrap()
         .unwrap();
 
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 120, 26), 0);
+    let layout = rendered_layout(&terminal, Rect::new(0, 0, 120, 26), 0);
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
     let status_text = render_rect_to_string(&terminal, layout.status_bar_area);
 
@@ -2178,7 +2238,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     );
     assert!(
         transcript_text.contains("Preview branch line 01"),
-        "Expected Alt+Home in Tree preview to scroll b1 to top:\n{transcript_text}"
+        "Expected PgUp in Tree preview to scroll b1 to top:\n{transcript_text}"
     );
     assert!(
         status_text.contains("Cannot join a root context (no parent branch)"),
@@ -2195,16 +2255,16 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
         "Root /join attempt must not mark any thread merged"
     );
 
-    // Help modal must contain new keymap rows and zero /wb or Ctrl+B
+    // Help modal must contain new 2-mode keymap rows and zero /wb
     let mut help_app = App::new();
     help_app.show_help_modal = true;
     let mut help_term = Terminal::new(TestBackend::new(110, 30)).unwrap();
     draw_frame_mut(&mut help_term, &mut help_app).unwrap();
     let help_screen = render_to_string(&help_term);
-    assert!(help_screen.contains("Tab / Shift+Tab"), "{help_screen}");
-    assert!(help_screen.contains("Alt+↑/↓, PgUp/PgDn"), "{help_screen}");
-    assert!(help_screen.contains("Alt+Shift+↑/↓, Alt+J/K"), "{help_screen}");
-    assert!(help_screen.contains("Esc / Ctrl+G"), "{help_screen}");
+    assert!(help_screen.contains("WRITE Mode (Terminal & Composer)"), "{help_screen}");
+    assert!(help_screen.contains("MANAGE Mode (Sidebar)"), "{help_screen}");
+    assert!(help_screen.contains("Tab / Ctrl+T"), "{help_screen}");
+    assert!(help_screen.contains("PgUp/PgDn"), "{help_screen}");
+    assert!(help_screen.contains("/theme"), "{help_screen}");
     assert!(!help_screen.contains("/wb"), "{help_screen}");
-    assert!(help_screen.contains("Ctrl+B"), "{help_screen}");
 }

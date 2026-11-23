@@ -18,7 +18,7 @@ use grein_tui::runner::{
 };
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -370,30 +370,31 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
         "Collapsed 6-line tool output must be hidden initially:\n{collapsed_screen}"
     );
 
-    // Global Ctrl+O expands all collapsible cards and sets concise status notice
-    assert!(app.handle_key_event(ctrl('o')));
+    // In MANAGE (Tree), 'o' expands all collapsible cards and sets concise status notice
+    app.set_focus(FocusedPane::Tree);
+    assert!(app.handle_key_event(key(KeyCode::Char('o'))));
     assert!(app.status_notice.is_some());
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let expanded_screen = render_screen(&terminal);
     assert!(
         expanded_screen.contains("▼ ✓ read_file (src/app.rs)"),
-        "Ctrl+O must expand collapsed tool card:\n{expanded_screen}"
+        "'o' must expand collapsed tool card:\n{expanded_screen}"
     );
     assert!(
         expanded_screen.contains("│ l6"),
         "Expanded tool card body must be visible:\n{expanded_screen}"
     );
 
-    // Ctrl+O again collapses multi-line cards
-    assert!(app.handle_key_event(ctrl('o')));
+    // Second 'o' collapses multi-line cards
+    assert!(app.handle_key_event(key(KeyCode::Char('o'))));
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let recollapsed_screen = render_screen(&terminal);
     assert!(
         recollapsed_screen.contains("▶ ✓ read_file (src/app.rs) · 6 lines  [Ctrl+O]"),
-        "Second Ctrl+O must collapse multi-line tool card:\n{recollapsed_screen}"
+        "Second 'o' must collapse multi-line tool card:\n{recollapsed_screen}"
     );
 
-    // Ctrl+O on previewed branch in Tree targets previewed thread t-2
+    // 'o' on previewed branch in Tree targets previewed thread t-2
     apply_engine_event(
         &mut app,
         TuiEngineEvent::ToolInvoked {
@@ -416,12 +417,12 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Down)); // select t-2 in Tree
     assert_eq!(app.active_thread_id(), "t-1");
-    assert!(app.handle_key_event(ctrl('o')));
+    assert!(app.handle_key_event(key(KeyCode::Char('o'))));
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let preview_expanded = render_screen(&terminal);
     assert!(
         preview_expanded.contains("▼ ✓ grep (preview)"),
-        "Ctrl+O from Tree preview must expand previewed thread cards:\n{preview_expanded}"
+        "'o' from Tree preview must expand previewed thread cards:\n{preview_expanded}"
     );
 
     // Fallback rule: directly mutating app.active_transcript_md must render mutated markdown
@@ -542,15 +543,15 @@ fn test_exact_transcript_scroll_no_bottom_clipping_and_submit_auto_scroll() {
 
     let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
-    let layout = compute_layout_with_chrome(Rect::new(0, 0, 80, 18), 0);
+    let layout = grein_tui::render::compute_app_layout(&app, Rect::new(0, 0, 80, 18), 0, false);
     let transcript_screen = render_rect(&terminal, layout.transcript_area);
     assert!(
         transcript_screen.contains("BOTTOM_SENTINEL_EXACT_LINE"),
         "Last line must not be clipped at bottom of Transcript:\n{transcript_screen}"
     );
 
-    // User scrolls up (disabling auto_scroll)
-    app.handle_key_event(key(KeyCode::PageUp));
+    // User scrolls up via Alt+PgUp in WRITE mode (disabling auto_scroll)
+    app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
     assert!(!app.transcript_viewport("t-1").auto_scroll());
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let scrolled_up_screen = render_rect(&terminal, layout.transcript_area);
@@ -567,7 +568,7 @@ fn test_exact_transcript_scroll_no_bottom_clipping_and_submit_auto_scroll() {
     assert!(after_prompt_screen.contains("new prompt at bottom"));
 
     // Scroll up again, then !cmd shell submit re-enables auto_scroll
-    app.handle_key_event(key(KeyCode::PageUp));
+    app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
     assert!(!app.transcript_viewport("t-1").auto_scroll());
     app.submit_composer_prompt("!echo bottom_shell");
     assert!(
@@ -815,7 +816,8 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    send_key(&key_tx, KeyCode::Char('q'), KeyModifiers::NONE);
     let terminal = timeout(Duration::from_secs(3), runner)
         .await
         .unwrap()
@@ -883,10 +885,13 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
     assert!(modal_screen.contains("Gemini 2.5 Pro"), "{modal_screen}");
     assert!(modal_screen.contains("Claude Sonnet 4"), "{modal_screen}");
 
-    // Verify Green on active row ("Gemini 2.5 Pro") and Reversed Cyan on selected row ("Claude Sonnet 4")
+    // Verify theme.success on active row ("Gemini 2.5 Pro") and theme selection bg/fg (no REVERSED) on selected row ("Claude Sonnet 4")
+    let palette = grein_tui::theme::ThemePalette::from_preset(
+        grein_tui::theme::ThemePreset::TokyoNight,
+    );
     let buf = modal_term.backend().buffer();
-    let mut found_green_active = false;
-    let mut found_reversed_cyan = false;
+    let mut found_themed_active = false;
+    let mut found_themed_selected = false;
     for y in 0..buf.area.height {
         let mut row = String::new();
         for x in 0..buf.area.width {
@@ -894,22 +899,25 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
         }
         if let Some(byte_idx) = row.find("Gemini 2.5 Pro") {
             let col = row[..byte_idx].chars().count() as u16;
-            if buf[(col, y)].fg == Color::Green {
-                found_green_active = true;
+            if buf[(col, y)].fg == palette.success {
+                found_themed_active = true;
             }
         }
         if let Some(byte_idx) = row.find("Claude Sonnet 4") {
             let col = row[..byte_idx].chars().count() as u16;
             let cell = &buf[(col, y)];
-            if cell.fg == Color::Cyan && cell.modifier.contains(Modifier::REVERSED) {
-                found_reversed_cyan = true;
+            if cell.fg == palette.selection_fg
+                && cell.bg == palette.selection_bg
+                && !cell.modifier.contains(Modifier::REVERSED)
+            {
+                found_themed_selected = true;
             }
         }
     }
-    assert!(found_green_active, "Active choice must be highlighted in Green");
+    assert!(found_themed_active, "Active choice must use theme.success");
     assert!(
-        found_reversed_cyan,
-        "Selected row must be highlighted in Reversed Cyan"
+        found_themed_selected,
+        "Selected row must use theme selection fg/bg without REVERSED"
     );
 
     // Esc closes modal cleanly
@@ -984,11 +992,8 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
     app.submit_composer_prompt("/zoom");
     assert!(!app.sidebar_hidden);
 
+    // Clipboard copy via 'y' in Tree, Alt+Y globally, /copy code, /copy all; then Tree 'z' zoom
     app.set_focus(FocusedPane::Tree);
-    app.handle_key_event(key(KeyCode::Char('z')));
-    assert!(app.sidebar_hidden);
-
-    // Clipboard copy via 'y' in Tree, Alt+Y globally, /copy code, /copy all
     app.handle_key_event(key(KeyCode::Char('y')));
     assert_eq!(
         app.last_copied_text.as_deref(),
@@ -996,9 +1001,25 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
     );
     assert!(app.status_notice.is_some());
 
+    app.handle_key_event(key(KeyCode::Char('z')));
+    assert!(app.sidebar_hidden);
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+    // Minimal WRITE mode leaves Alt+Y unbound by default; /copy and user-bound Alt+Y copy cleanly
     app.set_focus(FocusedPane::Composer);
     app.last_copied_text = None;
-    app.handle_key_event(alt('y'));
+    assert!(!app.handle_key_event(alt('y')));
+    assert_eq!(app.last_copied_text, None);
+
+    app.submit_composer_prompt("/copy");
+    assert_eq!(
+        app.last_copied_text.as_deref(),
+        Some("Explanation:\n```rust\nfn demo() {}\n```\nDone.")
+    );
+
+    app.last_copied_text = None;
+    app.submit_composer_prompt("/bind copy_reply alt+y");
+    assert!(app.handle_key_event(alt('y')));
     assert_eq!(
         app.last_copied_text.as_deref(),
         Some("Explanation:\n```rust\nfn demo() {}\n```\nDone.")
@@ -1040,11 +1061,19 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
         }
     }
 
-    let mut quit_upper = App::new();
-    quit_upper.handle_key_event(ctrl('C'));
-    assert!(quit_upper.should_quit());
+    // Ctrl+C in empty Composer guides to Ctrl+G then q instead of quitting; Ctrl+C in MANAGE quits when idle
+    let mut safe_ctrl_c = App::new();
+    safe_ctrl_c.handle_key_event(ctrl('C'));
+    assert!(!safe_ctrl_c.should_quit());
+    assert_eq!(
+        safe_ctrl_c.status_notice.as_deref(),
+        Some("Use Ctrl+G then q (or /quit) to exit")
+    );
+    safe_ctrl_c.handle_key_event(ctrl('g'));
+    safe_ctrl_c.handle_key_event(ctrl('C'));
+    assert!(safe_ctrl_c.should_quit());
 
-    // 2. Zero-modifier Tree keys: J/K, Ctrl+U/D, g/G, f, z, y
+    // 2. Zero-modifier Tree keys: J/K, Ctrl+U/D, gg/G, f, z, y
     let mut tree_app = App::new();
     apply_hydrated_session(
         &mut tree_app,
@@ -1114,15 +1143,16 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
     tree_app.transcript_viewport_mut("r1").scroll_to_bottom();
     tree_app.set_focus(FocusedPane::Tree);
 
-    // Ctrl+U / Ctrl+D half-page scroll, g / G top / bottom
+    // Ctrl+U / Ctrl+D half-page scroll right-pane preview; gg / G jump top / bottom of tree selection
     assert!(tree_app.handle_key_event(ctrl('u')));
     assert!(tree_app.transcript_viewport("r1").scroll_offset() < 80);
     assert!(tree_app.handle_key_event(ctrl('d')));
     assert_eq!(tree_app.transcript_viewport("r1").scroll_offset(), 80);
-    assert!(tree_app.handle_key_event(key(KeyCode::Char('g'))));
-    assert_eq!(tree_app.transcript_viewport("r1").scroll_offset(), 0);
     assert!(tree_app.handle_key_event(key(KeyCode::Char('G'))));
-    assert_eq!(tree_app.transcript_viewport("r1").scroll_offset(), 80);
+    assert_eq!(tree_app.tree.selected_index(), Some(2));
+    assert!(tree_app.handle_key_event(key(KeyCode::Char('g'))));
+    assert!(tree_app.handle_key_event(key(KeyCode::Char('g'))));
+    assert_eq!(tree_app.tree.selected_index(), Some(0));
 
     // 'f' forks selected thread, 'J'/'K' switch roots
     tree_app.handle_key_event(key(KeyCode::Down)); // select b1
@@ -1145,23 +1175,20 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
     draw_frame_mut(&mut full_term, &mut tree_app).unwrap();
     let full_help = render_screen(&full_term);
     for expected in [
-        "Global",
-        "ᛇ Grein Navigation",
-        "Composer & Slash Commands",
+        "WRITE Mode (Terminal & Composer)",
+        "MANAGE Mode (Sidebar)",
+        "Worktrees View",
+        "Palette & Slash Commands",
         "Ctrl+J",
         "Ctrl+T",
         "Alt+Z",
-        "Ctrl+O",
-        "Ctrl+B",
-        "Ctrl+F",
+        "/theme",
+        "/bind",
+        "/sidebar",
         "/model",
-        "/mode",
-        "/thinking",
-        "/commands",
         "/copy",
-        "/zoom",
         "/quit",
-        "Press Esc, q, ?, or Enter to close",
+        "Esc, q, ?, F1, or Enter to close",
     ] {
         assert!(
             full_help.contains(expected),
@@ -1174,10 +1201,10 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
     draw_frame_mut(&mut tiny_term, &mut tree_app).unwrap();
     let tiny_top = render_screen(&tiny_term);
     assert!(
-        tiny_top.contains("Press Esc, q, ?, or Enter to close"),
+        tiny_top.contains("Esc/q/?/F1 Close"),
         "Footer must remain pinned on tiny terminal:\n{tiny_top}"
     );
-    for _ in 0..15 {
+    for _ in 0..18 {
         tree_app.handle_key_event(key(KeyCode::Char('j')));
     }
     assert!(tree_app.help_scroll_offset > 0);
@@ -1187,5 +1214,5 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
         tiny_scrolled.contains("/model") || tiny_scrolled.contains("/copy"),
         "Scrolling down in help modal on tiny terminal must reveal slash commands:\n{tiny_scrolled}"
     );
-    assert!(tiny_scrolled.contains("Press Esc, q, ?, or Enter to close"));
+    assert!(tiny_scrolled.contains("Esc/q/?/F1 Close"));
 }

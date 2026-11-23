@@ -16,7 +16,7 @@ use grein_tui::runner::{
 };
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -174,28 +174,33 @@ fn setup_multi_repo_app() -> App {
 }
 
 #[test]
-fn test_ctrl_t_toggles_views_unhides_zoom_and_works_in_terminal_passthrough() {
+fn test_manage_ctrl_t_toggles_views_unhides_zoom_and_leaves_ctrl_t_passthrough_in_terminal() {
     let mut app = setup_multi_repo_app();
     assert_eq!(app.sidebar_view, SidebarView::Grein);
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
-    // Ctrl+T from Composer -> Worktrees view, focuses Tree, queues ListWorktrees
+    // Ctrl+T in WRITE mode passes straight to Composer/Terminal; Ctrl+G -> MANAGE then Ctrl+T / Tab switches views
+    assert!(!app.handle_key_event(ctrl('t')));
+    assert_eq!(app.sidebar_view, SidebarView::Grein);
+    assert!(app.handle_key_event(ctrl('g')));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+
+    // Ctrl+T from MANAGE -> Worktrees view, focuses Tree, queues ListWorktrees
     assert!(app.handle_key_event(ctrl('t')));
     assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(!app.sidebar_hidden);
-    assert_eq!(
+    assert!(matches!(
         app.pending_actions.pop_front(),
         Some(AppAction::ListWorktrees)
-    );
+    ));
 
-    // Ctrl+T again -> returns to Grein view and focuses Tree without ListWorktrees
+    // Ctrl+T again -> returns to Grein view and focuses Tree
     assert!(app.handle_key_event(ctrl('t')));
     assert_eq!(app.sidebar_view, SidebarView::Grein);
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
-    assert!(app.pending_actions.is_empty());
 
-    // Enter live Terminal thread, zoom out with Alt+Z, then press Ctrl+T inside Terminal passthrough
+    // Enter live Terminal thread, zoom out with Alt+Z, verify Ctrl+T passes through as \x14 to PTY
     app.switch_thread("t-term");
     app.set_focus(FocusedPane::Terminal);
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
@@ -220,41 +225,35 @@ fn test_ctrl_t_toggles_views_unhides_zoom_and_works_in_terminal_passthrough() {
         "Alt+Z must NOT forward to PtyWrite"
     );
 
-    // Now Ctrl+T while zoomed inside Terminal unhides sidebar -> Worktrees, focuses Tree, queues ListWorktrees & PtyResize
+    // Inside WRITE mode Terminal, Ctrl+T is NOT intercepted — passes through as \x14 (readline transpose)
     app.pending_actions.clear();
     assert!(app.handle_key_event(ctrl('t')));
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::PtyWrite {
+            thread_id: "t-term".to_string(),
+            bytes: vec![0x14],
+        })
+    );
+
+    // Ctrl+G enters MANAGE (unhiding sidebar and resizing PTY), then Ctrl+T switches to Worktrees
+    app.pending_actions.clear();
+    assert!(app.handle_key_event(ctrl('g')));
     assert!(!app.sidebar_hidden);
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert!(app
+        .pending_actions
+        .iter()
+        .any(|a| matches!(a, AppAction::PtyResize { thread_id, cols, .. } if thread_id == "t-term" && *cols < 110)));
+
+    app.pending_actions.clear();
+    assert!(app.handle_key_event(ctrl('t')));
     assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     assert!(app
         .pending_actions
         .iter()
         .any(|a| matches!(a, AppAction::ListWorktrees)));
-    assert!(
-        app.pending_actions
-            .iter()
-            .any(|a| matches!(a, AppAction::PtyResize { thread_id, cols, .. } if thread_id == "t-term" && *cols < 110)),
-        "Ctrl+T unhiding Terminal sidebar must emit PtyResize: {:?}",
-        app.pending_actions
-    );
-    assert!(
-        !app.pending_actions
-            .iter()
-            .any(|a| matches!(a, AppAction::PtyWrite { .. })),
-        "Ctrl+T must NOT forward \\x14 to PtyWrite"
-    );
-
-    // While unhidden inside Terminal, Ctrl+T still switches directly to Worktrees without PtyWrite
-    app.sidebar_view = SidebarView::Grein;
-    app.set_focus(FocusedPane::Terminal);
-    app.pending_actions.clear();
-    assert!(app.handle_key_event(ctrl('t')));
-    assert_eq!(app.sidebar_view, SidebarView::Worktrees);
-    assert_eq!(app.focused_pane(), FocusedPane::Tree);
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::ListWorktrees)
-    );
 }
 
 #[test]
@@ -275,6 +274,7 @@ fn test_alt_z_toggles_zoom_globally_without_interfering_with_ctrl_t() {
     }
 
     // Preserve Worktrees view when Alt+Z hides & restores sidebar
+    app.set_focus(FocusedPane::Tree);
     app.handle_key_event(ctrl('t'));
     assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     assert!(app.handle_key_event(alt('z')));
@@ -295,6 +295,7 @@ fn test_alt_z_toggles_zoom_globally_without_interfering_with_ctrl_t() {
 #[test]
 fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete_modal() {
     let mut app = setup_multi_repo_app();
+    app.set_focus(FocusedPane::Tree);
     app.handle_key_event(ctrl('t'));
     app.pending_actions.clear();
 
@@ -305,7 +306,8 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
     // Tab strip and per-repo grouping + longest path prefix ● active indicator
     let status = render_rect(&terminal, Rect::new(0, 27, 120, 1));
     assert!(
-        status.contains("Enter attach · t term · w/n new · d/x del · / filter · Ctrl+T tree"),
+        status.contains("MANAGE · WORKTREES")
+            && status.contains("Enter attach · p prune · y copy"),
         "{status}"
     );
     assert!(screen.contains("ᛇ Grein │ ⎇ Worktrees"), "{screen}");
@@ -323,11 +325,14 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         "Sibling prefix feat-auth-v2 must NOT get ●:\n{screen}"
     );
 
-    // Verify tab strip styling (Grein dim, Worktrees cyan+bold) and yellow *3
+    // Verify theme styling (Grein muted, Worktrees accent+bold) and dirty badge color
+    let palette = grein_tui::theme::ThemePalette::from_preset(
+        grein_tui::theme::ThemePreset::TokyoNight,
+    );
     let buf = terminal.backend().buffer();
-    let mut worktrees_tab_cyan_bold = false;
-    let mut grein_tab_dim = false;
-    let mut dirty_yellow = false;
+    let mut worktrees_tab_accent_bold = false;
+    let mut grein_tab_muted = false;
+    let mut dirty_themed = false;
     for y in 0..buf.area.height {
         let mut row = String::new();
         for x in 0..buf.area.width {
@@ -335,27 +340,27 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         }
         if let Some(byte_idx) = row.find("ᛇ Grein") {
             let col = row[..byte_idx].chars().count() as u16;
-            if buf[(col, y)].fg == Color::DarkGray {
-                grein_tab_dim = true;
+            if buf[(col, y)].fg == palette.muted {
+                grein_tab_muted = true;
             }
         }
         if let Some(byte_idx) = row.find("⎇ Worktrees") {
             let col = row[..byte_idx].chars().count() as u16;
             let c = &buf[(col, y)];
-            if c.fg == Color::Cyan && c.modifier.contains(Modifier::BOLD) {
-                worktrees_tab_cyan_bold = true;
+            if c.fg == palette.accent && c.modifier.contains(Modifier::BOLD) {
+                worktrees_tab_accent_bold = true;
             }
         }
         if let Some(byte_idx) = row.find("*3") {
             let col = row[..byte_idx].chars().count() as u16;
-            if buf[(col, y)].fg == Color::Yellow {
-                dirty_yellow = true;
+            if buf[(col, y)].fg == palette.dirty {
+                dirty_themed = true;
             }
         }
     }
-    assert!(grein_tab_dim, "Inactive Grein tab must be DarkGray");
-    assert!(worktrees_tab_cyan_bold, "Active Worktrees tab must be Cyan+Bold");
-    assert!(dirty_yellow, "Dirty badge *3 must be Yellow");
+    assert!(grein_tab_muted, "Inactive Grein tab must use theme.muted");
+    assert!(worktrees_tab_accent_bold, "Active Worktrees tab must use theme.accent+Bold");
+    assert!(dirty_themed, "Dirty badge *3 must use theme.dirty");
 
     // Navigation & folding: 0=repo-a header, 1=main, 2=feat/auth, 3=detached@deadbeef, 4=repo-b header, 5=develop
     assert_eq!(app.worktree_selected_idx, 0);
@@ -414,6 +419,7 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
     assert!(app.worktree_filter_query.is_empty());
 
     // Actions on rows: r refresh, Enter on header folds, Enter on entry switches worktree, t creates terminal, w/n ensures worktree
+    app.pending_actions.clear();
     app.handle_key_event(key(KeyCode::Char('r')));
     assert_eq!(
         app.pending_actions.pop_front(),
@@ -435,6 +441,10 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         })
     );
     assert_eq!(app.status_notice.as_deref(), Some("Switching worktree..."));
+    // Enter on a worktree attaches and returns to WRITE; Ctrl+G re-enters MANAGE Worktrees for t/w/n/d
+    app.handle_key_event(ctrl('g'));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    app.pending_actions.clear();
 
     app.handle_key_event(key(KeyCode::Char('t')));
     assert!(matches!(
@@ -559,11 +569,10 @@ fn test_composer_worktree_autocomplete_and_slash_commands() {
     reordered.insert(0, beta);
     app.worktrees = reordered;
 
-    // Outside '/worktree ', Tab still cycles branches
+    // Outside '/worktree ' in Composer, Tab does not hijack threads
     assert_eq!(app.active_thread_id(), "t-auth");
     app.handle_key_event(key(KeyCode::Tab));
-    assert_eq!(app.active_thread_id(), "t-term");
-    app.switch_thread("t-auth");
+    assert_eq!(app.active_thread_id(), "t-auth");
     app.set_focus(FocusedPane::Composer);
     app.pending_actions.clear();
 
@@ -629,7 +638,7 @@ fn test_composer_worktree_autocomplete_and_slash_commands() {
     );
     assert!(!app.worktree_autocomplete_open);
 
-    // Esc closes popup without leaving Composer; Tab afterwards cycles branches normally
+    // Esc closes popup without leaving Composer
     app.input_buffer.clear();
     app.cursor_position = 0;
     type_str(&mut app, "/wt ");
@@ -638,7 +647,7 @@ fn test_composer_worktree_autocomplete_and_slash_commands() {
     assert!(!app.worktree_autocomplete_open);
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
     app.handle_key_event(key(KeyCode::Tab));
-    assert_ne!(app.active_thread_id(), "t-auth");
+    assert_eq!(app.active_thread_id(), "t-auth");
 
     // Enter on worktree candidate dispatches SwitchThreadWorktree and clears Composer
     app.switch_thread("t-auth");
@@ -866,7 +875,8 @@ async fn test_e2e_runner_worktree_switch_ensure_remove_refresh_list_and_metadata
     })
     .await;
 
-    // 1. Ctrl+T lists worktrees
+    // 1. Ctrl+G -> MANAGE, Ctrl+T lists worktrees
+    key_tx.send(Event::Key(ctrl('g'))).unwrap();
     key_tx.send(Event::Key(ctrl('t'))).unwrap();
     wait_for("list_worktrees on Ctrl+T", || {
         engine.state.lock().unwrap().list_calls >= 1
@@ -874,7 +884,7 @@ async fn test_e2e_runner_worktree_switch_ensure_remove_refresh_list_and_metadata
     .await;
     let meta_after_boot = engine.state.lock().unwrap().meta_calls;
 
-    // 2. Move down twice to feat/auth (dirty=3) and press Enter -> switch_thread_worktree + refreshes list_worktrees & thread_metadata
+    // 2. Move down twice to feat/auth (dirty=3) and press Enter -> switch_thread_worktree + enters WRITE mode + refreshes
     key_tx.send(Event::Key(key(KeyCode::Down))).unwrap();
     key_tx.send(Event::Key(key(KeyCode::Down))).unwrap();
     key_tx.send(Event::Key(key(KeyCode::Enter))).unwrap();
@@ -885,7 +895,8 @@ async fn test_e2e_runner_worktree_switch_ensure_remove_refresh_list_and_metadata
     .await;
     let meta_after_switch = engine.state.lock().unwrap().meta_calls;
 
-    // 3. Press 'w' -> ensure_thread_worktree + refreshes list_worktrees & thread_metadata
+    // Return to MANAGE Worktrees, press 'w' -> ensure_thread_worktree + refreshes list_worktrees & thread_metadata
+    key_tx.send(Event::Key(ctrl('g'))).unwrap();
     key_tx.send(Event::Key(key(KeyCode::Char('w')))).unwrap();
     wait_for("ensure_thread_worktree and refresh", || {
         let g = engine.state.lock().unwrap();
@@ -904,7 +915,7 @@ async fn test_e2e_runner_worktree_switch_ensure_remove_refresh_list_and_metadata
     })
     .await;
 
-    key_tx.send(Event::Key(ctrl('q'))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Char('q')))).unwrap();
     let terminal = timeout(Duration::from_secs(3), runner)
         .await
         .unwrap()

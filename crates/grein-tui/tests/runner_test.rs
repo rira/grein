@@ -12,7 +12,7 @@ fn test_terminal_guard_raii_lifecycle() {
 }
 
 #[tokio::test]
-async fn test_runner_event_loop_quits_on_q_key_outside_composer_and_ctrl_q_anywhere() {
+async fn test_runner_event_loop_quits_on_q_key_in_manage_and_leaves_ctrl_q_unbound_in_composer() {
     let backend = TestBackend::new(80, 24);
     let _terminal = Terminal::new(backend).expect("failed to create test terminal");
     let mut app_state = grein_tui::state::AppState::new();
@@ -31,7 +31,10 @@ async fn test_runner_event_loop_quits_on_q_key_outside_composer_and_ctrl_q_anywh
         crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
     let exit_ctrl_q = grein_tui::runner::handle_event(&mut app_state, ctrl_q)
         .expect("handling event should succeed");
-    assert!(exit_ctrl_q, "Ctrl+Q must signal event loop termination from Composer");
+    assert!(
+        !exit_ctrl_q,
+        "Ctrl+Q must not abruptly quit from Composer"
+    );
 
     let mut tree_app = grein_tui::state::AppState::new();
     tree_app.set_focus(FocusedPane::Tree);
@@ -43,12 +46,12 @@ async fn test_runner_event_loop_quits_on_q_key_outside_composer_and_ctrl_q_anywh
 
     assert!(
         exit_requested,
-        "'q' key outside Composer must signal event loop termination"
+        "'q' key in MANAGE mode must signal event loop termination when idle"
     );
 }
 
 #[tokio::test]
-async fn test_runner_event_loop_quits_on_ctrl_c() {
+async fn test_runner_event_loop_ctrl_c_in_composer_does_not_quit() {
     let mut app_state = grein_tui::state::AppState::new();
 
     let ctrl_c_event =
@@ -57,7 +60,14 @@ async fn test_runner_event_loop_quits_on_ctrl_c() {
     let exit_requested = grein_tui::runner::handle_event(&mut app_state, ctrl_c_event)
         .expect("handling event should succeed");
 
-    assert!(exit_requested, "Ctrl+C must signal event loop termination");
+    assert!(
+        !exit_requested,
+        "Ctrl+C in empty Composer must show guidance instead of quitting"
+    );
+    assert_eq!(
+        app_state.status_notice.as_deref(),
+        Some("Use Ctrl+G then q (or /quit) to exit")
+    );
 }
 
 #[tokio::test]
@@ -214,13 +224,13 @@ fn test_golden_e2e_two_column_integration_and_multiline_sqlite() {
         "Blackboard pane must not render in 2-column layout"
     );
     // Composer pane & status bar assertions
-    let shell = grein_tui::app::active_shell_label();
     assert!(
         screen.contains("Composer")
             && screen.contains("Draft line 1")
             && screen.contains("Draft line 2")
-            && (screen.contains(&format!("Ctrl+G tree · Alt+T {shell} · F1 help"))
-                || screen.contains(&format!("Esc cancel · Ctrl+G tree · Alt+T {shell}"))),
-        "Composer pane must auto-grow for multi-line draft and render bottom status bar"
+            && screen.contains("WRITE · AGENT")
+            && (screen.contains("Ctrl+G manage · Alt+Z zoom")
+                || screen.contains("Esc cancel · Ctrl+G manage")),
+        "Composer pane must auto-grow for multi-line draft and render bottom status bar:\n{screen}"
     );
 }
