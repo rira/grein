@@ -21,10 +21,12 @@ pub struct HydratedTurn {
 }
 
 /// A hydrated thread with its trunk transcript.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HydratedThread {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub custom_name: Option<String>,
     pub turns: Vec<HydratedTurn>,
 }
 
@@ -51,6 +53,8 @@ pub struct ThreadMeta {
     pub git_branch: Option<String>,
     #[serde(default)]
     pub git_dirty: usize,
+    #[serde(default)]
+    pub custom_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +246,11 @@ pub enum TuiEngineEvent {
         thread_id: String,
         title: String,
     },
+    ThreadCustomNameUpdated {
+        thread_id: String,
+        #[serde(default)]
+        custom_name: Option<String>,
+    },
     ThreadMerged {
         thread_id: String,
         target_thread_id: String,
@@ -323,6 +332,7 @@ pub trait TuiEnginePort: Send + Sync {
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or("Branch")
                 .to_string(),
+            custom_name: None,
             turns: Vec::new(),
         })
     }

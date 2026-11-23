@@ -740,6 +740,7 @@ impl App {
             self.threads.push(ThreadItem {
                 id: new_id,
                 title,
+                custom_name: None,
                 anchors: Vec::new(),
             });
         }
@@ -863,6 +864,20 @@ impl App {
                 created_at: 1,
             });
         }
+        let _ = storage.delete_blackboard_entry("active_thread_custom_name");
+        if let Some(custom_name) = self
+            .threads
+            .first()
+            .and_then(|t| crate::app::normalize_custom_name(t.custom_name.as_deref()))
+        {
+            let _ = storage.insert_blackboard_entry(&BlackboardEntry {
+                id: BlackboardEntryId::now_v7(),
+                key: "active_thread_custom_name".to_string(),
+                value: custom_name,
+                kind: BlackboardEntryKind::Note,
+                created_at: 1,
+            });
+        }
     }
 
     pub fn load_state_from_sqlite(&mut self, db_path: &Path) {
@@ -913,11 +928,17 @@ impl App {
             .filter(|v| !v.trim().is_empty())
             .or(first_user_content)
             .unwrap_or_else(|| "Active Session".to_string());
+        let custom_name = storage
+            .get_blackboard_entry("active_thread_custom_name")
+            .ok()
+            .flatten()
+            .and_then(|e| crate::app::normalize_custom_name(Some(&e.value)));
 
         let tid_str = thread.id.to_string();
         self.threads = vec![ThreadItem {
             id: tid_str.clone(),
             title,
+            custom_name,
             anchors: Vec::new(),
         }];
         self.active_thread_id = tid_str.clone();
@@ -1036,6 +1057,7 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
         app.threads.push(ThreadItem {
             id: t.id.clone(),
             title: t.title.clone(),
+            custom_name: crate::app::normalize_custom_name(t.custom_name.as_deref()),
             anchors,
         });
     }
@@ -1242,9 +1264,14 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             }
         }
         TuiEngineEvent::ThreadCreated { thread } => {
+            app.rename_prompt = None;
+            let incoming_custom = crate::app::normalize_custom_name(thread.custom_name.as_deref());
             if let Some(existing) = app.threads.iter_mut().find(|t| t.id == thread.id) {
                 if !thread.title.trim().is_empty() {
                     existing.title = thread.title;
+                }
+                if incoming_custom.is_some() {
+                    existing.custom_name = incoming_custom;
                 }
                 rebuild_tree_nodes(app);
                 return;
@@ -1263,6 +1290,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.threads.push(ThreadItem {
                 id: new_id.clone(),
                 title: thread.title,
+                custom_name: incoming_custom,
                 anchors,
             });
             app.switch_thread(&new_id);
@@ -1276,6 +1304,19 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
         TuiEngineEvent::ThreadTitleUpdated { thread_id, title } => {
             if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
                 thread.title = title;
+            }
+            rebuild_tree_nodes(app);
+        }
+        TuiEngineEvent::ThreadCustomNameUpdated {
+            thread_id,
+            custom_name,
+        } => {
+            let normalized = crate::app::normalize_custom_name(custom_name.as_deref());
+            if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
+                thread.custom_name = normalized.clone();
+            }
+            if let Some(meta) = app.thread_meta.get_mut(&thread_id) {
+                meta.custom_name = normalized;
             }
             rebuild_tree_nodes(app);
         }
@@ -1297,13 +1338,9 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 });
-            let source_title = app
-                .threads
-                .iter()
-                .find(|t| t.id == thread_id)
-                .map(|t| t.title.clone())
-                .unwrap_or_else(|| thread_id.clone());
+            let source_title = app.display_title_for(&thread_id, &thread_id);
             if has_target {
                 let clean_summary = summary.trim();
                 let join_note = if clean_summary.is_empty() {
@@ -1324,12 +1361,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 if target_thread_id == app.active_thread_id {
                     app.sync_anchors();
                 }
-                let target_title = app
-                    .threads
-                    .iter()
-                    .find(|t| t.id == target_thread_id)
-                    .map(|t| t.title.as_str())
-                    .unwrap_or(target_thread_id.as_str());
+                let target_title = app.display_title_for(&target_thread_id, &target_thread_id);
                 app.status_notice = Some(format!("Joined {source_title} → {target_title}"));
             } else {
                 app.status_notice = Some(format!("Joined {source_title} to Shared Context"));
@@ -1339,6 +1371,11 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
         TuiEngineEvent::ThreadMetadataUpdated { meta } => {
             app.thread_meta.clear();
             for m in meta {
+                if let Some(custom) = crate::app::normalize_custom_name(m.custom_name.as_deref()) {
+                    if let Some(t) = app.threads.iter_mut().find(|t| t.id == m.thread_id) {
+                        t.custom_name = Some(custom);
+                    }
+                }
                 app.thread_meta.insert(m.thread_id.clone(), m);
             }
             let active = app.active_thread_id.clone();
@@ -1565,6 +1602,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
         }
         TuiEngineEvent::Error { message } => {
             let active = app.active_thread_id.clone();
+            app.status_notice = Some(format!("Error: {message}"));
             app.streaming_assistant_threads.remove(&active);
             app.thread_thoughts.remove(&active);
             app.thread_active_tool.remove(&active);
@@ -1715,6 +1753,7 @@ fn dispatch_action(
                             cwd: None,
                             git_branch: None,
                             git_dirty: 0,
+                            custom_name: None,
                         };
                         let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
                             TuiEngineEvent::ThreadCreated { thread },
@@ -1748,8 +1787,12 @@ fn dispatch_action(
             tokio::spawn(async move {
                 match engine.rename_thread(&thread_id, &title).await {
                     Ok(()) => {
+                        let custom_name = crate::app::normalize_custom_name(Some(&title));
                         let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
-                            TuiEngineEvent::ThreadTitleUpdated { thread_id, title },
+                            TuiEngineEvent::ThreadCustomNameUpdated {
+                                thread_id,
+                                custom_name,
+                            },
                         ));
                     }
                     Err(err) => {
@@ -1937,6 +1980,7 @@ fn dispatch_action(
                             cwd,
                             git_branch: None,
                             git_dirty: 0,
+                            custom_name: None,
                         };
                         let _ =
                             local_ev_tx.send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));
@@ -2559,6 +2603,7 @@ pub async fn run_with_engine_events<B: Backend>(
                 app.thread_turn_started_ms.remove(&target_thread);
                 app.thread_statuses
                     .insert(target_thread.clone(), "error".to_string());
+                app.status_notice = Some(format!("Error: {message}"));
                 with_thread_transcript_mut(&mut app, &target_thread, |buf| {
                     ensure_paragraph_break(buf);
                     buf.push_str(&format!("Error: {message}\n\n"));

@@ -32,10 +32,6 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
-fn shift(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::SHIFT)
-}
-
 fn alt(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::ALT)
 }
@@ -109,6 +105,7 @@ fn meta_entry(
         cwd: cwd.map(str::to_string),
         git_branch: git_branch.map(str::to_string),
         git_dirty,
+        custom_name: None,
     }
 }
 
@@ -137,6 +134,7 @@ fn test_dynamic_shell_label_from_env_and_status_bar() {
                 id: "t-1".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -145,7 +143,7 @@ fn test_dynamic_shell_label_from_env_and_status_bar() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let idle_screen = render_screen(&terminal);
     assert!(
-        idle_screen.contains("WRITE · AGENT") && idle_screen.contains("Ctrl+G manage · Alt+Z zoom"),
+        idle_screen.contains("WRITE · AGENT") && idle_screen.contains("Ctrl+G manage · Alt+Z sidebar"),
         "Idle status bar must reflect WRITE mode and zoom hint:\n{idle_screen}"
     );
 
@@ -154,7 +152,7 @@ fn test_dynamic_shell_label_from_env_and_status_bar() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let busy_screen = render_screen(&terminal);
     assert!(
-        busy_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"),
+        busy_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z sidebar"),
         "Busy status bar must reflect Esc cancel:\n{busy_screen}"
     );
 }
@@ -178,11 +176,13 @@ fn test_pty_scrollback_shortcuts_mouse_scroll_cwd_and_badge_rendering() {
                             .collect::<Vec<_>>()
                             .join("\n"),
                     }],
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -217,9 +217,9 @@ fn test_pty_scrollback_shortcuts_mouse_scroll_cwd_and_badge_rendering() {
 
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
 
-    // Shift+PageUp / Alt+PageUp -> PtyScroll { delta: 5 } (no PtyWrite)
+    // Alt+K / Alt+J -> PtyScroll { delta: +/-5 } (no PtyWrite)
     app.pending_actions.clear();
-    assert!(app.handle_key_event(shift(KeyCode::PageUp)));
+    assert!(app.handle_key_event(alt(KeyCode::Char('k'))));
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::PtyScroll {
@@ -227,25 +227,7 @@ fn test_pty_scrollback_shortcuts_mouse_scroll_cwd_and_badge_rendering() {
             delta: 5,
         })
     );
-    assert!(app.handle_key_event(alt(KeyCode::PageUp)));
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::PtyScroll {
-            thread_id: "t-term".to_string(),
-            delta: 5,
-        })
-    );
-
-    // Shift+PageDown / Alt+PageDown -> PtyScroll { delta: -5 } (no PtyWrite)
-    assert!(app.handle_key_event(shift(KeyCode::PageDown)));
-    assert_eq!(
-        app.pending_actions.pop_front(),
-        Some(AppAction::PtyScroll {
-            thread_id: "t-term".to_string(),
-            delta: -5,
-        })
-    );
-    assert!(app.handle_key_event(alt(KeyCode::PageDown)));
+    assert!(app.handle_key_event(alt(KeyCode::Char('j'))));
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::PtyScroll {
@@ -303,7 +285,7 @@ fn test_pty_scrollback_shortcuts_mouse_scroll_cwd_and_badge_rendering() {
     );
 
     // Render Terminal status bar & header: status bar shows Ctrl+G manage + [scroll -5] (no duplicate cwd);
-    // header shows >_ Shell · /home/user/projects/grein
+    // header shows >_ /home/user/projects/grein
     let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let status = render_rect(&terminal, Rect::new(0, 23, 110, 1));
@@ -311,7 +293,7 @@ fn test_pty_scrollback_shortcuts_mouse_scroll_cwd_and_badge_rendering() {
     assert!(status.contains("WRITE · SHELL") && status.contains("Ctrl+G manage"), "{status}");
     assert!(status.contains("[scroll -5]"), "{status}");
     assert!(!status.contains("/home/user/projects/grein"), "{status}");
-    assert!(full.contains(">_ Shell · /home/user/projects/grein"), "{full}");
+    assert!(full.contains(">_ /home/user/projects/grein"), "{full}");
 
     // On Agent thread, mouse ScrollUp scrolls Transcript cleanly
     app.switch_thread("t-agent");
@@ -351,6 +333,7 @@ async fn test_exited_pty_enter_restart_and_runner_scroll_restart_roundtrip() {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                                  custom_name: None,
                 }],
             })
         }
@@ -450,6 +433,7 @@ async fn test_exited_pty_enter_restart_and_runner_scroll_restart_roundtrip() {
                 id: "t-term".to_string(),
                 title: "Shell".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -520,8 +504,8 @@ async fn test_exited_pty_enter_restart_and_runner_scroll_restart_roundtrip() {
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 1. Shift+PageUp calls engine.pty_scroll(5) and shows [scroll -5]
-    key_tx.send(Event::Key(shift(KeyCode::PageUp))).unwrap();
+    // 1. Alt+K calls engine.pty_scroll(5) and shows [scroll -5]
+    key_tx.send(Event::Key(alt(KeyCode::Char('k')))).unwrap();
     for _ in 0..100 {
         if !engine.state.lock().unwrap().scrolls.is_empty() {
             break;
@@ -596,6 +580,7 @@ fn test_vim_transcript_search_and_f1_g_question_help_triggers() {
                     role: "Assistant".to_string(),
                     content: body,
                 }],
+                              custom_name: None,
             }],
         },
     );
@@ -603,32 +588,31 @@ fn test_vim_transcript_search_and_f1_g_question_help_triggers() {
     let mut terminal = Terminal::new(TestBackend::new(110, 22)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
 
-    // 1. F1 toggles Help in MANAGE (Tree) and Transcript fallback, while remaining unbound in WRITE Composer
+    // 1. F1 remains unbound in Composer, Tree, and Transcript (single '?' canonical Help trigger)
     app.set_focus(FocusedPane::Composer);
     assert!(!app.handle_key_event(key(KeyCode::F(1))));
     assert!(!app.show_help_modal);
     for pane in [FocusedPane::Tree, FocusedPane::Transcript] {
         app.set_focus(pane);
         app.help_scroll_offset = 5;
-        assert!(app.handle_key_event(key(KeyCode::F(1))));
-        assert!(app.show_help_modal, "F1 must open Help in {pane:?}");
+        assert!(app.handle_key_event(key(KeyCode::Char('?'))));
+        assert!(app.show_help_modal, "? must open Help in {pane:?}");
         assert_eq!(app.help_scroll_offset, 0);
-        app.handle_key_event(key(KeyCode::F(1)));
-        assert!(!app.show_help_modal, "Second F1 must toggle Help closed");
+        app.handle_key_event(key(KeyCode::Char('?')));
+        assert!(!app.show_help_modal, "Second ? must toggle Help closed");
     }
 
-    // 2. '?' opens Help directly in MANAGE Tree and g? also works; '/' opens Forward Search
+    // 2. '?' opens Help directly in MANAGE Tree while legacy F1 stays unbound; '/' opens Forward Search
     app.set_focus(FocusedPane::Tree);
-    app.handle_key_event(key(KeyCode::Char('?')));
-    assert!(app.show_help_modal, "? must open Help in Tree");
-    app.handle_key_event(key(KeyCode::Char('?')));
-    assert!(!app.show_help_modal);
-
+    app.handle_key_event(key(KeyCode::F(1)));
+    assert!(!app.show_help_modal, "F1 must not open Help");
     app.handle_key_event(key(KeyCode::Char('g')));
     assert!(app.pending_g_prefix);
-    app.handle_key_event(key(KeyCode::Char('?')));
+    app.handle_key_event(key(KeyCode::Char('x')));
     assert!(!app.pending_g_prefix);
-    assert!(app.show_help_modal, "g? must open Help in Tree");
+    assert!(!app.show_help_modal);
+    app.handle_key_event(key(KeyCode::Char('?')));
+    assert!(app.show_help_modal, "'?' must open Help in Tree");
     app.handle_key_event(key(KeyCode::Esc));
     assert!(!app.show_help_modal);
 
@@ -755,6 +739,7 @@ fn test_vim_transcript_search_and_f1_g_question_help_triggers() {
         id: "t-term".to_string(),
         title: "Shell".to_string(),
         anchors: Vec::new(),
+                                         custom_name: None,
     });
     app.thread_meta.insert(
         "t-term".to_string(),
@@ -794,31 +779,37 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
                     id: "r1".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "b1".to_string(),
                     title: "Branch A".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "g1".to_string(),
                     title: "Grand A1".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "gg1".to_string(),
                     title: "TermChild".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "b2".to_string(),
                     title: "Branch B".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "r2".to_string(),
                     title: "Root 2".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -894,13 +885,22 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
     // b1 is still folded (4 visible nodes: r1, b1, b2, r2)
     assert_eq!(app.tree.nodes.len(), 4);
 
-    // Left on expanded r1 folds it again; Right unfolds it; Right again activates r1 -> Composer
+    // Left on expanded r1 folds it; Right unfolds it; Right again steps into 1st child (staying in MANAGE);
+    // Enter enters WRITE (Composer)
     app.handle_key_event(key(KeyCode::Left));
     assert!(app.collapsed_threads.contains("r1"));
     app.handle_key_event(key(KeyCode::Right));
     assert!(!app.collapsed_threads.contains("r1"));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Right));
+    assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    let sel_after_right = match app.tree.nodes.get(app.tree.selected_index().unwrap()) {
+        Some(TreeNode::Thread(t)) => t.id.as_str(),
+        _ => "",
+    };
+    assert_eq!(sel_after_right, "b1");
+    app.tree.select_index(0); // r1
+    app.handle_key_event(key(KeyCode::Enter));
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
     // Space on leaf b2 is a safe no-op
@@ -925,7 +925,7 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
     assert!(!app.collapsed_threads.contains("b1"));
     assert_eq!(app.tree.nodes.len(), 6);
 
-    // Fold r1 again, then Alt+T from MANAGE Tree while g1 is active/selected jumps to child terminal gg1 and unfolds r1 + b1
+    // Fold r1 again, then switching via custom JumpTerminal binding while g1 is active jumps to child terminal gg1 and unfolds r1 + b1
     app.switch_thread("r1");
     app.collapsed_threads.insert("r1".to_string());
     app.collapsed_threads.insert("b1".to_string());
@@ -934,6 +934,9 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
     assert!(!app.collapsed_threads.contains("b1"));
     app.collapsed_threads.insert("r1".to_string());
     app.set_focus(FocusedPane::Tree);
+    app.keymap
+        .bind(grein_tui::keymap::BindableAction::JumpTerminal, "alt+t")
+        .unwrap();
     app.handle_key_event(alt(KeyCode::Char('t')));
     assert_eq!(app.active_thread_id(), "gg1");
     assert_eq!(app.focused_pane(), FocusedPane::Terminal);
@@ -965,6 +968,7 @@ fn test_tree_folding_space_h_l_rendering_and_auto_unfold_ancestors() {
                 id: "g1-new".to_string(),
                 title: "Created Child".to_string(),
                 turns: Vec::new(),
+                        custom_name: None,
             },
         },
     );
@@ -986,19 +990,18 @@ fn test_help_modal_documents_search_folding_pty_scroll_restart_and_git_badge() {
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let help = render_screen(&terminal);
 
-    let shell = active_shell_label();
     for expected in [
         "WRITE Mode (Terminal & Composer)",
         "MANAGE Mode (Sidebar)",
-        "F1",
-        "PgUp/PgDn",
-        "Space",
-        "Alt/Shift+PgUp/PgDn",
-        "All keys pass straight to >_",
-        &format!(">_ {shell}"),
+        "Alt+K / Alt+J",
+        "Alt+H / Alt+L",
+        "Ctrl+F/B, Ctrl+U/D",
+        "h/←/Space",
+        "Esc, q, ?, or Enter to close",
     ] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
+    let _ = active_shell_label();
 }
 
 #[test]
@@ -1013,21 +1016,25 @@ fn test_worktree_git_status_badge_clean_dirty_and_none() {
                     id: "t-clean".to_string(),
                     title: "Clean".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-dirty".to_string(),
                     title: "Dirty".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-none".to_string(),
                     title: "Plain".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Term".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1101,16 +1108,19 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
                     id: "t-agent".to_string(),
                     title: "Main Agent".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-agent-2".to_string(),
                     title: "Side Agent".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1134,7 +1144,7 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
     let tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
         tree_status.contains("MANAGE · GREIN")
-            && tree_status.contains("Enter write · a new · f fork · t shell"),
+            && tree_status.contains("[↵]write [n]ew [f]ork [s]hell"),
         "Tree status bar must render MANAGE action hints:\n{tree_status}"
     );
 
@@ -1145,7 +1155,7 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
     let busy_tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
         busy_tree_status.contains("MANAGE · GREIN")
-            && busy_tree_status.contains("Enter write · a new · f fork · t shell"),
+            && busy_tree_status.contains("[↵]write [n]ew [f]ork [s]hell"),
         "Busy agent in MANAGE must keep MANAGE hints:\n{busy_tree_status}"
     );
     app.thread_statuses.insert("t-agent".to_string(), "idle".to_string());
@@ -1166,26 +1176,26 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
     let term_tree_status = render_rect(&terminal, Rect::new(0, 29, 110, 1));
     assert!(
         term_tree_status.contains("MANAGE · GREIN")
-            && term_tree_status.contains("Enter write · a new · f fork · t shell"),
+            && term_tree_status.contains("[↵]write [n]ew [f]ork [s]hell"),
         "Tree status bar must show MANAGE hints even when active thread is Terminal:\n{term_tree_status}"
     );
 
-    // 2. 'a' in Tree emits AppAction::CreateRoot { title: None } without modifying Composer
+    // 2. 'n' in Tree emits AppAction::CreateRoot { title: None } without modifying Composer
     app.switch_thread("t-agent");
     app.set_focus(FocusedPane::Tree);
     app.pending_actions.clear();
-    assert!(app.handle_key_event(key(KeyCode::Char('a'))));
+    assert!(app.handle_key_event(key(KeyCode::Char('n'))));
     assert_eq!(
         app.pending_actions.pop_front(),
         Some(AppAction::CreateRoot { title: None })
     );
     assert_eq!(app.composer_input(), "");
 
-    app.handle_key_event(ctrl('a'));
-    app.handle_key_event(alt(KeyCode::Char('a')));
+    app.handle_key_event(ctrl('n'));
+    app.handle_key_event(alt(KeyCode::Char('n')));
     assert!(
         app.pending_actions.is_empty(),
-        "Ctrl+a / Alt+a in Tree must not trigger CreateRoot"
+        "Ctrl+n / Alt+n in Tree must not trigger CreateRoot"
     );
 
     // 3. 'w' in Tree emits AppAction::EnsureThreadWorktree for selected Agent or >_ Terminal
@@ -1224,7 +1234,7 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
         })
     );
 
-    // 4. Help modal documents 'a' and 'w' cleanly without overflow at 110x30 and scrolls on 80x12
+    // 4. Help modal documents 'n', 's', and 'w' cleanly without overflow at 110x30 and scrolls on 80x12
     app.show_help_modal = true;
     app.help_scroll_offset = 5;
     draw_frame_mut(&mut terminal, &mut app).unwrap();
@@ -1234,15 +1244,15 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
     );
     let help = render_screen(&terminal);
     for expected in [
-        "a / f / r / d / x",
+        "n / f / r / d",
         "New root / fork / inline rename / delete",
-        "t / T, w / m / o / y",
-        "Esc, q, ?, F1, or Enter to close",
+        "s / S, w / m / o / y",
+        "Esc, q, ?, or Enter to close",
     ] {
         assert!(help.contains(expected), "Help modal missing {expected:?}:\n{help}");
     }
     assert!(
-        !help.contains("Scroll") || help.contains("Esc, q, ?, F1, or Enter to close"),
+        !help.contains("Scroll") || help.contains("Esc, q, ?, or Enter to close"),
         "Help modal must fit cleanly in 110x30 without overflow scroll prompt:\n{help}"
     );
 }

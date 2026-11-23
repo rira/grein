@@ -343,9 +343,9 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
     assert_eq!(app.input_buffer, "keep\n this draft");
     assert_eq!(app.cursor_position, 5);
 
-    // Alt+1..9 are reserved and must not be bound in Composer
+    // Alt+1..9 jump roots and never leak characters into the Composer buffer
     for digit in '1'..='9' {
-        assert!(!app.handle_key_event(alt(digit)));
+        assert!(app.handle_key_event(alt(digit)));
     }
     assert_eq!(app.input_buffer, "keep\n this draft");
     assert_eq!(app.cursor_position, 5);
@@ -397,7 +397,7 @@ fn test_preservations_non_composer_isolation_and_help_modal() {
     assert!(screen.contains("MANAGE Mode"), "Missing MANAGE Mode in help:\n{screen}");
     assert!(screen.contains("Ctrl+A/E/B/F/W/U/K/Y"), "Missing Readline in help:\n{screen}");
     assert!(
-        screen.contains("Esc/q/?/F1 Close") || screen.contains("Esc, q, ?, F1, or Enter to close"),
+        screen.contains("Esc/q/? Close") || screen.contains("Esc, q, ?, or Enter to close"),
         "Help modal footer clipped:\n{screen}"
     );
 }

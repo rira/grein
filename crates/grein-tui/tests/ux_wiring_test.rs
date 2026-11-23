@@ -286,11 +286,13 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
                         role: "User".to_string(),
                         content: "inspect files".to_string(),
                     }],
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Side".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -446,6 +448,7 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
                 id: "r1".to_string(),
                 title: "Root".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -460,6 +463,7 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
                     role: "User".to_string(),
                     content: "branch work".to_string(),
                 }],
+                        custom_name: None,
             },
         },
     );
@@ -515,6 +519,7 @@ fn test_exact_transcript_scroll_no_bottom_clipping_and_submit_auto_scroll() {
                 id: "t-1".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -550,8 +555,8 @@ fn test_exact_transcript_scroll_no_bottom_clipping_and_submit_auto_scroll() {
         "Last line must not be clipped at bottom of Transcript:\n{transcript_screen}"
     );
 
-    // User scrolls up via Alt+PgUp in WRITE mode (disabling auto_scroll)
-    app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
+    // User scrolls up via Alt+K in WRITE mode (disabling auto_scroll)
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
     assert!(!app.transcript_viewport("t-1").auto_scroll());
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let scrolled_up_screen = render_rect(&terminal, layout.transcript_area);
@@ -568,7 +573,7 @@ fn test_exact_transcript_scroll_no_bottom_clipping_and_submit_auto_scroll() {
     assert!(after_prompt_screen.contains("new prompt at bottom"));
 
     // Scroll up again, then !cmd shell submit re-enables auto_scroll
-    app.handle_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
     assert!(!app.transcript_viewport("t-1").auto_scroll());
     app.submit_composer_prompt("!echo bottom_shell");
     assert!(
@@ -663,6 +668,7 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
                 id: "t-1".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -769,6 +775,7 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
             id: "t-main".to_string(),
             title: "Main".to_string(),
             turns: Vec::new(),
+                          custom_name: None,
         }],
     };
     let engine = ConfigMockEngine::new(session);
@@ -960,6 +967,7 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
                         content: "Explanation:\n```rust\nfn demo() {}\n```\nDone.".to_string(),
                     },
                 ],
+                              custom_name: None,
             }],
         },
     );
@@ -1049,17 +1057,11 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
     assert!(app.handle_key_event(ctrl('b')));
     assert_eq!(&app.input_buffer[..app.cursor_position], "h");
 
-    // Alt+1..9 remain unbound in all panes
-    for pane in [
-        FocusedPane::Composer,
-        FocusedPane::Tree,
-        FocusedPane::Transcript,
-    ] {
-        app.set_focus(pane);
-        for d in '1'..='9' {
-            assert!(!app.handle_key_event(alt(d)));
-        }
+    // Alt+1..9 jump roots cleanly without leaking digits into Composer buffer
+    for d in '1'..='9' {
+        assert!(app.handle_key_event(alt(d)));
     }
+    assert_eq!(app.input_buffer, "héllo");
 
     // Ctrl+C in empty Composer guides to Ctrl+G then q instead of quitting; Ctrl+C in MANAGE quits when idle
     let mut safe_ctrl_c = App::new();
@@ -1088,16 +1090,19 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                         role: "Assistant".to_string(),
                         content: "root1 reply".to_string(),
                     }],
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "b1".to_string(),
                     title: "Branch 1".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "r2".to_string(),
                     title: "Root 2".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -1115,6 +1120,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "b1".to_string(),
@@ -1125,6 +1131,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "r2".to_string(),
@@ -1135,6 +1142,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     cwd: None,
                     git_branch: None,
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -1180,7 +1188,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
         "Worktrees View",
         "Palette & Slash Commands",
         "Ctrl+J",
-        "Ctrl+T",
+        "Tab",
         "Alt+Z",
         "/theme",
         "/bind",
@@ -1188,7 +1196,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
         "/model",
         "/copy",
         "/quit",
-        "Esc, q, ?, F1, or Enter to close",
+        "Esc, q, ?, or Enter to close",
     ] {
         assert!(
             full_help.contains(expected),
@@ -1201,7 +1209,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
     draw_frame_mut(&mut tiny_term, &mut tree_app).unwrap();
     let tiny_top = render_screen(&tiny_term);
     assert!(
-        tiny_top.contains("Esc/q/?/F1 Close"),
+        tiny_top.contains("Esc/q/? Close"),
         "Footer must remain pinned on tiny terminal:\n{tiny_top}"
     );
     for _ in 0..18 {
@@ -1214,5 +1222,5 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
         tiny_scrolled.contains("/model") || tiny_scrolled.contains("/copy"),
         "Scrolling down in help modal on tiny terminal must reveal slash commands:\n{tiny_scrolled}"
     );
-    assert!(tiny_scrolled.contains("Esc/q/?/F1 Close"));
+    assert!(tiny_scrolled.contains("Esc/q/? Close"));
 }

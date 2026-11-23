@@ -58,11 +58,13 @@ fn seed_agent_and_terminal(app: &mut App) {
                     id: "t-agent".to_string(),
                     title: "Main Agent".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Terminal".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -80,6 +82,7 @@ fn seed_agent_and_terminal(app: &mut App) {
                     cwd: Some("/home/alice/projects/grein".to_string()),
                     git_branch: Some("feature/super-long-branch-name-that-exceeds-28-chars".to_string()),
                     git_dirty: 2,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-term".to_string(),
@@ -90,6 +93,7 @@ fn seed_agent_and_terminal(app: &mut App) {
                     cwd: Some("/home/alice/projects/my-repo".to_string()),
                     git_branch: Some("main".to_string()),
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -166,10 +170,13 @@ fn test_unified_write_mode_zero_collision_altgr_and_safe_ctrl_c() {
         })
     );
 
-    // Alt+G and F6 toggle WRITE <-> MANAGE just like Ctrl+G
-    assert!(app.handle_key_event(alt('g')));
+    // Ctrl+G toggles WRITE <-> MANAGE; legacy Alt+G and F6 remain unbound
+    assert!(!app.handle_key_event(alt('g')));
+    assert!(!app.handle_key_event(key(KeyCode::F(6))));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert!(app.handle_key_event(ctrl('g')));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
-    assert!(app.handle_key_event(key(KeyCode::F(6))));
+    assert!(app.handle_key_event(ctrl('g')));
     assert_eq!(app.focused_pane(), FocusedPane::Composer);
 
     // Terminal WRITE mode passes Ctrl+Q, Ctrl+T, Alt+T, F1, ?, Ctrl+F straight to PtyWrite
@@ -376,11 +383,13 @@ fn test_tier1_tier2_chrome_smart_labels_overflow_and_sidebar_sizing() {
                     id: "t-agent".to_string(),
                     title: "A very long conversation title that overflows the dynamic sidebar".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Terminal".to_string(),
                     turns: Vec::new(),
+                    custom_name: None,
                 },
             ],
         },
@@ -398,6 +407,7 @@ fn test_tier1_tier2_chrome_smart_labels_overflow_and_sidebar_sizing() {
                     cwd: Some("/home/alice/projects/grein".to_string()),
                     git_branch: Some("feature/super-long-branch-name-that-exceeds-28-chars".to_string()),
                     git_dirty: 2,
+                    custom_name: None,
                 },
                 ThreadMeta {
                     thread_id: "t-term".to_string(),
@@ -408,6 +418,7 @@ fn test_tier1_tier2_chrome_smart_labels_overflow_and_sidebar_sizing() {
                     cwd: Some("/home/alice/repos/api/.grein/worktrees/feat-x".to_string()),
                     git_branch: Some("feat/x".to_string()),
                     git_dirty: 0,
+                    custom_name: None,
                 },
             ],
         },
@@ -416,7 +427,7 @@ fn test_tier1_tier2_chrome_smart_labels_overflow_and_sidebar_sizing() {
     // Smart >_ auto-labels & cwd shortening
     assert_eq!(
         display_thread_title(&app.threads[1], app.thread_meta.get("t-term")),
-        "feat-x"
+        "worktree: feat-x"
     );
     assert_eq!(
         shorten_terminal_cwd_with_home(
@@ -453,20 +464,20 @@ fn test_tier1_tier2_chrome_smart_labels_overflow_and_sidebar_sizing() {
     let screen = render_screen(&terminal);
     assert!(screen.contains('╭') && screen.contains('╰'), "{screen}");
     assert!(screen.contains('▌'), "{screen}");
-    assert!(screen.contains("1 agents · 1 shells"), "{screen}");
+    assert!(screen.contains("1 agent · 1 shell"), "{screen}");
     assert!(screen.contains("⎇ feature/super-long-branch…"), "{screen}");
     assert!(
         screen.contains("conversation title that overflows"),
         "MANAGE 1-row hover overflow must render overflowing selected title across divider:\n{screen}"
     );
 
-    // Verify full sidebar footer displays at wider width without truncating ": cmd"
+    // Verify full sidebar footer keeps concise agent/shell count without clipped ": cmd"
     app.execute_sidebar_command("sidebar fixed 32");
     terminal
         .draw(|f| render_app_mut(f, &mut app))
         .unwrap();
     let wide_screen = render_screen(&terminal);
-    assert!(wide_screen.contains("1 agents · 1 shells · : cmd"), "{wide_screen}");
+    assert!(wide_screen.contains("1 agent · 1 shell"), "{wide_screen}");
 
     // Verify selected row does NOT use Modifier::REVERSED and row 1 col 23 (divider) shows overlaid char
     let buf = terminal.backend().buffer();
@@ -479,7 +490,7 @@ fn test_tier1_tier2_chrome_smart_labels_overflow_and_sidebar_sizing() {
         .draw(|f| render_app_mut(f, &mut app))
         .unwrap();
     let term_screen = render_screen(&terminal);
-    assert!(term_screen.contains(">_ feat-x · ⎇ feat-x"), "{term_screen}");
+    assert!(term_screen.contains(">_ ⎇ feat-x"), "{term_screen}");
     assert!(term_screen.contains("● live"), "{term_screen}");
     assert!(term_screen.contains("WRITE · SHELL"), "{term_screen}");
 }
@@ -509,6 +520,7 @@ async fn test_e2e_preferences_load_palette_diff_preview_and_prune() {
                     id: "t-1".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                                  custom_name: None,
                 }],
             })
         }

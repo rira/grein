@@ -269,6 +269,8 @@ pub enum BindableAction {
     ToggleZoom,
     ScrollUp,
     ScrollDown,
+    PrevSibling,
+    NextSibling,
     ToggleWorktrees,
     JumpTerminal,
     NewAgent,
@@ -288,6 +290,8 @@ impl BindableAction {
             Self::ToggleZoom,
             Self::ScrollUp,
             Self::ScrollDown,
+            Self::PrevSibling,
+            Self::NextSibling,
             Self::ToggleWorktrees,
             Self::JumpTerminal,
             Self::NewAgent,
@@ -307,6 +311,8 @@ impl BindableAction {
             Self::ToggleZoom => "toggle_zoom",
             Self::ScrollUp => "scroll_up",
             Self::ScrollDown => "scroll_down",
+            Self::PrevSibling => "prev_sibling",
+            Self::NextSibling => "next_sibling",
             Self::ToggleWorktrees => "toggle_worktrees",
             Self::JumpTerminal => "jump_terminal",
             Self::NewAgent => "new_agent",
@@ -326,6 +332,8 @@ impl BindableAction {
             Self::ToggleZoom => "Toggle sidebar zoom",
             Self::ScrollUp => "Scroll terminal/transcript up",
             Self::ScrollDown => "Scroll terminal/transcript down",
+            Self::PrevSibling => "Switch to previous sibling thread",
+            Self::NextSibling => "Switch to next sibling thread",
             Self::ToggleWorktrees => "Toggle Grein <-> Worktrees view",
             Self::JumpTerminal => "Open or jump to terminal",
             Self::NewAgent => "Create new root agent thread",
@@ -348,6 +356,8 @@ impl BindableAction {
             "toggle_zoom" | "zoom" => Some(Self::ToggleZoom),
             "scroll_up" | "page_up" | "scrollback_up" => Some(Self::ScrollUp),
             "scroll_down" | "page_down" | "scrollback_down" => Some(Self::ScrollDown),
+            "prev_sibling" | "previous_sibling" | "sibling_prev" => Some(Self::PrevSibling),
+            "next_sibling" | "sibling_next" => Some(Self::NextSibling),
             "toggle_worktrees" | "worktrees" | "wt_view" => Some(Self::ToggleWorktrees),
             "jump_terminal" | "terminal" | "term" => Some(Self::JumpTerminal),
             "new_agent" | "create_root" | "new_root" | "new" => Some(Self::NewAgent),
@@ -364,20 +374,12 @@ impl BindableAction {
 
     pub fn default_chords(&self) -> Vec<KeyChord> {
         match self {
-            Self::EnterManageMode => vec![
-                KeyChord::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
-                KeyChord::new(KeyCode::Char('g'), KeyModifiers::ALT),
-                KeyChord::new(KeyCode::F(6), KeyModifiers::NONE),
-            ],
+            Self::EnterManageMode => vec![KeyChord::new(KeyCode::Char('g'), KeyModifiers::CONTROL)],
             Self::ToggleZoom => vec![KeyChord::new(KeyCode::Char('z'), KeyModifiers::ALT)],
-            Self::ScrollUp => vec![
-                KeyChord::new(KeyCode::PageUp, KeyModifiers::ALT),
-                KeyChord::new(KeyCode::PageUp, KeyModifiers::SHIFT),
-            ],
-            Self::ScrollDown => vec![
-                KeyChord::new(KeyCode::PageDown, KeyModifiers::ALT),
-                KeyChord::new(KeyCode::PageDown, KeyModifiers::SHIFT),
-            ],
+            Self::ScrollUp => vec![KeyChord::new(KeyCode::Char('k'), KeyModifiers::ALT)],
+            Self::ScrollDown => vec![KeyChord::new(KeyCode::Char('j'), KeyModifiers::ALT)],
+            Self::PrevSibling => vec![KeyChord::new(KeyCode::Char('h'), KeyModifiers::ALT)],
+            Self::NextSibling => vec![KeyChord::new(KeyCode::Char('l'), KeyModifiers::ALT)],
             _ => Vec::new(),
         }
     }

@@ -49,8 +49,16 @@ fn rounded_block(theme: &ThemePalette, is_focused: bool) -> Block<'static> {
 fn max_grein_sidebar_row_width(state: &AppState) -> usize {
     let mut max_w = 26usize;
     if !state.tree.nodes.is_empty() {
+        let mut root_count = 0usize;
         for node in &state.tree.nodes {
             if let TreeNode::Thread(t) = node {
+                let depth = state.tree.depth_for(&t.id);
+                let root_w = if depth == 0 {
+                    root_count += 1;
+                    if root_count <= 9 { 2 } else { 0 }
+                } else {
+                    0
+                };
                 let prefix_w = state.tree.prefix_for(&t.id).chars().count();
                 let title_w = state.display_title_for(&t.id, &t.title).chars().count();
                 let branch_w = state
@@ -59,7 +67,7 @@ fn max_grein_sidebar_row_width(state: &AppState) -> usize {
                     .and_then(|m| m.git_branch.as_deref())
                     .map(|b| b.chars().count().min(14) + 3)
                     .unwrap_or(0);
-                max_w = max_w.max(prefix_w + title_w + branch_w + 10);
+                max_w = max_w.max(root_w + prefix_w + title_w + branch_w + 10);
             }
         }
     } else {
@@ -68,11 +76,18 @@ fn max_grein_sidebar_row_width(state: &AppState) -> usize {
             &state.thread_meta,
             &state.collapsed_threads,
         );
+        let mut root_count = 0usize;
         for e in ordered {
             let t = &state.threads[e.index];
+            let root_w = if e.depth == 0 {
+                root_count += 1;
+                if root_count <= 9 { 2 } else { 0 }
+            } else {
+                0
+            };
             let prefix_w = e.prefix.chars().count();
             let title_w = state.display_title_for(&t.id, &t.title).chars().count();
-            max_w = max_w.max(prefix_w + title_w + 10);
+            max_w = max_w.max(root_w + prefix_w + title_w + 10);
         }
     }
     max_w + 2
@@ -144,6 +159,7 @@ pub fn compute_app_layout(
         let right_w = area.width.saturating_sub(tree_w);
         let right_x = area.x + tree_w;
         layout.tree_area.width = tree_w;
+        layout.tree_area.height = layout.status_bar_area.y.saturating_sub(layout.tree_area.y);
         layout.transcript_area.x = right_x;
         layout.transcript_area.width = right_w;
         if !composer_hidden && layout.composer_area.width > 0 {
@@ -215,16 +231,32 @@ fn clamp_char_boundary(text: &str, pos: usize) -> usize {
     idx
 }
 
+pub(crate) struct ComposerVisualRow {
+    pub stops: Vec<(usize, usize)>,
+}
+
+pub(crate) struct ComposerVisualLayout {
+    pub lines: Vec<Line<'static>>,
+    pub rows: Vec<ComposerVisualRow>,
+    pub cursor_col: u16,
+    pub cursor_row: u16,
+}
+
 struct ComposerTextLayout {
     lines: Vec<Line<'static>>,
     cursor_col: u16,
     cursor_row: u16,
 }
 
-fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> ComposerTextLayout {
-    if inner_width == 0 {
-        return ComposerTextLayout {
+pub(crate) fn layout_composer_visual_rows(
+    input: &str,
+    cursor_pos: usize,
+    max_width: Option<usize>,
+) -> ComposerVisualLayout {
+    if max_width == Some(0) {
+        return ComposerVisualLayout {
             lines: vec![Line::raw("")],
+            rows: vec![ComposerVisualRow { stops: vec![(0, 0)] }],
             cursor_col: 0,
             cursor_row: 0,
         };
@@ -232,6 +264,7 @@ fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> C
 
     let cursor_byte = clamp_char_boundary(input, cursor_pos);
     let mut out_lines: Vec<Line<'static>> = Vec::new();
+    let mut out_rows: Vec<ComposerVisualRow> = Vec::new();
     let mut cursor_col = 0usize;
     let mut cursor_row = 0usize;
     let mut cursor_set = false;
@@ -239,6 +272,7 @@ fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> C
 
     for logical_line in input.split('\n') {
         let mut cur_line = String::new();
+        let mut cur_stops: Vec<(usize, usize)> = Vec::new();
         let mut cur_w = 0usize;
         let mut idx = 0usize;
         let bytes = logical_line.as_bytes();
@@ -248,13 +282,17 @@ fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> C
             if ch.is_whitespace() {
                 let byte_idx = line_start + idx;
                 let cw = if ch == '\t' { 1 } else { char_display_width(ch) };
-                if cur_w > 0 && cur_w + cw > inner_width {
+                if max_width.is_some_and(|w| cur_w > 0 && cur_w + cw > w) {
                     out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                    out_rows.push(ComposerVisualRow {
+                        stops: std::mem::take(&mut cur_stops),
+                    });
                     cur_w = 0;
                 }
+                cur_stops.push((byte_idx, cur_w));
                 if byte_idx == cursor_byte && !cursor_set {
                     cursor_col = cur_w;
-                    cursor_row = out_lines.len();
+                    cursor_row = out_rows.len();
                     cursor_set = true;
                 }
                 cur_line.push(if ch == '\t' { ' ' } else { ch });
@@ -272,20 +310,27 @@ fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> C
                     idx += wch.len_utf8();
                 }
                 let word = &logical_line[word_start..idx];
-                if cur_w > 0 && cur_w + word_w > inner_width && word_w <= inner_width {
+                if max_width.is_some_and(|w| cur_w > 0 && cur_w + word_w > w && word_w <= w) {
                     out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                    out_rows.push(ComposerVisualRow {
+                        stops: std::mem::take(&mut cur_stops),
+                    });
                     cur_w = 0;
                 }
                 for (rel_idx, wch) in word.char_indices() {
                     let byte_idx = line_start + word_start + rel_idx;
                     let cw = char_display_width(wch);
-                    if cur_w > 0 && cur_w + cw > inner_width {
+                    if max_width.is_some_and(|w| cur_w > 0 && cur_w + cw > w) {
                         out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                        out_rows.push(ComposerVisualRow {
+                            stops: std::mem::take(&mut cur_stops),
+                        });
                         cur_w = 0;
                     }
+                    cur_stops.push((byte_idx, cur_w));
                     if byte_idx == cursor_byte && !cursor_set {
                         cursor_col = cur_w;
-                        cursor_row = out_lines.len();
+                        cursor_row = out_rows.len();
                         cursor_set = true;
                     }
                     cur_line.push(wch);
@@ -296,36 +341,55 @@ fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> C
 
         let line_end = line_start + logical_line.len();
         if line_end == cursor_byte && !cursor_set {
-            if cur_w >= inner_width {
+            if max_width.is_some_and(|w| cur_w >= w) {
                 out_lines.push(Line::from(std::mem::take(&mut cur_line)));
+                out_rows.push(ComposerVisualRow {
+                    stops: std::mem::take(&mut cur_stops),
+                });
                 cur_w = 0;
             }
             cursor_col = cur_w;
-            cursor_row = out_lines.len();
+            cursor_row = out_rows.len();
             cursor_set = true;
         }
+        cur_stops.push((line_end, cur_w));
         out_lines.push(Line::from(cur_line));
+        out_rows.push(ComposerVisualRow { stops: cur_stops });
         line_start = line_end + 1;
     }
 
-    if out_lines.is_empty() {
+    if out_rows.is_empty() {
         out_lines.push(Line::raw(""));
+        out_rows.push(ComposerVisualRow { stops: vec![(0, 0)] });
     }
 
-    ComposerTextLayout {
+    ComposerVisualLayout {
         lines: out_lines,
+        rows: out_rows,
         cursor_col: cursor_col.min(u16::MAX as usize) as u16,
         cursor_row: cursor_row.min(u16::MAX as usize) as u16,
     }
 }
 
+fn layout_composer_text(input: &str, cursor_pos: usize, inner_width: usize) -> ComposerTextLayout {
+    let layout = layout_composer_visual_rows(input, cursor_pos, Some(inner_width));
+    ComposerTextLayout {
+        lines: layout.lines,
+        cursor_col: layout.cursor_col,
+        cursor_row: layout.cursor_row,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_thread_row(
     id: &str,
     title: &str,
     depth: usize,
+    root_number: Option<usize>,
     prefix: &str,
     hidden_descendants: usize,
     is_selected: bool,
+    elide_sidebar: bool,
     state: &AppState,
 ) -> Line<'static> {
     let theme = &state.theme_palette;
@@ -333,7 +397,14 @@ fn render_thread_row(
     let is_merged = state.thread_meta.get(id).is_some_and(|m| m.merged);
     let is_terminal = state.is_terminal_thread(id);
     let exit_code_opt = state.terminal_exit_code(id);
-    let display_title = state.display_title_for(id, title);
+    let parts = state.display_parts_for_elided(id, title, elide_sidebar);
+    let root_badge = if depth == 0 {
+        root_number
+            .filter(|n| (1..=9).contains(n))
+            .map(|n| format!("{n} "))
+    } else {
+        None
+    };
     let glyph_opt = if is_terminal {
         let color = match exit_code_opt {
             Some(Some(c)) if c != 0 => theme.error,
@@ -365,10 +436,14 @@ fn render_thread_row(
             .fg(theme.selection_fg)
             .bg(bg)
             .add_modifier(Modifier::BOLD);
+        let sel_muted = Style::default().fg(theme.muted).bg(bg);
         let mut spans = vec![
             Span::styled("▌", Style::default().fg(theme.selection_bar).bg(bg)),
-            Span::styled(prefix.to_string(), Style::default().fg(theme.muted).bg(bg)),
+            Span::styled(prefix.to_string(), sel_muted),
         ];
+        if let Some(num) = root_badge {
+            spans.push(Span::styled(num, sel_muted.add_modifier(Modifier::DIM)));
+        }
         if !fold_prefix.is_empty() {
             spans.push(Span::styled(
                 fold_prefix,
@@ -384,18 +459,22 @@ fn render_thread_row(
                 Style::default().fg(glyph_color).bg(bg),
             ));
         }
-        spans.push(Span::styled(display_title, sel_title));
+        if let Some(name) = parts.custom_name {
+            spans.push(Span::styled(format!("[{name}]"), sel_title));
+            if is_terminal || !crate::app::is_generic_agent_placeholder(&parts.auto_label) {
+                spans.push(Span::styled(format!(" {}", parts.auto_label), sel_muted));
+            }
+        } else {
+            spans.push(Span::styled(parts.auto_label, sel_title));
+        }
         if let Some(badge) = fold_badge {
-            spans.push(Span::styled(badge, Style::default().fg(theme.muted).bg(bg)));
+            spans.push(Span::styled(badge, sel_muted));
         }
         if let Some((badge, color)) = exit_badge {
             spans.push(Span::styled(badge, Style::default().fg(color).bg(bg)));
         }
         if is_merged {
-            spans.push(Span::styled(
-                " [joined]",
-                Style::default().fg(theme.muted).bg(bg),
-            ));
+            spans.push(Span::styled(" [joined]", sel_muted));
         }
         Line::from(spans)
     } else {
@@ -408,10 +487,14 @@ fn render_thread_row(
                 .fg(theme.text)
                 .add_modifier(Modifier::BOLD)
         };
+        let muted_style = Style::default().fg(theme.muted);
         let mut spans = vec![
             Span::raw(" "),
-            Span::styled(prefix.to_string(), Style::default().fg(theme.muted)),
+            Span::styled(prefix.to_string(), muted_style),
         ];
+        if let Some(num) = root_badge {
+            spans.push(Span::styled(num, muted_style.add_modifier(Modifier::DIM)));
+        }
         if !fold_prefix.is_empty() {
             spans.push(Span::styled(
                 fold_prefix,
@@ -426,15 +509,22 @@ fn render_thread_row(
                 Style::default().fg(glyph_color),
             ));
         }
-        spans.push(Span::styled(display_title, title_style));
+        if let Some(name) = parts.custom_name {
+            spans.push(Span::styled(format!("[{name}]"), title_style));
+            if is_terminal || !crate::app::is_generic_agent_placeholder(&parts.auto_label) {
+                spans.push(Span::styled(format!(" {}", parts.auto_label), muted_style));
+            }
+        } else {
+            spans.push(Span::styled(parts.auto_label, title_style));
+        }
         if let Some(badge) = fold_badge {
-            spans.push(Span::styled(badge, Style::default().fg(theme.muted)));
+            spans.push(Span::styled(badge, muted_style));
         }
         if let Some((badge, color)) = exit_badge {
             spans.push(Span::styled(badge, Style::default().fg(color)));
         }
         if is_merged {
-            spans.push(Span::styled(" [joined]", Style::default().fg(theme.muted)));
+            spans.push(Span::styled(" [joined]", muted_style));
         }
         Line::from(spans)
     }
@@ -726,7 +816,9 @@ fn render_sidebar_bottom_panel(
                 .filter(|t| state.is_terminal_thread(&t.id))
                 .count();
             let agents = state.threads.len().saturating_sub(shells);
-            let text = format!("{agents} agents · {shells} shells · : cmd · ? help");
+            let agent_word = if agents == 1 { "agent" } else { "agents" };
+            let shell_word = if shells == 1 { "shell" } else { "shells" };
+            let text = format!("{agents} {agent_word} · {shells} {shell_word}");
             truncate_single_line(&text, inner.width as usize)
         }
         SidebarView::Worktrees => {
@@ -917,6 +1009,7 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> TreeRe
     let mut lines = Vec::new();
     let selected = state.tree.selected_index();
     let mut selected_line_idx: Option<usize> = None;
+    let mut selected_full_line: Option<Line<'static>> = None;
 
     if !state.tree.nodes.is_empty() {
         let fallback_layout: Option<HashMap<&str, (usize, String, usize)>> =
@@ -940,12 +1033,10 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> TreeRe
                 None
             };
 
+        let mut root_count = 0usize;
         for (node_idx, node) in state.tree.nodes.iter().enumerate() {
             if let TreeNode::Thread(t) = node {
                 let is_selected = selected == Some(node_idx);
-                if is_selected {
-                    selected_line_idx = Some(lines.len());
-                }
                 let (depth, prefix, hidden_descendants) = if let Some(ref map) = fallback_layout {
                     map.get(t.id.as_str())
                         .map(|(d, p, h)| (*d, p.as_str(), *h))
@@ -961,13 +1052,35 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> TreeRe
                         state.tree_hidden_counts.get(&t.id).copied().unwrap_or(0),
                     )
                 };
+                let root_number = if depth == 0 {
+                    root_count += 1;
+                    (root_count <= 9).then_some(root_count)
+                } else {
+                    None
+                };
+                if is_selected {
+                    selected_line_idx = Some(lines.len());
+                    selected_full_line = Some(render_thread_row(
+                        &t.id,
+                        &t.title,
+                        depth,
+                        root_number,
+                        prefix,
+                        hidden_descendants,
+                        true,
+                        false,
+                        state,
+                    ));
+                }
                 lines.push(render_thread_row(
                     &t.id,
                     &t.title,
                     depth,
+                    root_number,
                     prefix,
                     hidden_descendants,
                     is_selected,
+                    true,
                     state,
                 ));
             }
@@ -978,19 +1091,39 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> TreeRe
             &state.thread_meta,
             &state.collapsed_threads,
         );
+        let mut root_count = 0usize;
         for (row_idx, entry) in ordered.into_iter().enumerate() {
             let thread = &state.threads[entry.index];
             let is_selected = selected == Some(row_idx);
+            let root_number = if entry.depth == 0 {
+                root_count += 1;
+                (root_count <= 9).then_some(root_count)
+            } else {
+                None
+            };
             if is_selected {
                 selected_line_idx = Some(lines.len());
+                selected_full_line = Some(render_thread_row(
+                    &thread.id,
+                    &thread.title,
+                    entry.depth,
+                    root_number,
+                    &entry.prefix,
+                    entry.hidden_descendants,
+                    true,
+                    false,
+                    state,
+                ));
             }
             lines.push(render_thread_row(
                 &thread.id,
                 &thread.title,
                 entry.depth,
+                root_number,
                 &entry.prefix,
                 entry.hidden_descendants,
                 is_selected,
+                true,
                 state,
             ));
         }
@@ -1030,7 +1163,7 @@ fn render_tree_view_inner(f: &mut Frame, area: Rect, state: &AppState) -> TreeRe
         if rel_y >= list_area.height {
             return None;
         }
-        let line = lines.get(sel_idx)?;
+        let line = selected_full_line.as_ref().or_else(|| lines.get(sel_idx))?;
         (line.width() > list_area.width as usize)
             .then(|| (list_area.x, list_area.y + rel_y, line.clone()))
     });
@@ -1070,6 +1203,7 @@ struct RenderMetrics {
     worktree_diff_max_scroll: u16,
     transcript_inner_height: u16,
     composer_scroll_y: u16,
+    composer_inner_width: u16,
     help_scroll_offset: u16,
     help_max_scroll: u16,
     frame_area: Rect,
@@ -1089,6 +1223,7 @@ pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
     state.worktree_diff_max_scroll = metrics.worktree_diff_max_scroll;
     state.transcript_viewport_height = metrics.transcript_inner_height;
     state.composer_scroll_y = metrics.composer_scroll_y;
+    state.last_composer_inner_width = metrics.composer_inner_width;
     state.last_frame_area = Some(metrics.frame_area);
     if let Some(updated_search) = metrics.updated_search {
         state.transcript_search = updated_search;
@@ -1204,6 +1339,25 @@ fn render_subagent_strip(
     let block = rounded_block(theme, false).title(" Subagents ");
     let widget = Paragraph::new(lines).block(block);
     f.render_widget(widget, area);
+}
+
+fn format_status_git_branch(branch: &str) -> String {
+    let clean = branch.trim();
+    if let Some(rest) = clean.strip_prefix("worktree-") {
+        if rest.len() >= 8
+            && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            && rest.bytes().filter(|b| b.is_ascii_hexdigit()).count() >= 8
+        {
+            let short_id: String = rest.chars().take(8).collect();
+            return format!("worktree: {short_id}");
+        }
+    }
+    if let Some(stripped) = clean.strip_suffix("-wt") {
+        if !stripped.is_empty() {
+            return format!("worktree: {stripped}");
+        }
+    }
+    clean.to_string()
 }
 
 fn render_status_bar(
@@ -1328,10 +1482,11 @@ fn render_status_bar(
             .map(|b| (b, m.git_dirty))
     });
     let git_badge = git_meta.map(|(branch, dirty)| {
+        let formatted = format_status_git_branch(branch);
         let raw = if dirty > 0 {
-            format!("⎇ {branch}*")
+            format!("⎇ {formatted}*")
         } else {
-            format!("⎇ {branch}")
+            format!("⎇ {formatted}")
         };
         let capped = truncate_single_line(&raw, 28);
         let color = if dirty > 0 { theme.dirty } else { theme.accent };
@@ -1381,7 +1536,7 @@ fn render_status_bar(
         let search_hint = if search.editing {
             " · Enter/Esc"
         } else {
-            " · n/N · Esc"
+            " · [n]ext [N]prev [Esc] clear"
         };
         let counter_color = if search.matches.is_empty() && !search.query.is_empty() {
             theme.error
@@ -1430,15 +1585,39 @@ fn render_status_bar(
             .first()
             .map(|c| c.display_label())
             .unwrap_or_else(|| "Alt+Z".to_string());
+        let scroll_up_key = state
+            .keymap
+            .chords_for(BindableAction::ScrollUp)
+            .first()
+            .map(|c| c.display_label())
+            .unwrap_or_else(|| "Alt+K".to_string());
+        let scroll_down_key = state
+            .keymap
+            .chords_for(BindableAction::ScrollDown)
+            .first()
+            .map(|c| c.display_label())
+            .unwrap_or_else(|| "Alt+J".to_string());
+        let prev_sib_key = state
+            .keymap
+            .chords_for(BindableAction::PrevSibling)
+            .first()
+            .map(|c| c.display_label())
+            .unwrap_or_else(|| "Alt+H".to_string());
+        let next_sib_key = state
+            .keymap
+            .chords_for(BindableAction::NextSibling)
+            .first()
+            .map(|c| c.display_label())
+            .unwrap_or_else(|| "Alt+L".to_string());
 
         let left_hint = if tree_focused {
             match state.sidebar_view {
                 SidebarView::Grein => {
-                    "Enter write · a new · f fork · t shell · r rename · d del · : cmd · ? help"
+                    "[↵]write [n]ew [f]ork [s]hell [w]orktree [r]ename [d]el  : cmd  ? help"
                         .to_string()
                 }
                 SidebarView::Worktrees => {
-                    "Enter attach · p prune · y copy · d del · / filter · : cmd · ? help"
+                    "[↵]attach [s]hell [w]orktree [p]rune [r]efresh [d]el  / filter  ? help"
                         .to_string()
                 }
             }
@@ -1446,12 +1625,12 @@ fn render_status_bar(
             if state.terminal_exit_code(active_id).is_some() {
                 format!("exited · Enter restart · Esc/{manage_key} manage")
             } else {
-                format!("{manage_key} manage · {zoom_key} zoom · Shift+PgUp/PgDn scroll")
+                format!("{manage_key} manage · {zoom_key} sidebar · {scroll_up_key}/{scroll_down_key} scroll")
             }
         } else if is_busy {
-            format!("Esc cancel · {manage_key} manage · {zoom_key} zoom")
+            format!("Esc cancel · {manage_key} manage · {zoom_key} sidebar")
         } else {
-            format!("{manage_key} manage · {zoom_key} zoom · /theme · /help")
+            format!("{manage_key} manage · {zoom_key} sidebar · {scroll_up_key}/{scroll_down_key} scroll · {prev_sib_key}/{next_sib_key} sibling · /help")
         };
 
         if let Some(notice) = state.status_notice.as_deref() {
@@ -1821,13 +2000,10 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
     let zoom_key = km.display_for(BindableAction::ToggleZoom);
     let scroll_up = km.display_for(BindableAction::ScrollUp);
     let scroll_down = km.display_for(BindableAction::ScrollDown);
-    let scroll_label = if scroll_up == "Alt+PgUp / Shift+PgUp"
-        && scroll_down == "Alt+PgDn / Shift+PgDn"
-    {
-        "Alt/Shift+PgUp/PgDn".to_string()
-    } else {
-        format!("{scroll_up} / {scroll_down}")
-    };
+    let prev_sib = km.display_for(BindableAction::PrevSibling);
+    let next_sib = km.display_for(BindableAction::NextSibling);
+    let scroll_label = format!("{scroll_up} / {scroll_down}");
+    let sib_label = format!("{prev_sib} / {next_sib}");
 
     let sections: [(&str, Vec<(String, String)>); 4] = [
         (
@@ -1838,7 +2014,11 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
                     "Toggle WRITE <-> MANAGE (sidebar)".to_string(),
                 ),
                 (zoom_key, "Toggle sidebar zoom (full width)".to_string()),
-                (scroll_label, "Scroll active pane viewport".to_string()),
+                (
+                    scroll_label,
+                    "Scroll viewport (Alt+1..9 jump root)".to_string(),
+                ),
+                (sib_label, "Prev / next sibling context".to_string()),
                 (
                     "Ctrl+C (Composer)".to_string(),
                     "Cancel turn / clear input / exit hint".to_string(),
@@ -1849,14 +2029,7 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
                 ),
                 (
                     "Ctrl+A/E/B/F/W/U/K/Y".to_string(),
-                    "Readline editing; AltGr chars preserved".to_string(),
-                ),
-                (
-                    "Shell (WRITE)".to_string(),
-                    format!(
-                        "All keys pass straight to >_ {}",
-                        crate::app::active_shell_label()
-                    ),
+                    "Readline editing; ↑/↓ navigate lines".to_string(),
                 ),
             ],
         ),
@@ -1864,32 +2037,36 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
             "── MANAGE Mode (Sidebar) ──",
             vec![
                 (
-                    "Tab / Ctrl+T".to_string(),
+                    "Tab".to_string(),
                     "Switch ᛇ Grein <-> ⎇ Worktrees".to_string(),
                 ),
                 (
-                    "j/k/↑/↓, Enter/l, Esc".to_string(),
-                    "Browse / enter WRITE (Space/h/l fold)".to_string(),
+                    "j/k/↑/↓, →/l, ↵".to_string(),
+                    "Move / unfold or child / enter WRITE".to_string(),
                 ),
                 (
-                    "gg / G, J / K".to_string(),
-                    "Top/bottom item; J/K switch root".to_string(),
+                    "h/←/Space, H/L, J/K".to_string(),
+                    "Fold / fold-or-expand all / switch root".to_string(),
                 ),
                 (
-                    "PgUp/PgDn, Ctrl+U/D".to_string(),
-                    "Scroll right-pane preview (diff/chat/>_)".to_string(),
+                    "Ctrl+F/B, Ctrl+U/D".to_string(),
+                    "Full/half-page preview; Alt+K/J scroll".to_string(),
                 ),
                 (
-                    "a / f / r / d / x".to_string(),
+                    "gg / G, 1..9 / Alt+1..9".to_string(),
+                    "Top / bottom item; jump to root 1..9".to_string(),
+                ),
+                (
+                    "n / f / r / d".to_string(),
                     "New root / fork / inline rename / delete".to_string(),
                 ),
                 (
-                    "t / T, w / m / o / y".to_string(),
-                    ">_ jump/new, worktree/join/cards/copy".to_string(),
+                    "s / S, w / m / o / y".to_string(),
+                    "Child/root >_, worktree, join, cards, copy".to_string(),
                 ),
                 (
-                    ": , /, ? / F1, z, q".to_string(),
-                    "Command palette / search / help / zoom / quit".to_string(),
+                    ": , /, ?, z, q".to_string(),
+                    "Palette / search / help / zoom / quit".to_string(),
                 ),
             ],
         ),
@@ -1897,16 +2074,16 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
             "── Worktrees View ──",
             vec![
                 (
-                    "Enter / l, y".to_string(),
-                    "Attach worktree & write / copy path".to_string(),
+                    "Enter, s, w".to_string(),
+                    "Attach worktree / shell / allocate".to_string(),
                 ),
                 (
-                    "t, w/a, p, r".to_string(),
-                    "Shell here / allocate / prune / refresh".to_string(),
+                    "p / r / d / y / /".to_string(),
+                    "Prune / refresh / delete / copy / filter".to_string(),
                 ),
                 (
-                    "d / x, /".to_string(),
-                    "Delete worktree (confirm) / filter".to_string(),
+                    "l / h / H / L".to_string(),
+                    "Unfold / fold / collapse or expand all".to_string(),
                 ),
             ],
         ),
@@ -1914,12 +2091,8 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
             "── Palette & Slash Commands ──",
             vec![
                 (
-                    "/theme [name]".to_string(),
-                    "Live theme picker or set preset".to_string(),
-                ),
-                (
-                    "/bind /unbind /keybinds".to_string(),
-                    "Customize WRITE keybindings".to_string(),
+                    "/theme, /bind, /unbind".to_string(),
+                    "Theme picker and WRITE keybindings".to_string(),
                 ),
                 (
                     "/sidebar [dynamic|fixed]".to_string(),
@@ -1985,9 +2158,9 @@ fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) 
     }
 
     let footer_text = if max_scroll > 0 {
-        " Esc/q/?/F1 Close · ↑/↓/j/k/PgUp/PgDn/Ctrl+U/D/g/G Scroll"
+        " Esc/q/? Close · ↑/↓/j/k/Ctrl+U/D/F/B/g/G Scroll"
     } else {
-        " Esc, q, ?, F1, or Enter to close"
+        " Esc, q, ?, or Enter to close"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2050,7 +2223,7 @@ fn render_terminal_pane(
         .find(|t| t.id == display_thread_id)
         .map(|t| t.title.as_str())
         .unwrap_or("Terminal");
-    let display_title = state.display_title_for(display_thread_id, raw_title);
+    let parts = state.display_parts_for_elided(display_thread_id, raw_title, false);
     let short_cwd = state
         .pty_screens
         .get(display_thread_id)
@@ -2065,15 +2238,15 @@ fn render_terminal_pane(
         })
         .map(shorten_terminal_cwd);
 
+    let label = match (parts.custom_name.as_deref(), short_cwd.as_deref()) {
+        (Some(name), Some(cwd)) => format!("[{name}] · {cwd}"),
+        (Some(name), None) => format!("[{name}]"),
+        (None, Some(cwd)) => cwd.to_string(),
+        (None, None) => parts.auto_label,
+    };
     let left_title = match preview_title {
-        Some(_) => match short_cwd {
-            Some(cwd) => format!(" >_ {display_title} · {cwd} (Preview) "),
-            None => format!(" >_ {display_title} (Preview) "),
-        },
-        None => match short_cwd {
-            Some(cwd) => format!(" >_ {display_title} · {cwd} "),
-            None => format!(" >_ {display_title} "),
-        },
+        Some(_) => format!(" >_ {label} (Preview) "),
+        None => format!(" >_ {label} "),
     };
     let (status_pill, status_color) = match state.terminal_exit_code(display_thread_id) {
         Some(Some(0)) => (" ✓ exit 0 ".to_string(), theme.success),
@@ -2257,7 +2430,7 @@ fn render_worktree_diff_pane(
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
-                    " Press Enter to attach · t for shell · p to prune stale worktrees.",
+                    " Press Enter to attach · s for shell · p to prune stale worktrees.",
                     Style::default().fg(theme.muted),
                 )),
             ],
@@ -2760,9 +2933,10 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let strip_h = subagent_strip_height(active_subagents.len());
     let mut layout = compute_app_layout(state, f.area(), strip_h, !show_composer);
 
+    let mut composer_inner_width = 0u16;
     let (composer_layout, visual_line_count) = if show_composer && layout.composer_area.height > 0
     {
-        let composer_inner_width = layout.composer_area.width.saturating_sub(2);
+        composer_inner_width = layout.composer_area.width.saturating_sub(2);
         let composer_layout = layout_composer_text(
             &state.input_buffer,
             state.cursor_position,
@@ -2778,7 +2952,6 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         let desired_height = (visual_line_count + 2).clamp(3, 10).min(max_composer_h);
         if desired_height > layout.composer_area.height {
             let delta = desired_height - layout.composer_area.height;
-            layout.tree_area.height = layout.tree_area.height.saturating_sub(delta);
             layout.transcript_area.height = layout.transcript_area.height.saturating_sub(delta);
             layout.composer_area.y = layout.composer_area.y.saturating_sub(delta);
             layout.composer_area.height = desired_height;
@@ -3067,6 +3240,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         worktree_diff_max_scroll,
         transcript_inner_height,
         composer_scroll_y,
+        composer_inner_width,
         help_scroll_offset: rendered_help_scroll,
         help_max_scroll,
         frame_area: f.area(),
@@ -3117,11 +3291,13 @@ mod tests {
             crate::app::ThreadItem {
                 id: "t-1".to_string(),
                 title: "Trunk".to_string(),
+                custom_name: None,
                 anchors: Vec::new(),
             },
             crate::app::ThreadItem {
                 id: "t-2".to_string(),
                 title: "Side".to_string(),
+                custom_name: None,
                 anchors: Vec::new(),
             },
         ];
@@ -3168,7 +3344,7 @@ mod tests {
         assert!(screen.contains("●"));
         assert!(screen.contains("⚠"));
         assert!(screen.contains("WRITE · AGENT"));
-        assert!(screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"));
+        assert!(screen.contains("Esc cancel · Ctrl+G manage · Alt+Z sidebar"));
         assert!(!screen.contains("Enter: Send"));
     }
 }

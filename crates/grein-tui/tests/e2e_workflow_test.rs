@@ -46,6 +46,7 @@ impl MockLiveEngine {
                 id: trunk_id.to_string(),
                 title: title.to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
             thread_meta: vec![ThreadMeta {
                 thread_id: trunk_id.to_string(),
@@ -56,6 +57,7 @@ impl MockLiveEngine {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                                  custom_name: None,
             }],
             active_thread_id: trunk_id.to_string(),
             turn_completed_notify: Arc::new(Notify::new()),
@@ -228,6 +230,7 @@ impl TuiEnginePort for MockLiveEngine {
             id: id.clone(),
             title: resolved_title,
             turns: Vec::new(),
+                               custom_name: None,
         });
         guard.thread_meta.push(ThreadMeta {
             thread_id: id.clone(),
@@ -238,6 +241,7 @@ impl TuiEnginePort for MockLiveEngine {
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+                                   custom_name: None,
         });
         guard.active_thread_id = id.clone();
         Ok(id)
@@ -256,6 +260,7 @@ impl TuiEnginePort for MockLiveEngine {
             id: id.clone(),
             title: resolved_title,
             turns: Vec::new(),
+                         custom_name: None,
         };
         guard.threads.push(thread.clone());
         guard.thread_meta.push(ThreadMeta {
@@ -267,6 +272,7 @@ impl TuiEnginePort for MockLiveEngine {
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+                                   custom_name: None,
         });
         guard.active_thread_id = id;
         Ok(thread)
@@ -948,6 +954,7 @@ fn rendered_layout(
             let right_w = area.width.saturating_sub(sw);
             let right_x = area.x + sw;
             layout.tree_area.width = sw;
+            layout.tree_area.height = layout.status_bar_area.y.saturating_sub(layout.tree_area.y);
             layout.transcript_area.x = right_x;
             layout.transcript_area.width = right_w;
             if layout.composer_area.width > 0 {
@@ -981,16 +988,19 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
                     content: "### Auth Overview\nChecks JWT signatures.".to_string(),
                 },
             ],
+            custom_name: None,
         },
         HydratedThread {
             id: "t-child".to_string(),
             title: "Auth Child".to_string(),
             turns: Vec::new(),
+            custom_name: None,
         },
         HydratedThread {
             id: "t-grand".to_string(),
             title: "JWT Grandchild".to_string(),
             turns: Vec::new(),
+            custom_name: None,
         },
     ];
     let meta = vec![
@@ -1003,6 +1013,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
         ThreadMeta {
             thread_id: "t-child".to_string(),
@@ -1013,6 +1024,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
         ThreadMeta {
             thread_id: "t-grand".to_string(),
@@ -1023,6 +1035,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
     ];
     let engine = MockLiveEngine::new_with_session("t-grand", threads, meta);
@@ -1125,6 +1138,7 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
                 id: format!("t-{i}"),
                 title: format!("Branch-{i:02}"),
                 turns: Vec::new(),
+                         custom_name: None,
             })
             .collect();
         let meta = (0..14)
@@ -1137,6 +1151,7 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                         custom_name: None,
             })
             .collect();
         (threads, meta)
@@ -1306,11 +1321,11 @@ async fn test_e2e_fork_grein_close_delete_tree_x_d_and_sole_thread_guard() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 4. Close/delete remaining forks via MANAGE Tree 'x'/'d' + 'y' confirm
+    // 4. Close/delete remaining forks via MANAGE Tree 'd' + 'y' confirm ('x' dropped)
     send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
-    send_key(&key_tx, KeyCode::Char('x'), KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('d'), KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Char('y'), KeyModifiers::NONE);
-    wait_for("Tree x+y deleted t-branch-2", || {
+    wait_for("Tree d+y deleted t-branch-2", || {
         engine.deleted_threads().contains(&"t-branch-2".to_string())
     })
     .await;
@@ -1324,8 +1339,7 @@ async fn test_e2e_fork_grein_close_delete_tree_x_d_and_sole_thread_guard() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 5. Sole-thread guard on remaining Main context via Tree x/d and Composer /close
-    send_key(&key_tx, KeyCode::Char('x'), KeyModifiers::NONE);
+    // 5. Sole-thread guard on remaining Main context via Tree 'd' and Composer /close
     send_key(&key_tx, KeyCode::Char('d'), KeyModifiers::NONE);
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     send_text(&key_tx, "/close");
@@ -1586,6 +1600,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
                 id: "t-1".to_string(),
                 title: "Main".to_string(),
                 turns: Vec::new(),
+                              custom_name: None,
             }],
         },
     );
@@ -1600,7 +1615,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     draw_frame_mut(&mut stepped_terminal, &mut app).unwrap();
     let thought_screen = render_to_string(&stepped_terminal);
     assert!(thought_screen.contains("thinking: inspecting logs"));
-    assert!(thought_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z zoom"));
+    assert!(thought_screen.contains("Esc cancel · Ctrl+G manage · Alt+Z sidebar"));
 
     apply_engine_event(
         &mut app,
@@ -1636,7 +1651,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
     draw_frame_mut(&mut stepped_terminal, &mut app).unwrap();
     let cleared_screen = render_to_string(&stepped_terminal);
     assert!(!cleared_screen.contains("Subagents"));
-    assert!(cleared_screen.contains("Ctrl+G manage · Alt+Z zoom"));
+    assert!(cleared_screen.contains("Ctrl+G manage · Alt+Z sidebar"));
     assert!(cleared_screen.contains("0 subagents"));
 }
 
@@ -1703,7 +1718,7 @@ async fn test_e2e_minimal_composer_and_help_modal_triggers_dismissal() {
         assert!(full_text.contains("/join"));
         assert!(full_text.contains("/theme"));
         assert!(full_text.contains("/bind"));
-        assert!(full_text.contains("Esc, q, ?, F1, or Enter to close"));
+        assert!(full_text.contains("Esc, q, ?, or Enter to close"));
         assert!(engine.recorded_turns().is_empty());
     }
 
@@ -1815,6 +1830,7 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
                     id: "t-root".to_string(),
                     title: "Main".to_string(),
                     turns: Vec::new(),
+                                  custom_name: None,
                 }],
             })
         }
@@ -1839,6 +1855,7 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
                 cwd: None,
                 git_branch: None,
                 git_dirty: 0,
+                        custom_name: None,
             }])
         }
         async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
@@ -1988,15 +2005,14 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
     .await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 3. Create new root via MANAGE 'a', then rename it inline with 'r'
+    // 3. Create new root via MANAGE 'n', then rename it inline with 'r'
     send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
-    send_key(&key_tx, KeyCode::Char('a'), KeyModifiers::NONE);
+    send_key(&key_tx, KeyCode::Char('n'), KeyModifiers::NONE);
     wait_for("new root created", || engine.threads_count() == 3).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
 
     send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Char('r'), KeyModifiers::NONE);
-    send_key(&key_tx, KeyCode::Char('u'), KeyModifiers::CONTROL);
     send_text(&key_tx, "Docs Root");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
     wait_for("new root renamed", || {
@@ -2029,15 +2045,15 @@ async fn test_e2e_root_create_rename_shortcuts_and_join_workflow() {
     let tree_text = render_rect_to_string(&terminal, layout.tree_area);
     let transcript_text = render_rect_to_string(&terminal, layout.transcript_area);
 
-    assert!(tree_text.contains("ᛉ Main"), "{tree_text}");
+    assert!(tree_text.contains("1 ᛉ Main"), "{tree_text}");
     assert!(
-        tree_text.contains("└─ Auth Spike [joined]"),
-        "Expected joined badge and tree connector without ᛉ on idle sub-branch:\n{tree_text}"
+        tree_text.contains("└─ [Auth Spike] temp-name [joined]"),
+        "Expected unified custom+auto label and joined badge without ᛉ on idle sub-branch:\n{tree_text}"
     );
     assert!(!tree_text.contains("ᛉ Auth Spike"), "{tree_text}");
-    assert!(tree_text.contains("ᛉ Docs Root"), "{tree_text}");
+    assert!(tree_text.contains("2 ᛉ [Docs Root]"), "{tree_text}");
     assert!(
-        transcript_text.contains("Joined from Auth Spike: Token rotation verified"),
+        transcript_text.contains("Joined from [Auth Spike] temp-name: Token rotation verified"),
         "Expected joined summary blockquote in Main transcript:\n{transcript_text}"
     );
 }
@@ -2062,6 +2078,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 role: "Assistant".to_string(),
                 content: long_lines,
             }],
+            custom_name: None,
         },
         HydratedThread {
             id: "b1".to_string(),
@@ -2071,6 +2088,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 role: "Assistant".to_string(),
                 content: preview_lines,
             }],
+            custom_name: None,
         },
         HydratedThread {
             id: "b2".to_string(),
@@ -2080,6 +2098,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 role: "Assistant".to_string(),
                 content: "MARKER_BRANCH_1B".to_string(),
             }],
+            custom_name: None,
         },
         HydratedThread {
             id: "r2".to_string(),
@@ -2089,6 +2108,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 role: "Assistant".to_string(),
                 content: "MARKER_ROOT_TWO".to_string(),
             }],
+            custom_name: None,
         },
         HydratedThread {
             id: "r3".to_string(),
@@ -2098,6 +2118,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 role: "Assistant".to_string(),
                 content: "MARKER_LONE_ROOT".to_string(),
             }],
+            custom_name: None,
         },
     ];
     let meta = vec![
@@ -2110,6 +2131,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
         ThreadMeta {
             thread_id: "b1".to_string(),
@@ -2120,6 +2142,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
         ThreadMeta {
             thread_id: "b2".to_string(),
@@ -2130,6 +2153,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
         ThreadMeta {
             thread_id: "r2".to_string(),
@@ -2140,6 +2164,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
         ThreadMeta {
             thread_id: "r3".to_string(),
@@ -2150,6 +2175,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             cwd: None,
             git_branch: None,
             git_dirty: 0,
+            custom_name: None,
         },
     ];
 
@@ -2169,19 +2195,18 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 1. Alt+1..9 remain unbound; Alt+PgUp scrolls active r1 up from Composer
-    for digit in '1'..='9' {
-        send_key(&key_tx, KeyCode::Char(digit), KeyModifiers::ALT);
-    }
-    send_key(&key_tx, KeyCode::PageUp, KeyModifiers::ALT);
+    // 1. Alt+1..3 jump roots cleanly; Alt+K scrolls active r1 up from Composer
+    send_key(&key_tx, KeyCode::Char('2'), KeyModifiers::ALT);
+    send_key(&key_tx, KeyCode::Char('1'), KeyModifiers::ALT);
+    send_key(&key_tx, KeyCode::Char('k'), KeyModifiers::ALT);
     tokio::time::sleep(Duration::from_millis(40)).await;
 
-    // 2. In MANAGE (Ctrl+G), Alt+J switches r1 -> r2 -> r3, Alt+K -> r2, Alt+Shift+Up -> r1; Esc enters WRITE
+    // 2. In MANAGE (Ctrl+G), J switches r1 -> r2 -> r3, K -> r2 -> r1; Esc enters WRITE
     send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
-    send_key(&key_tx, KeyCode::Char('j'), KeyModifiers::ALT);
-    send_key(&key_tx, KeyCode::Char('j'), KeyModifiers::ALT);
-    send_key(&key_tx, KeyCode::Char('k'), KeyModifiers::ALT);
-    send_key(&key_tx, KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT);
+    send_key(&key_tx, KeyCode::Char('J'), KeyModifiers::SHIFT);
+    send_key(&key_tx, KeyCode::Char('J'), KeyModifiers::SHIFT);
+    send_key(&key_tx, KeyCode::Char('K'), KeyModifiers::SHIFT);
+    send_key(&key_tx, KeyCode::Char('K'), KeyModifiers::SHIFT);
     send_key(&key_tx, KeyCode::Esc, KeyModifiers::NONE);
 
     // 3. Ctrl+G toggles Composer -> Tree during SLOW_TURN without cancelling; Ctrl+G back to WRITE + Esc cancels turn
@@ -2212,12 +2237,12 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     send_text(&key_tx, "/join");
     send_key(&key_tx, KeyCode::Enter, KeyModifiers::NONE);
 
-    // 5. Enter Tree, preview b1, scroll preview transcript to top via Ctrl+U steps so line 01 renders
+    // 5. Enter Tree, preview b1, scroll preview transcript to top via Ctrl+B / Ctrl+U steps so line 01 renders
     send_key(&key_tx, KeyCode::Char('g'), KeyModifiers::CONTROL);
     send_key(&key_tx, KeyCode::Down, KeyModifiers::NONE);
     tokio::time::sleep(Duration::from_millis(30)).await;
     for _ in 0..8 {
-        send_key(&key_tx, KeyCode::PageUp, KeyModifiers::NONE);
+        send_key(&key_tx, KeyCode::Char('u'), KeyModifiers::CONTROL);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2238,7 +2263,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     );
     assert!(
         transcript_text.contains("Preview branch line 01"),
-        "Expected PgUp in Tree preview to scroll b1 to top:\n{transcript_text}"
+        "Expected Ctrl+U in Tree preview to scroll b1 to top:\n{transcript_text}"
     );
     assert!(
         status_text.contains("Cannot join a root context (no parent branch)"),
@@ -2263,8 +2288,8 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
     let help_screen = render_to_string(&help_term);
     assert!(help_screen.contains("WRITE Mode (Terminal & Composer)"), "{help_screen}");
     assert!(help_screen.contains("MANAGE Mode (Sidebar)"), "{help_screen}");
-    assert!(help_screen.contains("Tab / Ctrl+T"), "{help_screen}");
-    assert!(help_screen.contains("PgUp/PgDn"), "{help_screen}");
+    assert!(help_screen.contains("Tab"), "{help_screen}");
+    assert!(help_screen.contains("Ctrl+F/B, Ctrl+U/D"), "{help_screen}");
     assert!(help_screen.contains("/theme"), "{help_screen}");
     assert!(!help_screen.contains("/wb"), "{help_screen}");
 }

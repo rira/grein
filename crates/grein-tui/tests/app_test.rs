@@ -16,11 +16,15 @@ fn default_focus_starts_on_composer_and_toggles_cleanly_with_tree() {
     app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    // Idle Esc stays in WRITE mode; F6 / Alt+G / Ctrl+G enter MANAGE, and Esc in MANAGE returns to WRITE
+    // Idle Esc stays in WRITE mode; Ctrl+G enters MANAGE (F6/Alt+G dropped), and Esc in MANAGE returns to WRITE
     app.handle_key_event(key(KeyCode::Esc));
     assert_eq!(app.focused_pane(), FocusPane::Composer);
 
-    app.handle_key_event(key(KeyCode::F(6)));
+    assert!(!app.handle_key_event(key(KeyCode::F(6))));
+    assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT)));
+    assert_eq!(app.focused_pane(), FocusPane::Composer);
+
+    app.handle_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert_eq!(app.focused_pane(), FocusPane::Sidebar);
 
     app.handle_key_event(key(KeyCode::Esc));
