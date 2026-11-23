@@ -223,6 +223,8 @@ pub struct Thread {
     pub kind: ThreadKind,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub custom_name: Option<String>,
 }
 
 impl Thread {
@@ -250,6 +252,7 @@ impl Thread {
             parent_thread_id: None,
             kind: ThreadKind::default(),
             cwd: None,
+            custom_name: None,
         }
     }
 
@@ -265,6 +268,11 @@ impl Thread {
 
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_custom_name(mut self, custom_name: Option<String>) -> Self {
+        self.custom_name = custom_name;
         self
     }
 

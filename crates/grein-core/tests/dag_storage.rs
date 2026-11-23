@@ -251,6 +251,7 @@ fn test_thread_new_defaults_and_with_title() {
     assert!(!thread.merged);
     assert_eq!(thread.kind, ThreadKind::Agent);
     assert_eq!(thread.cwd, None);
+    assert_eq!(thread.custom_name, None);
 
     let titled = thread.with_title("Investigate auth");
     assert_eq!(titled.title, "Investigate auth");
@@ -258,6 +259,7 @@ fn test_thread_new_defaults_and_with_title() {
     assert!(!titled.merged);
     assert_eq!(titled.kind, ThreadKind::Agent);
     assert_eq!(titled.cwd, None);
+    assert_eq!(titled.custom_name, None);
 }
 
 #[test]
@@ -312,6 +314,7 @@ fn test_legacy_threads_schema_migration_adds_metadata_columns_idempotently(
     assert_eq!(fetched.parent_thread_id, None);
     assert_eq!(fetched.kind, ThreadKind::Agent);
     assert_eq!(fetched.cwd, None);
+    assert_eq!(fetched.custom_name, None);
 
     let all = storage.list_threads()?;
     assert_eq!(all.len(), 1);
@@ -511,6 +514,7 @@ fn test_legacy_threads_migration_adds_kind_and_cwd_idempotently(
     assert_eq!(fetched.title, "Pre-terminal thread");
     assert_eq!(fetched.kind, ThreadKind::Agent);
     assert_eq!(fetched.cwd, None);
+    assert_eq!(fetched.custom_name, None);
 
     let listed = storage.list_threads()?;
     assert_eq!(listed, vec![fetched]);
@@ -678,6 +682,7 @@ fn test_thread_json_serde_backward_compatibility_and_kind_roundtrip(
     assert_eq!(parsed.title, "Legacy Thread");
     assert_eq!(parsed.kind, ThreadKind::Agent);
     assert_eq!(parsed.cwd, None);
+    assert_eq!(parsed.custom_name, None);
 
     let term = Thread::new(tid, node_id, anchor_id, node_id, ThreadLifecycleState::Idle)
         .with_kind(ThreadKind::Terminal)
@@ -690,6 +695,249 @@ fn test_thread_json_serde_backward_compatibility_and_kind_roundtrip(
     assert_eq!(roundtripped, term);
     assert_eq!(roundtripped.kind(), ThreadKind::Terminal);
     assert_eq!(roundtripped.cwd(), Some("/tmp/wt-path"));
+
+    Ok(())
+}
+
+struct TempDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempDirGuard {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("grein-dag-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&path).expect("failed to create test temp dir");
+        Self { path }
+    }
+
+    fn db_path(&self) -> std::path::PathBuf {
+        self.path.join("grein.db")
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn test_thread_with_custom_name_builder_and_serde_roundtrip(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tid = ThreadId::new_v7();
+    let node_id = NodeId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+
+    let default_thread = Thread::new(tid, node_id, anchor_id, node_id, ThreadLifecycleState::Idle);
+    assert_eq!(default_thread.custom_name, None);
+
+    let named = default_thread.with_custom_name(Some("Auth".to_string()));
+    assert_eq!(named.custom_name.as_deref(), Some("Auth"));
+
+    let serialized = serde_json::to_string(&named)?;
+    assert!(serialized.contains("\"custom_name\":\"Auth\""));
+    let roundtripped: Thread = serde_json::from_str(&serialized)?;
+    assert_eq!(roundtripped, named);
+    assert_eq!(roundtripped.custom_name.as_deref(), Some("Auth"));
+
+    let cleared = named.with_custom_name(None);
+    assert_eq!(cleared.custom_name, None);
+    let cleared_json = serde_json::to_string(&cleared)?;
+    let cleared_roundtrip: Thread = serde_json::from_str(&cleared_json)?;
+    assert_eq!(cleared_roundtrip.custom_name, None);
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_custom_name_persistence_update_clear_and_not_found(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDirGuard::new();
+    let db_path = temp.db_path();
+
+    let root_node = ConversationNode::new_root(AuthorRole::User, "hello");
+    let default_tid;
+    let inserted_tid = ThreadId::new_v7();
+
+    {
+        let storage = SqliteDagStorage::open(&db_path)?;
+        storage.insert_node(&root_node)?;
+
+        default_tid = storage.create_thread(root_node.id, AnchorId::new_v7())?;
+        let created = storage
+            .get_thread(default_tid)?
+            .expect("created thread must exist");
+        assert_eq!(created.custom_name, None);
+
+        let pre_named = Thread::new(
+            inserted_tid,
+            root_node.id,
+            AnchorId::new_v7(),
+            root_node.id,
+            ThreadLifecycleState::Idle,
+        )
+        .with_title("Auto Inserted")
+        .with_custom_name(Some("Auth".to_string()));
+        storage.insert_thread(&pre_named)?;
+
+        storage.update_thread_custom_name(&default_tid, Some("Terminal"))?;
+    }
+
+    {
+        let reopened = SqliteDagStorage::open(&db_path)?;
+        let fetched_default = reopened
+            .get_thread(default_tid)?
+            .expect("default thread must persist across reload");
+        assert_eq!(fetched_default.custom_name.as_deref(), Some("Terminal"));
+
+        let fetched_inserted = reopened
+            .get_thread(inserted_tid)?
+            .expect("inserted thread must persist across reload");
+        assert_eq!(fetched_inserted.title, "Auto Inserted");
+        assert_eq!(fetched_inserted.custom_name.as_deref(), Some("Auth"));
+
+        let listed = reopened.list_threads()?;
+        assert_eq!(listed, vec![fetched_default, fetched_inserted]);
+
+        reopened.update_thread_custom_name(&default_tid, Some("Auth"))?;
+        reopened.update_thread_custom_name(&inserted_tid, None)?;
+    }
+
+    {
+        let reopened_again = SqliteDagStorage::open(&db_path)?;
+        let updated = reopened_again
+            .get_thread(default_tid)?
+            .expect("updated thread must persist across reload");
+        assert_eq!(updated.custom_name.as_deref(), Some("Auth"));
+
+        let cleared = reopened_again
+            .get_thread(inserted_tid)?
+            .expect("cleared thread must persist across reload");
+        assert_eq!(cleared.custom_name, None);
+        assert_eq!(cleared.title, "Auto Inserted");
+
+        let listed = reopened_again.list_threads()?;
+        assert_eq!(listed, vec![updated, cleared]);
+
+        let missing_id = ThreadId::new_v7();
+        let err = reopened_again.update_thread_custom_name(&missing_id, Some("Nope"));
+        assert!(matches!(err, Err(CoreError::ThreadNotFound(_))));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_legacy_threads_migration_adds_custom_name_column_idempotently(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_id TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_node_id TEXT NOT NULL,
+            anchor_id TEXT NOT NULL,
+            active_leaf_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            acp_session_id TEXT,
+            merged INTEGER NOT NULL DEFAULT 0,
+            parent_thread_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'agent',
+            cwd TEXT,
+            FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+            FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );",
+    )?;
+
+    let root_id = NodeId::new_v7();
+    let thread_id = ThreadId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+    conn.execute(
+        "INSERT INTO nodes (id, parent_id, role, content, created_at) VALUES (?1, NULL, 'user', 'Root', 1)",
+        rusqlite::params![root_id.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, kind, cwd)
+         VALUES (?1, ?2, ?3, ?2, 'idle', 2, 'Auto Title', 'terminal', '/tmp/work')",
+        rusqlite::params![thread_id.to_string(), root_id.to_string(), anchor_id.to_string()],
+    )?;
+
+    let storage = SqliteDagStorage::new(conn)?;
+    storage.run_migrations()?;
+
+    let fetched = storage
+        .get_thread(thread_id)?
+        .expect("Existing thread must survive migration");
+    assert_eq!(fetched.id, thread_id);
+    assert_eq!(fetched.title, "Auto Title");
+    assert_eq!(fetched.kind, ThreadKind::Terminal);
+    assert_eq!(fetched.cwd.as_deref(), Some("/tmp/work"));
+    assert_eq!(fetched.custom_name, None);
+
+    let listed = storage.list_threads()?;
+    assert_eq!(listed, vec![fetched]);
+
+    storage.update_thread_custom_name(&thread_id, Some("Terminal"))?;
+    let renamed = storage
+        .get_thread(thread_id)?
+        .expect("Migrated thread must support custom_name updates");
+    assert_eq!(renamed.custom_name.as_deref(), Some("Terminal"));
+    assert_eq!(renamed.title, "Auto Title");
+    assert_eq!(renamed.cwd.as_deref(), Some("/tmp/work"));
+
+    Ok(())
+}
+
+#[test]
+fn test_update_thread_title_and_custom_name_are_independent(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = SqliteDagStorage::in_memory()?;
+
+    let root_node = ConversationNode::new_root(AuthorRole::User, "root");
+    storage.insert_node(&root_node)?;
+
+    let thread_id =
+        storage.create_thread_with_title(root_node.id, AnchorId::new_v7(), "Initial Auto Title")?;
+
+    storage.update_thread_custom_name(&thread_id, Some("Auth"))?;
+    let after_custom = storage
+        .get_thread(thread_id)?
+        .expect("Thread must exist after custom_name update");
+    assert_eq!(after_custom.title, "Initial Auto Title");
+    assert_eq!(after_custom.custom_name.as_deref(), Some("Auth"));
+
+    storage.update_thread_title(&thread_id, "Updated Auto Title")?;
+    let after_title = storage
+        .get_thread(thread_id)?
+        .expect("Thread must exist after title update");
+    assert_eq!(after_title.title, "Updated Auto Title");
+    assert_eq!(after_title.custom_name.as_deref(), Some("Auth"));
+
+    storage.update_thread_custom_name(&thread_id, Some("Terminal"))?;
+    let after_rename = storage
+        .get_thread(thread_id)?
+        .expect("Thread must exist after custom_name change");
+    assert_eq!(after_rename.title, "Updated Auto Title");
+    assert_eq!(after_rename.custom_name.as_deref(), Some("Terminal"));
+
+    storage.update_thread_custom_name(&thread_id, None)?;
+    let after_clear = storage
+        .get_thread(thread_id)?
+        .expect("Thread must exist after clearing custom_name");
+    assert_eq!(after_clear.title, "Updated Auto Title");
+    assert_eq!(after_clear.custom_name, None);
+
+    let listed = storage.list_threads()?;
+    assert_eq!(listed, vec![after_clear]);
 
     Ok(())
 }
