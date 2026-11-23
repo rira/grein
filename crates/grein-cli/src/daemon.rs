@@ -385,10 +385,16 @@ mod tests {
         );
 
         let wt_err_rpc = raw_client
-            .session_ensure_thread_worktree(&term_id)
+            .session_ensure_thread_worktree("nonexistent-thread-id")
             .await
-            .expect("session_ensure_thread_worktree on terminal");
-        assert_eq!(wt_err_rpc["error"]["code"], -32602);
+            .expect("session_ensure_thread_worktree on unknown thread");
+        assert_eq!(wt_err_rpc["error"]["code"], -32004);
+
+        let wt_missing_rpc = raw_client
+            .json_rpc("session.ensure_thread_worktree", json!({}))
+            .await
+            .expect("session_ensure_thread_worktree without thread_id");
+        assert_eq!(wt_missing_rpc["error"]["code"], -32602);
 
         server.abort();
     }

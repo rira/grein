@@ -19,13 +19,26 @@ use tokio::sync::{mpsc, Mutex};
 #[derive(Debug, Parser, Clone, PartialEq, Eq)]
 #[command(name = "grein", version, about = "Grein autonomous engineering CLI")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Start a fresh session in an ACP agent branch instead of a terminal"
+    )]
+    pub agent: bool,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialSessionMode {
+    Terminal,
+    Agent,
 }
 
 /// Adapts an engine client (any `DaemonEngine`) to the TUI engine port.
 struct EngineClientPort<E> {
     client: E,
+    initial_mode: InitialSessionMode,
     events_tx: mpsc::UnboundedSender<TuiEngineEvent>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>>,
     has_live_stream: AtomicBool,
@@ -35,10 +48,16 @@ struct EngineClientPort<E> {
 }
 
 impl<E> EngineClientPort<E> {
+    #[cfg(test)]
     fn new(client: E) -> Self {
+        Self::new_with_mode(client, InitialSessionMode::Agent)
+    }
+
+    fn new_with_mode(client: E, initial_mode: InitialSessionMode) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
             client,
+            initial_mode,
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
             has_live_stream: AtomicBool::new(false),
@@ -68,6 +87,22 @@ impl<E: DaemonEngine> EngineClientPort<E> {
                 content: entry.content,
             })
             .collect())
+    }
+
+    async fn hydrate_summaries(
+        &self,
+        summaries: Vec<grein_cli::engine::ThreadSummary>,
+    ) -> io::Result<Vec<HydratedThread>> {
+        let mut threads = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let turns = self.load_hydrated_turns(&summary.thread_id).await?;
+            threads.push(HydratedThread {
+                id: summary.thread_id,
+                title: summary.title,
+                turns,
+            });
+        }
+        Ok(threads)
     }
 
     async fn fetch_and_emit_thread_metadata(&self) -> Option<Vec<ThreadMeta>> {
@@ -102,33 +137,49 @@ where
     E: DaemonEngine + Send + Sync + 'static,
 {
     async fn hydrate_session(&self) -> io::Result<HydratedSession> {
-        let main = self.client.ensure_main_thread().await.map_err(to_io)?;
         let summaries = self.client.list_threads().await.map_err(to_io)?;
-        let mut threads = Vec::with_capacity(summaries.len());
-        for summary in summaries {
-            let entries = self
-                .client
-                .get_thread_transcript(&summary.thread_id)
-                .await
-                .map_err(to_io)?;
-            let turns = entries
-                .into_iter()
-                .map(|entry| HydratedTurn {
-                    id: entry.node_id,
-                    role: entry.role,
-                    content: entry.content,
-                })
-                .collect();
-            threads.push(HydratedThread {
-                id: summary.thread_id,
-                title: summary.title,
-                turns,
-            });
-        }
-        let active_thread_id = threads
-            .first()
-            .map(|t| t.id.clone())
-            .unwrap_or(main.thread_id);
+        let (active_thread_id, threads) = if !summaries.is_empty() {
+            let threads = self.hydrate_summaries(summaries).await?;
+            let active_thread_id = threads
+                .first()
+                .map(|t| t.id.clone())
+                .unwrap_or_default();
+            (active_thread_id, threads)
+        } else {
+            match self.initial_mode {
+                InitialSessionMode::Terminal => {
+                    let term = self
+                        .client
+                        .create_terminal(None, None, None, 24, 80)
+                        .await
+                        .map_err(to_io)?;
+                    let hydrated = HydratedThread {
+                        id: term.thread_id.clone(),
+                        title: term.title,
+                        turns: Vec::new(),
+                    };
+                    (term.thread_id, vec![hydrated])
+                }
+                InitialSessionMode::Agent => {
+                    let main = self.client.ensure_main_thread().await.map_err(to_io)?;
+                    let summaries = self.client.list_threads().await.map_err(to_io)?;
+                    let mut threads = self.hydrate_summaries(summaries).await?;
+                    if threads.is_empty() {
+                        let turns = self.load_hydrated_turns(&main.thread_id).await?;
+                        threads.push(HydratedThread {
+                            id: main.thread_id.clone(),
+                            title: main.title,
+                            turns,
+                        });
+                    }
+                    let active_thread_id = threads
+                        .first()
+                        .map(|t| t.id.clone())
+                        .unwrap_or(main.thread_id);
+                    (active_thread_id, threads)
+                }
+            }
+        };
         let _ = self.fetch_and_emit_thread_metadata().await;
         if let Ok(agent_metas) = self.client.agent_metadata().await {
             for entry in agent_metas {
@@ -601,12 +652,21 @@ where
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
+    let initial_mode = if cli.agent {
+        InitialSessionMode::Agent
+    } else {
+        InitialSessionMode::Terminal
+    };
 
     match cli.command {
         None | Some(Command::Standalone {}) => {
             if std::io::stdout().is_terminal() {
                 let engine = InProcessEngine::open(&grein_cli::daemon::default_db_path())?;
-                grein_tui::run_with_engine(Arc::new(EngineClientPort::new(engine))).await?;
+                grein_tui::run_with_engine(Arc::new(EngineClientPort::new_with_mode(
+                    engine,
+                    initial_mode,
+                )))
+                .await?;
             }
         }
         Some(Command::Daemon(DaemonArgs { socket })) => {
@@ -617,7 +677,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let socket_path = socket.unwrap_or_else(grein_cli::daemon::default_socket_path);
             let transport = UnixSocketEngineClient::connect(&socket_path).await?;
             if std::io::stdout().is_terminal() {
-                grein_tui::run_with_engine(Arc::new(EngineClientPort::new(transport))).await?;
+                grein_tui::run_with_engine(Arc::new(EngineClientPort::new_with_mode(
+                    transport,
+                    initial_mode,
+                )))
+                .await?;
             }
         }
         Some(Command::Threads(args)) => {
@@ -1424,6 +1488,156 @@ done
         assert!(
             saw_restart_event,
             "EngineClientPort::pty_restart must forward PtyScreenUpdated"
+        );
+    }
+
+    #[test]
+    fn test_cli_agent_flag_defaults_false_and_parses_true() {
+        let default_cli = Cli::try_parse_from(["grein"]).expect("parse default grein");
+        assert!(!default_cli.agent);
+
+        let agent_cli = Cli::try_parse_from(["grein", "--agent"]).expect("parse grein --agent");
+        assert!(agent_cli.agent);
+
+        let attach_agent =
+            Cli::try_parse_from(["grein", "attach", "--agent"]).expect("parse attach --agent");
+        assert!(attach_agent.agent);
+
+        let standalone_agent = Cli::try_parse_from(["grein", "--agent", "standalone"])
+            .expect("parse --agent standalone");
+        assert!(standalone_agent.agent);
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_terminal_mode_empty_db_hydrates_root_terminal_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let db_path = temp.path().join("term_first.db");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, canonical_dir.clone(), None).expect("open");
+        let port = EngineClientPort::new_with_mode(engine, InitialSessionMode::Terminal);
+
+        let session = port.hydrate_session().await.expect("hydrate terminal mode");
+        assert_eq!(session.threads.len(), 1);
+        assert_eq!(session.active_thread_id, session.threads[0].id);
+        assert_eq!(session.threads[0].title, "Terminal");
+        assert!(session.threads[0].turns.is_empty());
+
+        let meta = port.thread_metadata().await.expect("thread_metadata");
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].thread_id, session.active_thread_id);
+        assert_eq!(meta[0].kind, grein_core::model::ThreadKind::Terminal);
+        assert!(meta[0].parent_thread_id.is_none());
+        assert_eq!(
+            meta[0].cwd.as_deref(),
+            Some(canonical_dir.to_string_lossy().as_ref())
+        );
+
+        let mut rx = port.events_rx.lock().await.take().expect("events_rx");
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                TuiEngineEvent::ThreadMetadataUpdated { meta }
+                    if meta.len() == 1
+                        && meta[0].thread_id == session.active_thread_id
+                        && meta[0].kind == grein_core::model::ThreadKind::Terminal
+            )),
+            "offline hydrate_session must emit ThreadMetadataUpdated for root terminal: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_agent_mode_empty_db_hydrates_main_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_first.db");
+
+        let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+            .expect("open");
+        let port = EngineClientPort::new_with_mode(engine, InitialSessionMode::Agent);
+
+        let session = port.hydrate_session().await.expect("hydrate agent mode");
+        assert_eq!(session.threads.len(), 1);
+        assert_eq!(session.active_thread_id, session.threads[0].id);
+        assert_eq!(session.threads[0].title, "Main");
+
+        let meta = port.thread_metadata().await.expect("thread_metadata");
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].kind, grein_core::model::ThreadKind::Agent);
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_reopen_terminal_only_db_preserves_threads_without_main() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("reopen_term_only.db");
+
+        let term_id = {
+            let engine =
+                InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                    .expect("open 1");
+            let port = EngineClientPort::new_with_mode(engine, InitialSessionMode::Terminal);
+            let session = port.hydrate_session().await.expect("hydrate 1");
+            assert_eq!(session.threads.len(), 1);
+            session.active_thread_id
+        };
+
+        for mode in [InitialSessionMode::Terminal, InitialSessionMode::Agent] {
+            let reopened =
+                InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), None)
+                    .expect("reopen");
+            let port = EngineClientPort::new_with_mode(reopened, mode);
+            let session = port.hydrate_session().await.expect("rehydrate");
+            assert_eq!(
+                session.threads.len(),
+                1,
+                "reopening terminal-only DB in {mode:?} mode must not inject Main agent"
+            );
+            assert_eq!(session.active_thread_id, term_id);
+            assert_eq!(session.threads[0].id, term_id);
+            assert_eq!(session.threads[0].title, "Terminal");
+
+            let meta = port.thread_metadata().await.expect("meta");
+            assert_eq!(meta.len(), 1);
+            assert_eq!(meta[0].kind, grein_core::model::ThreadKind::Terminal);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_engine_client_port_terminal_mode_with_live_stream_hydrates_cleanly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let db_path = temp.path().join("live_term_first.db");
+
+        let engine =
+            InProcessEngine::open_with_config(&db_path, canonical_dir.clone(), None).expect("open");
+        let port = EngineClientPort::new_with_mode(engine, InitialSessionMode::Terminal);
+
+        let mut rx = port.subscribe_events().await.expect("subscribe");
+        let session = port.hydrate_session().await.expect("hydrate");
+        assert_eq!(session.threads.len(), 1);
+        assert_eq!(session.threads[0].title, "Terminal");
+        assert_eq!(session.active_thread_id, session.threads[0].id);
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                TuiEngineEvent::ThreadMetadataUpdated { meta }
+                    if meta.iter().any(|m| {
+                        m.thread_id == session.active_thread_id
+                            && m.kind == grein_core::model::ThreadKind::Terminal
+                    })
+            )),
+            "live stream terminal-first hydration must deliver ThreadMetadataUpdated: {events:?}"
         );
     }
 }

@@ -247,13 +247,6 @@ done
         Some(branch.thread_id.as_str())
     );
 
-    // Ensure ensure_thread_worktree rejects Terminal threads cleanly.
-    let term_wt_err = engine
-        .ensure_thread_worktree(&child_term.thread_id)
-        .await
-        .expect_err("ensure_thread_worktree on terminal must fail");
-    assert!(matches!(term_wt_err, EngineError::InvalidParams(_)));
-
     engine
         .pty_write(
             &child_term.thread_id,
@@ -263,6 +256,326 @@ done
         .expect("pty_write");
     let expected_line = format!("TERM_PWD={wt_path}");
     wait_for_pty_snapshot(&engine, &child_term.thread_id, 24, 140, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == expected_line)
+    })
+    .await;
+
+    // Terminal threads can also allocate their own dedicated worktree.
+    let child_wt_path = engine
+        .ensure_thread_worktree(&child_term.thread_id)
+        .await
+        .expect("ensure_thread_worktree on terminal must succeed");
+    let expected_child_wt = std::fs::canonicalize(
+        canonical_repo
+            .join(".grein")
+            .join("worktrees")
+            .join(&child_term.thread_id),
+    )
+    .expect("canonical child terminal worktree");
+    assert_eq!(child_wt_path, expected_child_wt.to_string_lossy());
+    assert!(expected_child_wt.join(".git").exists());
+}
+
+#[tokio::test]
+async fn test_ensure_thread_worktree_on_terminal_creates_worktree_respawns_pty_and_is_idempotent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    init_test_git_repo(&repo_root);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let db_path = temp.path().join("term_wt.db");
+
+    let term_id = {
+        let engine = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
+            .expect("open engine");
+        let term = engine
+            .create_terminal(None, Some("Root Term"), None, 26, 120)
+            .await
+            .expect("create root terminal");
+
+        engine
+            .pty_write(
+                &term.thread_id,
+                b"printf '\\nINIT_PWD=%s PID=%s\\n' \"$(pwd)\" \"$$\"\n".to_vec(),
+            )
+            .await
+            .expect("pty_write init");
+        let init_prefix = format!("INIT_PWD={} PID=", canonical_repo.to_string_lossy());
+        let init_snap =
+            wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+                s.plain_text()
+                    .lines()
+                    .any(|l| l.trim().starts_with(&init_prefix))
+            })
+            .await;
+        let old_pid: u32 = init_snap
+            .plain_text()
+            .lines()
+            .find(|l| l.trim().starts_with(&init_prefix))
+            .expect("init pid line")
+            .trim()
+            .strip_prefix(&init_prefix)
+            .expect("strip prefix")
+            .trim()
+            .parse()
+            .expect("parse old pid");
+        assert!(is_process_alive(old_pid), "initial PTY shell must be alive");
+
+        let mut rx = engine.subscribe_tui_events();
+        let wt_path = engine
+            .ensure_thread_worktree(&term.thread_id)
+            .await
+            .expect("ensure_thread_worktree on terminal");
+
+        let expected_wt = std::fs::canonicalize(
+            canonical_repo
+                .join(".grein")
+                .join("worktrees")
+                .join(&term.thread_id),
+        )
+        .expect("canonical worktree");
+        assert_eq!(wt_path, expected_wt.to_string_lossy());
+        assert!(expected_wt.join(".git").exists());
+
+        let expected_branch = format!("worktree-{}", term.thread_id);
+        let mut saw_idle = false;
+        let mut saw_screen = false;
+        let mut saw_meta = false;
+        let ev_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < ev_deadline && !(saw_idle && saw_screen && saw_meta) {
+            match timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(TuiEngineEvent::ThreadStatusChanged { thread_id, status }))
+                    if thread_id == term.thread_id && status == "idle" =>
+                {
+                    saw_idle = true;
+                }
+                Ok(Some(TuiEngineEvent::PtyScreenUpdated {
+                    thread_id,
+                    snapshot,
+                })) if thread_id == term.thread_id
+                    && !snapshot.exited
+                    && snapshot.rows == 26
+                    && snapshot.cols == 120 =>
+                {
+                    saw_screen = true;
+                }
+                Ok(Some(TuiEngineEvent::ThreadMetadataUpdated { meta }))
+                    if meta.iter().any(|m| {
+                        m.thread_id == term.thread_id
+                            && m.cwd.as_deref() == Some(wt_path.as_str())
+                            && m.git_branch.as_deref() == Some(expected_branch.as_str())
+                    }) =>
+                {
+                    saw_meta = true;
+                }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_idle, "expected ThreadStatusChanged idle");
+        assert!(saw_screen, "expected PtyScreenUpdated for respawned PTY");
+        assert!(saw_meta, "expected ThreadMetadataUpdated with worktree cwd and branch");
+
+        let old_deadline = Instant::now() + Duration::from_secs(2);
+        while is_process_alive(old_pid) {
+            assert!(
+                Instant::now() < old_deadline,
+                "old PTY shell {old_pid} must terminate on worktree transition"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        engine
+            .pty_write(
+                &term.thread_id,
+                b"printf '\\nWT_TERM_PWD=%s PID=%s\\n' \"$(pwd)\" \"$$\"\n".to_vec(),
+            )
+            .await
+            .expect("pty_write in worktree");
+        let wt_prefix = format!("WT_TERM_PWD={wt_path} PID=");
+        let wt_snap =
+            wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+                s.plain_text()
+                    .lines()
+                    .any(|l| l.trim().starts_with(&wt_prefix))
+            })
+            .await;
+        let new_pid: u32 = wt_snap
+            .plain_text()
+            .lines()
+            .find(|l| l.trim().starts_with(&wt_prefix))
+            .expect("wt pid line")
+            .trim()
+            .strip_prefix(&wt_prefix)
+            .expect("strip wt prefix")
+            .trim()
+            .parse()
+            .expect("parse new pid");
+        assert_ne!(new_pid, old_pid, "PTY must respawn with a new shell process");
+        assert!(is_process_alive(new_pid));
+
+        let meta_now = engine.thread_metadata().await.expect("meta");
+        let term_meta = meta_now
+            .iter()
+            .find(|m| m.thread_id == term.thread_id)
+            .expect("term meta");
+        assert_eq!(term_meta.git_branch.as_deref(), Some(expected_branch.as_str()));
+        assert_eq!(term_meta.cwd.as_deref(), Some(wt_path.as_str()));
+
+        // Idempotent when invoked twice at worktree root: preserves live PTY.
+        let wt_path_again = engine
+            .ensure_thread_worktree(&term.thread_id)
+            .await
+            .expect("second ensure_thread_worktree");
+        assert_eq!(wt_path_again, wt_path);
+        assert!(is_process_alive(new_pid), "idempotent call must keep live PTY");
+
+        // Move cwd into a subdirectory inside the worktree via OSC 7 and invoke again.
+        let sub_wt = expected_wt.join("sub_wt");
+        std::fs::create_dir_all(&sub_wt).expect("mkdir sub_wt");
+        let canonical_sub_wt = std::fs::canonicalize(&sub_wt).expect("canonical sub_wt");
+        let canonical_sub_wt_str = canonical_sub_wt.to_string_lossy().into_owned();
+
+        let osc7_cmd = format!(
+            "cd '{}' && printf '\\n' && printf '\\033]7;file://localhost%s\\007\\n' '{}' && printf 'SUB_WT_READY\\n'\n",
+            canonical_sub_wt_str, canonical_sub_wt_str
+        );
+        engine
+            .pty_write(&term.thread_id, osc7_cmd.into_bytes())
+            .await
+            .expect("pty_write sub_wt osc7");
+        wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+            s.plain_text().lines().any(|l| l.trim() == "SUB_WT_READY")
+        })
+        .await;
+
+        let sub_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let meta_sub = engine.thread_metadata().await.expect("meta sub");
+            let cur_cwd = meta_sub
+                .iter()
+                .find(|m| m.thread_id == term.thread_id)
+                .and_then(|m| m.cwd.clone());
+            if cur_cwd.as_deref() == Some(canonical_sub_wt_str.as_str()) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < sub_deadline,
+                "expected OSC 7 cwd to update to {canonical_sub_wt_str}, got {cur_cwd:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let wt_path_from_sub = engine
+            .ensure_thread_worktree(&term.thread_id)
+            .await
+            .expect("ensure_thread_worktree from subdir inside worktree");
+        assert_eq!(wt_path_from_sub, wt_path);
+        assert!(
+            is_process_alive(new_pid),
+            "ensure_thread_worktree inside worktree subdir must not kill live PTY"
+        );
+
+        let meta_after_sub = engine.thread_metadata().await.expect("meta after sub");
+        let term_meta_sub = meta_after_sub
+            .iter()
+            .find(|m| m.thread_id == term.thread_id)
+            .expect("term meta sub");
+        assert_eq!(
+            term_meta_sub.cwd.as_deref(),
+            Some(canonical_sub_wt_str.as_str()),
+            "idempotent ensure_thread_worktree must preserve subdir cwd inside worktree"
+        );
+
+        engine
+            .pty_write(
+                &term.thread_id,
+                b"printf '\\nSTILL_ALIVE_PWD=%s PID=%s\\n' \"$(pwd)\" \"$$\"\n".to_vec(),
+            )
+            .await
+            .expect("pty_write still alive");
+        let alive_line = format!("STILL_ALIVE_PWD={canonical_sub_wt_str} PID={new_pid}");
+        wait_for_pty_snapshot(&engine, &term.thread_id, 26, 120, Duration::from_secs(5), |s| {
+            s.plain_text().lines().any(|l| l.trim() == alive_line)
+        })
+        .await;
+
+        term.thread_id
+    };
+
+    // Cold reopen: verify lazy PTY spawns inside persisted worktree subdir.
+    let reopened = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
+        .expect("reopen");
+    let _ = reopened
+        .pty_snapshot(&term_id, 24, 140)
+        .await
+        .expect("lazy pty_snapshot reopened");
+    reopened
+        .pty_write(
+            &term_id,
+            b"printf '\\nCOLD_SUB_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+        )
+        .await
+        .expect("pty_write reopened");
+    let expected_sub = canonical_repo
+        .join(".grein")
+        .join("worktrees")
+        .join(&term_id)
+        .join("sub_wt");
+    let expected_cold = format!("COLD_SUB_PWD={}", expected_sub.to_string_lossy());
+    wait_for_pty_snapshot(&reopened, &term_id, 24, 140, Duration::from_secs(5), |s| {
+        s.plain_text().lines().any(|l| l.trim() == expected_cold)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_ensure_thread_worktree_on_cold_terminal_updates_cwd_before_lazy_spawn() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    init_test_git_repo(&repo_root);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let db_path = temp.path().join("cold_term_wt.db");
+
+    let term_id = {
+        let engine = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
+            .expect("open 1");
+        let term = engine
+            .create_terminal(None, Some("Cold Term"), None, 24, 80)
+            .await
+            .expect("create_terminal");
+        term.thread_id
+    };
+
+    let reopened = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), None)
+        .expect("reopen");
+    let wt_path = reopened
+        .ensure_thread_worktree(&term_id)
+        .await
+        .expect("ensure_thread_worktree on cold terminal");
+    let expected_wt = std::fs::canonicalize(
+        canonical_repo
+            .join(".grein")
+            .join("worktrees")
+            .join(&term_id),
+    )
+    .expect("canonical worktree");
+    assert_eq!(wt_path, expected_wt.to_string_lossy());
+
+    let _ = reopened
+        .pty_snapshot(&term_id, 24, 140)
+        .await
+        .expect("lazy pty_snapshot");
+    reopened
+        .pty_write(
+            &term_id,
+            b"printf '\\nLAZY_WT_PWD=%s\\n' \"$(pwd)\"\n".to_vec(),
+        )
+        .await
+        .expect("pty_write lazy");
+    let expected_line = format!("LAZY_WT_PWD={wt_path}");
+    wait_for_pty_snapshot(&reopened, &term_id, 24, 140, Duration::from_secs(5), |s| {
         s.plain_text().lines().any(|l| l.trim() == expected_line)
     })
     .await;
@@ -363,6 +676,12 @@ async fn test_create_terminal_coalesced_events_exit_and_guardrails_without_acp()
         .await
         .expect_err("set_agent_config on terminal must fail");
     assert!(matches!(set_cfg_err, EngineError::InvalidParams(_)));
+
+    let non_git_wt_err = engine
+        .ensure_thread_worktree(&term.thread_id)
+        .await
+        .expect_err("ensure_thread_worktree outside git repo must fail");
+    assert!(matches!(non_git_wt_err, EngineError::InvalidParams(_)));
 
     assert!(
         !acp_marker.exists(),

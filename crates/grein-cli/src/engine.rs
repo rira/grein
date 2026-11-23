@@ -1531,14 +1531,24 @@ impl EngineRuntime {
                     if raw_path.is_dir() {
                         if let Ok(canonical_path) = std::fs::canonicalize(raw_path) {
                             if let Some(canonical_dir) = canonical_path.to_str() {
-                                if let Ok(Some(thread)) = self.storage.get_thread(tid) {
-                                    if thread.cwd.as_deref() != Some(canonical_dir)
-                                        && self
-                                            .storage
-                                            .update_thread_cwd(&tid, Some(canonical_dir))
-                                            .is_ok()
-                                    {
-                                        cwd_updated = true;
+                                let is_still_current = self
+                                    .active_pty_sessions
+                                    .lock()
+                                    .ok()
+                                    .is_some_and(|map| {
+                                        map.get(&thread_id)
+                                            .is_some_and(|cur| Arc::ptr_eq(cur, &session))
+                                    });
+                                if is_still_current {
+                                    if let Ok(Some(thread)) = self.storage.get_thread(tid) {
+                                        if thread.cwd.as_deref() != Some(canonical_dir)
+                                            && self
+                                                .storage
+                                                .update_thread_cwd(&tid, Some(canonical_dir))
+                                                .is_ok()
+                                        {
+                                            cwd_updated = true;
+                                        }
                                     }
                                 }
                             }
@@ -1651,6 +1661,60 @@ impl EngineRuntime {
             .to_str()
             .map(ToOwned::to_owned)
             .ok_or_else(|| EngineError::InvalidParams("terminal cwd is not valid UTF-8".to_string()))
+    }
+
+    async fn teardown_active_pty(
+        &self,
+        thread_id: &str,
+        clear_pending_size: bool,
+    ) -> Result<Option<(u16, u16)>, EngineError> {
+        let removed_pty = self
+            .active_pty_sessions
+            .lock()
+            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
+            .remove(thread_id);
+        if clear_pending_size || removed_pty.is_some() {
+            if let Ok(mut pending) = self.pending_pty_sizes.lock() {
+                pending.remove(thread_id);
+            }
+        }
+        if let Ok(mut exited) = self.pty_exited_threads.lock() {
+            exited.remove(thread_id);
+        }
+        if let Some(pty_session) = removed_pty {
+            let snap = pty_session.snapshot();
+            let dims = (snap.rows, snap.cols);
+            let _ = tokio::task::spawn_blocking(move || drop(pty_session)).await;
+            Ok(Some(dims))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn respawn_terminal_pty(
+        self: &Arc<Self>,
+        tid: ThreadId,
+        thread_id: &str,
+        cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+        let target_rows = if rows == 0 { 24 } else { rows.max(4) };
+        let target_cols = if cols == 0 { 80 } else { cols.max(10) };
+        let session = self
+            .spawn_pty_for_thread(thread_id, cwd, target_rows, target_cols)
+            .await?;
+        let _ = self.storage.update_thread_status(tid, ThreadStatus::Idle);
+        let snap = pty_snapshot_to_tui(session.snapshot());
+        self.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+            thread_id: thread_id.to_string(),
+            status: "idle".to_string(),
+        });
+        self.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+            thread_id: thread_id.to_string(),
+            snapshot: snap.clone(),
+        });
+        Ok(snap)
     }
 
     async fn spawn_pty_for_thread(
@@ -4032,64 +4096,27 @@ impl DaemonEngine for InProcessEngine {
         let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
         let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
 
-        let removed_pty = self
-            .runtime
-            .active_pty_sessions
-            .lock()
-            .map_err(|_| EngineError::Storage("pty session map poisoned".to_string()))?
-            .remove(thread_id);
-        if let Ok(mut pending) = self.runtime.pending_pty_sizes.lock() {
-            pending.remove(thread_id);
-        }
-        if let Ok(mut exited) = self.runtime.pty_exited_threads.lock() {
-            exited.remove(thread_id);
-        }
-        if let Some(pty_session) = removed_pty {
-            let _ = tokio::task::spawn_blocking(move || drop(pty_session)).await;
-        }
-
-        let target_rows = if rows == 0 { 24 } else { rows.max(4) };
-        let target_cols = if cols == 0 { 80 } else { cols.max(10) };
+        let _ = self.runtime.teardown_active_pty(thread_id, true).await?;
         let cwd = self.runtime.resolve_thread_cwd(&thread);
-        let session = self
+        let snap = self
             .runtime
-            .spawn_pty_for_thread(thread_id, cwd, target_rows, target_cols)
+            .respawn_terminal_pty(tid, thread_id, cwd, rows, cols)
             .await?;
-
-        let _ = self
-            .runtime
-            .storage
-            .update_thread_status(tid, ThreadStatus::Idle);
-        let snap = pty_snapshot_to_tui(session.snapshot());
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadStatusChanged {
-                thread_id: thread_id.to_string(),
-                status: "idle".to_string(),
-            });
-        self.runtime
             .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
-        self.runtime.emit_tui(TuiEngineEvent::PtyScreenUpdated {
-            thread_id: thread_id.to_string(),
-            snapshot: snap.clone(),
-        });
         Ok(snap)
     }
 
     async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         let tid: ThreadId = parse_typed_id(thread_id)
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        let initial = self
+        let _initial = self
             .runtime
             .storage
             .get_thread(tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
-        if initial.kind == ThreadKind::Terminal {
-            return Err(EngineError::InvalidParams(
-                "cannot allocate a git worktree for a terminal thread".to_string(),
-            ));
-        }
 
         let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
         let thread = self
@@ -4136,37 +4163,57 @@ impl DaemonEngine for InProcessEngine {
             .map(ToOwned::to_owned)
             .ok_or_else(|| EngineError::InvalidParams("worktree path is not valid UTF-8".to_string()))?;
 
-        let cwd_changed = thread.cwd.as_deref() != Some(path_str.as_str());
-        if cwd_changed {
-            self.runtime
-                .storage
-                .update_thread_cwd(&tid, Some(&path_str))
-                .map_err(storage_err)?;
-            self.runtime
-                .storage
-                .update_thread_acp_session_id(&tid, None)
-                .map_err(storage_err)?;
-            let old_session = {
-                let mut state = self.runtime.lock()?;
-                state
-                    .active_acp_sessions
-                    .remove(thread_id)
-                    .map(|s| (s.session_id.clone(), s.driver_gen))
-            };
-            if let Some((session_id, driver_gen)) = old_session {
-                let driver_opt = {
-                    let guard = self.runtime.acp_driver.lock().await;
-                    guard
-                        .as_ref()
-                        .filter(|s| s.generation == driver_gen && s.driver.is_running())
-                        .map(|s| Arc::clone(&s.driver))
+        let already_inside_worktree = thread.cwd.as_deref().is_some_and(|cur| {
+            let cur_path = Path::new(cur);
+            cur_path.starts_with(&canonical)
+                || std::fs::canonicalize(cur_path)
+                    .map(|c| c.starts_with(&canonical))
+                    .unwrap_or(false)
+        });
+        if !already_inside_worktree {
+            if thread.kind == ThreadKind::Terminal {
+                let old_dims = self.runtime.teardown_active_pty(thread_id, false).await?;
+                self.runtime
+                    .storage
+                    .update_thread_cwd(&tid, Some(&path_str))
+                    .map_err(storage_err)?;
+                if let Some((rows, cols)) = old_dims {
+                    let _ = self
+                        .runtime
+                        .respawn_terminal_pty(tid, thread_id, PathBuf::from(&path_str), rows, cols)
+                        .await?;
+                }
+            } else {
+                self.runtime
+                    .storage
+                    .update_thread_cwd(&tid, Some(&path_str))
+                    .map_err(storage_err)?;
+                self.runtime
+                    .storage
+                    .update_thread_acp_session_id(&tid, None)
+                    .map_err(storage_err)?;
+                let old_session = {
+                    let mut state = self.runtime.lock()?;
+                    state
+                        .active_acp_sessions
+                        .remove(thread_id)
+                        .map(|s| (s.session_id.clone(), s.driver_gen))
                 };
-                if let Some(driver) = driver_opt {
-                    let _ = tokio::time::timeout(
-                        CLOSE_SESSION_TIMEOUT,
-                        driver.close_session(&session_id),
-                    )
-                    .await;
+                if let Some((session_id, driver_gen)) = old_session {
+                    let driver_opt = {
+                        let guard = self.runtime.acp_driver.lock().await;
+                        guard
+                            .as_ref()
+                            .filter(|s| s.generation == driver_gen && s.driver.is_running())
+                            .map(|s| Arc::clone(&s.driver))
+                    };
+                    if let Some(driver) = driver_opt {
+                        let _ = tokio::time::timeout(
+                            CLOSE_SESSION_TIMEOUT,
+                            driver.close_session(&session_id),
+                        )
+                        .await;
+                    }
                 }
             }
         }
