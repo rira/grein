@@ -1242,13 +1242,15 @@ async fn test_pty_scroll_scrollback_navigation_and_events() {
     engine
         .pty_write(
             &term.thread_id,
-            b"printf '\\n'; i=1; while [ \"$i\" -le 60 ]; do printf \"SCROLL_%02d\\n\" \"$i\"; i=$((i+1)); done\n".to_vec(),
+            b"printf '\\n'; i=1; while [ \"$i\" -le 60 ]; do printf \"SCROLL_%02d\\n\" \"$i\"; i=$((i+1)); done; printf \"SCROLL_%s\" \"READY\"; read -r grein_pause\n".to_vec(),
         )
         .await
         .expect("pty_write flood");
 
     let bottom_snap = wait_for_pty_snapshot(&engine, &term.thread_id, 24, 80, Duration::from_secs(5), |s| {
-        s.plain_text().lines().any(|l| l.trim() == "SCROLL_60")
+        let text = s.plain_text();
+        text.lines().any(|l| l.trim() == "SCROLL_60")
+            && text.lines().any(|l| l.trim() == "SCROLL_READY")
     })
     .await;
     assert_eq!(bottom_snap.scrollback_offset, 0);

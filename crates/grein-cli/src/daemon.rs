@@ -443,7 +443,7 @@ mod tests {
         client
             .pty_write(
                 &term.thread_id,
-                b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf \"DAEMON_L_%02d\\n\" \"$i\"; i=$((i+1)); done\n".to_vec(),
+                b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf \"DAEMON_L_%02d\\n\" \"$i\"; i=$((i+1)); done; printf \"DAEMON_%s\" \"READY\"; read -r grein_pause; exit 7\n".to_vec(),
             )
             .await
             .expect("pty_write");
@@ -454,7 +454,10 @@ mod tests {
                 .pty_snapshot(&term.thread_id, 24, 80)
                 .await
                 .expect("pty_snapshot");
-            if snap.plain_text().lines().any(|l| l.trim() == "DAEMON_L_50") {
+            let text = snap.plain_text();
+            if text.lines().any(|l| l.trim() == "DAEMON_L_50")
+                && text.lines().any(|l| l.trim() == "DAEMON_READY")
+            {
                 saw_50 = true;
                 break;
             }
@@ -477,7 +480,7 @@ mod tests {
         assert_eq!(scroll_back.scrollback_offset, 0);
 
         client
-            .pty_write(&term.thread_id, b"printf '\\n'; exit 7\n".to_vec())
+            .pty_write(&term.thread_id, b"\n".to_vec())
             .await
             .expect("pty_write exit 7");
 

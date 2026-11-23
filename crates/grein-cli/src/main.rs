@@ -1427,7 +1427,7 @@ done
 
         port.pty_write(
             &term.id,
-            b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf \"PORT_L_%02d\\n\" \"$i\"; i=$((i+1)); done\n".to_vec(),
+            b"printf '\\n'; i=1; while [ \"$i\" -le 50 ]; do printf \"PORT_L_%02d\\n\" \"$i\"; i=$((i+1)); done; printf \"PORT_%s\" \"READY\"; read -r grein_pause; exit 7\n".to_vec(),
         )
         .await
         .expect("pty_write");
@@ -1435,7 +1435,10 @@ done
         let mut saw_50 = false;
         for _ in 0..150 {
             let snap = port.pty_snapshot(&term.id, 24, 80).await.expect("snapshot");
-            if snap.plain_text().lines().any(|l| l.trim() == "PORT_L_50") {
+            let text = snap.plain_text();
+            if text.lines().any(|l| l.trim() == "PORT_L_50")
+                && text.lines().any(|l| l.trim() == "PORT_READY")
+            {
                 saw_50 = true;
                 break;
             }
@@ -1448,7 +1451,7 @@ done
         let restored = port.pty_scroll(&term.id, -10).await.expect("pty_scroll -10");
         assert_eq!(restored.scrollback_offset, 0);
 
-        port.pty_write(&term.id, b"printf '\\n'; exit 7\n".to_vec())
+        port.pty_write(&term.id, b"\n".to_vec())
             .await
             .expect("exit 7");
         let mut saw_exit = false;
