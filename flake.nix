@@ -7,6 +7,7 @@
 
   outputs = { self, nixpkgs }:
     let
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       pkgsFor = system: nixpkgs.legacyPackages.${system};
@@ -17,7 +18,7 @@
           pkgs = pkgsFor system;
           grein = pkgs.rustPlatform.buildRustPackage {
             pname = "grein";
-            version = "0.1.0";
+            version = cargoToml.workspace.package.version;
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;

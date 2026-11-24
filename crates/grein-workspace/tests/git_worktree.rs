@@ -26,8 +26,8 @@ fn init_test_git_repo() -> TempDir {
     };
 
     run(&["init"]);
-    run(&["config", "user.name", "Eldi Test"]);
-    run(&["config", "user.email", "test@eldi.dev"]);
+    run(&["config", "user.name", "Grein Test"]);
+    run(&["config", "user.email", "test@grein.dev"]);
 
     let test_file = root.join("main.rs");
     fs::write(&test_file, "fn main() { println!(\"base\"); }\n")

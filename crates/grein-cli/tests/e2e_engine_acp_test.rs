@@ -465,7 +465,7 @@ async fn test_e2e_unsolicited_subagent_wakeup_persistence_branch_local_and_delet
 #[tokio::test]
 #[ignore = "requires live local agy binary and Google OAuth session"]
 async fn live_agy_acp_smoke() {
-    let agy_bin = std::env::var("AGY_BIN").unwrap_or_else(|_| "/home/richard/.local/bin/agy".to_string());
+    let agy_bin = std::env::var("AGY_BIN").unwrap_or_else(|_| "agy".to_string());
     let temp = tempfile::tempdir().expect("tempdir");
     let db_path = temp.path().join("live_smoke.db");
     let cfg = AcpBackendConfig {

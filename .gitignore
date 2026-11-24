@@ -19,3 +19,13 @@
 .idea/
 *.swp
 *~
+
+# SQLite, environment, Nix, and runtime artifacts
+*.sqlite
+*.sqlite*
+.env
+.env.*
+.direnv/
+result
+result-*
+*.sock
