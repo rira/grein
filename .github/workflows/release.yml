@@ -109,6 +109,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Run Apple Silicon macOS PTY tests
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --locked -p grein-workspace --test pty_session_test
+
       - name: Build release binary
         env:
           TARGET: ${{ matrix.target }}

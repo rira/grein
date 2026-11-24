@@ -100,9 +100,14 @@ fn test_formula_metadata_and_dependencies_are_hardened() {
         content.contains("homepage \"https://github.com/rira/grein\""),
         "Formula/grein.rb must keep homepage"
     );
+    let expected_url = format!(
+        "url \"https://github.com/rira/grein/archive/refs/tags/v{}.tar.gz\"",
+        env!("CARGO_PKG_VERSION")
+    );
     assert!(
-        content.contains("url \"https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz\""),
-        "Formula/grein.rb must keep v0.1.0 archive URL"
+        content.contains(&expected_url),
+        "Formula/grein.rb must keep current version archive URL ({})",
+        expected_url
     );
     assert!(
         content.contains("license \"MIT\""),
@@ -132,6 +137,10 @@ fn test_release_workflow_hardening_and_tap_formula() {
         "release.yml must not install redundant pkg-config or libsqlite3-dev"
     );
 
+    assert!(
+        content.contains("Run Apple Silicon macOS PTY tests"),
+        "release.yml must run Apple Silicon macOS PTY tests before packaging"
+    );
     assert!(
         content.contains("Smoke-test native binary version"),
         "release.yml must smoke-test native binary --version"

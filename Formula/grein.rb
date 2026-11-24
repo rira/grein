@@ -1,8 +1,8 @@
 class Grein < Formula
   desc "Terminal workspace for branching AI sessions, git worktrees, and shells"
   homepage "https://github.com/rira/grein"
-  url "https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "ed4275756f15e7b6c3fc7bea9b1c2eb98ef625403a00fee8d58c995e51535754"
+  url "https://github.com/rira/grein/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
   depends_on "rust" => :build

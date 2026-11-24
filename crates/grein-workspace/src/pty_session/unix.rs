@@ -240,7 +240,6 @@ pub(super) fn open_pty_pair(rows: u16, cols: u16) -> io::Result<(OwnedFd, OwnedF
         return Err(io::Error::last_os_error());
     }
     let slave_path = slave_pty_path(&master_fd)?;
-    set_pty_winsize(master_fd.as_raw_fd(), rows, cols)?;
 
     let slave_file = OpenOptions::new()
         .read(true)
@@ -249,6 +248,7 @@ pub(super) fn open_pty_pair(rows: u16, cols: u16) -> io::Result<(OwnedFd, OwnedF
         .open(&slave_path)?;
     let slave_fd = OwnedFd::from(slave_file);
     set_cloexec(slave_fd.as_raw_fd())?;
+    set_pty_winsize(slave_fd.as_raw_fd(), rows, cols)?;
 
     Ok((master_fd, slave_fd))
 }

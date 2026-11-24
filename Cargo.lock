@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "grein-acp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "grein-core",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "grein-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "grein-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "grein-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "crossterm",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "grein-workspace"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "grein-core",
  "libc",
