@@ -1,6 +1,44 @@
-use super::{SectionPatch, SettingsPatch, SettingsSnapshot, SETTINGS_VERSION, THEME_NAMESPACE};
+use super::{
+    normalize_section_name, SectionPatch, SettingsFormat, SettingsPatch, SettingsSnapshot,
+    SETTINGS_VERSION, THEME_NAMESPACE,
+};
 use crate::error::CoreError;
+use crate::port::outbound::SettingsCodec;
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TomlSettingsCodec;
+
+impl SettingsCodec for TomlSettingsCodec {
+    fn format(&self) -> SettingsFormat {
+        SettingsFormat::Toml
+    }
+
+    fn format_name(&self) -> &'static str {
+        "toml"
+    }
+
+    fn encode(&self, snapshot: &SettingsSnapshot) -> crate::Result<String> {
+        Ok(format_toml_snapshot(snapshot))
+    }
+
+    fn encode_section(
+        &self,
+        section: &str,
+        entries: &BTreeMap<String, String>,
+    ) -> crate::Result<String> {
+        let section = normalize_section_name(section)?;
+        Ok(format_toml_single_section(section, entries))
+    }
+
+    fn decode(&self, raw: &str) -> crate::Result<SettingsPatch> {
+        parse_toml_settings(raw)
+    }
+
+    fn decode_theme(&self, raw: &str) -> crate::Result<SettingsPatch> {
+        parse_toml_theme(raw)
+    }
+}
 
 pub(super) fn format_toml_snapshot(snapshot: &SettingsSnapshot) -> String {
     let mut out = format!("# grein configuration\nversion = {}\n", snapshot.version);

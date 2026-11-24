@@ -291,11 +291,11 @@ fn sqlite_storage_node_anchor_thread_errors_and_corrupt_rows() -> Result<(), Box
     )?;
     assert!(matches!(
         storage.get_thread(bad_uuid_thread_id),
-        Err(CoreError::Database(_))
+        Err(CoreError::Storage(_))
     ));
     assert!(matches!(
         storage.list_threads(),
-        Err(CoreError::Database(_))
+        Err(CoreError::Storage(_))
     ));
     raw.execute(
         "DELETE FROM threads WHERE id = ?1",
@@ -324,11 +324,11 @@ fn sqlite_storage_node_anchor_thread_errors_and_corrupt_rows() -> Result<(), Box
     )?;
     assert!(matches!(
         storage.get_blackboard_entry("bad_uuid_key"),
-        Err(CoreError::Database(_))
+        Err(CoreError::Storage(_))
     ));
     assert!(matches!(
         storage.list_blackboard_entries(),
-        Err(CoreError::Database(_))
+        Err(CoreError::Storage(_))
     ));
     raw.execute("DELETE FROM blackboard_entries WHERE key = 'bad_uuid_key'", [])?;
 
@@ -339,7 +339,7 @@ fn sqlite_storage_node_anchor_thread_errors_and_corrupt_rows() -> Result<(), Box
     )?;
     assert!(matches!(
         storage.list_nodes(),
-        Err(CoreError::Database(_))
+        Err(CoreError::Storage(_))
     ));
     raw.execute("DELETE FROM nodes WHERE id = 'not-a-node-uuid'", [])?;
 
@@ -350,7 +350,7 @@ fn sqlite_storage_node_anchor_thread_errors_and_corrupt_rows() -> Result<(), Box
     )?;
     assert!(matches!(
         storage.list_anchors(),
-        Err(CoreError::Database(_))
+        Err(CoreError::Storage(_))
     ));
 
     assert_eq!(ThreadKind::from_str("agent")?, ThreadKind::Agent);

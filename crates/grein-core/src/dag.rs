@@ -4,7 +4,7 @@ pub use crate::storage::sqlite::{SqliteStorage, SqliteStorage as SqliteDagStorag
 use std::collections::HashMap;
 use uuid::Uuid;
 
-pub trait DagStorage {
+pub trait DagStorage: Send + Sync {
     fn insert_node(&self, node: &ConversationNode) -> Result<(), CoreError>;
     fn get_node(&self, id: &Uuid) -> Result<Option<ConversationNode>, CoreError>;
     fn get_children(&self, parent_id: &Uuid) -> Result<Vec<ConversationNode>, CoreError>;

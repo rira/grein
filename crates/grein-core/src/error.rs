@@ -1,9 +1,11 @@
 use thiserror::Error;
 
+pub type Result<T> = std::result::Result<T, CoreError>;
+
 #[derive(Error, Debug)]
 pub enum CoreError {
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    #[error("Storage error: {0}")]
+    Storage(String),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

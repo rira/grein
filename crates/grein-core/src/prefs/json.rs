@@ -1,7 +1,50 @@
-use super::{SectionPatch, SettingsPatch, SettingsSnapshot, SETTINGS_VERSION, THEME_NAMESPACE};
+use super::{
+    normalize_section_name, SectionPatch, SettingsFormat, SettingsPatch, SettingsSnapshot,
+    SETTINGS_VERSION, THEME_NAMESPACE,
+};
 use crate::error::CoreError;
+use crate::port::outbound::SettingsCodec;
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JsonSettingsCodec;
+
+impl SettingsCodec for JsonSettingsCodec {
+    fn format(&self) -> SettingsFormat {
+        SettingsFormat::Json
+    }
+
+    fn format_name(&self) -> &'static str {
+        "json"
+    }
+
+    fn encode(&self, snapshot: &SettingsSnapshot) -> crate::Result<String> {
+        format_json_snapshot(snapshot)
+    }
+
+    fn encode_section(
+        &self,
+        section: &str,
+        entries: &BTreeMap<String, String>,
+    ) -> crate::Result<String> {
+        let section = normalize_section_name(section)?;
+        let mut preferences = BTreeMap::new();
+        preferences.insert(section.to_string(), entries.clone());
+        format_json_snapshot(&SettingsSnapshot {
+            version: SETTINGS_VERSION,
+            preferences,
+        })
+    }
+
+    fn decode(&self, raw: &str) -> crate::Result<SettingsPatch> {
+        parse_json_settings(raw)
+    }
+
+    fn decode_theme(&self, raw: &str) -> crate::Result<SettingsPatch> {
+        parse_json_theme(raw)
+    }
+}
 
 pub(super) fn format_json_snapshot(snapshot: &SettingsSnapshot) -> Result<String, CoreError> {
     let mut json = serde_json::to_string_pretty(snapshot)?;
