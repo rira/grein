@@ -11,7 +11,8 @@ use grein_workspace::port::{
 
 use super::registry::{AgentPlugin, LifecyclePlugin, RegistryError, WorkspacePlugin};
 use crate::discovery::{
-    discover_acp_agents, resolve_agents_configuration, AcpAgent, AcpAgentKind, DiscoveryError,
+    claude_acp_args, discover_acp_agents, resolve_agents_configuration, AcpAgent, AcpAgentKind,
+    DiscoveryError,
 };
 use crate::engine::AcpBackendConfig;
 use crate::subagent_watch::{AntigravityBrainObserver, NoopSubagentObserver, SubagentObserverPort};
@@ -79,6 +80,14 @@ impl AgentPlugin for AgyAgentPlugin {
         AcpAgentKind::Agy
     }
 
+    fn short_name(&self) -> String {
+        "agy".into()
+    }
+
+    fn display_name(&self) -> String {
+        "Antigravity (agy)".into()
+    }
+
     fn executable_path(&self) -> Option<&Path> {
         self.executable_path.as_deref()
     }
@@ -141,6 +150,18 @@ impl AgentPlugin for ClaudeAgentPlugin {
         AcpAgentKind::Claude
     }
 
+    fn short_name(&self) -> String {
+        "claude".into()
+    }
+
+    fn display_name(&self) -> String {
+        "Claude Code".into()
+    }
+
+    fn install_hint(&self) -> Option<String> {
+        Some("nix shell --impure nixpkgs#claude-agent-acp".into())
+    }
+
     fn executable_path(&self) -> Option<&Path> {
         self.executable_path.as_deref()
     }
@@ -152,7 +173,7 @@ impl AgentPlugin for ClaudeAgentPlugin {
     fn acp_backend_config(&self, cwd: &Path) -> Option<AcpBackendConfig> {
         self.executable_path.as_ref().map(|exe| AcpBackendConfig {
             command: exe.to_string_lossy().into_owned(),
-            args: vec!["--acp".to_string()],
+            args: claude_acp_args(exe),
             auth_method: self.auth_method.clone(),
             cwd: cwd.to_path_buf(),
         })
@@ -237,7 +258,7 @@ impl CustomAcpAgentPlugin {
             .unwrap_or("custom");
         let args = match agent.kind {
             AcpAgentKind::Agy => vec!["acp".to_string(), "--stdio".to_string()],
-            AcpAgentKind::Claude => vec!["--acp".to_string()],
+            AcpAgentKind::Claude => claude_acp_args(&agent.executable_path),
             AcpAgentKind::Custom => Vec::new(),
         };
         let auth_method = match agent.kind {
@@ -252,6 +273,36 @@ impl CustomAcpAgentPlugin {
             auth_method,
         )
     }
+
+    fn derived_short_name(&self) -> String {
+        let trimmed_id = self.id.trim();
+        if !trimmed_id.starts_with("agent.custom.") && !trimmed_id.is_empty() {
+            return trimmed_id.to_string();
+        }
+        if let Some(stem) = self
+            .executable_path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return stem.to_string();
+        }
+        let stripped = trimmed_id
+            .strip_prefix("agent.custom.")
+            .unwrap_or(trimmed_id)
+            .trim();
+        let stripped = match stripped.split_once('.') {
+            Some((idx, rest)) if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) => rest,
+            _ => stripped,
+        };
+        if stripped.is_empty() {
+            "custom".to_string()
+        } else {
+            stripped.to_string()
+        }
+    }
 }
 
 #[async_trait]
@@ -264,6 +315,19 @@ impl LifecyclePlugin for CustomAcpAgentPlugin {
 impl AgentPlugin for CustomAcpAgentPlugin {
     fn kind(&self) -> AcpAgentKind {
         self.kind
+    }
+
+    fn short_name(&self) -> String {
+        self.derived_short_name()
+    }
+
+    fn display_name(&self) -> String {
+        let short = self.short_name();
+        if short == "custom" {
+            "Custom".to_string()
+        } else {
+            format!("Custom ({short})")
+        }
     }
 
     fn executable_path(&self) -> Option<&Path> {
@@ -458,5 +522,78 @@ mod tests {
         assert!(!wt.supports_cwd(&non_git));
         assert!(shadow.supports_cwd(&non_git));
         assert!(!shadow.supports_cwd(&git_repo));
+    }
+
+    #[test]
+    fn agent_plugins_expose_metadata_and_claude_adapter_args() {
+        let cwd = Path::new("/tmp");
+
+        let agy = AgyAgentPlugin::new(Some(PathBuf::from("/usr/bin/agy")), None);
+        assert_eq!(agy.short_name(), "agy");
+        assert_eq!(agy.display_name(), "Antigravity (agy)");
+        assert_eq!(agy.install_hint(), None);
+
+        let claude = ClaudeAgentPlugin::new(Some(PathBuf::from("/usr/bin/claude")), None);
+        assert_eq!(claude.short_name(), "claude");
+        assert_eq!(claude.display_name(), "Claude Code");
+        assert_eq!(
+            claude.install_hint().as_deref(),
+            Some("nix shell --impure nixpkgs#claude-agent-acp")
+        );
+        assert_eq!(
+            claude.acp_backend_config(cwd).expect("claude cfg").args,
+            vec!["--acp"]
+        );
+
+        let claude_agent_acp =
+            ClaudeAgentPlugin::new(Some(PathBuf::from("/usr/local/bin/claude-agent-acp")), None);
+        assert!(claude_agent_acp
+            .acp_backend_config(cwd)
+            .expect("claude-agent-acp cfg")
+            .args
+            .is_empty());
+
+        let claude_code_acp =
+            ClaudeAgentPlugin::new(Some(PathBuf::from("/usr/local/bin/claude-code-acp")), None);
+        assert!(claude_code_acp
+            .acp_backend_config(cwd)
+            .expect("claude-code-acp cfg")
+            .args
+            .is_empty());
+
+        let custom_env =
+            CustomAcpAgentPlugin::from_env(Some("/usr/local/bin/custom-acp".into()), None, None)
+                .expect("from_env");
+        assert_eq!(custom_env.short_name(), "custom-acp");
+        assert_eq!(custom_env.display_name(), "Custom (custom-acp)");
+        assert_eq!(custom_env.install_hint(), None);
+
+        let custom_discovered = CustomAcpAgentPlugin::from_discovered(
+            0,
+            AcpAgent {
+                kind: AcpAgentKind::Custom,
+                executable_path: PathBuf::from("/opt/my-acp"),
+            },
+        );
+        assert_eq!(custom_discovered.short_name(), "my-acp");
+        assert_eq!(custom_discovered.display_name(), "Custom (my-acp)");
+
+        let custom_claude_acp = CustomAcpAgentPlugin::from_discovered(
+            1,
+            AcpAgent {
+                kind: AcpAgentKind::Claude,
+                executable_path: PathBuf::from("/opt/bin/claude-agent-acp"),
+            },
+        );
+        assert!(custom_claude_acp
+            .acp_backend_config(cwd)
+            .expect("custom claude cfg")
+            .args
+            .is_empty());
+
+        let explicit_id =
+            CustomAcpAgentPlugin::new("bespoke", AcpAgentKind::Custom, None, Vec::new(), None);
+        assert_eq!(explicit_id.short_name(), "bespoke");
+        assert_eq!(explicit_id.display_name(), "Custom (bespoke)");
     }
 }

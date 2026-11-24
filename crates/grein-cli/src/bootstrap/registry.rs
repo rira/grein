@@ -8,7 +8,7 @@ use grein_acp::AgentDriverFactory;
 use grein_workspace::port::{GitInspectorPort, WorkspaceIsolationPort};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::discovery::{AcpAgent, AcpAgentKind};
+use crate::discovery::{kind_from_label, AcpAgent, AcpAgentKind};
 use crate::engine::AcpBackendConfig;
 use crate::subagent_watch::SubagentObserverPort;
 
@@ -39,6 +39,18 @@ pub trait LifecyclePlugin: Send + Sync {
 
 pub trait AgentPlugin: LifecyclePlugin {
     fn kind(&self) -> AcpAgentKind;
+
+    fn short_name(&self) -> String {
+        self.id().to_string()
+    }
+
+    fn display_name(&self) -> String {
+        self.id().to_string()
+    }
+
+    fn install_hint(&self) -> Option<String> {
+        None
+    }
 
     fn executable_path(&self) -> Option<&Path>;
 
@@ -156,6 +168,25 @@ impl PluginRegistry<Frozen> {
 
     pub fn agent_plugin(&self, id: &str) -> Option<&Arc<dyn AgentPlugin>> {
         self.agent_plugins.iter().find(|p| p.id() == id)
+    }
+
+    pub fn agent_plugin_by_name(&self, name: &str) -> Option<&Arc<dyn AgentPlugin>> {
+        let needle = name.trim();
+        if needle.is_empty() {
+            return None;
+        }
+
+        if let Some(exact) = self.agent_plugins.iter().find(|p| {
+            p.id().eq_ignore_ascii_case(needle) || p.short_name().eq_ignore_ascii_case(needle)
+        }) {
+            return Some(exact);
+        }
+
+        let resolved_kind = kind_from_label(needle);
+        self.agent_plugins.iter().find(|p| {
+            p.kind().label().eq_ignore_ascii_case(needle)
+                || (resolved_kind != AcpAgentKind::Custom && p.kind() == resolved_kind)
+        })
     }
 
     pub fn workspace_plugin(&self, id: &str) -> Option<&Arc<dyn WorkspacePlugin>> {
@@ -482,5 +513,94 @@ mod tests {
                 "shutdown:first",
             ]
         );
+    }
+
+    #[test]
+    fn agent_plugin_defaults_and_lookup_by_name_work_case_insensitively() {
+        use crate::bootstrap::plugins::{AgyAgentPlugin, ClaudeAgentPlugin, CustomAcpAgentPlugin};
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockAgentPlugin {
+            id: "mock.agent".into(),
+            log,
+            fail_start: false,
+            fail_shutdown: false,
+            available: false,
+        };
+        assert_eq!(mock.short_name(), "mock.agent");
+        assert_eq!(mock.display_name(), "mock.agent");
+        assert_eq!(mock.install_hint(), None);
+
+        let mut builder = PluginRegistryBuilder::new();
+        builder
+            .register_agent_plugin(Arc::new(AgyAgentPlugin::new(
+                Some(PathBuf::from("/usr/bin/agy")),
+                None,
+            )))
+            .unwrap();
+        builder
+            .register_agent_plugin(Arc::new(ClaudeAgentPlugin::new(
+                Some(PathBuf::from("/usr/bin/claude-agent-acp")),
+                None,
+            )))
+            .unwrap();
+        builder
+            .register_agent_plugin(Arc::new(CustomAcpAgentPlugin::from_discovered(
+                0,
+                AcpAgent {
+                    kind: AcpAgentKind::Custom,
+                    executable_path: PathBuf::from("/opt/alpha"),
+                },
+            )))
+            .unwrap();
+        builder
+            .register_agent_plugin(Arc::new(CustomAcpAgentPlugin::from_discovered(
+                1,
+                AcpAgent {
+                    kind: AcpAgentKind::Custom,
+                    executable_path: PathBuf::from("/opt/beta"),
+                },
+            )))
+            .unwrap();
+
+        let frozen = builder.freeze();
+        assert_eq!(
+            frozen.agent_plugin_by_name("AGY").map(|p| p.id()),
+            Some("agent.agy")
+        );
+        assert_eq!(
+            frozen.agent_plugin_by_name("agent.agy").map(|p| p.id()),
+            Some("agent.agy")
+        );
+        assert_eq!(
+            frozen.agent_plugin_by_name("claude").map(|p| p.id()),
+            Some("agent.claude")
+        );
+        assert_eq!(
+            frozen.agent_plugin_by_name("AGENT.CLAUDE").map(|p| p.id()),
+            Some("agent.claude")
+        );
+        assert_eq!(
+            frozen
+                .agent_plugin_by_name("claude-agent-acp")
+                .map(|p| p.id()),
+            Some("agent.claude")
+        );
+        assert_eq!(
+            frozen
+                .agent_plugin_by_name("CLAUDE-CODE-ACP")
+                .map(|p| p.id()),
+            Some("agent.claude")
+        );
+        assert_eq!(
+            frozen.agent_plugin_by_name("BETA").map(|p| p.id()),
+            Some("agent.custom.1.beta")
+        );
+        assert_eq!(
+            frozen.agent_plugin_by_name("custom").map(|p| p.id()),
+            Some("agent.custom.0.alpha")
+        );
+        assert!(frozen.agent_plugin_by_name("nonexistent").is_none());
+        assert!(frozen.agent_plugin_by_name("   ").is_none());
     }
 }

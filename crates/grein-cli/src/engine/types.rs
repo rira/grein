@@ -12,7 +12,7 @@ pub use grein_core::port::dto::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::discovery::{discover_acp_agents, AcpAgentKind};
+use crate::discovery::{claude_acp_args, discover_acp_agents, AcpAgentKind};
 
 pub(super) const INTERNAL_ROOT_CONTENT: &str = "Session initialized";
 pub(super) const ACP_SYSTEM_PROMPT_MAX_CHARS: usize = 32_000;
@@ -107,7 +107,7 @@ impl AcpBackendConfig {
         if let Some(claude) = agents.iter().find(|a| a.kind == AcpAgentKind::Claude) {
             return Some(Self {
                 command: claude.executable_path.to_string_lossy().into_owned(),
-                args: vec!["--acp".to_string()],
+                args: claude_acp_args(&claude.executable_path),
                 auth_method: auth_override.unwrap_or(None),
                 cwd,
             });
@@ -504,5 +504,67 @@ mod tests {
         assert_eq!(core_snap.row_wrapped, vec![true, false]);
         assert_eq!(core_snap.mouse_protocol_mode, PtyMouseMode::AnyMotion);
         assert_eq!(core_snap.mouse_protocol_encoding, PtyMouseEncoding::Sgr);
+    }
+
+    #[test]
+    fn discover_default_from_derives_claude_args_per_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let early = temp.path().join("early");
+        let late = temp.path().join("late");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+
+        let make_exec = |dir: &std::path::Path, name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, "#!/bin/sh\nexit 0\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+            p
+        };
+
+        let claude = make_exec(&early, "claude");
+        let early_only = super::AcpBackendConfig::discover_default_from(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Some(&early.to_string_lossy()),
+        )
+        .expect("claude config");
+        assert_eq!(early_only.command, claude.to_string_lossy());
+        assert_eq!(early_only.args, vec!["--acp".to_string()]);
+
+        let code_acp = make_exec(&late, "claude-code-acp");
+        let search = std::env::join_paths([&early, &late])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let with_code_acp = super::AcpBackendConfig::discover_default_from(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Some(&search),
+        )
+        .expect("claude-code-acp config");
+        assert_eq!(with_code_acp.command, code_acp.to_string_lossy());
+        assert!(with_code_acp.args.is_empty());
+
+        let agent_acp = make_exec(&late, "claude-agent-acp");
+        let with_agent_acp = super::AcpBackendConfig::discover_default_from(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Some(&search),
+        )
+        .expect("claude-agent-acp config");
+        assert_eq!(with_agent_acp.command, agent_acp.to_string_lossy());
+        assert!(with_agent_acp.args.is_empty());
     }
 }
