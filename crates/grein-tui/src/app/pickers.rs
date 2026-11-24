@@ -300,6 +300,24 @@ impl App {
                 _ => {}
             }
         }
+        if let Some(def_provider) = prefs
+            .ui
+            .get("default_agent_provider")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.default_agent_provider = Some(def_provider.to_string());
+            if self
+                .agent_providers
+                .iter()
+                .any(|p| p.id == def_provider && p.available)
+            {
+                for p in &mut self.agent_providers {
+                    p.is_default = p.id == def_provider;
+                }
+            }
+        }
         self.maybe_queue_terminal_resize();
     }
 
@@ -587,6 +605,13 @@ impl App {
         if self.theme_picker.is_some() {
             self.pending_g_prefix = false;
             self.handle_key_theme_picker(key);
+            self.sync_focus_out();
+            return true;
+        }
+
+        if self.agent_picker.is_some() {
+            self.pending_g_prefix = false;
+            self.handle_key_agent_picker(key);
             self.sync_focus_out();
             return true;
         }

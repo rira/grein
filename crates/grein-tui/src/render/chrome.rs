@@ -247,13 +247,28 @@ pub(super) fn render_status_bar(
         let color = if dirty > 0 { theme.dirty } else { theme.accent };
         (capped, color)
     });
+    let provider_badge = (!active_is_terminal)
+        .then(|| {
+            state
+                .thread_meta
+                .get(active_id)
+                .and_then(|m| m.agent_provider.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|p| truncate_single_line(p, 20))
+        })
+        .flatten();
 
     let right_prefix = format!("{mode} · {model} · ");
     let right_suffix = format!(" · {sa_label}");
     let git_prefix_chars = git_badge
         .as_ref()
         .map_or(0, |(badge, _)| badge.chars().count() + 3);
+    let provider_prefix_chars = provider_badge
+        .as_ref()
+        .map_or(0, |p| p.chars().count() + 3);
     let total_right_chars = git_prefix_chars
+        + provider_prefix_chars
         + right_prefix.chars().count()
         + live_status.chars().count()
         + right_suffix.chars().count();
@@ -445,6 +460,16 @@ pub(super) fn render_status_bar(
                 Style::default().fg(theme.muted).bg(bar_bg),
             ));
         }
+        if let Some(ref provider) = provider_badge {
+            spans.push(Span::styled(
+                provider.clone(),
+                Style::default().fg(theme.accent).bg(bar_bg),
+            ));
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(theme.muted).bg(bar_bg),
+            ));
+        }
         spans.push(Span::styled(
             right_prefix,
             Style::default().fg(theme.muted).bg(bar_bg),
@@ -465,8 +490,12 @@ pub(super) fn render_status_bar(
                 .as_ref()
                 .map(|(badge, _)| format!("{badge} · "))
                 .unwrap_or_default();
+            let compact_provider = provider_badge
+                .as_ref()
+                .map(|p| format!("{p} · "))
+                .unwrap_or_default();
             let compact_right = truncate_single_line(
-                &format!("{compact_git}{right_prefix}{live_status}{right_suffix}"),
+                &format!("{compact_git}{compact_provider}{right_prefix}{live_status}{right_suffix}"),
                 remaining - 1,
             );
             let pad = remaining.saturating_sub(1 + compact_right.chars().count());

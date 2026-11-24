@@ -319,9 +319,9 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         },
         HelpEntry {
             section: MANAGE_SEC,
-            keys: ": , /, ?, z, q".to_string(),
-            description: "Palette / search / help / zoom / quit".to_string(),
-            keywords: "palette command search filter help zoom hide show sidebar quit",
+            keys: "A, :, /, ?, z, q".to_string(),
+            description: "Agents, palette, search, help, zoom, quit".to_string(),
+            keywords: "agent provider palette command search filter help zoom hide show sidebar quit",
         },
         HelpEntry {
             section: WT_SEC,
@@ -355,9 +355,9 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         },
         HelpEntry {
             section: CMD_SEC,
-            keys: "/model /mode /thinking".to_string(),
-            description: "Configure agent model, mode, effort".to_string(),
-            keywords: "model mode thinking effort reasoning config",
+            keys: "/agent /model /mode /effort".to_string(),
+            description: "Switch/spawn agent, model, mode, effort".to_string(),
+            keywords: "agent provider model mode thinking effort reasoning config",
         },
         HelpEntry {
             section: CMD_SEC,

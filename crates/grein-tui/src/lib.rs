@@ -27,8 +27,8 @@ pub mod vt_input;
 use std::sync::Arc;
 
 pub use app::{
-    AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, FocusDirection, FocusPane,
-    FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm, PendingThreadDelete,
+    AgentPickerModal, AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, FocusDirection,
+    FocusPane, FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm, PendingThreadDelete,
     RenamePromptState, SidebarLayoutConfig, SidebarMode, ThreadItem, TreeAction, TuiError,
     TuiServices,
 };

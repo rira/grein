@@ -1,3 +1,4 @@
+mod agent_picker;
 mod chrome;
 mod composer;
 mod help_modal;
@@ -29,6 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
+use agent_picker::render_agent_picker_modal;
 use chrome::{render_status_bar, render_subagent_strip};
 use composer::{layout_composer_text, render_composer_ghost_suffix};
 use help_modal::render_help_modal;
@@ -482,6 +484,8 @@ fn render_app_inner(f: &mut Frame, state: &AppState, capture_lines: bool) -> Ren
         render_quit_confirm_modal(f, f.area(), pending, theme);
     } else if let Some(ref picker) = state.theme_picker {
         render_theme_picker_modal(f, f.area(), picker, state);
+    } else if let Some(ref picker) = state.agent_picker {
+        render_agent_picker_modal(f, f.area(), picker, state);
     } else if let Some(ref picker) = state.config_picker {
         render_config_picker_modal(f, f.area(), picker, theme);
     } else if state.show_help_modal {

@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 
 use crate::app::{normalize_custom_name, App, AppAction};
 use crate::engine_port::{
-    AgentOptionsSnapshot, PtyScreenSnapshot, ThreadMeta, TuiEngineEvent, TuiEnginePort,
-    WorktreeEntry,
+    AgentOptionsSnapshot, AgentProviderInfo, PreferencesPort, PtyScreenSnapshot, ThreadMeta,
+    TuiEngineEvent, TuiEnginePort, WorktreeEntry,
 };
 
 use super::engine_events::apply_engine_event;
@@ -15,6 +15,11 @@ pub(super) enum RunnerLocalEvent {
     Engine(TuiEngineEvent),
     OptimisticThreadMeta(ThreadMeta),
     StatusNotice(String),
+    AgentProvidersListed(Vec<AgentProviderInfo>),
+    ProviderSwitched {
+        thread_id: String,
+        provider: String,
+    },
     OpenConfigPicker {
         snapshot: AgentOptionsSnapshot,
         config_id: String,
@@ -109,6 +114,7 @@ async fn poll_metadata_to_local(
 
 fn dispatch_action(
     engine: Arc<dyn TuiEnginePort>,
+    preferences: Arc<dyn PreferencesPort>,
     action: AppAction,
     local_ev_tx: mpsc::UnboundedSender<RunnerLocalEvent>,
     err_tx: mpsc::UnboundedSender<(Option<String>, String)>,
@@ -191,6 +197,116 @@ fn dispatch_action(
                     }
                     Err(err) => {
                         let _ = err_tx.send((None, err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::CreateAgentThread {
+            title,
+            cwd,
+            parent_thread_id,
+            agent_provider,
+        } => {
+            tokio::spawn(async move {
+                match engine
+                    .create_agent_thread(
+                        title.as_deref(),
+                        cwd.as_deref(),
+                        parent_thread_id.as_deref(),
+                        agent_provider.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(mut thread) => {
+                        let resolved_provider = thread.agent_provider.clone().or(agent_provider);
+                        if thread.agent_provider.is_none() {
+                            thread.agent_provider = resolved_provider.clone();
+                        }
+                        let optimistic = ThreadMeta {
+                            thread_id: thread.id.clone(),
+                            parent_thread_id,
+                            inherited_turn_count: 0,
+                            merged: false,
+                            kind: grein_core::ThreadKind::Agent,
+                            cwd,
+                            git_branch: None,
+                            git_dirty: 0,
+                            custom_name: thread.custom_name.clone(),
+                            agent_provider: resolved_provider,
+                        };
+                        let _ =
+                            local_ev_tx.send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));
+                        let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
+                            TuiEngineEvent::ThreadCreated { thread },
+                        ));
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                    }
+                    Err(err) => {
+                        let _ = err_tx.send((None, err.to_string()));
+                    }
+                }
+            });
+        }
+        AppAction::SwitchThreadProvider {
+            thread_id,
+            provider,
+        } => {
+            tokio::spawn(async move {
+                match engine.switch_thread_provider(&thread_id, &provider).await {
+                    Ok(resolved) => {
+                        let active_provider = if resolved.trim().is_empty() {
+                            provider
+                        } else {
+                            resolved
+                        };
+                        poll_metadata_to_local(engine.as_ref(), &local_ev_tx).await;
+                        let _ = local_ev_tx.send(RunnerLocalEvent::ProviderSwitched {
+                            thread_id,
+                            provider: active_provider,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "Switch provider failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::RefreshAgentProviders => {
+            tokio::spawn(async move {
+                match engine.list_agent_providers().await {
+                    Ok(providers) => {
+                        let _ =
+                            local_ev_tx.send(RunnerLocalEvent::AgentProvidersListed(providers));
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "List agent providers failed: {err}"
+                        )));
+                    }
+                }
+            });
+        }
+        AppAction::SaveDefaultAgentProvider { provider } => {
+            tokio::spawn(async move {
+                if let Err(err) = preferences
+                    .save_ui_pref("default_agent_provider", &provider)
+                    .await
+                {
+                    let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                        "Save default agent failed: {err}"
+                    )));
+                }
+                match engine.list_agent_providers().await {
+                    Ok(providers) => {
+                        let _ =
+                            local_ev_tx.send(RunnerLocalEvent::AgentProvidersListed(providers));
+                    }
+                    Err(err) => {
+                        let _ = local_ev_tx.send(RunnerLocalEvent::StatusNotice(format!(
+                            "List agent providers failed: {err}"
+                        )));
                     }
                 }
             });
@@ -637,6 +753,7 @@ fn dispatch_action(
 pub(super) fn drain_pending_actions(
     app: &mut App,
     engine: &Arc<dyn TuiEnginePort>,
+    preferences: &Arc<dyn PreferencesPort>,
     local_ev_tx: &mpsc::UnboundedSender<RunnerLocalEvent>,
     err_tx: &mpsc::UnboundedSender<(Option<String>, String)>,
     pty_write_tx: &mpsc::UnboundedSender<(String, Vec<u8>)>,
@@ -654,6 +771,7 @@ pub(super) fn drain_pending_actions(
         }
         dispatch_action(
             Arc::clone(engine),
+            Arc::clone(preferences),
             action,
             local_ev_tx.clone(),
             err_tx.clone(),

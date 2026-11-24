@@ -33,11 +33,38 @@ use crate::app::{
     find_config_option, match_config_choice, App, AppAction, FocusedPane, TreeAction, TuiError,
     TuiServices,
 };
-use crate::engine_port::{TuiEngineEvent, TuiEnginePort};
+use crate::engine_port::{
+    PreferencesPort, ThreadMeta, TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot,
+};
 
 use dispatch::{
     cache_snapshot_options, drain_pending_actions, handle_streamed_engine_event, RunnerLocalEvent,
 };
+
+struct EnginePreferencesBridge(Arc<dyn TuiEnginePort>);
+
+#[async_trait::async_trait]
+impl PreferencesPort for EnginePreferencesBridge {
+    async fn load_preferences(&self) -> io::Result<UserPreferencesSnapshot> {
+        self.0.load_preferences().await
+    }
+
+    async fn save_theme_preference(&self, theme: &str) -> io::Result<()> {
+        self.0.save_theme_preference(theme).await
+    }
+
+    async fn save_keybinding_preference(&self, action: &str, binding: &str) -> io::Result<()> {
+        self.0.save_keybinding_preference(action, binding).await
+    }
+
+    async fn remove_keybinding_preference(&self, action: &str) -> io::Result<()> {
+        self.0.remove_keybinding_preference(action).await
+    }
+
+    async fn save_ui_pref(&self, key: &str, value: &str) -> io::Result<()> {
+        self.0.save_ui_preference(key, value).await
+    }
+}
 use transcript_sync::{ensure_paragraph_break, with_thread_transcript_mut};
 use tree_order::rebuild_tree_nodes as rebuild_nodes;
 
@@ -211,8 +238,23 @@ pub async fn run_with_engine_events<B: Backend>(
     let mut engine_events = engine.subscribe_events().await?;
     let session = engine.hydrate_session().await?;
     apply_hydrated_session(&mut app, &session);
+    let prefs_port: Arc<dyn PreferencesPort> = if app.services.has_custom_preferences() {
+        Arc::clone(&app.services.preferences)
+    } else {
+        Arc::new(EnginePreferencesBridge(Arc::clone(&engine)))
+    };
     match engine.load_preferences().await {
-        Ok(prefs) => {
+        Ok(mut prefs) => {
+            if app.services.has_custom_preferences() {
+                if let Ok(svc_prefs) = app.services.preferences.load_preferences().await {
+                    if svc_prefs.theme.is_some() {
+                        prefs.theme = svc_prefs.theme;
+                    }
+                    prefs.theme_overrides.extend(svc_prefs.theme_overrides);
+                    prefs.keybindings.extend(svc_prefs.keybindings);
+                    prefs.ui.extend(svc_prefs.ui);
+                }
+            }
             app.apply_preferences(&prefs);
         }
         Err(err) => {
@@ -227,6 +269,14 @@ pub async fn run_with_engine_events<B: Backend>(
         }
         Err(err) => {
             app.status_notice = Some(format!("Metadata sync failed: {err}"));
+        }
+    }
+    match engine.list_agent_providers().await {
+        Ok(providers) => {
+            app.set_agent_providers(providers);
+        }
+        Err(err) => {
+            app.status_notice = Some(format!("Agent providers sync failed: {err}"));
         }
     }
 
@@ -258,6 +308,7 @@ pub async fn run_with_engine_events<B: Backend>(
     drain_pending_actions(
         &mut app,
         &engine,
+        &prefs_port,
         &local_ev_tx,
         &err_tx,
         &pty_write_tx,
@@ -269,6 +320,7 @@ pub async fn run_with_engine_events<B: Backend>(
         drain_pending_actions(
             &mut app,
             &engine,
+            &prefs_port,
             &local_ev_tx,
             &err_tx,
             &pty_write_tx,
@@ -287,6 +339,7 @@ pub async fn run_with_engine_events<B: Backend>(
                 drain_pending_actions(
                     &mut app,
                     &engine,
+                    &prefs_port,
                     &local_ev_tx,
                     &err_tx,
                     &pty_write_tx,
@@ -300,7 +353,26 @@ pub async fn run_with_engine_events<B: Backend>(
                 match local_event {
                     RunnerLocalEvent::Engine(event) => apply_engine_event(&mut app, event),
                     RunnerLocalEvent::OptimisticThreadMeta(meta) => {
-                        if !app.thread_meta.contains_key(&meta.thread_id) {
+                        if let Some(existing) = app.thread_meta.get_mut(&meta.thread_id) {
+                            let mut changed = false;
+                            if existing.parent_thread_id.is_none() && meta.parent_thread_id.is_some() {
+                                existing.parent_thread_id = meta.parent_thread_id;
+                                changed = true;
+                            }
+                            if existing.cwd.is_none() && meta.cwd.is_some() {
+                                existing.cwd = meta.cwd;
+                                changed = true;
+                            }
+                            if existing.agent_provider.is_none() && meta.agent_provider.is_some() {
+                                existing.agent_provider = meta.agent_provider;
+                                changed = true;
+                            }
+                            if changed {
+                                let active = app.active_thread_id.clone();
+                                app.unfold_ancestors_for(&active);
+                                rebuild_nodes(&mut app);
+                            }
+                        } else {
                             app.thread_meta.insert(meta.thread_id.clone(), meta);
                             let active = app.active_thread_id.clone();
                             app.unfold_ancestors_for(&active);
@@ -311,6 +383,26 @@ pub async fn run_with_engine_events<B: Backend>(
                     }
                     RunnerLocalEvent::StatusNotice(notice) => {
                         app.status_notice = Some(notice);
+                    }
+                    RunnerLocalEvent::AgentProvidersListed(providers) => {
+                        app.set_agent_providers(providers);
+                    }
+                    RunnerLocalEvent::ProviderSwitched { thread_id, provider } => {
+                        let label = app
+                            .agent_providers
+                            .iter()
+                            .find(|p| p.id.eq_ignore_ascii_case(&provider))
+                            .map(|p| p.display_name.clone())
+                            .unwrap_or_else(|| provider.clone());
+                        app.thread_meta
+                            .entry(thread_id.clone())
+                            .and_modify(|m| m.agent_provider = Some(provider.clone()))
+                            .or_insert_with(|| ThreadMeta {
+                                thread_id,
+                                agent_provider: Some(provider),
+                                ..ThreadMeta::default()
+                            });
+                        app.status_notice = Some(format!("Switched agent to {label}"));
                     }
                     RunnerLocalEvent::PtySnapshotLoaded { thread_id, snapshot } => {
                         apply_engine_event(
@@ -495,6 +587,7 @@ pub async fn run_with_engine_events<B: Backend>(
                 drain_pending_actions(
                     &mut app,
                     &engine,
+                    &prefs_port,
                     &local_ev_tx,
                     &err_tx,
                     &pty_write_tx,

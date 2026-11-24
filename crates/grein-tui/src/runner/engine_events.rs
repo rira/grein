@@ -47,6 +47,7 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.last_pty_sizes.clear();
     app.config_picker = None;
     app.theme_picker = None;
+    app.agent_picker = None;
     app.pending_worktree_delete = None;
     app.pending_thread_delete = None;
     app.pending_quit_confirm = None;
@@ -96,6 +97,16 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
         app.thread_statuses
             .entry(t.id.clone())
             .or_insert_with(|| "idle".to_string());
+        if t.agent_provider.is_some() {
+            app.thread_meta
+                .entry(t.id.clone())
+                .and_modify(|m| m.agent_provider = t.agent_provider.clone())
+                .or_insert_with(|| ThreadMeta {
+                    thread_id: t.id.clone(),
+                    agent_provider: t.agent_provider.clone(),
+                    ..ThreadMeta::default()
+                });
+        }
         app.threads.push(ThreadItem {
             id: t.id.clone(),
             title: t.title.clone(),
@@ -315,6 +326,16 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 if incoming_custom.is_some() {
                     existing.custom_name = incoming_custom;
                 }
+                if thread.agent_provider.is_some() {
+                    app.thread_meta
+                        .entry(thread.id)
+                        .and_modify(|m| m.agent_provider = thread.agent_provider.clone())
+                        .or_insert_with(|| ThreadMeta {
+                            thread_id: existing.id.clone(),
+                            agent_provider: thread.agent_provider.clone(),
+                            ..ThreadMeta::default()
+                        });
+                }
                 rebuild_tree_nodes(app);
                 return;
             }
@@ -329,6 +350,16 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.thread_statuses
                 .entry(new_id.clone())
                 .or_insert_with(|| "idle".to_string());
+            if thread.agent_provider.is_some() {
+                app.thread_meta
+                    .entry(new_id.clone())
+                    .and_modify(|m| m.agent_provider = thread.agent_provider.clone())
+                    .or_insert_with(|| ThreadMeta {
+                        thread_id: new_id.clone(),
+                        agent_provider: thread.agent_provider.clone(),
+                        ..ThreadMeta::default()
+                    });
+            }
             app.threads.push(ThreadItem {
                 id: new_id.clone(),
                 title: thread.title,
