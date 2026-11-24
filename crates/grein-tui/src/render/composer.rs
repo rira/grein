@@ -223,3 +223,40 @@ pub(super) fn render_composer_ghost_suffix(
     let y = inner_area.y + visible_row;
     f.buffer_mut().set_stringn(x, y, &clipped, remaining, style);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn test_layout_composer_zero_and_single_width_with_cjk_emoji_and_tabs() {
+        let zero = layout_composer_visual_rows("abc\t中😀", 3, Some(0));
+        assert_eq!(zero.lines.len(), 1);
+        assert_eq!(zero.cursor_col, 0);
+        assert_eq!(zero.cursor_row, 0);
+
+        let one = layout_composer_visual_rows("a\tb中😀c", 0, Some(1));
+        assert!(one.lines.len() >= 5);
+        assert_eq!(one.cursor_col, 0);
+
+        let end_cursor = layout_composer_visual_rows("ab", 2, Some(2));
+        assert_eq!(end_cursor.cursor_row, 1);
+        assert_eq!(end_cursor.cursor_col, 0);
+
+        assert_eq!(clip_to_display_width("a中b\nc", 3), "a中");
+        assert_eq!(clip_to_display_width("😀x", 1), "");
+
+        let backend = TestBackend::new(10, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = ThemePalette::default();
+        terminal
+            .draw(|f| {
+                render_composer_ghost_suffix(f, Rect::new(0, 0, 5, 2), 2, 0, "hello world", &theme);
+                render_composer_ghost_suffix(f, Rect::new(0, 0, 0, 0), 0, 0, "hello", &theme);
+                render_composer_ghost_suffix(f, Rect::new(0, 0, 5, 2), 5, 0, "hello", &theme);
+            })
+            .unwrap();
+    }
+}

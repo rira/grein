@@ -151,4 +151,52 @@ mod tests {
         assert_eq!(x11[0], ("xclip", &["-selection", "clipboard"][..]));
         assert_eq!(x11[1], ("xsel", &["--clipboard", "--input"][..]));
     }
+
+    #[test]
+    fn test_base64_all_byte_values_and_clipboard_command_paths() {
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let encoded = encode_base64(&all_bytes);
+        assert_eq!(encoded.len(), 344);
+        assert!(encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='));
+        assert!(encoded.ends_with('='));
+
+        let missing = try_clipboard_command(
+            "/nonexistent/grein-missing-clipboard-tool",
+            &["--flag"],
+            "payload",
+        );
+        assert!(missing.is_err());
+
+        let failing = try_clipboard_command("false", &[], "payload");
+        assert!(failing.is_err());
+
+        let ok = try_clipboard_command("cat", &[], "payload");
+        assert!(ok.is_ok());
+
+        let prev_path = std::env::var_os("PATH");
+        let prev_wayland = std::env::var_os("WAYLAND_DISPLAY");
+        std::env::set_var("PATH", "");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-test");
+
+        let res = copy_to_clipboard("hello");
+        if std::io::stdout().is_terminal() {
+            assert_eq!(res, Ok("osc52"));
+        } else {
+            let err = res.unwrap_err();
+            assert!(err.contains("wl-copy"));
+            assert!(err.contains("xclip"));
+            assert!(err.contains("xsel"));
+        }
+
+        match prev_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match prev_wayland {
+            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+            None => std::env::remove_var("WAYLAND_DISPLAY"),
+        }
+    }
 }

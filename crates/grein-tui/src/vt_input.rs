@@ -65,7 +65,10 @@ pub fn encode_key_event(key: KeyEvent, application_cursor: bool) -> Option<Vec<u
 
     match key.code {
         KeyCode::Char(c) => {
-            if ctrl {
+            if ctrl && alt && !c.is_control() && !c.is_ascii_alphabetic() {
+                let mut buf = [0u8; 4];
+                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+            } else if ctrl {
                 let b = ctrl_byte(c)?;
                 if alt {
                     Some(vec![0x1b, b])
@@ -357,9 +360,134 @@ mod tests {
     fn encodes_bracketed_and_raw_paste() {
         assert_eq!(encode_paste("echo hi", false), b"echo hi");
         assert_eq!(encode_paste("a\nb", false), b"a\rb");
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc");
         assert_eq!(
             encode_paste("echo hi\nls", true),
             b"\x1b[200~echo hi\nls\x1b[201~"
         );
+        assert_eq!(
+            encode_paste("safe\x1b[201~injected\x1b[201~end", true),
+            b"\x1b[200~safeinjectedend\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn encodes_swedish_altgr_characters_as_utf8() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let altgr_shift = altgr | KeyModifiers::SHIFT;
+        for ch in ['@', '£', '$', '{', '}', '[', ']', '\\', '|', '~', '€', 'µ'] {
+            let expected = Some(ch.to_string().into_bytes());
+            assert_eq!(
+                encode_key_event(key(KeyCode::Char(ch), altgr), false),
+                expected,
+                "AltGr char {ch:?}"
+            );
+            assert_eq!(
+                encode_key_event(key(KeyCode::Char(ch), altgr_shift), false),
+                expected,
+                "AltGr+Shift char {ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_ctrl_punctuation_ctrl_alt_alpha_alt_specials_and_edge_cases() {
+        let ctrl_punct = [
+            (' ', 0x00),
+            ('@', 0x00),
+            ('2', 0x00),
+            ('[', 0x1b),
+            ('3', 0x1b),
+            ('\\', 0x1c),
+            ('4', 0x1c),
+            (']', 0x1d),
+            ('5', 0x1d),
+            ('^', 0x1e),
+            ('6', 0x1e),
+            ('~', 0x1e),
+            ('_', 0x1f),
+            ('/', 0x1f),
+            ('7', 0x1f),
+            ('?', 0x7f),
+            ('8', 0x7f),
+        ];
+        for (ch, byte) in ctrl_punct {
+            assert_eq!(
+                encode_key_event(key(KeyCode::Char(ch), KeyModifiers::CONTROL), false),
+                Some(vec![byte]),
+                "Ctrl+{ch:?}"
+            );
+        }
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('{'), KeyModifiers::CONTROL), false),
+            None
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('€'), KeyModifiers::CONTROL), false),
+            None
+        );
+
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('a'), ctrl_alt), false),
+            Some(vec![0x1b, 0x01])
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('Z'), ctrl_alt), false),
+            Some(vec![0x1b, 0x1a])
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Char('\x03'), ctrl_alt), false),
+            None
+        );
+
+        assert_eq!(
+            encode_key_event(key(KeyCode::Enter, KeyModifiers::ALT), false),
+            Some(vec![0x1b, b'\r'])
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Tab, KeyModifiers::ALT), false),
+            Some(b"\x1b\t".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Esc, KeyModifiers::ALT), false),
+            Some(vec![0x1b, 0x1b])
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Backspace, KeyModifiers::CONTROL), false),
+            Some(vec![0x08])
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Backspace, ctrl_alt), false),
+            Some(vec![0x1b, 0x08])
+        );
+
+        assert_eq!(
+            encode_key_event(key(KeyCode::F(13), KeyModifiers::NONE), false),
+            None
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::F(24), KeyModifiers::NONE), false),
+            None
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::CapsLock, KeyModifiers::NONE), false),
+            None
+        );
+
+        let repeat = KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(encode_key_event(repeat, false), Some(b"\x1b[A".to_vec()));
+        let repeat_altgr = KeyEvent {
+            code: KeyCode::Char('{'),
+            modifiers: ctrl_alt,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        };
+        assert_eq!(encode_key_event(repeat_altgr, false), Some(b"{".to_vec()));
     }
 }
