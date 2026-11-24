@@ -27,6 +27,8 @@ pub struct HydratedThread {
     pub title: String,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
     pub turns: Vec<HydratedTurn>,
 }
 
@@ -44,6 +46,8 @@ pub struct ThreadSummary {
     pub title: String,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_provider: Option<String>,
     pub parent_node_id: String,
     #[serde(default)]
     pub active_leaf_id: String,
@@ -104,6 +108,8 @@ pub struct ThreadMeta {
     pub git_dirty: usize,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +288,21 @@ pub struct AgentMetaEntry {
     pub config_options: Vec<AgentConfigOption>,
     #[serde(default)]
     pub available_commands: Vec<AgentSlashCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProviderInfo {
+    pub id: String,
+    pub plugin_id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub available: bool,
+    #[serde(default)]
+    pub executable: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub install_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

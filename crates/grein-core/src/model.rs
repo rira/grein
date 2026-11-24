@@ -225,6 +225,8 @@ pub struct Thread {
     pub cwd: Option<String>,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
 }
 
 impl Thread {
@@ -253,6 +255,7 @@ impl Thread {
             kind: ThreadKind::default(),
             cwd: None,
             custom_name: None,
+            agent_provider: None,
         }
     }
 
@@ -273,6 +276,11 @@ impl Thread {
 
     pub fn with_custom_name(mut self, custom_name: Option<String>) -> Self {
         self.custom_name = custom_name;
+        self
+    }
+
+    pub fn with_agent_provider(mut self, provider: impl Into<String>) -> Self {
+        self.agent_provider = Some(provider.into());
         self
     }
 
@@ -314,5 +322,9 @@ impl Thread {
 
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    pub fn agent_provider(&self) -> Option<&str> {
+        self.agent_provider.as_deref()
     }
 }

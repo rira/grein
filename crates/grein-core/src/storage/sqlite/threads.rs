@@ -21,6 +21,7 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread> {
     let kind_str: String = row.get(9)?;
     let cwd: Option<String> = row.get(10)?;
     let custom_name: Option<String> = row.get(11)?;
+    let agent_provider: Option<String> = row.get(12)?;
 
     let id = parse_uuid(0, &id_str)?;
     let parent_node_id = parse_uuid(1, &parent_node_id_str)?;
@@ -49,6 +50,7 @@ fn thread_from_row(row: &rusqlite::Row<'_>) -> Result<Thread> {
         kind,
         cwd,
         custom_name,
+        agent_provider,
     })
 }
 
@@ -67,8 +69,8 @@ impl SqliteStorage {
 
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, acp_session_id, merged, parent_thread_id, kind, cwd, custom_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, acp_session_id, merged, parent_thread_id, kind, cwd, custom_name, agent_provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 thread.id.to_string(),
                 thread.parent_node_id.to_string(),
@@ -83,6 +85,7 @@ impl SqliteStorage {
                 thread.kind.as_str(),
                 thread.cwd,
                 thread.custom_name,
+                thread.agent_provider,
             ],
         )?;
         tx.commit()?;
@@ -227,11 +230,23 @@ impl SqliteStorage {
         )
     }
 
+    pub fn update_thread_agent_provider(
+        &self,
+        thread_id: &ThreadId,
+        provider: Option<&str>,
+    ) -> Result<()> {
+        self.update_thread_field(
+            thread_id,
+            "UPDATE threads SET agent_provider = ?1 WHERE id = ?2",
+            provider,
+        )
+    }
+
     pub fn get_thread<B: Borrow<Uuid>>(&self, thread_id: B) -> Result<Option<Thread>> {
         let t_ref = thread_id.borrow();
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged, parent_thread_id, kind, cwd, custom_name
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged, parent_thread_id, kind, cwd, custom_name, agent_provider
              FROM threads WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![t_ref.to_string()])?;
@@ -245,7 +260,7 @@ impl SqliteStorage {
     pub fn list_threads(&self) -> Result<Vec<Thread>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged, parent_thread_id, kind, cwd, custom_name
+            "SELECT id, parent_node_id, anchor_id, active_leaf_id, status, title, acp_session_id, merged, parent_thread_id, kind, cwd, custom_name, agent_provider
              FROM threads ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query([])?;

@@ -61,6 +61,11 @@ pub trait SessionRepository: DagStorage + Send + Sync {
         thread_id: &ThreadId,
         custom_name: Option<&str>,
     ) -> Result<()>;
+    fn update_thread_agent_provider(
+        &self,
+        thread_id: &ThreadId,
+        provider: Option<&str>,
+    ) -> Result<()>;
     fn delete_thread(&self, thread_id: &ThreadId) -> Result<bool>;
     fn get_thread_leaf(&self, thread_id: &ThreadId) -> Result<NodeId>;
     fn get_thread_state(&self, thread_id: &ThreadId) -> Result<ThreadStatus>;

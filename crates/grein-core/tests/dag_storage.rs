@@ -252,6 +252,8 @@ fn test_thread_new_defaults_and_with_title() {
     assert_eq!(thread.kind, ThreadKind::Agent);
     assert_eq!(thread.cwd, None);
     assert_eq!(thread.custom_name, None);
+    assert_eq!(thread.agent_provider, None);
+    assert_eq!(thread.agent_provider(), None);
 
     let titled = thread.with_title("Investigate auth");
     assert_eq!(titled.title, "Investigate auth");
@@ -260,6 +262,7 @@ fn test_thread_new_defaults_and_with_title() {
     assert_eq!(titled.kind, ThreadKind::Agent);
     assert_eq!(titled.cwd, None);
     assert_eq!(titled.custom_name, None);
+    assert_eq!(titled.agent_provider, None);
 }
 
 #[test]
@@ -315,6 +318,7 @@ fn test_legacy_threads_schema_migration_adds_metadata_columns_idempotently(
     assert_eq!(fetched.kind, ThreadKind::Agent);
     assert_eq!(fetched.cwd, None);
     assert_eq!(fetched.custom_name, None);
+    assert_eq!(fetched.agent_provider, None);
 
     let all = storage.list_threads()?;
     assert_eq!(all.len(), 1);
@@ -515,6 +519,7 @@ fn test_legacy_threads_migration_adds_kind_and_cwd_idempotently(
     assert_eq!(fetched.kind, ThreadKind::Agent);
     assert_eq!(fetched.cwd, None);
     assert_eq!(fetched.custom_name, None);
+    assert_eq!(fetched.agent_provider, None);
 
     let listed = storage.list_threads()?;
     assert_eq!(listed, vec![fetched]);
@@ -683,6 +688,7 @@ fn test_thread_json_serde_backward_compatibility_and_kind_roundtrip(
     assert_eq!(parsed.kind, ThreadKind::Agent);
     assert_eq!(parsed.cwd, None);
     assert_eq!(parsed.custom_name, None);
+    assert_eq!(parsed.agent_provider, None);
 
     let term = Thread::new(tid, node_id, anchor_id, node_id, ThreadLifecycleState::Idle)
         .with_kind(ThreadKind::Terminal)
@@ -1041,6 +1047,180 @@ fn test_list_recent_user_prompts_recency_dedup_blanks_and_limit(
         capped,
         vec!["third prompt".to_string(), "first prompt".to_string()]
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_with_agent_provider_builder_and_serde_roundtrip(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tid = ThreadId::new_v7();
+    let node_id = NodeId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+
+    let default_thread = Thread::new(tid, node_id, anchor_id, node_id, ThreadLifecycleState::Idle);
+    assert_eq!(default_thread.agent_provider, None);
+    assert_eq!(default_thread.agent_provider(), None);
+
+    let with_provider = default_thread.with_agent_provider("claude");
+    assert_eq!(with_provider.agent_provider.as_deref(), Some("claude"));
+    assert_eq!(with_provider.agent_provider(), Some("claude"));
+
+    let serialized = serde_json::to_string(&with_provider)?;
+    assert!(serialized.contains("\"agent_provider\":\"claude\""));
+    let roundtripped: Thread = serde_json::from_str(&serialized)?;
+    assert_eq!(roundtripped, with_provider);
+    assert_eq!(roundtripped.agent_provider(), Some("claude"));
+
+    Ok(())
+}
+
+#[test]
+fn test_thread_agent_provider_persistence_update_clear_and_not_found(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDirGuard::new();
+    let db_path = temp.db_path();
+
+    let root_node = ConversationNode::new_root(AuthorRole::User, "hello");
+    let none_tid = ThreadId::new_v7();
+    let provider_tid = ThreadId::new_v7();
+
+    {
+        let storage = SqliteDagStorage::open(&db_path)?;
+        storage.insert_node(&root_node)?;
+
+        let without_provider = Thread::new(
+            none_tid,
+            root_node.id,
+            AnchorId::new_v7(),
+            root_node.id,
+            ThreadLifecycleState::Idle,
+        )
+        .with_title("Default");
+        storage.insert_thread(&without_provider)?;
+
+        let with_provider = Thread::new(
+            provider_tid,
+            root_node.id,
+            AnchorId::new_v7(),
+            root_node.id,
+            ThreadLifecycleState::Idle,
+        )
+        .with_title("Claude")
+        .with_agent_provider("claude");
+        storage.insert_thread(&with_provider)?;
+
+        let fetched_none = storage.get_thread(none_tid)?.expect("none_tid must exist");
+        assert_eq!(fetched_none.agent_provider(), None);
+
+        let fetched_provider = storage
+            .get_thread(provider_tid)?
+            .expect("provider_tid must exist");
+        assert_eq!(fetched_provider.agent_provider(), Some("claude"));
+
+        let listed = storage.list_threads()?;
+        assert_eq!(listed, vec![fetched_none, fetched_provider]);
+    }
+
+    {
+        let reopened = SqliteDagStorage::open(&db_path)?;
+        reopened.update_thread_agent_provider(&none_tid, Some("claude"))?;
+        reopened.update_thread_agent_provider(&provider_tid, None)?;
+    }
+
+    {
+        let reopened_again = SqliteDagStorage::open(&db_path)?;
+        let updated_to_some = reopened_again
+            .get_thread(none_tid)?
+            .expect("none_tid must persist across reload");
+        assert_eq!(updated_to_some.agent_provider(), Some("claude"));
+
+        let cleared_to_none = reopened_again
+            .get_thread(provider_tid)?
+            .expect("provider_tid must persist across reload");
+        assert_eq!(cleared_to_none.agent_provider(), None);
+
+        let listed = reopened_again.list_threads()?;
+        assert_eq!(listed, vec![updated_to_some, cleared_to_none]);
+
+        let missing_id = ThreadId::new_v7();
+        let err = reopened_again.update_thread_agent_provider(&missing_id, Some("claude"));
+        assert!(matches!(err, Err(CoreError::ThreadNotFound(_))));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_legacy_threads_migration_adds_agent_provider_column_idempotently(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute_batch(
+        "CREATE TABLE nodes (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_id TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (parent_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY NOT NULL,
+            parent_node_id TEXT NOT NULL,
+            anchor_id TEXT NOT NULL,
+            active_leaf_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            acp_session_id TEXT,
+            merged INTEGER NOT NULL DEFAULT 0,
+            parent_thread_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'agent',
+            cwd TEXT,
+            custom_name TEXT,
+            FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
+            FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
+        );",
+    )?;
+
+    let root_id = NodeId::new_v7();
+    let thread_id = ThreadId::new_v7();
+    let anchor_id = AnchorId::new_v7();
+    conn.execute(
+        "INSERT INTO nodes (id, parent_id, role, content, created_at) VALUES (?1, NULL, 'user', 'Root', 1)",
+        rusqlite::params![root_id.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO threads (id, parent_node_id, anchor_id, active_leaf_id, status, created_at, title, kind, cwd, custom_name)
+         VALUES (?1, ?2, ?3, ?2, 'idle', 2, 'Auto Title', 'agent', '/tmp/work', 'LegacyCustom')",
+        rusqlite::params![thread_id.to_string(), root_id.to_string(), anchor_id.to_string()],
+    )?;
+
+    let storage = SqliteDagStorage::new(conn)?;
+    storage.run_migrations()?;
+
+    let fetched = storage
+        .get_thread(thread_id)?
+        .expect("Existing thread must survive migration");
+    assert_eq!(fetched.id, thread_id);
+    assert_eq!(fetched.title, "Auto Title");
+    assert_eq!(fetched.custom_name.as_deref(), Some("LegacyCustom"));
+    assert_eq!(fetched.agent_provider, None);
+
+    let listed = storage.list_threads()?;
+    assert_eq!(listed, vec![fetched]);
+
+    storage.update_thread_agent_provider(&thread_id, Some("claude"))?;
+    let updated = storage
+        .get_thread(thread_id)?
+        .expect("Migrated thread must support agent_provider updates");
+    assert_eq!(updated.agent_provider(), Some("claude"));
+
+    storage.update_thread_agent_provider(&thread_id, None)?;
+    let cleared = storage
+        .get_thread(thread_id)?
+        .expect("Migrated thread must support clearing agent_provider");
+    assert_eq!(cleared.agent_provider(), None);
 
     Ok(())
 }

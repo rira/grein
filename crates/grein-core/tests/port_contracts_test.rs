@@ -8,9 +8,9 @@ use grein_core::model::{
     ThreadStatus,
 };
 use grein_core::port::dto::{
-    AgentConfigChoice, AgentConfigOption, AgentMetaEntry, AgentOptionsSnapshot, AgentSlashCommand,
-    EngineControlEvent, EngineStreamEvent, HydratedSession, HydratedThread, HydratedTurn,
-    PermissionDecisionPayload, PtyCell, PtyColor, PtyMouseEncoding, PtyMouseMode,
+    AgentConfigChoice, AgentConfigOption, AgentMetaEntry, AgentOptionsSnapshot, AgentProviderInfo,
+    AgentSlashCommand, EngineControlEvent, EngineStreamEvent, HydratedSession, HydratedThread,
+    HydratedTurn, PermissionDecisionPayload, PtyCell, PtyColor, PtyMouseEncoding, PtyMouseMode,
     PtyScreenSnapshot, SessionSnapshot, ShellCommandResult, SubagentSnapshot, SubagentStatus,
     ThreadMeta, ThreadSummary, TranscriptEntry, TuiEngineEvent, TurnDispatchResult,
     UserPreferencesSnapshot, WorktreeEntry,
@@ -122,6 +122,9 @@ fn session_repository_trait_object_covers_full_lifecycle() -> grein_core::Result
     repo.update_thread_status(&main_tid.0, ThreadStatus::Streaming)?;
     repo.update_thread_title(&main_tid, "Main Updated")?;
     repo.update_thread_custom_name(&main_tid, Some("Primary"))?;
+    repo.update_thread_agent_provider(&main_tid, Some("claude"))?;
+    repo.update_thread_agent_provider(&direct_tid, Some("codex"))?;
+    repo.update_thread_agent_provider(&direct_tid, None)?;
     repo.update_thread_cwd(&term_tid, Some("/tmp/wt2"))?;
     repo.update_thread_acp_session_id(&branch_tid, Some("acp-1"))?;
     repo.mark_thread_merged(&branch_tid, true)?;
@@ -129,8 +132,12 @@ fn session_repository_trait_object_covers_full_lifecycle() -> grein_core::Result
     let main_loaded = repo.get_thread(&main_tid.0)?.expect("main thread");
     assert_eq!(main_loaded.title, "Main Updated");
     assert_eq!(main_loaded.custom_name.as_deref(), Some("Primary"));
+    assert_eq!(main_loaded.agent_provider.as_deref(), Some("claude"));
     assert_eq!(main_loaded.status, ThreadStatus::Streaming);
     assert_eq!(main_loaded.active_leaf_id, asst_1.id);
+
+    let direct_loaded = repo.get_thread(&direct_tid.0)?.expect("direct thread");
+    assert_eq!(direct_loaded.agent_provider, None);
 
     let branch_loaded = repo.get_thread(&branch_tid.0)?.expect("branch thread");
     assert_eq!(branch_loaded.acp_session_id.as_deref(), Some("acp-1"));
@@ -396,11 +403,13 @@ fn port_dto_wire_format_matches_existing_contracts() -> Result<(), Box<dyn std::
         git_branch: Some("main".into()),
         git_dirty: 1,
         custom_name: Some("Shell".into()),
+        agent_provider: Some("claude".into()),
     };
     let hydrated_thread = HydratedThread {
         id: "t-1".into(),
         title: "Main".into(),
         custom_name: None,
+        agent_provider: Some("claude".into()),
         turns: vec![HydratedTurn {
             id: "n-1".into(),
             role: "user".into(),
@@ -608,6 +617,86 @@ fn port_dto_wire_format_matches_existing_contracts() -> Result<(), Box<dyn std::
         })?,
     );
     assert!(!misc.0.is_empty() && !misc.9.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn agent_provider_dtos_roundtrip_and_default_missing_fields(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provider_full = AgentProviderInfo {
+        id: "claude".into(),
+        plugin_id: "grein-acp-claude".into(),
+        display_name: "Claude Code".into(),
+        kind: "acp".into(),
+        available: true,
+        executable: Some("/usr/local/bin/claude-agent-acp".into()),
+        is_default: true,
+        install_hint: Some("npm install -g @zed-industries/claude-agent-acp".into()),
+    };
+    let provider_json = serde_json::to_string(&provider_full)?;
+    let provider_decoded: AgentProviderInfo = serde_json::from_str(&provider_json)?;
+    assert_eq!(provider_decoded, provider_full);
+
+    let provider_minimal: AgentProviderInfo = serde_json::from_str(
+        r#"{
+            "id": "codex",
+            "plugin_id": "grein-acp-codex",
+            "display_name": "Codex",
+            "kind": "acp",
+            "available": false
+        }"#,
+    )?;
+    assert_eq!(provider_minimal.executable, None);
+    assert!(!provider_minimal.is_default);
+    assert_eq!(provider_minimal.install_hint, None);
+
+    let legacy_meta: ThreadMeta = serde_json::from_str(
+        r#"{
+            "thread_id": "t-1",
+            "parent_thread_id": null,
+            "inherited_turn_count": 0
+        }"#,
+    )?;
+    assert_eq!(legacy_meta.agent_provider, None);
+    let meta_with_provider = ThreadMeta {
+        agent_provider: Some("claude".into()),
+        ..legacy_meta
+    };
+    let meta_roundtrip: ThreadMeta =
+        serde_json::from_str(&serde_json::to_string(&meta_with_provider)?)?;
+    assert_eq!(meta_roundtrip, meta_with_provider);
+
+    let legacy_hydrated: HydratedThread = serde_json::from_str(
+        r#"{
+            "id": "t-1",
+            "title": "Main",
+            "turns": []
+        }"#,
+    )?;
+    assert_eq!(legacy_hydrated.agent_provider, None);
+    let hydrated_with_provider = HydratedThread {
+        agent_provider: Some("claude".into()),
+        ..legacy_hydrated
+    };
+    let hydrated_roundtrip: HydratedThread =
+        serde_json::from_str(&serde_json::to_string(&hydrated_with_provider)?)?;
+    assert_eq!(hydrated_roundtrip, hydrated_with_provider);
+
+    let legacy_summary: ThreadSummary =
+        serde_json::from_str(r#"{"thread_id":"t-1","parent_node_id":"n-0","merged":false}"#)?;
+    assert_eq!(legacy_summary.agent_provider, None);
+    let summary_none_json = serde_json::to_string(&legacy_summary)?;
+    assert!(!summary_none_json.contains("agent_provider"));
+
+    let summary_with_provider = ThreadSummary {
+        agent_provider: Some("claude".into()),
+        ..legacy_summary
+    };
+    let summary_some_json = serde_json::to_string(&summary_with_provider)?;
+    assert!(summary_some_json.contains("\"agent_provider\":\"claude\""));
+    let summary_roundtrip: ThreadSummary = serde_json::from_str(&summary_some_json)?;
+    assert_eq!(summary_roundtrip, summary_with_provider);
 
     Ok(())
 }

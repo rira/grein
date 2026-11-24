@@ -120,6 +120,7 @@ impl SqliteStorage {
                 kind TEXT NOT NULL DEFAULT 'agent',
                 cwd TEXT,
                 custom_name TEXT,
+                agent_provider TEXT,
                 FOREIGN KEY (parent_node_id) REFERENCES nodes(id) ON DELETE RESTRICT,
                 FOREIGN KEY (active_leaf_id) REFERENCES nodes(id) ON DELETE RESTRICT
             );
@@ -188,6 +189,10 @@ impl SqliteStorage {
             (
                 "custom_name",
                 "ALTER TABLE threads ADD COLUMN custom_name TEXT",
+            ),
+            (
+                "agent_provider",
+                "ALTER TABLE threads ADD COLUMN agent_provider TEXT",
             ),
         ];
         for (column_name, ddl) in thread_column_migrations {
@@ -330,6 +335,14 @@ impl SessionRepository for SqliteStorage {
         custom_name: Option<&str>,
     ) -> Result<()> {
         SqliteStorage::update_thread_custom_name(self, thread_id, custom_name)
+    }
+
+    fn update_thread_agent_provider(
+        &self,
+        thread_id: &ThreadId,
+        provider: Option<&str>,
+    ) -> Result<()> {
+        SqliteStorage::update_thread_agent_provider(self, thread_id, provider)
     }
 
     fn delete_thread(&self, thread_id: &ThreadId) -> Result<bool> {
