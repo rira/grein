@@ -483,3 +483,29 @@ pub(super) fn render_status_bar(
     let widget = Paragraph::new(Line::from(spans)).style(Style::default().bg(bar_bg));
     f.render_widget(widget, area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_elapsed_ms_and_truncation_and_git_branch() {
+        assert_eq!(format_elapsed_ms(0, 10_000), "0s");
+        assert_eq!(format_elapsed_ms(5_000, 3_000), "0s");
+        assert_eq!(format_elapsed_ms(1_000, 45_999), "44s");
+        assert_eq!(format_elapsed_ms(1_000, 65_000), "1m 04s");
+        assert_eq!(format_elapsed_ms(1_000, 3_665_000), "1h 01m");
+
+        assert_eq!(truncate_single_line("  hello   world  ", 20), "hello world");
+        assert_eq!(truncate_single_line("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate_single_line("abcdef", 1), "a");
+        assert_eq!(truncate_single_line("abcdef", 0), "");
+
+        assert_eq!(
+            format_status_git_branch("worktree-abcdef123456"),
+            "worktree: abcdef12"
+        );
+        assert_eq!(format_status_git_branch("feat-wt"), "worktree: feat");
+        assert_eq!(format_status_git_branch("main"), "main");
+    }
+}
