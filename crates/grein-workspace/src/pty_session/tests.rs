@@ -298,3 +298,129 @@ fn test_build_pty_command_scrubs_outer_terminal_env_and_sets_term() {
     assert!(!envs.contains_key(OsStr::new("HOME")));
     assert!(!envs.contains_key(OsStr::new("STARSHIP_CONFIG")));
 }
+
+#[test]
+fn test_scanner_intermediate_ignore_dcs_overflow_and_utf8_recovery() {
+    let mut scanner = TerminalScanner::default();
+
+    assert!(scanner.executes_c0());
+    assert!(scanner.will_print_byte(b'A'));
+    assert!(!scanner.will_print_byte(0x0a));
+
+    // EscIntermediate: ESC ( B then abort via CAN/SUB and ESC restart
+    let esc_inter = b"\x1b(B\x1b(\x00 \x18\x1b(\x1a\x1b(\x1b[5n";
+    let mut events = Vec::new();
+    for &b in esc_inter {
+        if let Some(ev) = scanner.feed_byte(b) {
+            events.push(ev);
+        }
+    }
+    assert_eq!(events, vec![ScannerEvent::DeviceStatus]);
+
+    // CsiIntermediate -> ground / CsiIgnore -> ground, plus CAN/SUB and ':' subparam
+    let csi_cases = b"\x1b[1 p\x1b[ 1?m\x1b[ \x18\x1b[ \x1b[5n\x1b[4:3m\x1b[5:1n\x1b[1?5n\x1b[1?\x80\x1b[1?\x18\x1b[1?\x1a\x1b[1?\x1b[6n";
+    events.clear();
+    for &b in csi_cases {
+        if let Some(ev) = scanner.feed_byte(b) {
+            events.push(ev);
+        }
+    }
+    assert_eq!(
+        events,
+        vec![ScannerEvent::DeviceStatus, ScannerEvent::CursorPosition]
+    );
+
+    // >16 CSI param overflow sets csi_ignore and drops result
+    let overflow_csi = b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17n\x1b[5n";
+    events.clear();
+    for &b in overflow_csi {
+        if let Some(ev) = scanner.feed_byte(b) {
+            events.push(ev);
+        }
+    }
+    assert_eq!(events, vec![ScannerEvent::DeviceStatus]);
+
+    // DcsString + DcsEsc + C1 ST + CAN/SUB + OscEsc non-ST
+    let dcs_osc = b"\x1bPqdata\x1b\\\x1bXpm\x9c\x1b^abc\x18\x1b_xyz\x1a\x1bPq\x1b[5n\x1b]7;file:///tmp\x18\x1b]7;file:///tmp\x1b[6n";
+    events.clear();
+    for &b in dcs_osc {
+        if let Some(ev) = scanner.feed_byte(b) {
+            events.push(ev);
+        }
+    }
+    assert_eq!(
+        events,
+        vec![ScannerEvent::DeviceStatus, ScannerEvent::CursorPosition]
+    );
+
+    // Multi-byte UTF-8 and invalid continuation recovery
+    assert_eq!(scanner.feed_byte(0xc3), None);
+    assert!(scanner.will_print_byte(0xa9));
+    assert_eq!(scanner.feed_byte(0xa9), None);
+
+    assert_eq!(scanner.feed_byte(0xe2), None);
+    assert!(!scanner.will_print_byte(0x82));
+    assert_eq!(scanner.feed_byte(0x82), None);
+    assert!(scanner.will_print_byte(0xac));
+    assert_eq!(scanner.feed_byte(0xac), None);
+
+    // Interrupted 4-byte sequence followed by ASCII and ESC
+    assert_eq!(scanner.feed_byte(0xf0), None);
+    assert!(scanner.will_print_byte(b'X'));
+    assert_eq!(scanner.feed_byte(b'X'), None);
+    assert_eq!(scanner.feed_byte(0x1b), None);
+    assert_eq!(scanner.feed_byte(b'c'), Some(ScannerEvent::Reset));
+
+    // Invalid hex nibble in OSC 7 percent-encoding stays literal
+    assert_eq!(
+        parse_osc7_cwd(b"file:///tmp/100%ZZok%"),
+        Some("/tmp/100%ZZok%".to_string())
+    );
+}
+
+#[test]
+fn test_pty_state_resize_clamping_eviction_and_cols_one_wrap() {
+    let mut state = PtyState::new(10, 20);
+    state.set_scroll_region(3, 8);
+    assert!(state.scroll_region_active());
+
+    // Invalid region (top >= bottom) resets scroll region
+    state.set_scroll_region(5, 3);
+    assert!(!state.scroll_region_active());
+
+    // Bottom=0 means max_row; resizing shrinks scroll_bottom and resets scroll_top when inverted
+    state.set_scroll_region(4, 0);
+    assert!(state.scroll_region_active());
+    state.resize(6, 20);
+    assert!(state.scroll_region_active());
+    state.resize(2, 20);
+    assert!(!state.scroll_region_active());
+
+    // Eviction past 1000 scrollback rows
+    for i in 0..1050usize {
+        state.push_scrollback_row(vec![PtyCell {
+            contents: i.to_string(),
+            ..PtyCell::default()
+        }]);
+    }
+    assert_eq!(state.scrollback.len(), 1000);
+    assert_eq!(state.scrollback.front().expect("front")[0].contents, "50");
+    assert_eq!(state.scrollback.back().expect("back")[0].contents, "1049");
+
+    // cols == 1 wrap scroll and cols == 4 / cols == 3 wide-char wrap
+    let mut scanner = TerminalScanner::default();
+    let mut narrow = PtyState::new(3, 1);
+    let mut responses = Vec::new();
+    process_pty_bytes(b"\x1b[3;1Habcd", &mut scanner, &mut narrow, &mut responses);
+    assert_eq!(narrow.scrollback.len(), 3);
+
+    let mut four_col = PtyState::new(3, 4);
+    process_pty_bytes(b"\x1b[3;1H123\xf0\x9f\x93\xa6", &mut scanner, &mut four_col, &mut responses);
+    assert_eq!(four_col.scrollback.len(), 1);
+
+    let mut three_col = PtyState::new(3, 3);
+    process_pty_bytes(b"\x1b[3;1H12\xf0\x9f\x93\xa6", &mut scanner, &mut three_col, &mut responses);
+    assert!(three_col.scrollback.is_empty());
+    process_pty_bytes(b"XY", &mut scanner, &mut three_col, &mut responses);
+    assert_eq!(three_col.scrollback.len(), 1);
+}

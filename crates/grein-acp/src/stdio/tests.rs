@@ -589,3 +589,129 @@ fn prompt_completed_extracts_camel_case_usage() {
         }
     );
 }
+
+#[test]
+fn parser_tool_call_update_and_fallback_edge_cases() {
+    use super::parser::format_rpc_error;
+
+    assert_eq!(format_rpc_error(&json!({"message": "plain"})), "plain");
+    assert_eq!(format_rpc_error(&json!(404)), "404");
+
+    let make_notif = |update: serde_json::Value| JsonRpcNotification {
+        jsonrpc: "2.0".into(),
+        method: "session/update".into(),
+        params: Some(json!({ "sessionId": "s1", "update": update })),
+    };
+
+    assert_eq!(
+        translate_session_update(&make_notif(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-content-text",
+            "name": "bash",
+            "status": "completed",
+            "rawOutput": { "output": "" },
+            "content": [{ "type": "text", "text": "direct content text" }]
+        }))),
+        Some((
+            "s1".into(),
+            DriverEvent::ToolCallUpdate {
+                session_id: "s1".into(),
+                tool_call_id: "tc-content-text".into(),
+                name: "bash".into(),
+                status: "completed".into(),
+                output: "direct content text".into(),
+            }
+        ))
+    );
+
+    assert_eq!(
+        translate_session_update(&make_notif(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-nonstring-raw",
+            "name": "bash",
+            "status": "completed",
+            "rawOutput": { "output": { "exitCode": 0 } }
+        }))),
+        Some((
+            "s1".into(),
+            DriverEvent::ToolCallUpdate {
+                session_id: "s1".into(),
+                tool_call_id: "tc-nonstring-raw".into(),
+                name: "bash".into(),
+                status: "completed".into(),
+                output: "{\"exitCode\":0}".into(),
+            }
+        ))
+    );
+
+    assert_eq!(
+        translate_session_update(&make_notif(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-empty-raw-str",
+            "name": "bash",
+            "status": "completed",
+            "rawOutput": { "output": "" }
+        }))),
+        Some((
+            "s1".into(),
+            DriverEvent::ToolCallUpdate {
+                session_id: "s1".into(),
+                tool_call_id: "tc-empty-raw-str".into(),
+                name: "bash".into(),
+                status: "completed".into(),
+                output: String::new(),
+            }
+        ))
+    );
+
+    assert_eq!(
+        translate_session_update(&make_notif(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-null-raw",
+            "name": "bash",
+            "status": "completed",
+            "rawOutput": { "output": null }
+        }))),
+        Some((
+            "s1".into(),
+            DriverEvent::ToolCallUpdate {
+                session_id: "s1".into(),
+                tool_call_id: "tc-null-raw".into(),
+                name: "bash".into(),
+                status: "completed".into(),
+                output: String::new(),
+            }
+        ))
+    );
+
+    assert_eq!(
+        translate_session_update(&JsonRpcNotification {
+            jsonrpc: "2.0".into(),
+            method: "other/method".into(),
+            params: None,
+        }),
+        None
+    );
+
+    assert_eq!(
+        parse_permission_request(&JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: "other/req".into(),
+            params: None,
+        }),
+        None
+    );
+}
+
+#[tokio::test]
+async fn default_agent_driver_trait_methods_covered() {
+    let driver = StubAgentDriver;
+    assert!(driver.recent_stderr().is_empty());
+    let mut rx = driver.subscribe_session("s1");
+    assert!(rx.try_recv().is_err());
+    assert!(matches!(
+        driver.submit_prompt("s1", "hi").await,
+        Err(StdioRunnerError::CommunicationError(msg)) if msg.contains("submit_prompt")
+    ));
+}
