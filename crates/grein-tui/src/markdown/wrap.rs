@@ -1,13 +1,24 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineMeta {
+    pub soft_wrapped: bool,
+    pub joined_by_space: bool,
+}
+
 #[derive(Debug, Clone)]
 enum CellSegment {
     Word(Vec<Span<'static>>, usize),
     Space(Vec<Span<'static>>, usize),
 }
 
-fn char_display_width(ch: char) -> usize {
+struct MetaTracker<'a> {
+    out_meta: &'a mut Vec<LineMeta>,
+    next_meta: LineMeta,
+}
+
+pub(crate) fn char_display_width(ch: char) -> usize {
     if ch.is_ascii() {
         if ch.is_control() {
             0
@@ -134,8 +145,25 @@ fn append_token_slice(
     }
 }
 
+fn push_wrapped_line(
+    out: &mut Vec<Vec<Span<'static>>>,
+    tracker: Option<&mut MetaTracker<'_>>,
+    spans: Vec<Span<'static>>,
+    next_joined_by_space: bool,
+) {
+    out.push(spans);
+    if let Some(t) = tracker {
+        t.out_meta.push(t.next_meta);
+        t.next_meta = LineMeta {
+            soft_wrapped: true,
+            joined_by_space: next_joined_by_space,
+        };
+    }
+}
+
 fn push_spans_char_wrapped(
     out: &mut Vec<Vec<Span<'static>>>,
+    mut tracker: Option<&mut MetaTracker<'_>>,
     cur_line: &mut Vec<Span<'static>>,
     cur_w: &mut usize,
     spans: Vec<Span<'static>>,
@@ -145,7 +173,12 @@ fn push_spans_char_wrapped(
         for ch in sp.content.chars() {
             let cw = char_display_width(ch);
             if *cur_w > 0 && *cur_w + cw > max_width {
-                out.push(std::mem::take(cur_line));
+                push_wrapped_line(
+                    out,
+                    tracker.as_deref_mut(),
+                    std::mem::take(cur_line),
+                    false,
+                );
                 *cur_w = 0;
             }
             push_merged_char(cur_line, ch, sp.style);
@@ -212,6 +245,7 @@ pub(super) fn wrap_spans_to_width(
                     } else {
                         push_spans_char_wrapped(
                             &mut lines,
+                            None,
                             &mut cur_line,
                             &mut cur_w,
                             word_spans,
@@ -230,22 +264,46 @@ pub(super) fn wrap_spans_to_width(
     lines
 }
 
+pub fn wrap_styled_lines_with_meta(
+    lines: Vec<Line<'static>>,
+    max_width: usize,
+) -> (Vec<Line<'static>>, Vec<LineMeta>) {
+    let mut wrapped_lines = Vec::new();
+    let mut wrapped_meta = Vec::new();
+    for line in lines {
+        let (fragments, meta) = wrap_styled_line_with_meta(line, max_width);
+        wrapped_lines.extend(fragments);
+        wrapped_meta.extend(meta);
+    }
+    debug_assert_eq!(wrapped_lines.len(), wrapped_meta.len());
+    (wrapped_lines, wrapped_meta)
+}
+
 pub fn wrap_styled_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .flat_map(|line| wrap_styled_line(line, max_width))
-        .collect()
+    wrap_styled_lines_with_meta(lines, max_width).0
 }
 
 pub fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+    wrap_styled_line_with_meta(line, max_width).0
+}
+
+pub fn wrap_styled_line_with_meta(
+    line: Line<'static>,
+    max_width: usize,
+) -> (Vec<Line<'static>>, Vec<LineMeta>) {
     if max_width == 0 {
-        return vec![line];
+        return (vec![line], vec![LineMeta::default()]);
     }
 
     let line_style = line.style;
     let line_alignment = line.alignment;
     let segments = tokenize_spans(line.spans, false);
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut out_meta: Vec<LineMeta> = Vec::new();
+    let mut tracker = MetaTracker {
+        out_meta: &mut out_meta,
+        next_meta: LineMeta::default(),
+    };
     let mut cur_line: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
     let mut has_word_on_line = false;
@@ -265,7 +323,14 @@ pub fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'stat
                         None => pending_ws = Some((sp_spans, sp_w)),
                     }
                 } else {
-                    push_spans_char_wrapped(&mut out, &mut cur_line, &mut cur_w, sp_spans, max_width);
+                    push_spans_char_wrapped(
+                        &mut out,
+                        Some(&mut tracker),
+                        &mut cur_line,
+                        &mut cur_w,
+                        sp_spans,
+                        max_width,
+                    );
                 }
             }
             CellSegment::Word(word_spans, word_w) => {
@@ -286,9 +351,14 @@ pub fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'stat
                     }
                     cur_w += ws_w + word_w;
                 } else {
-                    pending_ws = None;
+                    let broke_on_ws = pending_ws.take().is_some();
                     if cur_w > 0 && (has_word_on_line || word_w <= max_width) {
-                        out.push(std::mem::take(&mut cur_line));
+                        push_wrapped_line(
+                            &mut out,
+                            Some(&mut tracker),
+                            std::mem::take(&mut cur_line),
+                            broke_on_ws,
+                        );
                         cur_w = 0;
                     }
 
@@ -300,6 +370,7 @@ pub fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'stat
                     } else {
                         push_spans_char_wrapped(
                             &mut out,
+                            Some(&mut tracker),
                             &mut cur_line,
                             &mut cur_w,
                             word_spans,
@@ -321,14 +392,144 @@ pub fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'stat
     }
 
     if !cur_line.is_empty() || out.is_empty() {
-        out.push(cur_line);
+        push_wrapped_line(&mut out, Some(&mut tracker), cur_line, false);
     }
 
-    out.into_iter()
+    let lines = out
+        .into_iter()
         .map(|spans| {
             let mut l = Line::from(spans).style(line_style);
             l.alignment = line_alignment;
             l
         })
-        .collect()
+        .collect::<Vec<_>>();
+    debug_assert_eq!(lines.len(), out_meta.len());
+    (lines, out_meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_wrap_styled_lines_with_meta_space_vs_hard_newline() {
+        let input = vec![Line::raw("alpha beta gamma"), Line::raw("second line")];
+        let (lines, meta) = wrap_styled_lines_with_meta(input.clone(), 11);
+        assert_eq!(lines.len(), meta.len());
+        assert_eq!(plain(&lines), vec!["alpha beta", "gamma", "second line"]);
+        assert_eq!(
+            meta,
+            vec![
+                LineMeta {
+                    soft_wrapped: false,
+                    joined_by_space: false,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: true,
+                },
+                LineMeta {
+                    soft_wrapped: false,
+                    joined_by_space: false,
+                },
+            ]
+        );
+        assert_eq!(wrap_styled_lines(input, 11), lines);
+    }
+
+    #[test]
+    fn test_wrap_styled_lines_with_meta_mid_token_url_and_mixed() {
+        let url = "https://example.com/very/long/path/token";
+        let (lines, meta) = wrap_styled_lines_with_meta(vec![Line::raw(url)], 14);
+        assert_eq!(lines.len(), meta.len());
+        assert_eq!(
+            plain(&lines),
+            vec!["https://exampl", "e.com/very/lon", "g/path/token"]
+        );
+        assert_eq!(
+            meta,
+            vec![
+                LineMeta {
+                    soft_wrapped: false,
+                    joined_by_space: false,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: false,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: false,
+                },
+            ]
+        );
+
+        let mixed = format!("See {url}");
+        let (mixed_lines, mixed_meta) = wrap_styled_lines_with_meta(vec![Line::raw(mixed)], 14);
+        assert_eq!(mixed_lines.len(), mixed_meta.len());
+        assert_eq!(
+            plain(&mixed_lines),
+            vec!["See", "https://exampl", "e.com/very/lon", "g/path/token"]
+        );
+        assert_eq!(
+            mixed_meta,
+            vec![
+                LineMeta {
+                    soft_wrapped: false,
+                    joined_by_space: false,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: true,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: false,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_wrap_styled_lines_with_meta_edge_cases_preserve_length_invariant() {
+        let (empty_lines, empty_meta) = wrap_styled_lines_with_meta(Vec::new(), 10);
+        assert!(empty_lines.is_empty());
+        assert!(empty_meta.is_empty());
+
+        let (zero_w, zero_meta) = wrap_styled_lines_with_meta(vec![Line::raw("abc def")], 0);
+        assert_eq!(zero_w.len(), zero_meta.len());
+        assert_eq!(zero_meta, vec![LineMeta::default()]);
+
+        let (blank, blank_meta) = wrap_styled_lines_with_meta(vec![Line::raw("")], 10);
+        assert_eq!(blank.len(), blank_meta.len());
+        assert_eq!(blank_meta, vec![LineMeta::default()]);
+
+        let (wide, wide_meta) = wrap_styled_lines_with_meta(vec![Line::raw("🦀🦀🦀🦀")], 5);
+        assert_eq!(wide.len(), wide_meta.len());
+        assert_eq!(plain(&wide), vec!["🦀🦀", "🦀🦀"]);
+        assert_eq!(
+            wide_meta,
+            vec![
+                LineMeta {
+                    soft_wrapped: false,
+                    joined_by_space: false,
+                },
+                LineMeta {
+                    soft_wrapped: true,
+                    joined_by_space: false,
+                },
+            ]
+        );
+    }
 }
