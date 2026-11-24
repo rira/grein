@@ -5,7 +5,11 @@ mod wrap;
 
 pub use ansi::render_ansi_text;
 pub use inline::parse_inline_spans;
-pub use wrap::{wrap_styled_line, wrap_styled_lines};
+pub(crate) use wrap::char_display_width;
+pub use wrap::{
+    wrap_styled_line, wrap_styled_line_with_meta, wrap_styled_lines, wrap_styled_lines_with_meta,
+    LineMeta,
+};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};

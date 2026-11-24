@@ -15,6 +15,7 @@ pub mod pane;
 pub mod render;
 pub mod runner;
 pub mod search;
+pub mod selection;
 pub mod state;
 pub mod status;
 pub mod syntax;
