@@ -86,6 +86,10 @@ pub struct InteractivePtySession {
     wake_write: Option<OwnedFd>,
     reader_thread: Option<JoinHandle<()>>,
     on_update: Arc<dyn Fn() + Send + Sync>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    shell: Option<String>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    extra_env: Vec<(String, String)>,
     pid: u32,
 }
 
@@ -220,6 +224,14 @@ impl InteractivePtySession {
             wake_write: Some(wake_write_fd),
             reader_thread: Some(reader_thread),
             on_update,
+            shell: shell_override
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            extra_env: extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
             pid,
         })
     }
@@ -311,6 +323,53 @@ impl InteractivePtySession {
     /// Returns the OS process ID of the spawned shell child process.
     pub fn child_pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Returns whether the spawned child process has exited.
+    pub fn is_exited(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .exited
+    }
+
+    /// Returns the live OS working directory of the child process while running.
+    pub fn live_cwd(&self) -> Option<PathBuf> {
+        if self.is_exited() {
+            return None;
+        }
+        live_process_cwd(self.pid)
+    }
+
+    /// Returns the latest non-empty terminal window title emitted via OSC 0/2.
+    pub fn terminal_title(&self) -> Option<String> {
+        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let title = guard.parser.screen().title().trim();
+        (!title.is_empty()).then(|| title.to_string())
+    }
+
+    /// Spawns a fresh PTY session in `cwd` preserving current dimensions, shell, env, and update callback.
+    pub fn restart_in_cwd(&self, cwd: &Path) -> io::Result<Self> {
+        let (rows, cols) = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parser
+            .screen()
+            .size();
+        let env_refs: Vec<(&str, &str)> = self
+            .extra_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        Self::spawn_with_env(
+            cwd,
+            rows,
+            cols,
+            self.shell.as_deref(),
+            &env_refs,
+            Arc::clone(&self.on_update),
+        )
     }
 
     /// Polls the child process OS working directory as a fallback when OSC 7 is unavailable.

@@ -435,40 +435,43 @@ struct StubAgentDriver;
 
 #[async_trait]
 impl AgentDriver for StubAgentDriver {
-    async fn initialize(&self) -> Result<AcpInitializeResult, StdioRunnerError> {
+    fn is_running(&self) -> bool {
+        true
+    }
+    async fn initialize(&self) -> Result<AcpInitializeResult, AgentDriverError> {
         unreachable!()
     }
-    async fn authenticate(&self, _method_id: &str) -> Result<(), StdioRunnerError> {
+    async fn authenticate(&self, _method_id: &str) -> Result<(), AgentDriverError> {
         unreachable!()
     }
     async fn new_session(
         &self,
         _cwd: &Path,
         _system_prompt_append: Option<&str>,
-    ) -> Result<AcpSessionInfo, StdioRunnerError> {
+    ) -> Result<AcpSessionInfo, AgentDriverError> {
         unreachable!()
     }
     async fn send_prompt(
         &self,
         _session_id: &str,
         _prompt: &str,
-    ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, StdioRunnerError> {
+    ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, AgentDriverError> {
         unreachable!()
     }
     async fn respond_permission(
         &self,
         _request_id: serde_json::Value,
         _option_id: Option<&str>,
-    ) -> Result<(), StdioRunnerError> {
+    ) -> Result<(), AgentDriverError> {
         unreachable!()
     }
-    async fn cancel_session(&self, _session_id: &str) -> Result<(), StdioRunnerError> {
+    async fn cancel_session(&self, _session_id: &str) -> Result<(), AgentDriverError> {
         unreachable!()
     }
-    async fn close_session(&self, _session_id: &str) -> Result<(), StdioRunnerError> {
+    async fn close_session(&self, _session_id: &str) -> Result<(), AgentDriverError> {
         unreachable!()
     }
-    async fn shutdown(&self) -> Result<(), StdioRunnerError> {
+    async fn shutdown(&self) -> Result<(), AgentDriverError> {
         unreachable!()
     }
 }
@@ -476,17 +479,18 @@ impl AgentDriver for StubAgentDriver {
 #[tokio::test]
 async fn default_agent_driver_config_setters_return_not_supported() {
     let driver = StubAgentDriver;
+    assert!(driver.is_running());
     assert!(matches!(
         driver.set_session_model("s1", "m1").await,
-        Err(StdioRunnerError::CommunicationError(msg)) if msg == "not supported"
+        Err(AgentDriverError::Unsupported(msg)) if msg == "not supported"
     ));
     assert!(matches!(
         driver.set_session_mode("s1", "mode1").await,
-        Err(StdioRunnerError::CommunicationError(msg)) if msg == "not supported"
+        Err(AgentDriverError::Unsupported(msg)) if msg == "not supported"
     ));
     assert!(matches!(
         driver.set_config_option("s1", "cfg", "val").await,
-        Err(StdioRunnerError::CommunicationError(msg)) if msg == "not supported"
+        Err(AgentDriverError::Unsupported(msg)) if msg == "not supported"
     ));
 }
 
@@ -712,6 +716,6 @@ async fn default_agent_driver_trait_methods_covered() {
     assert!(rx.try_recv().is_err());
     assert!(matches!(
         driver.submit_prompt("s1", "hi").await,
-        Err(StdioRunnerError::CommunicationError(msg)) if msg.contains("submit_prompt")
+        Err(AgentDriverError::Unsupported(msg)) if msg.contains("submit_prompt")
     ));
 }

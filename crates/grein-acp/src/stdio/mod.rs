@@ -7,13 +7,13 @@ mod tests;
 
 use std::sync::{Mutex, MutexGuard};
 
-pub use driver::AcpStdioDriver;
+pub use driver::{AcpStdioDriver, StdioAgentDriverFactory};
 pub use process::{StdioProcessConfig, StdioProcessRunner};
 pub use protocol::{
     AcpConfigChoice, AcpConfigOption, AcpInitializeResult, AcpModeOption, AcpModelOption,
-    AcpPermissionOption, AcpSessionInfo, AcpSlashCommand, AcpUsage, AgentDriver, DriverEvent,
-    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    StdioRunnerError,
+    AcpPermissionOption, AcpSessionInfo, AcpSlashCommand, AcpSpawnConfig, AcpUsage, AgentDriver,
+    AgentDriverError, AgentDriverFactory, DriverEvent, JsonRpcError, JsonRpcMessage,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, StdioRunnerError,
 };
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

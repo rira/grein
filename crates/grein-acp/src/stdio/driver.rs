@@ -12,10 +12,11 @@ use super::parser::{
     build_prompt_completed, format_rpc_error, parse_config_options_result, parse_initialize_result,
     parse_permission_request, parse_session_info, translate_session_update,
 };
-use super::process::StdioProcessRunner;
+use super::process::{StdioProcessConfig, StdioProcessRunner};
 use super::protocol::{
-    AcpConfigOption, AcpInitializeResult, AcpSessionInfo, AgentDriver, DriverEvent, JsonRpcMessage,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, StdioRunnerError, JSONRPC_VERSION,
+    AcpConfigOption, AcpInitializeResult, AcpSessionInfo, AcpSpawnConfig, AgentDriver,
+    AgentDriverError, AgentDriverFactory, DriverEvent, JsonRpcMessage, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, StdioRunnerError, JSONRPC_VERSION,
 };
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -374,44 +375,48 @@ impl AcpStdioDriver {
 
 #[async_trait]
 impl AgentDriver for AcpStdioDriver {
-    async fn initialize(&self) -> Result<AcpInitializeResult, StdioRunnerError> {
-        AcpStdioDriver::initialize(self).await
+    fn is_running(&self) -> bool {
+        AcpStdioDriver::is_running(self)
     }
 
-    async fn authenticate(&self, method_id: &str) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::authenticate(self, method_id).await
+    async fn initialize(&self) -> Result<AcpInitializeResult, AgentDriverError> {
+        Ok(AcpStdioDriver::initialize(self).await?)
+    }
+
+    async fn authenticate(&self, method_id: &str) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::authenticate(self, method_id).await?)
     }
 
     async fn new_session(
         &self,
         cwd: &Path,
         system_prompt_append: Option<&str>,
-    ) -> Result<AcpSessionInfo, StdioRunnerError> {
-        AcpStdioDriver::new_session(self, cwd, system_prompt_append).await
+    ) -> Result<AcpSessionInfo, AgentDriverError> {
+        Ok(AcpStdioDriver::new_session(self, cwd, system_prompt_append).await?)
     }
 
     async fn send_prompt(
         &self,
         session_id: &str,
         prompt: &str,
-    ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, StdioRunnerError> {
-        AcpStdioDriver::send_prompt(self, session_id, prompt).await
+    ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, AgentDriverError> {
+        Ok(AcpStdioDriver::send_prompt(self, session_id, prompt).await?)
     }
 
     async fn respond_permission(
         &self,
         request_id: serde_json::Value,
         option_id: Option<&str>,
-    ) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::respond_permission(self, request_id, option_id).await
+    ) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::respond_permission(self, request_id, option_id).await?)
     }
 
-    async fn cancel_session(&self, session_id: &str) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::cancel_session(self, session_id).await
+    async fn cancel_session(&self, session_id: &str) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::cancel_session(self, session_id).await?)
     }
 
-    async fn close_session(&self, session_id: &str) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::close_session(self, session_id).await
+    async fn close_session(&self, session_id: &str) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::close_session(self, session_id).await?)
     }
 
     fn recent_stderr(&self) -> Vec<String> {
@@ -422,24 +427,24 @@ impl AgentDriver for AcpStdioDriver {
         AcpStdioDriver::subscribe_session(self, session_id)
     }
 
-    async fn submit_prompt(&self, session_id: &str, prompt: &str) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::submit_prompt(self, session_id, prompt).await
+    async fn submit_prompt(&self, session_id: &str, prompt: &str) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::submit_prompt(self, session_id, prompt).await?)
     }
 
     async fn set_session_model(
         &self,
         session_id: &str,
         model_id: &str,
-    ) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::set_session_model(self, session_id, model_id).await
+    ) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::set_session_model(self, session_id, model_id).await?)
     }
 
     async fn set_session_mode(
         &self,
         session_id: &str,
         mode_id: &str,
-    ) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::set_session_mode(self, session_id, mode_id).await
+    ) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::set_session_mode(self, session_id, mode_id).await?)
     }
 
     async fn set_config_option(
@@ -447,12 +452,37 @@ impl AgentDriver for AcpStdioDriver {
         session_id: &str,
         config_id: &str,
         value: &str,
-    ) -> Result<Vec<AcpConfigOption>, StdioRunnerError> {
-        AcpStdioDriver::set_config_option(self, session_id, config_id, value).await
+    ) -> Result<Vec<AcpConfigOption>, AgentDriverError> {
+        Ok(AcpStdioDriver::set_config_option(self, session_id, config_id, value).await?)
     }
 
-    async fn shutdown(&self) -> Result<(), StdioRunnerError> {
-        AcpStdioDriver::shutdown(self).await
+    async fn shutdown(&self) -> Result<(), AgentDriverError> {
+        Ok(AcpStdioDriver::shutdown(self).await?)
+    }
+}
+
+/// [`AgentDriverFactory`] spawning [`AcpStdioDriver`] instances over child-process stdio.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdioAgentDriverFactory;
+
+impl StdioAgentDriverFactory {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl AgentDriverFactory for StdioAgentDriverFactory {
+    async fn spawn(&self, config: &AcpSpawnConfig) -> Result<Arc<dyn AgentDriver>, AgentDriverError> {
+        let mut proc_cfg = StdioProcessConfig::new(&config.command, config.args.clone());
+        if let Some(cwd) = &config.cwd {
+            proc_cfg = proc_cfg.with_current_dir(cwd);
+        }
+        if !config.env.is_empty() {
+            proc_cfg = proc_cfg.with_env(config.env.clone());
+        }
+        let runner = StdioProcessRunner::spawn(proc_cfg).await?;
+        Ok(Arc::new(AcpStdioDriver::new(runner)))
     }
 }
 
