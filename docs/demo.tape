@@ -42,7 +42,7 @@ Sleep 700ms
 Alt+j
 Sleep 700ms
 
-# 2. Enter MANAGE mode (Ctrl+G), create [n]ew root agent (n) and spawn child [s]hell (s)
+# 2. Enter MANAGE mode (Ctrl+G), create [n]ew root agent (n) and spawn child [s]hell threads (s)
 Ctrl+G
 Sleep 600ms
 Type "n"
@@ -58,11 +58,23 @@ Sleep 400ms
 Type "s"
 Sleep 900ms
 
-# 3. Cycle sibling threads in WRITE mode (Alt+H / Alt+L)
+# 3. Navigate in WRITE mode: Alt+H/L & Shift+Up/Down siblings, Shift+Left/Right parent/child, and Alt+1..9 root jumps
 Alt+h
-Sleep 700ms
+Sleep 500ms
 Alt+l
-Sleep 700ms
+Sleep 500ms
+Shift+Up
+Sleep 500ms
+Shift+Down
+Sleep 500ms
+Shift+Left
+Sleep 600ms
+Alt+1
+Sleep 600ms
+Alt+2
+Sleep 600ms
+Shift+Right
+Sleep 600ms
 
 # 4. Return to MANAGE (Ctrl+G), fuzzy-filter Help (? -> /), delete a thread (d -> y), and switch to Worktrees view (Tab)
 Ctrl+G
