@@ -1,8 +1,4 @@
-use std::ffi::OsString;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -17,76 +13,10 @@ use grein_tui::engine_port::{
 use grein_tui::render::render_app_mut;
 use grein_tui::runner::now_epoch_ms;
 use grein_tui::selection::SelectionPane;
+use grein_tui::TuiServices;
 use ratatui::backend::TestBackend;
 use ratatui::text::Span;
 use ratatui::Terminal;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct ClipboardMockGuard {
-    dir: PathBuf,
-    prev_path: Option<OsString>,
-    prev_wayland: Option<OsString>,
-}
-
-impl ClipboardMockGuard {
-    fn new(clipboard_text: &str, primary_text: Option<&str>) -> Self {
-        let unique = format!(
-            "grein-clip-test-{}-{}",
-            std::process::id(),
-            now_epoch_ms()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&dir).unwrap();
-
-        let clip_file = dir.join("clip.txt");
-        let prim_file = dir.join("prim.txt");
-        fs::write(&clip_file, clipboard_text).unwrap();
-        if let Some(p) = primary_text {
-            fs::write(&prim_file, p).unwrap();
-        }
-
-        let wl_paste_script = format!(
-            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--primary\" ]; then\n    if [ -f \"{prim}\" ]; then\n      cat \"{prim}\"\n      exit 0\n    fi\n    exit 1\n  fi\ndone\ncat \"{clip}\"\n",
-            prim = prim_file.display(),
-            clip = clip_file.display(),
-        );
-        let wl_path = dir.join("wl-paste");
-        fs::write(&wl_path, wl_paste_script).unwrap();
-        let mut perms = fs::metadata(&wl_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&wl_path, perms).unwrap();
-
-        let prev_path = std::env::var_os("PATH");
-        let prev_wayland = std::env::var_os("WAYLAND_DISPLAY");
-        let new_path = match &prev_path {
-            Some(p) => format!("{}:{}", dir.display(), p.to_string_lossy()),
-            None => dir.display().to_string(),
-        };
-        std::env::set_var("PATH", new_path);
-        std::env::set_var("WAYLAND_DISPLAY", "grein-test-wayland");
-
-        Self {
-            dir,
-            prev_path,
-            prev_wayland,
-        }
-    }
-}
-
-impl Drop for ClipboardMockGuard {
-    fn drop(&mut self) {
-        match &self.prev_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match &self.prev_wayland {
-            Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-            None => std::env::remove_var("WAYLAND_DISPLAY"),
-        }
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
 
 fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
     MouseEvent {
@@ -145,7 +75,11 @@ fn draw_app(terminal: &mut Terminal<TestBackend>, app: &mut App) {
 }
 
 fn setup_agent_app() -> App {
-    let mut app = App::new();
+    setup_agent_app_with_services(TuiServices::default())
+}
+
+fn setup_agent_app_with_services(services: TuiServices) -> App {
+    let mut app = App::with_services(services);
     app.active_thread_id = "t1".to_string();
     app.threads = vec![
         ThreadItem {
@@ -718,8 +652,11 @@ fn test_worktree_diff_selection_and_worktree_row_click() {
 
 #[test]
 fn test_composer_paste_normalization_ctrl_v_middle_click_and_inline_prompts() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut app = setup_agent_app();
+    let clip = Arc::new(InjectedTestClipboard::new(
+        Ok("clip\r\npayload"),
+        Ok("primary-payload"),
+    ));
+    let mut app = setup_agent_app_with_services(TuiServices::default().with_clipboard(clip.clone()));
     let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
     draw_app(&mut terminal, &mut app);
 
@@ -760,29 +697,26 @@ fn test_composer_paste_normalization_ctrl_v_middle_click_and_inline_prompts() {
     assert!(!app.handle_paste_event("ignored"));
 
     // 3. Ctrl+V in Composer reads clipboard; Middle click reads primary -> clipboard and focuses hovered Composer.
-    {
-        let _clip = ClipboardMockGuard::new("clip\r\npayload", Some("primary-payload"));
-        app.input_buffer.clear();
-        app.cursor_position = 0;
-        app.set_focus(FocusedPane::Composer);
-        assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)));
-        assert_eq!(app.input_buffer, "clip\npayload");
+    app.input_buffer.clear();
+    app.cursor_position = 0;
+    app.set_focus(FocusedPane::Composer);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+    assert_eq!(app.input_buffer, "clip\npayload");
 
-        // Switch focus to Tree, middle-click inside Composer -> focuses Composer and pastes primary!
-        app.set_focus(FocusedPane::Tree);
-        draw_app(&mut terminal, &mut app);
-        let composer_inner = app.pane_rects.composer_inner.unwrap();
-        app.input_buffer.clear();
-        app.cursor_position = 0;
-        assert!(app.handle_mouse_event(mouse(
-            MouseEventKind::Down(MouseButton::Middle),
-            composer_inner.x + 1,
-            composer_inner.y,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(app.focused_pane(), FocusedPane::Composer);
-        assert_eq!(app.input_buffer, "primary-payload");
-    }
+    // Switch focus to Tree, middle-click inside Composer -> focuses Composer and pastes primary!
+    app.set_focus(FocusedPane::Tree);
+    draw_app(&mut terminal, &mut app);
+    let composer_inner = app.pane_rects.composer_inner.unwrap();
+    app.input_buffer.clear();
+    app.cursor_position = 0;
+    assert!(app.handle_mouse_event(mouse(
+        MouseEventKind::Down(MouseButton::Middle),
+        composer_inner.x + 1,
+        composer_inner.y,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert_eq!(app.input_buffer, "primary-payload");
 
     // 4. `>_` Terminal Ctrl+V still emits raw `\x16` untouched!
     app.switch_thread("term1");
@@ -797,27 +731,26 @@ fn test_composer_paste_normalization_ctrl_v_middle_click_and_inline_prompts() {
     );
 
     // 5. Middle-click with no primary falls back to clipboard, focuses hovered Terminal, and writes PTY paste.
-    {
-        let _clip = ClipboardMockGuard::new("fallback-clip", None);
-        app.set_focus(FocusedPane::Tree);
-        draw_app(&mut terminal, &mut app);
-        let right_inner = app.pane_rects.right_inner.unwrap();
-        app.pending_actions.clear();
-        assert!(app.handle_mouse_event(mouse(
-            MouseEventKind::Down(MouseButton::Middle),
-            right_inner.x + 1,
-            right_inner.y,
-            KeyModifiers::NONE,
-        )));
-        assert_eq!(app.focused_pane(), FocusedPane::Terminal);
-        assert_eq!(
-            app.pending_actions.pop_front(),
-            Some(AppAction::PtyWrite {
-                thread_id: "term1".to_string(),
-                bytes: b"fallback-clip".to_vec(),
-            })
-        );
-    }
+    clip.set_clipboard(Ok("fallback-clip"));
+    clip.set_primary(Err("primary unavailable"));
+    app.set_focus(FocusedPane::Tree);
+    draw_app(&mut terminal, &mut app);
+    let right_inner = app.pane_rects.right_inner.unwrap();
+    app.pending_actions.clear();
+    assert!(app.handle_mouse_event(mouse(
+        MouseEventKind::Down(MouseButton::Middle),
+        right_inner.x + 1,
+        right_inner.y,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::PtyWrite {
+            thread_id: "term1".to_string(),
+            bytes: b"fallback-clip".to_vec(),
+        })
+    );
 }
 
 #[test]
@@ -910,6 +843,11 @@ impl InjectedTestClipboard {
 
     fn copied(&self) -> Vec<String> {
         self.copied.lock().unwrap().clone()
+    }
+
+    fn set_clipboard(&self, clipboard: Result<&str, &str>) {
+        *self.clipboard_result.lock().unwrap() =
+            clipboard.map(str::to_string).map_err(str::to_string);
     }
 
     fn set_primary(&self, primary: Result<&str, &str>) {
