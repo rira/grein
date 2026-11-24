@@ -1,13 +1,14 @@
 use crossterm::event::KeyEvent;
 use ratatui::text::Line;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io;
 use std::sync::Arc;
 use thiserror::Error;
 
 use crate::clipboard::{ChainedClipboardDriver, ClipboardPort};
 use crate::engine_port::{
-    AgentConfigChoice, AgentConfigOption, AgentSlashCommand, PtyScreenSnapshot, SubagentSnapshot,
-    ThreadMeta, WorktreeEntry,
+    AgentConfigChoice, AgentConfigOption, AgentProviderInfo, AgentSlashCommand, PreferencesPort,
+    PtyScreenSnapshot, SubagentSnapshot, ThreadMeta, UserPreferencesSnapshot, WorktreeEntry,
 };
 use crate::keymap::Keymap;
 use crate::markdown::LineMeta;
@@ -18,15 +19,47 @@ use crate::transcript::{ThreadTranscript, TranscriptViewport};
 
 use super::threads::is_generic_agent_placeholder;
 
+struct NoopPreferencesPort;
+
+#[async_trait::async_trait]
+impl PreferencesPort for NoopPreferencesPort {
+    async fn load_preferences(&self) -> io::Result<UserPreferencesSnapshot> {
+        Ok(UserPreferencesSnapshot::default())
+    }
+
+    async fn save_theme_preference(&self, _theme: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn save_keybinding_preference(&self, _action: &str, _binding: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn remove_keybinding_preference(&self, _action: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn save_ui_pref(&self, _key: &str, _value: &str) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct TuiServices {
     pub clipboard: Arc<dyn ClipboardPort>,
     pub pager: Arc<dyn PagerRunner>,
+    pub preferences: Arc<dyn PreferencesPort>,
+    has_custom_preferences: bool,
 }
 
 impl TuiServices {
     pub fn new(clipboard: Arc<dyn ClipboardPort>, pager: Arc<dyn PagerRunner>) -> Self {
-        Self { clipboard, pager }
+        Self {
+            clipboard,
+            pager,
+            preferences: Arc::new(NoopPreferencesPort),
+            has_custom_preferences: false,
+        }
     }
 
     pub fn with_clipboard(mut self, clipboard: Arc<dyn ClipboardPort>) -> Self {
@@ -38,6 +71,16 @@ impl TuiServices {
         self.pager = pager;
         self
     }
+
+    pub fn with_preferences(mut self, preferences: Arc<dyn PreferencesPort>) -> Self {
+        self.preferences = preferences;
+        self.has_custom_preferences = true;
+        self
+    }
+
+    pub(crate) fn has_custom_preferences(&self) -> bool {
+        self.has_custom_preferences
+    }
 }
 
 impl Default for TuiServices {
@@ -45,6 +88,8 @@ impl Default for TuiServices {
         Self {
             clipboard: Arc::new(ChainedClipboardDriver::default()),
             pager: Arc::new(DefaultPagerRunner::new()),
+            preferences: Arc::new(NoopPreferencesPort),
+            has_custom_preferences: false,
         }
     }
 }
@@ -54,6 +99,7 @@ impl std::fmt::Debug for TuiServices {
         f.debug_struct("TuiServices")
             .field("clipboard", &"<dyn ClipboardPort>")
             .field("pager", &"<dyn PagerRunner>")
+            .field("preferences", &"<dyn PreferencesPort>")
             .finish()
     }
 }
@@ -257,6 +303,12 @@ pub struct ConfigPickerModal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPickerModal {
+    pub selected_idx: usize,
+    pub target_thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
     Scrolled { delta: i32 },
     None,
@@ -275,6 +327,20 @@ pub enum AppAction {
     CreateRoot {
         title: Option<String>,
         cwd: Option<String>,
+    },
+    CreateAgentThread {
+        title: Option<String>,
+        cwd: Option<String>,
+        parent_thread_id: Option<String>,
+        agent_provider: Option<String>,
+    },
+    SwitchThreadProvider {
+        thread_id: String,
+        provider: String,
+    },
+    RefreshAgentProviders,
+    SaveDefaultAgentProvider {
+        provider: String,
     },
     RenameThread {
         thread_id: String,
@@ -565,6 +631,9 @@ pub struct App {
     pub theme_overrides: BTreeMap<String, String>,
     pub theme_palette: ThemePalette,
     pub theme_picker: Option<ThemePickerModal>,
+    pub agent_providers: Vec<AgentProviderInfo>,
+    pub agent_picker: Option<AgentPickerModal>,
+    pub default_agent_provider: Option<String>,
     pub keymap: Keymap,
     pub sidebar_layout: SidebarLayoutConfig,
     pub palette_active: bool,
@@ -671,6 +740,9 @@ impl Default for App {
             theme_overrides: BTreeMap::new(),
             theme_palette: ThemePalette::from_preset(ThemePreset::TokyoNight),
             theme_picker: None,
+            agent_providers: Vec::new(),
+            agent_picker: None,
+            default_agent_provider: None,
             keymap: Keymap::default(),
             sidebar_layout: SidebarLayoutConfig::default(),
             palette_active: false,

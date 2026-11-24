@@ -49,6 +49,7 @@ pub(crate) fn parse_term_cwd(rest: &str) -> Option<String> {
 
 pub fn palette_command_specs() -> &'static [(&'static str, &'static str)] {
     &[
+        ("agent", "Open agent picker or spawn sibling thread"),
         ("theme", "Open theme picker or set theme"),
         ("bind", "Bind WRITE key: :bind <action> <chord>"),
         ("unbind", "Reset/unbind action: :unbind <action>"),
@@ -105,6 +106,11 @@ impl App {
                 substring_matches.push((cmd.to_string(), desc.to_string()));
             }
         }
+        self.append_provider_palette_suggestions(
+            &needle,
+            &mut prefix_matches,
+            &mut substring_matches,
+        );
         prefix_matches.extend(substring_matches);
         prefix_matches
     }
@@ -454,6 +460,10 @@ impl App {
                 self.execute_autocomplete_command(rest);
                 true
             }
+            "/agent" => {
+                self.execute_agent_command(rest, from_palette);
+                true
+            }
             "/theme" => {
                 self.apply_theme_by_name(rest);
                 true
@@ -488,7 +498,9 @@ impl App {
             return;
         }
         let normalized = format!("/{trimmed}");
-        if !self.execute_slash_command(&normalized, true) {
+        if !self.execute_slash_command(&normalized, true)
+            && !self.try_execute_provider_palette_command(trimmed)
+        {
             let cmd_name = trimmed.split_whitespace().next().unwrap_or(trimmed);
             self.status_notice = Some(format!("Unknown sidebar command: :{cmd_name}"));
         }

@@ -1,3 +1,4 @@
+mod agent_picker;
 mod commands;
 mod completion;
 mod editing;
@@ -29,11 +30,11 @@ pub use threads::{
 #[allow(unused_imports)]
 pub(crate) use transcript_ops::CopyMode;
 pub use types::{
-    AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, ConfigPickerModal, FocusDirection,
-    FocusPane, FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm, PendingThreadDelete,
-    PendingWorktreeDelete, RenamePromptState, SidebarLayoutConfig, SidebarMode, SidebarView,
-    ThreadDisplayParts, ThreadItem, TreeAction, TuiError, TuiServices, WorktreeAutocompleteItem,
-    WorktreeRow,
+    AgentPickerModal, AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, ConfigPickerModal,
+    FocusDirection, FocusPane, FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm,
+    PendingThreadDelete, PendingWorktreeDelete, RenamePromptState, SidebarLayoutConfig,
+    SidebarMode, SidebarView, ThreadDisplayParts, ThreadItem, TreeAction, TuiError, TuiServices,
+    WorktreeAutocompleteItem, WorktreeRow,
 };
 #[allow(unused_imports)]
 pub(crate) use worktrees::{parse_worktree_autocomplete_query, worktree_matches_autocomplete};
@@ -69,6 +70,7 @@ impl App {
             || self.pending_thread_delete.is_some()
             || self.pending_quit_confirm.is_some()
             || self.theme_picker.is_some()
+            || self.agent_picker.is_some()
             || self.config_picker.is_some()
             || self.show_help_modal
     }

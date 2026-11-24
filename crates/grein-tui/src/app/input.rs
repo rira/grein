@@ -108,6 +108,10 @@ impl App {
                 });
                 None
             }
+            (KeyCode::Char('A'), _) if no_ctrl_alt => {
+                self.open_agent_picker();
+                None
+            }
             (KeyCode::Char('w'), _) if no_ctrl_alt => {
                 let (sel_id, _) = self.selected_tree_thread_info();
                 let thread_id = if sel_id.is_empty() {

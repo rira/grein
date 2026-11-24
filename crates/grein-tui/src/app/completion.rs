@@ -7,6 +7,7 @@ use super::types::{App, AppAction, FocusedPane};
 
 const STATIC_SLASH_COMMANDS: &[&str] = &[
     "/theme",
+    "/agent",
     "/sidebar",
     "/bind",
     "/unbind",

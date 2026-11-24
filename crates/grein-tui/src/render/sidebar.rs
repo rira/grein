@@ -98,6 +98,17 @@ fn render_thread_row(
     });
     let fold_prefix = if hidden_descendants > 0 { "▸ " } else { "" };
     let fold_badge = (hidden_descendants > 0).then(|| format!(" (+{hidden_descendants})"));
+    let provider_badge = (!is_terminal)
+        .then(|| {
+            state
+                .thread_meta
+                .get(id)
+                .and_then(|m| m.agent_provider.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|p| format!(" [{p}]"))
+        })
+        .flatten();
 
     if is_selected {
         let bg = theme.selection_bg;
@@ -144,6 +155,9 @@ fn render_thread_row(
         }
         if is_merged {
             spans.push(Span::styled(" [joined]", sel_muted));
+        }
+        if let Some(badge) = provider_badge {
+            spans.push(Span::styled(badge, sel_muted));
         }
         Line::from(spans)
     } else {
@@ -194,6 +208,9 @@ fn render_thread_row(
         }
         if is_merged {
             spans.push(Span::styled(" [joined]", muted_style));
+        }
+        if let Some(badge) = provider_badge {
+            spans.push(Span::styled(badge, muted_style));
         }
         Line::from(spans)
     }
@@ -371,10 +388,21 @@ fn render_sidebar_bottom_panel(
             .min(inner.height.saturating_sub(2) as usize);
         let reserved = 1 + max_sugg as u16;
         let top_y = inner.y + inner.height - reserved;
+        let (window_start, selected_idx) = super::agent_picker::palette_window_bounds(
+            suggestions.len(),
+            state.palette_match_idx,
+            max_sugg,
+        );
 
-        for (i, (cmd, desc)) in suggestions.iter().take(max_sugg).enumerate() {
-            let row_rect = Rect::new(inner.x, top_y + i as u16, inner.width, 1);
-            let is_sel = i == state.palette_match_idx.min(suggestions.len().saturating_sub(1));
+        for (row_i, (abs_i, (cmd, desc))) in suggestions
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(max_sugg)
+            .enumerate()
+        {
+            let row_rect = Rect::new(inner.x, top_y + row_i as u16, inner.width, 1);
+            let is_sel = abs_i == selected_idx;
             let line = if is_sel {
                 Line::from(vec![
                     Span::styled(
