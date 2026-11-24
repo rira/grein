@@ -211,7 +211,20 @@ pub(super) fn render_worktree_diff_pane(
                     if entry.attached_thread_ids.is_empty() {
                         "none".to_string()
                     } else {
-                        entry.attached_thread_ids.join(", ")
+                        entry
+                            .attached_thread_ids
+                            .iter()
+                            .map(|tid| {
+                                let raw_title = state
+                                    .threads
+                                    .iter()
+                                    .find(|t| t.id == *tid)
+                                    .map(|t| t.title.as_str())
+                                    .unwrap_or(tid.as_str());
+                                state.display_title_for(tid, raw_title)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     },
                     Style::default().fg(theme.text),
                 ),

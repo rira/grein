@@ -497,11 +497,20 @@ fn render_sidebar_bottom_panel(
                 .iter()
                 .map(|w| w.repo_root.as_str())
                 .collect();
-            let text = format!(
-                "{} repos · {} worktrees · p prune",
-                repos.len(),
-                state.worktrees.len()
-            );
+            let target_id = state.active_thread_id();
+            let raw_title = state
+                .threads
+                .iter()
+                .find(|t| t.id == target_id)
+                .map(|t| t.title.as_str())
+                .unwrap_or(target_id);
+            let target_title = state.display_title_for(target_id, raw_title);
+            let counts = format!(" · {} repos · {} wt", repos.len(), state.worktrees.len());
+            let max_title = (inner.width as usize)
+                .saturating_sub(8 + counts.chars().count())
+                .max(6);
+            let short_title = truncate_single_line(&target_title, max_title);
+            let text = format!("Target: {short_title}{counts}");
             truncate_single_line(&text, inner.width as usize)
         }
     };

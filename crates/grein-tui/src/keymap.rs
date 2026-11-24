@@ -281,6 +281,10 @@ pub enum BindableAction {
     ToggleCards,
     CopyReply,
     Quit,
+    AcceptCompletion,
+    NextCompletion,
+    PrevCompletion,
+    DismissCompletion,
 }
 
 impl BindableAction {
@@ -302,7 +306,21 @@ impl BindableAction {
             Self::ToggleCards,
             Self::CopyReply,
             Self::Quit,
+            Self::AcceptCompletion,
+            Self::NextCompletion,
+            Self::PrevCompletion,
+            Self::DismissCompletion,
         ]
+    }
+
+    pub fn is_composer_completion(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptCompletion
+                | Self::NextCompletion
+                | Self::PrevCompletion
+                | Self::DismissCompletion
+        )
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -323,6 +341,10 @@ impl BindableAction {
             Self::ToggleCards => "toggle_cards",
             Self::CopyReply => "copy_reply",
             Self::Quit => "quit",
+            Self::AcceptCompletion => "accept_completion",
+            Self::NextCompletion => "next_completion",
+            Self::PrevCompletion => "prev_completion",
+            Self::DismissCompletion => "dismiss_completion",
         }
     }
 
@@ -344,6 +366,10 @@ impl BindableAction {
             Self::ToggleCards => "Toggle tool/shell cards",
             Self::CopyReply => "Copy last reply or terminal screen",
             Self::Quit => "Quit Grein",
+            Self::AcceptCompletion => "Accept inline Composer completion",
+            Self::NextCompletion => "Next inline Composer completion",
+            Self::PrevCompletion => "Previous inline Composer completion",
+            Self::DismissCompletion => "Dismiss inline Composer completion",
         }
     }
 
@@ -368,6 +394,12 @@ impl BindableAction {
             "toggle_cards" | "cards" => Some(Self::ToggleCards),
             "copy_reply" | "copy" => Some(Self::CopyReply),
             "quit" | "exit" => Some(Self::Quit),
+            "accept_completion" | "complete" | "completion_accept" => Some(Self::AcceptCompletion),
+            "next_completion" | "completion_next" => Some(Self::NextCompletion),
+            "prev_completion" | "previous_completion" | "completion_prev" => {
+                Some(Self::PrevCompletion)
+            }
+            "dismiss_completion" | "completion_dismiss" => Some(Self::DismissCompletion),
             _ => None,
         }
     }
@@ -380,6 +412,18 @@ impl BindableAction {
             Self::ScrollDown => vec![KeyChord::new(KeyCode::Char('j'), KeyModifiers::ALT)],
             Self::PrevSibling => vec![KeyChord::new(KeyCode::Char('h'), KeyModifiers::ALT)],
             Self::NextSibling => vec![KeyChord::new(KeyCode::Char('l'), KeyModifiers::ALT)],
+            Self::AcceptCompletion => vec![
+                KeyChord::new(KeyCode::Tab, KeyModifiers::NONE),
+                KeyChord::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            ],
+            Self::NextCompletion => vec![
+                KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE),
+                KeyChord::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            ],
+            Self::PrevCompletion => vec![KeyChord::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
+            Self::DismissCompletion => {
+                vec![KeyChord::new(KeyCode::Char('e'), KeyModifiers::CONTROL)]
+            }
             _ => Vec::new(),
         }
     }
@@ -451,6 +495,16 @@ impl Keymap {
             return Err("enter_manage_mode must keep at least one binding".to_string());
         }
         for chord in &chords {
+            if let Some(manage_chords) = self.bindings.get(&BindableAction::EnterManageMode) {
+                if action != BindableAction::EnterManageMode
+                    && manage_chords.contains(chord)
+                    && manage_chords.len() == 1
+                {
+                    return Err("enter_manage_mode must keep at least one binding".to_string());
+                }
+            }
+        }
+        for chord in &chords {
             for (&other_action, other_chords) in &mut self.bindings {
                 if other_action != action {
                     other_chords.retain(|c| c != chord);
@@ -477,7 +531,16 @@ impl Keymap {
 
     pub fn match_write_key(&self, key: KeyEvent) -> Option<BindableAction> {
         for (&action, chords) in &self.bindings {
-            if chords.iter().any(|c| c.matches(key)) {
+            if !action.is_composer_completion() && chords.iter().any(|c| c.matches(key)) {
+                return Some(action);
+            }
+        }
+        None
+    }
+
+    pub fn match_composer_completion_key(&self, key: KeyEvent) -> Option<BindableAction> {
+        for (&action, chords) in &self.bindings {
+            if action.is_composer_completion() && chords.iter().any(|c| c.matches(key)) {
                 return Some(action);
             }
         }

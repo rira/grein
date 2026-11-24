@@ -1,5 +1,6 @@
 mod chrome;
 mod composer;
+mod help_modal;
 mod layout;
 mod modals;
 mod panes;
@@ -11,6 +12,7 @@ mod tests;
 pub(crate) use composer::{
     layout_composer_visual_rows, ComposerVisualLayout, ComposerVisualRow,
 };
+pub use help_modal::{fuzzy_match_positions, HelpEntry};
 pub use layout::{border_style, compute_app_layout, compute_sidebar_width, render_markdown_lines};
 pub use panes::build_transcript_wrapped_lines;
 pub use sidebar::render_tree_view;
@@ -26,12 +28,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use chrome::{render_status_bar, render_subagent_strip};
-use composer::layout_composer_text;
+use composer::{layout_composer_text, render_composer_ghost_suffix};
+use help_modal::render_help_modal;
 use layout::{rounded_block, themed_border_style};
 use modals::{
-    render_config_picker_modal, render_help_modal, render_permission_modal,
-    render_quit_confirm_modal, render_theme_picker_modal, render_thread_delete_modal,
-    render_worktree_autocomplete_popup, render_worktree_delete_modal,
+    render_config_picker_modal, render_permission_modal, render_quit_confirm_modal,
+    render_theme_picker_modal, render_thread_delete_modal, render_worktree_autocomplete_popup,
+    render_worktree_delete_modal,
 };
 use panes::{recompute_search_for_render, render_terminal_pane, render_worktree_diff_pane};
 use sidebar::{render_tree_view_inner, selected_tree_thread, TreeRenderResult};
@@ -124,7 +127,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         || state.focused_pane == PaneFocus::Tree
         || state.focus == PaneFocus::Tree;
     let showing_worktrees_diff =
-        !state.sidebar_hidden && state.sidebar_view == SidebarView::Worktrees;
+        tree_focused && !state.sidebar_hidden && state.sidebar_view == SidebarView::Worktrees;
     let preview =
         if tree_focused && !state.sidebar_hidden && state.sidebar_view == SidebarView::Grein {
             selected_tree_thread(state).filter(|(sel_id, _)| *sel_id != active_id)
@@ -286,7 +289,35 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let mut composer_scroll_y = state.composer_scroll_y;
     if let Some(composer_layout) = composer_layout {
         let composer_inner_width = layout.composer_area.width.saturating_sub(2);
-        let composer_block = rounded_block(theme, composer_focused).title(" Composer ");
+        let active_completion = state.composer_completion.as_ref().filter(|ac| {
+            composer_focused
+                && !state.has_active_modal()
+                && !state.transcript_search.editing
+                && !state.worktree_autocomplete_open
+                && state.composer_autocomplete_enabled
+                && ac.active().is_some()
+        });
+        let active_ghost = active_completion
+            .and_then(|ac| ac.active())
+            .map(|s| s.insert_suffix.as_str());
+        let mut composer_block = rounded_block(theme, composer_focused).title(" Composer ");
+        if let Some(ac) = active_completion {
+            let counter = format!("{}/{}", ac.selected_idx + 1, ac.matches.len());
+            let hint = if composer_inner_width >= 34 {
+                format!(" Tab/C-y accept · {counter} ")
+            } else {
+                format!(" {counter} ")
+            };
+            if composer_inner_width as usize >= hint.len() + 10 {
+                composer_block = composer_block.title_top(
+                    ratatui::text::Line::from(Span::styled(
+                        hint,
+                        Style::default().fg(theme.muted),
+                    ))
+                    .right_aligned(),
+                );
+            }
+        }
 
         let inner_height = layout.composer_area.height.saturating_sub(2).max(1);
         let max_composer_scroll = visual_line_count.saturating_sub(inner_height);
@@ -304,6 +335,23 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
 
         if composer_focused && !state.has_active_modal() && !state.transcript_search.editing {
             let visible_row = composer_layout.cursor_row.saturating_sub(composer_scroll_y);
+            if let Some(ghost) = active_ghost {
+                if composer_layout.cursor_row >= composer_scroll_y && visible_row < inner_height {
+                    render_composer_ghost_suffix(
+                        f,
+                        Rect::new(
+                            layout.composer_area.x + 1,
+                            layout.composer_area.y + 1,
+                            composer_inner_width,
+                            inner_height,
+                        ),
+                        composer_layout.cursor_col,
+                        visible_row,
+                        ghost,
+                        theme,
+                    );
+                }
+            }
             let cursor_x = layout.composer_area.x
                 + 1
                 + composer_layout

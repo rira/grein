@@ -1,4 +1,5 @@
 mod commands;
+mod completion;
 mod editing;
 mod input;
 mod navigation;

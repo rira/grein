@@ -228,6 +228,12 @@ pub async fn run_with_engine_events<B: Backend>(
     while let Ok(event) = engine_events.try_recv() {
         handle_streamed_engine_event(&mut app, event, &mut pending_local_merges);
     }
+    let initial_cwd = app
+        .thread_meta
+        .get(&app.active_thread_id)
+        .and_then(|m| m.cwd.clone());
+    app.pending_actions
+        .push_back(AppAction::FetchAutocompleteContext { cwd: initial_cwd });
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     drain_pending_actions(
         &mut app,
@@ -317,6 +323,8 @@ pub async fn run_with_engine_events<B: Backend>(
                             meta.cwd = Some(path.clone());
                         }
                         app.status_notice = Some(format!("Switched worktree: {path}"));
+                        app.pending_actions
+                            .push_back(AppAction::FetchAutocompleteContext { cwd: Some(path) });
                     }
                     RunnerLocalEvent::WorktreeRemoved { path } => {
                         app.worktrees.retain(|w| w.path != path);
@@ -355,6 +363,11 @@ pub async fn run_with_engine_events<B: Backend>(
                             summary
                         };
                         app.status_notice = Some(msg);
+                    }
+                    RunnerLocalEvent::AutocompleteContextLoaded { prompts, files } => {
+                        app.autocomplete_recent_prompts = prompts;
+                        app.autocomplete_workspace_files = files;
+                        app.sync_composer_completion();
                     }
                     RunnerLocalEvent::OpenConfigPicker {
                         snapshot,

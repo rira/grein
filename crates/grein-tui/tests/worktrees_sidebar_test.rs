@@ -310,7 +310,7 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
     let status = render_rect(&terminal, Rect::new(0, 27, 120, 1));
     assert!(
         status.contains("MANAGE · WORKTREES")
-            && status.contains("[↵]attach [s]hell [w]orktree [p]rune"),
+            && status.contains("[↵]attach [n]ew [s]hell [w]orktree [p]rune"),
         "{status}"
     );
     assert!(screen.contains("ᛇ Grein │ ⎇ Worktrees"), "{screen}");
@@ -444,11 +444,16 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         })
     );
     assert_eq!(app.status_notice.as_deref(), Some("Switching worktree..."));
-    // Enter on a worktree attaches and returns to WRITE; Ctrl+G re-enters MANAGE Worktrees for s/w/d
+    assert_eq!(app.sidebar_view, SidebarView::Grein);
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    // Enter on a worktree attaches and returns to Grein + WRITE; Ctrl+G then Tab re-enters MANAGE Worktrees for s/w/n/d
     app.handle_key_event(ctrl('g'));
+    app.handle_key_event(key(KeyCode::Tab));
     assert_eq!(app.focused_pane(), FocusedPane::Tree);
+    assert_eq!(app.sidebar_view, SidebarView::Worktrees);
     app.pending_actions.clear();
 
+    app.worktree_selected_idx = 2;
     app.handle_key_event(key(KeyCode::Char('s')));
     assert!(matches!(
         app.pending_actions.pop_front(),
@@ -458,7 +463,10 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
             ..
         }) if pid == "t-auth" && cwd == "/repos/alpha/.grein/worktrees/feat-auth"
     ));
+    assert_eq!(app.sidebar_view, SidebarView::Grein);
 
+    app.handle_key_event(key(KeyCode::Tab));
+    app.pending_actions.clear();
     app.handle_key_event(key(KeyCode::Char('w')));
     assert_eq!(
         app.pending_actions.pop_front(),
@@ -467,7 +475,19 @@ fn test_worktrees_sidebar_grouping_longest_prefix_fold_filter_actions_and_delete
         })
     );
     app.handle_key_event(key(KeyCode::Char('n')));
-    assert!(app.pending_actions.is_empty(), "'n' must stay clean on Worktrees view");
+    assert_eq!(
+        app.pending_actions.pop_front(),
+        Some(AppAction::CreateRoot {
+            title: None,
+            cwd: Some("/repos/alpha/.grein/worktrees/feat-auth".to_string()),
+        })
+    );
+    assert_eq!(app.sidebar_view, SidebarView::Grein);
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+
+    app.handle_key_event(ctrl('g'));
+    app.handle_key_event(key(KeyCode::Tab));
+    app.pending_actions.clear();
 
     // Primary deletion guard
     app.worktree_selected_idx = 1; // main (primary)
@@ -895,8 +915,9 @@ async fn test_e2e_runner_worktree_switch_ensure_remove_refresh_list_and_metadata
     .await;
     let meta_after_switch = engine.state.lock().unwrap().meta_calls;
 
-    // Return to MANAGE Worktrees, press 'w' -> ensure_thread_worktree + refreshes list_worktrees & thread_metadata
+    // Return to MANAGE Worktrees (Ctrl+G -> Grein, Tab -> Worktrees), press 'w' -> ensure_thread_worktree + refreshes list_worktrees & thread_metadata
     key_tx.send(Event::Key(ctrl('g'))).unwrap();
+    key_tx.send(Event::Key(key(KeyCode::Tab))).unwrap();
     key_tx.send(Event::Key(key(KeyCode::Char('w')))).unwrap();
     wait_for("ensure_thread_worktree and refresh", || {
         let g = engine.state.lock().unwrap();

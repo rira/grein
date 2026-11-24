@@ -1136,20 +1136,27 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
         app.pending_actions.pop_front(),
         Some(AppAction::CreateRoot {
             title: Some("Fresh Trunk".to_string()),
+            cwd: None,
         })
     );
     app.submit_composer_prompt("/new");
     assert_eq!(
         app.pending_actions.pop_front(),
-        Some(AppAction::CreateRoot { title: None })
+        Some(AppAction::CreateRoot {
+            title: None,
+            cwd: None,
+        })
     );
 
-    // 'n' in Tree emits CreateRoot { title: None }
+    // 'n' in Tree emits CreateRoot { title: None, cwd: None }
     app.set_focus(FocusedPane::Tree);
     app.handle_key_event(key(KeyCode::Char('n')));
     assert_eq!(
         app.pending_actions.pop_front(),
-        Some(AppAction::CreateRoot { title: None })
+        Some(AppAction::CreateRoot {
+            title: None,
+            cwd: None,
+        })
     );
 
     // Alt+N / Alt+R / F2 are unbound in WRITE mode (no hijacks while composing)

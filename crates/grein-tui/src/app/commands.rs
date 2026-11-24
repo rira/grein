@@ -57,6 +57,7 @@ pub fn palette_command_specs() -> &'static [(&'static str, &'static str)] {
         ("worktree", "Ensure or switch thread worktree"),
         ("worktrees", "Switch to Worktrees sidebar view"),
         ("prune", "Prune stale git worktrees"),
+        ("autocomplete", "Toggle inline word autocomplete (on|off)"),
         ("term", "Spawn terminal shell [path]"),
         ("fork", "Fork selected branch"),
         ("new", "Create new root agent thread"),
@@ -174,8 +175,10 @@ impl App {
             }
             BindableAction::NewAgent => {
                 self.status_notice = None;
-                self.pending_actions
-                    .push_back(AppAction::CreateRoot { title: None });
+                self.pending_actions.push_back(AppAction::CreateRoot {
+                    title: None,
+                    cwd: None,
+                });
             }
             BindableAction::ForkThread => {
                 let source_thread_id = self.selected_or_active_thread_id();
@@ -196,6 +199,8 @@ impl App {
             }
             BindableAction::Help => {
                 self.help_scroll_offset = 0;
+                self.help_filter_active = false;
+                self.help_filter_query.clear();
                 self.show_help_modal = true;
             }
             BindableAction::ToggleCards => {
@@ -207,6 +212,10 @@ impl App {
             BindableAction::Quit => {
                 self.request_quit_with_confirm();
             }
+            BindableAction::AcceptCompletion
+            | BindableAction::NextCompletion
+            | BindableAction::PrevCompletion
+            | BindableAction::DismissCompletion => {}
         }
     }
 
@@ -223,6 +232,8 @@ impl App {
         match head_lower.as_str() {
             "/?" | "/help" => {
                 self.help_scroll_offset = 0;
+                self.help_filter_active = false;
+                self.help_filter_query.clear();
                 self.show_help_modal = true;
                 true
             }
@@ -344,7 +355,7 @@ impl App {
                 let title = (!rest.is_empty()).then(|| rest.to_string());
                 self.status_notice = None;
                 self.pending_actions
-                    .push_back(AppAction::CreateRoot { title });
+                    .push_back(AppAction::CreateRoot { title, cwd: None });
                 true
             }
             "/rename" => {
@@ -425,6 +436,10 @@ impl App {
             }
             "/prune" => {
                 self.request_prune_worktrees();
+                true
+            }
+            "/autocomplete" => {
+                self.execute_autocomplete_command(rest);
                 true
             }
             "/theme" => {

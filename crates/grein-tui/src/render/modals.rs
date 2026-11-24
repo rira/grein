@@ -2,7 +2,6 @@ use crate::app::{
     worktree_display_label, AppState, ConfigPickerModal, PendingPermission, PendingQuitConfirm,
     PendingThreadDelete, PendingWorktreeDelete, WorktreeAutocompleteItem,
 };
-use crate::keymap::BindableAction;
 use crate::theme::{ThemePalette, ThemePickerModal, ThemePreset};
 use crate::ui::tree::compute_tree_scroll_offset;
 use ratatui::layout::Rect;
@@ -217,32 +216,57 @@ pub(super) fn render_theme_picker_modal(
         let is_selected = idx == picker.selected_idx;
         let is_original = *preset == picker.original_preset;
         let suffix = if is_original { " (saved)" } else { "" };
+        let preset_palette = ThemePalette::from_preset(*preset);
+        let swatch = preset_palette.swatch_colors();
+        let tone_label = preset.tone().label();
+        let name = preset.display_name();
+
+        let used_w = 2 + 10 + name.chars().count() + suffix.chars().count();
+        let right_w = tone_label.chars().count() + 1;
+        let gap = (inner.width as usize).saturating_sub(used_w + right_w).max(1);
+
+        let mut spans = Vec::with_capacity(11);
         if is_selected {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "▌ ",
-                    Style::default()
-                        .fg(theme.selection_bar)
-                        .bg(theme.selection_bg),
-                ),
-                Span::styled(
-                    format!("{} [{}]{suffix}", preset.display_name(), preset.as_str()),
-                    Style::default()
-                        .fg(theme.selection_fg)
-                        .bg(theme.selection_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            let bg = theme.selection_bg;
+            spans.push(Span::styled(
+                "▌ ",
+                Style::default().fg(theme.selection_bar).bg(bg),
+            ));
+            for (dot_i, color) in swatch.into_iter().enumerate() {
+                let sym = if dot_i + 1 < swatch.len() { "● " } else { "●" };
+                spans.push(Span::styled(sym, Style::default().fg(color).bg(bg)));
+            }
+            spans.push(Span::styled(" ", Style::default().bg(bg)));
+            spans.push(Span::styled(
+                format!("{name}{suffix}"),
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ".repeat(gap), Style::default().bg(bg)));
+            spans.push(Span::styled(
+                format!("{tone_label} "),
+                Style::default().fg(theme.muted).bg(bg),
+            ));
         } else {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{} [{}]", preset.display_name(), preset.as_str()),
-                    Style::default().fg(theme.text),
-                ),
-                Span::styled(suffix, Style::default().fg(theme.muted)),
-            ]));
+            spans.push(Span::raw("  "));
+            for (dot_i, color) in swatch.into_iter().enumerate() {
+                let sym = if dot_i + 1 < swatch.len() { "● " } else { "●" };
+                spans.push(Span::styled(sym, Style::default().fg(color)));
+            }
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(name, Style::default().fg(theme.text)));
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix, Style::default().fg(theme.muted)));
+            }
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(
+                format!("{tone_label} "),
+                Style::default().fg(theme.muted),
+            ));
         }
+        lines.push(Line::from(spans));
     }
 
     let footer = Line::from(Span::styled(
@@ -254,11 +278,21 @@ pub(super) fn render_theme_picker_modal(
         Paragraph::new(header),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let list_h = inner.height.saturating_sub(2);
+    let list_h = inner.height.saturating_sub(2) as usize;
     if list_h > 0 {
+        let scroll_y = if lines.len() <= list_h {
+            0
+        } else {
+            let max_s = lines.len() - list_h;
+            if picker.selected_idx >= list_h {
+                (picker.selected_idx + 1 - list_h).min(max_s) as u16
+            } else {
+                0
+            }
+        };
         f.render_widget(
-            Paragraph::new(lines),
-            Rect::new(inner.x, inner.y + 1, inner.width, list_h),
+            Paragraph::new(lines).scroll((scroll_y, 0)),
+            Rect::new(inner.x, inner.y + 1, inner.width, list_h as u16),
         );
     }
     if inner.height >= 2 {
@@ -267,190 +301,6 @@ pub(super) fn render_theme_picker_modal(
             Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
         );
     }
-}
-
-pub(super) fn render_help_modal(f: &mut Frame, area: Rect, state: &AppState) -> (u16, u16) {
-    let theme = &state.theme_palette;
-    let section_style = Style::default()
-        .fg(theme.warning)
-        .add_modifier(Modifier::BOLD);
-    let key_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-
-    let km = &state.keymap;
-    let enter_manage = km.display_for(BindableAction::EnterManageMode);
-    let zoom_key = km.display_for(BindableAction::ToggleZoom);
-    let scroll_up = km.display_for(BindableAction::ScrollUp);
-    let scroll_down = km.display_for(BindableAction::ScrollDown);
-    let prev_sib = km.display_for(BindableAction::PrevSibling);
-    let next_sib = km.display_for(BindableAction::NextSibling);
-    let scroll_label = format!("{scroll_up} / {scroll_down}");
-    let sib_label = format!("{prev_sib} / {next_sib}");
-    let manage_scroll_desc = format!("Full/half-page preview; {scroll_up}/{scroll_down} scroll");
-
-    let sections: [(&str, Vec<(String, String)>); 4] = [
-        (
-            "── WRITE Mode (Terminal & Composer) ──",
-            vec![
-                (
-                    enter_manage,
-                    "Toggle WRITE <-> MANAGE (sidebar)".to_string(),
-                ),
-                (zoom_key, "Toggle sidebar zoom (full width)".to_string()),
-                (
-                    scroll_label,
-                    "Scroll viewport (Alt+1..9 jump root)".to_string(),
-                ),
-                (sib_label, "Prev / next sibling context".to_string()),
-                (
-                    "Ctrl+C (Composer)".to_string(),
-                    "Cancel turn / clear input / exit hint".to_string(),
-                ),
-                (
-                    "Shift+Enter / Ctrl+J".to_string(),
-                    "Newline in Composer (Enter sends)".to_string(),
-                ),
-                (
-                    "Ctrl+A/E/B/F/W/U/K/Y".to_string(),
-                    "Readline editing; ↑/↓ navigate lines".to_string(),
-                ),
-            ],
-        ),
-        (
-            "── MANAGE Mode (Sidebar) ──",
-            vec![
-                (
-                    "Tab".to_string(),
-                    "Switch ᛇ Grein <-> ⎇ Worktrees".to_string(),
-                ),
-                (
-                    "j/k/↑/↓, →/l, ↵".to_string(),
-                    "Move / unfold or child / enter WRITE".to_string(),
-                ),
-                (
-                    "h/←/Space, H/L, J/K".to_string(),
-                    "Fold / fold-or-expand all / switch root".to_string(),
-                ),
-                ("Ctrl+F/B, Ctrl+U/D".to_string(), manage_scroll_desc),
-                (
-                    "gg / G, Alt+1..9".to_string(),
-                    "Top / bottom item; jump to root 1..9".to_string(),
-                ),
-                (
-                    "n / f / r / d".to_string(),
-                    "New root / fork / inline rename / delete".to_string(),
-                ),
-                (
-                    "s / S, w / m / o / y".to_string(),
-                    "Child/root >_, worktree, join, cards, copy".to_string(),
-                ),
-                (
-                    ": , /, ?, z, q".to_string(),
-                    "Palette / search / help / zoom / quit".to_string(),
-                ),
-            ],
-        ),
-        (
-            "── Worktrees View ──",
-            vec![
-                (
-                    "Enter, s, w".to_string(),
-                    "Attach worktree / shell / allocate".to_string(),
-                ),
-                (
-                    "p / r / d / y / /".to_string(),
-                    "Prune / refresh / delete / copy / filter".to_string(),
-                ),
-                (
-                    "l / h / H / L".to_string(),
-                    "Unfold / fold / collapse or expand all".to_string(),
-                ),
-            ],
-        ),
-        (
-            "── Palette & Slash Commands ──",
-            vec![
-                (
-                    "/theme, /bind, /unbind".to_string(),
-                    "Theme picker and WRITE keybindings".to_string(),
-                ),
-                (
-                    "/sidebar [dynamic|fixed]".to_string(),
-                    "Configure sidebar sizing & overflow".to_string(),
-                ),
-                (
-                    "/model /mode /thinking".to_string(),
-                    "Configure agent model, mode, effort".to_string(),
-                ),
-                (
-                    "/root /fork /join /term".to_string(),
-                    "Context & shell (!cmd, /wt, /prune)".to_string(),
-                ),
-                (
-                    "/copy [code|all], /quit".to_string(),
-                    "Clipboard export, /commands, /zoom, /q".to_string(),
-                ),
-            ],
-        ),
-    ];
-
-    let mut raw_body: Vec<Line<'static>> = Vec::new();
-    for (title, rows) in sections {
-        raw_body.push(Line::from(Span::styled(format!(" {title}"), section_style)));
-        for (k, desc) in rows {
-            raw_body.push(Line::from(vec![
-                Span::styled(format!(" {k:<25} "), key_style),
-                Span::styled(desc, Style::default().fg(theme.text)),
-            ]));
-        }
-    }
-
-    let popup_width = area.width.saturating_sub(6).clamp(30, 76).min(area.width);
-    let inner_width = popup_width.saturating_sub(2) as usize;
-    let wrapped_body = crate::markdown::wrap_styled_lines(raw_body, inner_width);
-
-    let popup_height = (wrapped_body.len() as u16 + 3).min(area.height.max(1));
-    let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
-    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
-
-    f.render_widget(Clear, popup_area);
-    let block = rounded_block(theme, true).title(" Keybindings & Commands ");
-    let inner = block.inner(popup_area);
-    f.render_widget(block, popup_area);
-
-    if inner.width == 0 || inner.height == 0 {
-        return (0, 0);
-    }
-
-    let body_height = inner.height.saturating_sub(1) as usize;
-    let max_scroll = wrapped_body
-        .len()
-        .saturating_sub(body_height)
-        .min(u16::MAX as usize) as u16;
-    let scroll_y = state.help_scroll_offset.min(max_scroll);
-
-    if body_height > 0 {
-        f.render_widget(
-            Paragraph::new(wrapped_body).scroll((scroll_y, 0)),
-            Rect::new(inner.x, inner.y, inner.width, body_height as u16),
-        );
-    }
-
-    let footer_text = if max_scroll > 0 {
-        " Esc/q/? Close · ↑/↓/j/k/Ctrl+U/D/F/B/g/G Scroll"
-    } else {
-        " Esc, q, ?, or Enter to close"
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            footer_text,
-            Style::default().fg(theme.muted),
-        ))),
-        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
-    );
-    (scroll_y, max_scroll)
 }
 
 pub(super) fn render_permission_modal(

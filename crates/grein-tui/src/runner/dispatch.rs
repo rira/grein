@@ -66,6 +66,10 @@ pub(super) enum RunnerLocalEvent {
         err: String,
     },
     WorktreesPruned(String),
+    AutocompleteContextLoaded {
+        prompts: Vec<String>,
+        files: Vec<String>,
+    },
 }
 
 async fn refresh_worktrees_and_metadata(
@@ -156,10 +160,28 @@ fn dispatch_action(
                 }
             });
         }
-        AppAction::CreateRoot { title } => {
+        AppAction::CreateRoot { title, cwd } => {
             tokio::spawn(async move {
-                match engine.create_root(title.as_deref()).await {
+                match engine
+                    .create_root_in_cwd(title.as_deref(), cwd.as_deref())
+                    .await
+                {
                     Ok(thread) => {
+                        if let Some(cwd_val) = cwd {
+                            let optimistic = ThreadMeta {
+                                thread_id: thread.id.clone(),
+                                parent_thread_id: None,
+                                inherited_turn_count: 0,
+                                merged: false,
+                                kind: grein_core::ThreadKind::Agent,
+                                cwd: Some(cwd_val),
+                                git_branch: None,
+                                git_dirty: 0,
+                                custom_name: thread.custom_name.clone(),
+                            };
+                            let _ = local_ev_tx
+                                .send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));
+                        }
                         let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
                             TuiEngineEvent::ThreadCreated { thread },
                         ));
@@ -591,6 +613,18 @@ fn dispatch_action(
                         "Save UI preference failed: {err}"
                     )));
                 }
+            });
+        }
+        AppAction::FetchAutocompleteContext { cwd } => {
+            tokio::spawn(async move {
+                let (prompts_res, files_res) = tokio::join!(
+                    engine.list_recent_user_prompts(200),
+                    engine.list_workspace_files(cwd.as_deref()),
+                );
+                let _ = local_ev_tx.send(RunnerLocalEvent::AutocompleteContextLoaded {
+                    prompts: prompts_res.unwrap_or_default(),
+                    files: files_res.unwrap_or_default(),
+                });
             });
         }
         AppAction::Scrolled { .. } | AppAction::None => {}

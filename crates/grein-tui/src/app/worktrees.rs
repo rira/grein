@@ -300,12 +300,26 @@ impl App {
         }
     }
 
+    fn sync_active_thread_from_grein_selection(&mut self) {
+        if self.sidebar_view != SidebarView::Grein {
+            return;
+        }
+        let (sel_id, _) = self.selected_tree_thread_info();
+        if !sel_id.is_empty()
+            && sel_id != self.active_thread_id
+            && self.threads.iter().any(|t| t.id == sel_id)
+        {
+            self.switch_thread(&sel_id);
+        }
+    }
+
     pub fn toggle_worktrees_sidebar_view(&mut self) {
         self.pending_rename_thread_id = None;
         self.rename_prompt = None;
         self.pending_g_prefix = false;
         self.worktree_filter_active = false;
         if self.sidebar_hidden {
+            self.sync_active_thread_from_grein_selection();
             self.sidebar_hidden = false;
             self.sidebar_view = SidebarView::Worktrees;
             self.focused_pane = FocusedPane::Tree;
@@ -319,6 +333,7 @@ impl App {
         }
         match self.sidebar_view {
             SidebarView::Grein => {
+                self.sync_active_thread_from_grein_selection();
                 self.sidebar_view = SidebarView::Worktrees;
                 self.focused_pane = FocusedPane::Tree;
                 self.clamp_worktree_selection();
@@ -338,6 +353,7 @@ impl App {
         self.pending_rename_thread_id = None;
         self.rename_prompt = None;
         self.pending_g_prefix = false;
+        self.sync_active_thread_from_grein_selection();
         self.sidebar_hidden = false;
         self.sidebar_view = SidebarView::Worktrees;
         self.worktree_filter_active = false;
@@ -597,6 +613,7 @@ impl App {
                             thread_id: active_id,
                             target_path: entry.path,
                         });
+                    self.sidebar_view = SidebarView::Grein;
                     self.focused_pane = if self.active_is_terminal() {
                         FocusedPane::Terminal
                     } else {
@@ -605,12 +622,24 @@ impl App {
                 }
                 None => {}
             },
+            KeyCode::Char('n') => {
+                if let Some(WorktreeRow::Entry(entry)) = selected_row {
+                    self.status_notice = None;
+                    self.sidebar_view = SidebarView::Grein;
+                    self.focused_pane = FocusedPane::Composer;
+                    self.pending_actions.push_back(AppAction::CreateRoot {
+                        title: None,
+                        cwd: Some(entry.path),
+                    });
+                }
+            }
             KeyCode::Char('s') => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
                     self.dispatch_create_terminal(
                         Some(self.active_thread_id.clone()),
                         Some(entry.path),
                     );
+                    self.sidebar_view = SidebarView::Grein;
                 }
             }
             KeyCode::Char('w') => {

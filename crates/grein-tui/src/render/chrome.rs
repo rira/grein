@@ -372,7 +372,7 @@ pub(super) fn render_status_bar(
                         .to_string()
                 }
                 SidebarView::Worktrees => {
-                    "[↵]attach [s]hell [w]orktree [p]rune [r]efresh [d]el  / filter  ? help"
+                    "[↵]attach [n]ew [s]hell [w]orktree [p]rune [r]efresh [d]el  / filter  ? help"
                         .to_string()
                 }
             }

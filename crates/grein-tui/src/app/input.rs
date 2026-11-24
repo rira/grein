@@ -40,7 +40,9 @@ impl App {
                         .map_or(0, Vec::len);
                     let strip_h = crate::layout::subagent_strip_height(sub_count);
                     let composer_hidden = self.active_is_terminal()
-                        || self.sidebar_view == SidebarView::Worktrees
+                        || (self.focused_pane == FocusedPane::Tree
+                            && !self.sidebar_hidden
+                            && self.sidebar_view == SidebarView::Worktrees)
                         || self.pending_rename_thread_id.is_some();
                     let layout =
                         crate::render::compute_app_layout(self, area, strip_h, composer_hidden);
@@ -50,7 +52,11 @@ impl App {
                 }
             });
 
-        if self.sidebar_view == SidebarView::Worktrees && !over_tree_pane {
+        if self.focused_pane == FocusedPane::Tree
+            && !self.sidebar_hidden
+            && self.sidebar_view == SidebarView::Worktrees
+            && !over_tree_pane
+        {
             if is_up {
                 self.worktree_diff_scroll = self.worktree_diff_scroll.saturating_sub(3);
             } else {
@@ -216,8 +222,10 @@ impl App {
             }
             KeyCode::Char('n') if no_ctrl_alt => {
                 self.status_notice = None;
-                self.pending_actions
-                    .push_back(AppAction::CreateRoot { title: None });
+                self.pending_actions.push_back(AppAction::CreateRoot {
+                    title: None,
+                    cwd: None,
+                });
                 None
             }
             KeyCode::Char('w') if no_ctrl_alt => {
@@ -384,6 +392,8 @@ impl App {
                     self.composer_desired_col = None;
                     self.worktree_autocomplete_open = false;
                     self.worktree_autocomplete_idx = 0;
+                    self.composer_completion = None;
+                    self.composer_completion_dismissed = false;
                     self.status_notice = Some("Cleared input".to_string());
                 } else {
                     let manage_hint = self.keymap.display_for(BindableAction::EnterManageMode);
@@ -404,6 +414,44 @@ impl App {
                 }
                 self.sync_focus_out();
                 return true;
+            }
+            if !self.has_active_modal()
+                && self
+                    .composer_completion
+                    .as_ref()
+                    .and_then(|c| c.active())
+                    .is_some()
+            {
+                if let Some(action) = self.keymap.match_composer_completion_key(key) {
+                    match action {
+                        BindableAction::AcceptCompletion => {
+                            self.accept_composer_completion();
+                            self.sync_focus_out();
+                            return true;
+                        }
+                        BindableAction::NextCompletion => {
+                            if let Some(ref mut ac) = self.composer_completion {
+                                ac.step_next();
+                            }
+                            self.sync_focus_out();
+                            return true;
+                        }
+                        BindableAction::PrevCompletion => {
+                            if let Some(ref mut ac) = self.composer_completion {
+                                ac.step_prev();
+                            }
+                            self.sync_focus_out();
+                            return true;
+                        }
+                        BindableAction::DismissCompletion => {
+                            self.composer_completion = None;
+                            self.composer_completion_dismissed = true;
+                            self.sync_focus_out();
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
             }
             let handled = self.handle_key_composer(key);
             self.sync_focus_out();
@@ -492,6 +540,8 @@ impl App {
             // Help via ?
             if no_ctrl_alt && key.code == KeyCode::Char('?') {
                 self.help_scroll_offset = 0;
+                self.help_filter_active = false;
+                self.help_filter_query.clear();
                 self.show_help_modal = true;
                 self.sync_focus_out();
                 return true;
@@ -656,6 +706,8 @@ impl App {
         }
         if no_ctrl_alt && key.code == KeyCode::Char('?') {
             self.help_scroll_offset = 0;
+            self.help_filter_active = false;
+            self.help_filter_query.clear();
             self.show_help_modal = true;
             self.sync_focus_out();
             return true;
