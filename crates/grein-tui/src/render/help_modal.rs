@@ -197,6 +197,19 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
     let scroll_down = km.display_for(BindableAction::ScrollDown);
     let prev_sib = km.display_for(BindableAction::PrevSibling);
     let next_sib = km.display_for(BindableAction::NextSibling);
+    let tree_up = km.display_for(BindableAction::TreeUp);
+    let tree_down = km.display_for(BindableAction::TreeDown);
+    let tree_parent = km.display_for(BindableAction::TreeParent);
+    let tree_child = km.display_for(BindableAction::TreeChild);
+    let tree_keys = if tree_up == "Shift+↑"
+        && tree_down == "Shift+↓"
+        && tree_parent == "Shift+←"
+        && tree_child == "Shift+→"
+    {
+        "Shift+↑/↓/←/→".to_string()
+    } else {
+        format!("{tree_up}/{tree_down}/{tree_parent}/{tree_child}")
+    };
     let compact_ac = |a| {
         km.display_for(a)
             .replace("Ctrl+", "C-")
@@ -211,7 +224,7 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         compact_ac(BindableAction::DismissCompletion)
     );
     let scroll_label = format!("{scroll_up} / {scroll_down}");
-    let sib_label = format!("{prev_sib} / {next_sib}");
+    let sib_label = format!("{prev_sib} / {next_sib}, {tree_keys}");
     let manage_scroll_desc = format!("Full/half-page preview; {scroll_up}/{scroll_down} scroll");
 
     const WRITE_SEC: &str = "── WRITE Mode (Terminal & Composer) ──";
@@ -241,8 +254,8 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         HelpEntry {
             section: WRITE_SEC,
             keys: sib_label,
-            description: "Prev / next sibling context".to_string(),
-            keywords: "sibling prev next cycle thread switch",
+            description: "Prev/next sibling; tree parent/child".to_string(),
+            keywords: "sibling prev next cycle thread switch tree parent child up down left right shift",
         },
         HelpEntry {
             section: WRITE_SEC,

@@ -465,14 +465,14 @@ impl App {
             .filter(|pid| *pid != thread_id && valid_ids.contains(pid))
     }
 
-    pub fn cycle_sibling_thread(&mut self, forward: bool) -> bool {
+    fn next_sibling_thread_id(&self, forward: bool) -> Option<String> {
         let ordered = compute_ordered_thread_entries(&self.threads, &self.thread_meta);
         if ordered.len() <= 1 {
-            return false;
+            return None;
         }
         let valid_ids: HashSet<&str> = self.threads.iter().map(|t| t.id.as_str()).collect();
         if !valid_ids.contains(self.active_thread_id.as_str()) {
-            return false;
+            return None;
         }
         let active_parent = self.effective_parent_id(&self.active_thread_id, &valid_ids);
         let siblings: Vec<String> = ordered
@@ -481,13 +481,71 @@ impl App {
             .filter(|id| self.effective_parent_id(id, &valid_ids) == active_parent)
             .collect();
         if siblings.len() <= 1 {
-            return false;
+            return None;
         }
-        let Some(pos) = siblings.iter().position(|id| id == &self.active_thread_id) else {
+        let pos = siblings.iter().position(|id| id == &self.active_thread_id)?;
+        let next_pos = step_wrapped(pos, siblings.len(), forward);
+        Some(siblings[next_pos].clone())
+    }
+
+    pub fn cycle_sibling_thread(&mut self, forward: bool) -> bool {
+        let Some(target_id) = self.next_sibling_thread_id(forward) else {
             return false;
         };
-        let next_pos = step_wrapped(pos, siblings.len(), forward);
-        let target_id = siblings[next_pos].clone();
+        self.switch_thread(target_id);
+        true
+    }
+
+    pub fn step_sibling_at_current_depth(&mut self, forward: bool) -> bool {
+        let Some(target_id) = self.next_sibling_thread_id(forward) else {
+            return false;
+        };
+        self.sidebar_view = SidebarView::Grein;
+        self.switch_thread(target_id);
+        true
+    }
+
+    pub fn ascend_to_parent_thread(&mut self) -> bool {
+        let valid_ids: HashSet<&str> = self.threads.iter().map(|t| t.id.as_str()).collect();
+        if !valid_ids.contains(self.active_thread_id.as_str()) {
+            return false;
+        }
+        let Some(parent_id) = self
+            .effective_parent_id(&self.active_thread_id, &valid_ids)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        self.last_visited_child
+            .insert(parent_id.clone(), self.active_thread_id.clone());
+        self.sidebar_view = SidebarView::Grein;
+        self.switch_thread(parent_id);
+        true
+    }
+
+    pub fn descend_to_child_thread(&mut self) -> bool {
+        let valid_ids: HashSet<&str> = self.threads.iter().map(|t| t.id.as_str()).collect();
+        if !valid_ids.contains(self.active_thread_id.as_str()) {
+            return false;
+        }
+        let ordered = compute_ordered_thread_entries(&self.threads, &self.thread_meta);
+        let children: Vec<String> = ordered
+            .iter()
+            .map(|e| self.threads[e.index].id.clone())
+            .filter(|id| {
+                self.effective_parent_id(id, &valid_ids) == Some(self.active_thread_id.as_str())
+            })
+            .collect();
+        if children.is_empty() {
+            return false;
+        }
+        let target_id = self
+            .last_visited_child
+            .get(&self.active_thread_id)
+            .filter(|last| children.iter().any(|c| c == *last))
+            .cloned()
+            .unwrap_or_else(|| children[0].clone());
+        self.sidebar_view = SidebarView::Grein;
         self.switch_thread(target_id);
         true
     }

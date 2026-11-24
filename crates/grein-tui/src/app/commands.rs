@@ -170,6 +170,18 @@ impl App {
             BindableAction::NextSibling => {
                 self.cycle_sibling_thread(true);
             }
+            BindableAction::TreeUp => {
+                self.step_sibling_at_current_depth(false);
+            }
+            BindableAction::TreeDown => {
+                self.step_sibling_at_current_depth(true);
+            }
+            BindableAction::TreeParent => {
+                self.ascend_to_parent_thread();
+            }
+            BindableAction::TreeChild => {
+                self.descend_to_child_thread();
+            }
             BindableAction::JumpTerminal => {
                 self.open_or_jump_to_terminal();
             }
@@ -675,7 +687,7 @@ impl App {
         }
         let Some(action) = BindableAction::from_str(action_str) else {
             self.status_notice = Some(format!(
-                "Unknown action '{action_str}'. Try: enter_manage_mode, toggle_zoom, toggle_worktrees, scroll_up, scroll_down, prev_sibling, next_sibling, jump_terminal, new_agent, fork_thread, worktree, command_palette, help"
+                "Unknown action '{action_str}'. Try: enter_manage_mode, toggle_zoom, toggle_worktrees, scroll_up, scroll_down, prev_sibling, next_sibling, tree_up, tree_down, tree_parent, tree_child, jump_terminal, new_agent, fork_thread, worktree, command_palette, help"
             ));
             return;
         };

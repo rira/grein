@@ -143,12 +143,13 @@ impl App {
             return None;
         }
 
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let no_ctrl_alt = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
 
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') if no_ctrl_alt => {
+        match (key.code, shift) {
+            (KeyCode::Down, false) | (KeyCode::Char('j'), _) if no_ctrl_alt => {
                 if !self.tree.nodes.is_empty() {
                     let curr = self.tree.selected_index().unwrap_or(0);
                     if curr + 1 < self.tree.nodes.len() {
@@ -159,7 +160,7 @@ impl App {
                 }
                 None
             }
-            KeyCode::Up | KeyCode::Char('k') if no_ctrl_alt => {
+            (KeyCode::Up, false) | (KeyCode::Char('k'), _) if no_ctrl_alt => {
                 if !self.tree.nodes.is_empty() {
                     let curr = self.tree.selected_index().unwrap_or(0);
                     if curr > 0 {
@@ -170,15 +171,15 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('J') if no_ctrl_alt => {
+            (KeyCode::Char('J'), _) if no_ctrl_alt => {
                 self.switch_root(true);
                 None
             }
-            KeyCode::Char('K') if no_ctrl_alt => {
+            (KeyCode::Char('K'), _) if no_ctrl_alt => {
                 self.switch_root(false);
                 None
             }
-            KeyCode::Char('g') if no_ctrl_alt => {
+            (KeyCode::Char('g'), _) if no_ctrl_alt => {
                 if had_g_prefix {
                     if !self.tree.nodes.is_empty() {
                         self.tree.select_index(0);
@@ -191,7 +192,7 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('G') if no_ctrl_alt => {
+            (KeyCode::Char('G'), _) if no_ctrl_alt => {
                 if !self.tree.nodes.is_empty() {
                     self.tree.select_index(self.tree.nodes.len() - 1);
                     let (sel_id, _) = self.selected_tree_thread_info();
@@ -199,7 +200,7 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('f') if no_ctrl_alt => {
+            (KeyCode::Char('f'), _) if no_ctrl_alt => {
                 let (source_thread_id, _) = self.selected_tree_thread_info();
                 self.status_notice = None;
                 self.pending_actions.push_back(AppAction::ForkBranch {
@@ -208,19 +209,19 @@ impl App {
                 });
                 None
             }
-            KeyCode::Char('z') if no_ctrl_alt => {
+            (KeyCode::Char('z'), _) if no_ctrl_alt => {
                 self.toggle_sidebar_zoom();
                 None
             }
-            KeyCode::Char('o') if no_ctrl_alt => {
+            (KeyCode::Char('o'), _) if no_ctrl_alt => {
                 self.toggle_transcript_cards();
                 None
             }
-            KeyCode::Char('y') if no_ctrl_alt => {
+            (KeyCode::Char('y'), _) if no_ctrl_alt => {
                 self.copy_transcript_content(CopyMode::LastReply);
                 None
             }
-            KeyCode::Char('n') if no_ctrl_alt => {
+            (KeyCode::Char('n'), _) if no_ctrl_alt => {
                 self.status_notice = None;
                 self.pending_actions.push_back(AppAction::CreateRoot {
                     title: None,
@@ -228,7 +229,7 @@ impl App {
                 });
                 None
             }
-            KeyCode::Char('w') if no_ctrl_alt => {
+            (KeyCode::Char('w'), _) if no_ctrl_alt => {
                 let (sel_id, _) = self.selected_tree_thread_info();
                 let thread_id = if sel_id.is_empty() {
                     self.active_thread_id.clone()
@@ -240,25 +241,25 @@ impl App {
                     .push_back(AppAction::EnsureThreadWorktree { thread_id });
                 None
             }
-            KeyCode::Char('s') if no_ctrl_alt => {
+            (KeyCode::Char('s'), _) if no_ctrl_alt => {
                 let (parent_thread_id, _) = self.selected_tree_thread_info();
                 self.dispatch_create_terminal(Some(parent_thread_id), None);
                 None
             }
-            KeyCode::Char('S') if no_ctrl_alt => {
+            (KeyCode::Char('S'), _) if no_ctrl_alt => {
                 self.dispatch_create_terminal(None, None);
                 None
             }
-            KeyCode::Char('r') if no_ctrl_alt => {
+            (KeyCode::Char('r'), _) if no_ctrl_alt => {
                 self.begin_inline_rename();
                 None
             }
-            KeyCode::Char('m') if no_ctrl_alt => {
+            (KeyCode::Char('m'), _) if no_ctrl_alt => {
                 let (source_thread_id, _) = self.selected_tree_thread_info();
                 self.request_join_thread(source_thread_id, None);
                 None
             }
-            KeyCode::Char('d') if no_ctrl_alt => {
+            (KeyCode::Char('d'), _) if no_ctrl_alt => {
                 if self.threads.len() <= 1 {
                     self.status_notice = Some("Cannot delete the only context".to_string());
                 } else {
@@ -267,28 +268,28 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('H') if no_ctrl_alt => {
+            (KeyCode::Char('H'), _) if no_ctrl_alt => {
                 self.collapse_all_in_tree();
                 None
             }
-            KeyCode::Char('L') if no_ctrl_alt => {
+            (KeyCode::Char('L'), _) if no_ctrl_alt => {
                 self.expand_all_in_tree();
                 None
             }
-            KeyCode::Char(' ') if no_ctrl_alt => {
+            (KeyCode::Char(' '), _) if no_ctrl_alt => {
                 let (sel_id, _) = self.selected_tree_thread_info();
                 self.toggle_tree_fold(&sel_id);
                 None
             }
-            KeyCode::Left | KeyCode::Char('h') if no_ctrl_alt => {
+            (KeyCode::Left, false) | (KeyCode::Char('h'), _) if no_ctrl_alt => {
                 self.fold_or_jump_parent_in_tree();
                 None
             }
-            KeyCode::Right | KeyCode::Char('l') if no_ctrl_alt => {
+            (KeyCode::Right, false) | (KeyCode::Char('l'), _) if no_ctrl_alt => {
                 let _ = self.expand_or_step_child_in_tree();
                 None
             }
-            KeyCode::Enter => self.activate_selected_tree_node(),
+            (KeyCode::Enter, _) => self.activate_selected_tree_node(),
             _ => None,
         }
     }
@@ -323,6 +324,10 @@ impl App {
                             | BindableAction::ScrollDown
                             | BindableAction::PrevSibling
                             | BindableAction::NextSibling
+                            | BindableAction::TreeUp
+                            | BindableAction::TreeDown
+                            | BindableAction::TreeParent
+                            | BindableAction::TreeChild
                     );
                 if !pty_alt_passthrough {
                     self.execute_bindable_action(action);
@@ -486,7 +491,9 @@ impl App {
                         self.clamp_worktree_selection();
                         self.maybe_fetch_selected_worktree_diff(false);
                     }
-                    (KeyCode::Enter | KeyCode::Down | KeyCode::Up, false, false) => {
+                    (KeyCode::Enter | KeyCode::Down | KeyCode::Up, false, false)
+                        if !shift || key.code == KeyCode::Enter =>
+                    {
                         self.worktree_filter_active = false;
                         self.clamp_worktree_selection();
                         self.maybe_fetch_selected_worktree_diff(false);

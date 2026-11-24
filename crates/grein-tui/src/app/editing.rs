@@ -180,7 +180,8 @@ impl App {
         let prev_buf = self.input_buffer.clone();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let is_vertical = matches!(key.code, KeyCode::Up | KeyCode::Down) && !ctrl && !alt;
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let is_vertical = matches!(key.code, KeyCode::Up | KeyCode::Down) && !ctrl && !alt && !shift;
         let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
 
         let handled = match (key.code, ctrl, alt) {
@@ -310,7 +311,7 @@ impl App {
                 self.cursor_position = pos;
                 true
             }
-            (KeyCode::Left, false, false) if pos > 0 => {
+            (KeyCode::Left, false, false) if !shift && pos > 0 => {
                 if let Some((idx, _)) = self.input_buffer[..pos].char_indices().next_back() {
                     self.cursor_position = idx;
                     true
@@ -318,7 +319,7 @@ impl App {
                     false
                 }
             }
-            (KeyCode::Right, false, false) if pos < self.input_buffer.len() => {
+            (KeyCode::Right, false, false) if !shift && pos < self.input_buffer.len() => {
                 if let Some(ch) = self.input_buffer[pos..].chars().next() {
                     self.cursor_position = pos + ch.len_utf8();
                     true
@@ -326,8 +327,8 @@ impl App {
                     false
                 }
             }
-            (KeyCode::Up, false, false) => self.move_composer_cursor_vertical(-1),
-            (KeyCode::Down, false, false) => self.move_composer_cursor_vertical(1),
+            (KeyCode::Up, false, false) if !shift => self.move_composer_cursor_vertical(-1),
+            (KeyCode::Down, false, false) if !shift => self.move_composer_cursor_vertical(1),
             _ => false,
         };
         if !is_vertical && (handled || self.input_buffer != prev_buf) {

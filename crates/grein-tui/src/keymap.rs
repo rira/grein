@@ -271,6 +271,10 @@ pub enum BindableAction {
     ScrollDown,
     PrevSibling,
     NextSibling,
+    TreeUp,
+    TreeDown,
+    TreeParent,
+    TreeChild,
     ToggleWorktrees,
     JumpTerminal,
     NewAgent,
@@ -296,6 +300,10 @@ impl BindableAction {
             Self::ScrollDown,
             Self::PrevSibling,
             Self::NextSibling,
+            Self::TreeUp,
+            Self::TreeDown,
+            Self::TreeParent,
+            Self::TreeChild,
             Self::ToggleWorktrees,
             Self::JumpTerminal,
             Self::NewAgent,
@@ -323,6 +331,10 @@ impl BindableAction {
         )
     }
 
+    pub fn is_write_action(self) -> bool {
+        !self.is_composer_completion()
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::EnterManageMode => "enter_manage_mode",
@@ -331,6 +343,10 @@ impl BindableAction {
             Self::ScrollDown => "scroll_down",
             Self::PrevSibling => "prev_sibling",
             Self::NextSibling => "next_sibling",
+            Self::TreeUp => "tree_up",
+            Self::TreeDown => "tree_down",
+            Self::TreeParent => "tree_parent",
+            Self::TreeChild => "tree_child",
             Self::ToggleWorktrees => "toggle_worktrees",
             Self::JumpTerminal => "jump_terminal",
             Self::NewAgent => "new_agent",
@@ -356,6 +372,10 @@ impl BindableAction {
             Self::ScrollDown => "Scroll terminal/transcript down",
             Self::PrevSibling => "Switch to previous sibling thread",
             Self::NextSibling => "Switch to next sibling thread",
+            Self::TreeUp => "Switch to previous sibling thread in tree",
+            Self::TreeDown => "Switch to next sibling thread in tree",
+            Self::TreeParent => "Switch to parent thread in tree",
+            Self::TreeChild => "Switch to child thread in tree",
             Self::ToggleWorktrees => "Toggle Grein <-> Worktrees view",
             Self::JumpTerminal => "Open or jump to terminal",
             Self::NewAgent => "Create new root agent thread",
@@ -384,6 +404,10 @@ impl BindableAction {
             "scroll_down" | "page_down" | "scrollback_down" => Some(Self::ScrollDown),
             "prev_sibling" | "previous_sibling" | "sibling_prev" => Some(Self::PrevSibling),
             "next_sibling" | "sibling_next" => Some(Self::NextSibling),
+            "tree_up" | "tree_prev" | "sibling_up" => Some(Self::TreeUp),
+            "tree_down" | "tree_next" | "sibling_down" => Some(Self::TreeDown),
+            "tree_parent" | "tree_up_level" | "parent_thread" => Some(Self::TreeParent),
+            "tree_child" | "tree_down_level" | "child_thread" => Some(Self::TreeChild),
             "toggle_worktrees" | "worktrees" | "wt_view" => Some(Self::ToggleWorktrees),
             "jump_terminal" | "terminal" | "term" => Some(Self::JumpTerminal),
             "new_agent" | "create_root" | "new_root" | "new" => Some(Self::NewAgent),
@@ -412,6 +436,10 @@ impl BindableAction {
             Self::ScrollDown => vec![KeyChord::new(KeyCode::Char('j'), KeyModifiers::ALT)],
             Self::PrevSibling => vec![KeyChord::new(KeyCode::Char('h'), KeyModifiers::ALT)],
             Self::NextSibling => vec![KeyChord::new(KeyCode::Char('l'), KeyModifiers::ALT)],
+            Self::TreeUp => vec![KeyChord::new(KeyCode::Up, KeyModifiers::SHIFT)],
+            Self::TreeDown => vec![KeyChord::new(KeyCode::Down, KeyModifiers::SHIFT)],
+            Self::TreeParent => vec![KeyChord::new(KeyCode::Left, KeyModifiers::SHIFT)],
+            Self::TreeChild => vec![KeyChord::new(KeyCode::Right, KeyModifiers::SHIFT)],
             Self::AcceptCompletion => vec![
                 KeyChord::new(KeyCode::Tab, KeyModifiers::NONE),
                 KeyChord::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
@@ -531,7 +559,7 @@ impl Keymap {
 
     pub fn match_write_key(&self, key: KeyEvent) -> Option<BindableAction> {
         for (&action, chords) in &self.bindings {
-            if !action.is_composer_completion() && chords.iter().any(|c| c.matches(key)) {
+            if action.is_write_action() && chords.iter().any(|c| c.matches(key)) {
                 return Some(action);
             }
         }

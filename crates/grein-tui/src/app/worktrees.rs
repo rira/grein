@@ -416,12 +416,12 @@ impl App {
         let idx = self.worktree_autocomplete_idx.min(candidates.len() - 1);
 
         match key.code {
-            KeyCode::Down if !ctrl && !alt => {
+            KeyCode::Down if !ctrl && !alt && !shift => {
                 self.composer_desired_col = None;
                 self.worktree_autocomplete_idx = (idx + 1) % candidates.len();
                 true
             }
-            KeyCode::Up if !ctrl && !alt => {
+            KeyCode::Up if !ctrl && !alt && !shift => {
                 self.composer_desired_col = None;
                 self.worktree_autocomplete_idx = (idx + candidates.len() - 1) % candidates.len();
                 true
@@ -480,6 +480,7 @@ impl App {
     }
 
     pub(super) fn handle_key_worktrees_tree(&mut self, key: KeyEvent, had_g_prefix: bool) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let no_ctrl_alt = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -490,18 +491,18 @@ impl App {
         let rows = self.visible_worktree_rows();
         let selected_row = rows.get(self.worktree_selected_idx).cloned();
 
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
+        match (key.code, shift) {
+            (KeyCode::Down, false) | (KeyCode::Char('j'), _) => {
                 if !rows.is_empty() && self.worktree_selected_idx + 1 < rows.len() {
                     self.worktree_selected_idx += 1;
                     self.maybe_fetch_selected_worktree_diff(false);
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            (KeyCode::Up, false) | (KeyCode::Char('k'), _) => {
                 self.worktree_selected_idx = self.worktree_selected_idx.saturating_sub(1);
                 self.maybe_fetch_selected_worktree_diff(false);
             }
-            KeyCode::Char('g') => {
+            (KeyCode::Char('g'), _) => {
                 if had_g_prefix {
                     self.worktree_selected_idx = 0;
                     self.pending_g_prefix = false;
@@ -510,13 +511,13 @@ impl App {
                     self.pending_g_prefix = true;
                 }
             }
-            KeyCode::Char('G') => {
+            (KeyCode::Char('G'), _) => {
                 if !rows.is_empty() {
                     self.worktree_selected_idx = rows.len() - 1;
                     self.maybe_fetch_selected_worktree_diff(false);
                 }
             }
-            KeyCode::Char(' ') => {
+            (KeyCode::Char(' '), _) => {
                 match selected_row {
                     Some(WorktreeRow::RepoHeader { repo_root, .. }) => {
                         self.toggle_worktree_repo_fold(&repo_root);
@@ -528,7 +529,7 @@ impl App {
                 }
                 self.maybe_fetch_selected_worktree_diff(false);
             }
-            KeyCode::Left | KeyCode::Char('h') => {
+            (KeyCode::Left, false) | (KeyCode::Char('h'), _) => {
                 match selected_row {
                     Some(WorktreeRow::RepoHeader {
                         repo_root,
@@ -551,19 +552,19 @@ impl App {
                 }
                 self.maybe_fetch_selected_worktree_diff(false);
             }
-            KeyCode::Char('H') => {
+            (KeyCode::Char('H'), _) => {
                 for wt in &self.worktrees {
                     self.collapsed_worktree_repos.insert(wt.repo_root.clone());
                 }
                 self.clamp_worktree_selection();
                 self.maybe_fetch_selected_worktree_diff(false);
             }
-            KeyCode::Char('L') => {
+            (KeyCode::Char('L'), _) => {
                 self.collapsed_worktree_repos.clear();
                 self.clamp_worktree_selection();
                 self.maybe_fetch_selected_worktree_diff(false);
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            (KeyCode::Right, false) | (KeyCode::Char('l'), _) => {
                 match selected_row {
                     Some(WorktreeRow::RepoHeader {
                         repo_root,
@@ -586,21 +587,21 @@ impl App {
                 }
                 self.maybe_fetch_selected_worktree_diff(false);
             }
-            KeyCode::Char('r') => {
+            (KeyCode::Char('r'), _) => {
                 self.status_notice = Some("Refreshing worktrees...".to_string());
                 self.worktree_list_in_flight = true;
                 self.pending_actions.push_back(AppAction::ListWorktrees);
                 self.maybe_fetch_selected_worktree_diff(true);
             }
-            KeyCode::Char('p') => {
+            (KeyCode::Char('p'), _) => {
                 self.request_prune_worktrees();
             }
-            KeyCode::Char('y') => {
+            (KeyCode::Char('y'), _) => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
                     self.finish_copy_to_clipboard("worktree path", entry.path);
                 }
             }
-            KeyCode::Enter => match selected_row {
+            (KeyCode::Enter, _) => match selected_row {
                 Some(WorktreeRow::RepoHeader { repo_root, .. }) => {
                     self.toggle_worktree_repo_fold(&repo_root);
                     self.maybe_fetch_selected_worktree_diff(false);
@@ -622,7 +623,7 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Char('n') => {
+            (KeyCode::Char('n'), _) => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
                     self.status_notice = None;
                     self.sidebar_view = SidebarView::Grein;
@@ -633,7 +634,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::Char('s') => {
+            (KeyCode::Char('s'), _) => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
                     self.dispatch_create_terminal(
                         Some(self.active_thread_id.clone()),
@@ -642,13 +643,13 @@ impl App {
                     self.sidebar_view = SidebarView::Grein;
                 }
             }
-            KeyCode::Char('w') => {
+            (KeyCode::Char('w'), _) => {
                 let thread_id = self.active_thread_id.clone();
                 self.status_notice = Some("Allocating worktree...".to_string());
                 self.pending_actions
                     .push_back(AppAction::EnsureThreadWorktree { thread_id });
             }
-            KeyCode::Char('d') => {
+            (KeyCode::Char('d'), _) => {
                 if let Some(WorktreeRow::Entry(entry)) = selected_row {
                     if entry.is_primary {
                         self.status_notice =
@@ -665,7 +666,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('z') => {
+            (KeyCode::Char('z'), _) => {
                 self.toggle_sidebar_zoom();
             }
             _ => {}

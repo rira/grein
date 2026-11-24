@@ -83,6 +83,7 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.collapsed_threads.clear();
     app.tree_has_children.clear();
     app.tree_hidden_counts.clear();
+    app.last_visited_child.clear();
 
     for t in &session.threads {
         let transcript = render_turns_md(&t.turns);
@@ -453,6 +454,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             app.collapsed_threads.remove(&thread_id);
             app.tree_has_children.remove(&thread_id);
             app.tree_hidden_counts.remove(&thread_id);
+            app.last_visited_child.remove(&thread_id);
+            app.last_visited_child.retain(|_, v| v != &thread_id);
             if app
                 .config_picker
                 .as_ref()
