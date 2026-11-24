@@ -72,6 +72,10 @@ pub fn apply_hydrated_session(app: &mut App, session: &HydratedSession) {
     app.sidebar_view = SidebarView::Grein;
     app.help_scroll_offset = 0;
     app.help_max_scroll = 0;
+    app.help_filter_active = false;
+    app.help_filter_query.clear();
+    app.composer_completion = None;
+    app.composer_completion_dismissed = false;
     app.status_notice = None;
     app.pending_rename_thread_id = None;
     app.transcript_search.clear();
@@ -331,6 +335,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                 anchors,
             });
             app.switch_thread(&new_id);
+            app.sidebar_view = SidebarView::Grein;
             if app.is_terminal_thread(&new_id) {
                 app.set_focus(FocusedPane::Terminal);
                 app.maybe_request_pty_snapshot(&new_id);
@@ -493,6 +498,8 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
             rebuild_tree_nodes(app);
             app.select_active_thread_in_tree();
             app.sync_focus_for_active_thread();
+            app.composer_completion_dismissed = false;
+            app.sync_composer_completion();
             let active = app.active_thread_id.clone();
             app.maybe_request_pty_snapshot(&active);
         }

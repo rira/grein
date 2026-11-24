@@ -1,4 +1,8 @@
+use crate::theme::ThemePalette;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui::Frame;
 
 fn char_display_width(ch: char) -> usize {
     if ch.is_ascii() {
@@ -172,4 +176,50 @@ pub(super) fn layout_composer_text(
         cursor_col: layout.cursor_col,
         cursor_row: layout.cursor_row,
     }
+}
+
+fn clip_to_display_width(text: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+        let cw = char_display_width(ch);
+        if used + cw > max_width {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
+}
+
+pub(super) fn render_composer_ghost_suffix(
+    f: &mut Frame,
+    inner_area: Rect,
+    cursor_col: u16,
+    visible_row: u16,
+    ghost: &str,
+    theme: &ThemePalette,
+) {
+    if inner_area.width == 0
+        || inner_area.height == 0
+        || cursor_col >= inner_area.width
+        || visible_row >= inner_area.height
+    {
+        return;
+    }
+    let remaining = (inner_area.width - cursor_col) as usize;
+    let clipped = clip_to_display_width(ghost, remaining);
+    if clipped.is_empty() {
+        return;
+    }
+    let mut style = Style::default().fg(theme.muted);
+    if theme.panel_bg != Color::Reset {
+        style = style.bg(theme.panel_bg);
+    }
+    let x = inner_area.x + cursor_col;
+    let y = inner_area.y + visible_row;
+    f.buffer_mut().set_stringn(x, y, &clipped, remaining, style);
 }

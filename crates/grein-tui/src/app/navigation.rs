@@ -251,6 +251,14 @@ impl App {
             self.rename_prompt = None;
         }
         self.sync_worktree_autocomplete(false);
+        if !self.composer_autocomplete_enabled
+            || self.composer_completion_dismissed
+            || self.worktree_autocomplete_open
+            || self.focused_pane != FocusedPane::Composer
+            || self.has_active_modal()
+        {
+            self.composer_completion = None;
+        }
     }
 
     pub fn focused_pane(&self) -> FocusedPane {
@@ -339,6 +347,7 @@ impl App {
         } else if self.focused_pane == FocusedPane::Tree {
             if self.sidebar_view == SidebarView::Worktrees {
                 self.worktree_filter_active = false;
+                self.sidebar_view = SidebarView::Grein;
                 self.focused_pane = if self.active_is_terminal() {
                     FocusedPane::Terminal
                 } else {

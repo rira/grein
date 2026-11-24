@@ -288,6 +288,18 @@ impl App {
             ThemePalette::from_prefs(prefs.theme.as_deref(), &prefs.theme_overrides);
         self.keymap = Keymap::from_prefs(&prefs.keybindings);
         self.sidebar_layout.apply_ui_prefs(&prefs.ui);
+        if let Some(val) = prefs.ui.get("composer_autocomplete") {
+            match val.trim().to_ascii_lowercase().as_str() {
+                "off" | "false" | "0" | "no" => {
+                    self.composer_autocomplete_enabled = false;
+                    self.composer_completion = None;
+                }
+                "on" | "true" | "1" | "yes" => {
+                    self.composer_autocomplete_enabled = true;
+                }
+                _ => {}
+            }
+        }
         self.maybe_queue_terminal_resize();
     }
 
@@ -590,54 +602,123 @@ impl App {
                     val
                 }
             };
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter if no_ctrl_alt => {
-                    self.show_help_modal = false;
-                    self.help_scroll_offset = 0;
+            if self.help_filter_active {
+                match (key.code, ctrl, alt) {
+                    (KeyCode::Esc, false, false) | (KeyCode::Char('c' | 'C'), true, false) => {
+                        self.help_filter_active = false;
+                        self.help_filter_query.clear();
+                        self.help_scroll_offset = 0;
+                    }
+                    (KeyCode::Enter, false, false) => {
+                        self.help_filter_active = false;
+                    }
+                    (KeyCode::Backspace, false, false) => {
+                        self.help_filter_query.pop();
+                        self.help_scroll_offset = 0;
+                    }
+                    (KeyCode::Char('u' | 'U'), true, false) => {
+                        self.help_filter_query.clear();
+                        self.help_scroll_offset = 0;
+                    }
+                    (KeyCode::Char('w' | 'W'), true, false) => {
+                        let trimmed_len = self.help_filter_query.trim_end().len();
+                        self.help_filter_query.truncate(trimmed_len);
+                        let start = prev_word_boundary(
+                            &self.help_filter_query,
+                            self.help_filter_query.len(),
+                        );
+                        self.help_filter_query.truncate(start);
+                        self.help_scroll_offset = 0;
+                    }
+                    (KeyCode::Up, false, false) | (KeyCode::Char('p' | 'P'), true, false) => {
+                        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
+                    }
+                    (KeyCode::Down, false, false) | (KeyCode::Char('n' | 'N'), true, false) => {
+                        self.help_scroll_offset =
+                            clamp_help(self, self.help_scroll_offset.saturating_add(1));
+                    }
+                    (KeyCode::PageUp, false, false) => {
+                        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
+                    }
+                    (KeyCode::PageDown, false, false) => {
+                        self.help_scroll_offset =
+                            clamp_help(self, self.help_scroll_offset.saturating_add(10));
+                    }
+                    (KeyCode::Home, false, false) => {
+                        self.help_scroll_offset = 0;
+                    }
+                    (KeyCode::End, false, false) => {
+                        self.help_scroll_offset = self.help_max_scroll;
+                    }
+                    (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
+                        self.help_filter_query.push(c);
+                        self.help_scroll_offset = 0;
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('q' | 'Q' | '?') if no_ctrl_alt => {
-                    self.show_help_modal = false;
-                    self.help_scroll_offset = 0;
+            } else {
+                match key.code {
+                    KeyCode::Char('/') if no_ctrl_alt => {
+                        self.help_filter_active = true;
+                    }
+                    KeyCode::Esc if no_ctrl_alt => {
+                        if !self.help_filter_query.is_empty() {
+                            self.help_filter_query.clear();
+                            self.help_scroll_offset = 0;
+                        } else {
+                            self.show_help_modal = false;
+                            self.help_scroll_offset = 0;
+                            self.help_filter_active = false;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char('q' | 'Q' | '?') if no_ctrl_alt => {
+                        self.show_help_modal = false;
+                        self.help_scroll_offset = 0;
+                        self.help_filter_active = false;
+                        self.help_filter_query.clear();
+                    }
+                    KeyCode::Char('c' | 'C') if ctrl && !alt => {
+                        self.show_help_modal = false;
+                        self.help_scroll_offset = 0;
+                        self.help_filter_active = false;
+                        self.help_filter_query.clear();
+                    }
+                    KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
+                        self.help_scroll_offset =
+                            clamp_help(self, self.help_scroll_offset.saturating_add(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
+                        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
+                    }
+                    KeyCode::PageDown if no_ctrl_alt => {
+                        self.help_scroll_offset =
+                            clamp_help(self, self.help_scroll_offset.saturating_add(10));
+                    }
+                    KeyCode::Char('d' | 'D') if ctrl && !alt => {
+                        self.help_scroll_offset =
+                            clamp_help(self, self.help_scroll_offset.saturating_add(10));
+                    }
+                    KeyCode::Char('f' | 'F') if ctrl && !alt => {
+                        self.help_scroll_offset =
+                            clamp_help(self, self.help_scroll_offset.saturating_add(20));
+                    }
+                    KeyCode::PageUp if no_ctrl_alt => {
+                        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
+                    }
+                    KeyCode::Char('u' | 'U') if ctrl && !alt => {
+                        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
+                    }
+                    KeyCode::Char('b' | 'B') if ctrl && !alt => {
+                        self.help_scroll_offset = self.help_scroll_offset.saturating_sub(20);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') if no_ctrl_alt => {
+                        self.help_scroll_offset = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('G') if no_ctrl_alt => {
+                        self.help_scroll_offset = self.help_max_scroll;
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('c' | 'C') if ctrl && !alt => {
-                    self.show_help_modal = false;
-                    self.help_scroll_offset = 0;
-                }
-                KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
-                    self.help_scroll_offset =
-                        clamp_help(self, self.help_scroll_offset.saturating_add(1));
-                }
-                KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
-                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
-                }
-                KeyCode::PageDown if no_ctrl_alt => {
-                    self.help_scroll_offset =
-                        clamp_help(self, self.help_scroll_offset.saturating_add(10));
-                }
-                KeyCode::Char('d' | 'D') if ctrl && !alt => {
-                    self.help_scroll_offset =
-                        clamp_help(self, self.help_scroll_offset.saturating_add(10));
-                }
-                KeyCode::Char('f' | 'F') if ctrl && !alt => {
-                    self.help_scroll_offset =
-                        clamp_help(self, self.help_scroll_offset.saturating_add(20));
-                }
-                KeyCode::PageUp if no_ctrl_alt => {
-                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
-                }
-                KeyCode::Char('u' | 'U') if ctrl && !alt => {
-                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
-                }
-                KeyCode::Char('b' | 'B') if ctrl && !alt => {
-                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(20);
-                }
-                KeyCode::Home | KeyCode::Char('g') if no_ctrl_alt => {
-                    self.help_scroll_offset = 0;
-                }
-                KeyCode::End | KeyCode::Char('G') if no_ctrl_alt => {
-                    self.help_scroll_offset = self.help_max_scroll;
-                }
-                _ => {}
             }
             self.sync_focus_out();
             return true;

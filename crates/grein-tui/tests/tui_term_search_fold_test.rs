@@ -1180,14 +1180,17 @@ fn test_tree_a_agent_root_w_worktree_status_hint_and_help_modal() {
         "Tree status bar must show MANAGE hints even when active thread is Terminal:\n{term_tree_status}"
     );
 
-    // 2. 'n' in Tree emits AppAction::CreateRoot { title: None } without modifying Composer
+    // 2. 'n' in Tree emits AppAction::CreateRoot { title: None, cwd: None } without modifying Composer
     app.switch_thread("t-agent");
     app.set_focus(FocusedPane::Tree);
     app.pending_actions.clear();
     assert!(app.handle_key_event(key(KeyCode::Char('n'))));
     assert_eq!(
         app.pending_actions.pop_front(),
-        Some(AppAction::CreateRoot { title: None })
+        Some(AppAction::CreateRoot {
+            title: None,
+            cwd: None,
+        })
     );
     assert_eq!(app.composer_input(), "");
 

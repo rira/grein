@@ -204,6 +204,8 @@ impl App {
     pub fn submit_composer_prompt(&mut self, prompt: impl Into<String>) {
         self.worktree_autocomplete_open = false;
         self.worktree_autocomplete_idx = 0;
+        self.composer_completion = None;
+        self.composer_completion_dismissed = false;
         let prompt = prompt.into();
         let trimmed = prompt.trim();
         if trimmed.is_empty() {
@@ -246,6 +248,11 @@ impl App {
         self.active_transcript_md
             .push_str(&render_node(&AuthorRole::User, trimmed));
         self.last_submitted_prompt = Some(trimmed.to_string());
+        self.autocomplete_recent_prompts.retain(|p| p != trimmed);
+        self.autocomplete_recent_prompts.insert(0, trimmed.to_string());
+        if self.autocomplete_recent_prompts.len() > 200 {
+            self.autocomplete_recent_prompts.truncate(200);
+        }
         self.sync_anchors();
         let active_id = self.active_thread_id.clone();
         self.thread_blocks

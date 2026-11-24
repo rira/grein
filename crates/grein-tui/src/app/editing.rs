@@ -100,7 +100,9 @@ impl App {
             self.input_buffer.insert_str(pos, text);
             self.cursor_position = pos + text.len();
             self.composer_desired_col = None;
+            self.composer_completion_dismissed = false;
             self.sync_worktree_autocomplete(true);
+            self.sync_composer_completion();
             self.sync_focus_out();
             return true;
         }
@@ -335,7 +337,11 @@ impl App {
             if !matches!(key.code, KeyCode::Enter) {
                 self.status_notice = None;
             }
+            self.composer_completion_dismissed = false;
             self.sync_worktree_autocomplete(true);
+            self.sync_composer_completion();
+        } else if handled && !self.composer_completion_dismissed {
+            self.sync_composer_completion();
         }
         handled
     }

@@ -457,7 +457,9 @@ impl App {
         self.sync_anchors();
         self.select_active_thread_in_tree();
         self.sync_focus_for_active_thread();
+        self.composer_completion_dismissed = false;
         self.sync_worktree_autocomplete(true);
+        self.sync_composer_completion();
         self.maybe_request_pty_snapshot(&active_id);
         self.maybe_queue_terminal_resize();
     }

@@ -220,6 +220,7 @@ pub enum AppAction {
     },
     CreateRoot {
         title: Option<String>,
+        cwd: Option<String>,
     },
     RenameThread {
         thread_id: String,
@@ -316,6 +317,9 @@ pub enum AppAction {
     SaveUiPreference {
         key: String,
         value: String,
+    },
+    FetchAutocompleteContext {
+        cwd: Option<String>,
     },
 }
 
@@ -475,6 +479,8 @@ pub struct App {
     pub show_help_modal: bool,
     pub help_scroll_offset: u16,
     pub help_max_scroll: u16,
+    pub help_filter_active: bool,
+    pub help_filter_query: String,
     pub config_picker: Option<ConfigPickerModal>,
     pub sidebar_hidden: bool,
     pub composer_scroll_y: u16,
@@ -523,6 +529,11 @@ pub struct App {
     pub worktree_diff_scroll: u16,
     pub worktree_diff_max_scroll: u16,
     pub worktree_diff_in_flight: Option<String>,
+    pub composer_autocomplete_enabled: bool,
+    pub autocomplete_workspace_files: Vec<String>,
+    pub autocomplete_recent_prompts: Vec<String>,
+    pub composer_completion: Option<crate::autocomplete::ActiveCompletion>,
+    pub composer_completion_dismissed: bool,
 }
 
 pub type AppState = App;
@@ -565,6 +576,8 @@ impl Default for App {
             show_help_modal: false,
             help_scroll_offset: 0,
             help_max_scroll: 0,
+            help_filter_active: false,
+            help_filter_query: String::new(),
             config_picker: None,
             sidebar_hidden: false,
             composer_scroll_y: 0,
@@ -613,6 +626,11 @@ impl Default for App {
             worktree_diff_scroll: 0,
             worktree_diff_max_scroll: 0,
             worktree_diff_in_flight: None,
+            composer_autocomplete_enabled: true,
+            autocomplete_workspace_files: Vec::new(),
+            autocomplete_recent_prompts: Vec::new(),
+            composer_completion: None,
+            composer_completion_dismissed: false,
         }
     }
 }

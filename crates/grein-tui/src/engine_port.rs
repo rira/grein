@@ -512,4 +512,20 @@ pub trait TuiEnginePort: Send + Sync {
     async fn save_ui_preference(&self, _key: &str, _value: &str) -> io::Result<()> {
         Ok(())
     }
+
+    async fn list_recent_user_prompts(&self, _limit: usize) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_workspace_files(&self, _root: Option<&str>) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn create_root_in_cwd(
+        &self,
+        title: Option<&str>,
+        _cwd: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        self.create_root(title).await
+    }
 }
