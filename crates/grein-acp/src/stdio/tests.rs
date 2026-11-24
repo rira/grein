@@ -712,10 +712,50 @@ fn parser_tool_call_update_and_fallback_edge_cases() {
 async fn default_agent_driver_trait_methods_covered() {
     let driver = StubAgentDriver;
     assert!(driver.recent_stderr().is_empty());
+    assert!(driver.exit_status().is_none());
     let mut rx = driver.subscribe_session("s1");
     assert!(rx.try_recv().is_err());
     assert!(matches!(
         driver.submit_prompt("s1", "hi").await,
         Err(AgentDriverError::Unsupported(msg)) if msg.contains("submit_prompt")
     ));
+}
+
+#[test]
+fn formats_stderr_snippet_and_terminated_detail() {
+    use super::driver::{format_stderr_snippet, format_terminated_detail};
+
+    assert_eq!(format_stderr_snippet(vec![]), None);
+    assert_eq!(
+        format_stderr_snippet(vec!["  ".into(), "".into()]),
+        None
+    );
+    assert_eq!(
+        format_stderr_snippet(vec![
+            "ignored-1".into(),
+            "line-2".into(),
+            "".into(),
+            "line-3".into(),
+            "  line-4  ".into(),
+        ]),
+        Some("line-2 | line-3 | line-4".into())
+    );
+
+    let long = "a".repeat(350);
+    let snippet = format_stderr_snippet(vec![long]).expect("non-empty");
+    assert_eq!(snippet.len(), 303);
+    assert!(snippet.ends_with("..."));
+
+    assert_eq!(
+        format_terminated_detail("agent process closed its output", None, None),
+        "agent process closed its output"
+    );
+    assert_eq!(
+        format_terminated_detail(
+            "agent process closed its output",
+            Some("exit status 1"),
+            Some("error: unknown option '--acp'")
+        ),
+        "agent process closed its output (exit status 1): error: unknown option '--acp'"
+    );
 }

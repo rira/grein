@@ -65,6 +65,7 @@ pub struct AcpSpawnConfig {
     pub cwd: Option<PathBuf>,
     pub auth_method: Option<String>,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
 }
 
 impl AcpSpawnConfig {
@@ -78,6 +79,7 @@ impl AcpSpawnConfig {
             cwd: None,
             auth_method: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
         }
     }
 
@@ -93,6 +95,11 @@ impl AcpSpawnConfig {
 
     pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
         self.env.extend(env);
+        self
+    }
+
+    pub fn without_env(mut self, key: impl Into<String>) -> Self {
+        self.env_remove.push(key.into());
         self
     }
 }
@@ -130,6 +137,10 @@ pub trait AgentDriver: Send + Sync {
 
     fn recent_stderr(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    fn exit_status(&self) -> Option<String> {
+        None
     }
 
     fn subscribe_session(&self, _session_id: &str) -> mpsc::UnboundedReceiver<DriverEvent> {

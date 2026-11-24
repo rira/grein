@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +20,10 @@ use super::protocol::{
 };
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const STDERR_WAIT_TIMEOUT: Duration = Duration::from_millis(150);
+const EXIT_HARVEST_WAIT: Duration = Duration::from_millis(20);
+const MAX_STDERR_SNIPPET_LINES: usize = 3;
+const MAX_STDERR_SNIPPET_CHARS: usize = 300;
 
 struct PendingRpc {
     tx: oneshot::Sender<Result<serde_json::Value, String>>,
@@ -38,6 +42,7 @@ pub struct AcpStdioDriver {
     session_sinks: SessionSinkMap,
     persistent_sinks: SessionSinkMap,
     next_id: AtomicU64,
+    shut_down: AtomicBool,
 }
 
 impl AcpStdioDriver {
@@ -65,6 +70,7 @@ impl AcpStdioDriver {
             session_sinks,
             persistent_sinks,
             next_id: AtomicU64::new(1),
+            shut_down: AtomicBool::new(false),
         }
     }
 
@@ -76,26 +82,93 @@ impl AcpStdioDriver {
         self.runner.recent_stderr()
     }
 
-    fn current_sender(&self) -> Result<mpsc::Sender<JsonRpcMessage>, StdioRunnerError> {
-        lock(&self.sender)
-            .clone()
-            .ok_or_else(|| StdioRunnerError::ProcessTerminated("driver is shut down".into()))
+    pub fn exit_status(&self) -> Option<String> {
+        self.runner.exit_status_summary()
     }
 
-    fn register_pending_rpc(
+    async fn closed_sender_error(&self) -> StdioRunnerError {
+        if self.shut_down.load(Ordering::SeqCst) {
+            return StdioRunnerError::ProcessTerminated("driver is shut down".into());
+        }
+        self.terminated_error("agent process closed its output").await
+    }
+
+    async fn send_failed_error(&self) -> StdioRunnerError {
+        if self.shut_down.load(Ordering::SeqCst) {
+            return StdioRunnerError::ProcessTerminated("driver is shut down".into());
+        }
+        self.runner.wait_for_stderr_briefly(STDERR_WAIT_TIMEOUT).await;
+        if self.runner.is_running() {
+            self.runner
+                .harvest_exit_status_briefly(EXIT_HARVEST_WAIT)
+                .await;
+        }
+        if !self.runner.is_running() {
+            return self.build_terminated_error("agent process closed its output");
+        }
+        StdioRunnerError::CommunicationError("agent input channel closed".into())
+    }
+
+    async fn terminated_error(&self, base: &str) -> StdioRunnerError {
+        self.runner.wait_for_stderr_briefly(STDERR_WAIT_TIMEOUT).await;
+        let _ = self.runner.is_running();
+        if self.runner.exit_status_summary().is_none() && !self.shut_down.load(Ordering::SeqCst) {
+            self.runner
+                .harvest_exit_status_briefly(EXIT_HARVEST_WAIT)
+                .await;
+        }
+        self.build_terminated_error(base)
+    }
+
+    fn build_terminated_error(&self, base: &str) -> StdioRunnerError {
+        let exit_status = self.runner.exit_status_summary();
+        let stderr_snippet = format_stderr_snippet(self.runner.recent_stderr());
+        StdioRunnerError::ProcessTerminated(format_terminated_detail(
+            base,
+            exit_status.as_deref(),
+            stderr_snippet.as_deref(),
+        ))
+    }
+
+    async fn current_sender(&self) -> Result<mpsc::Sender<JsonRpcMessage>, StdioRunnerError> {
+        let maybe_sender = lock(&self.sender).clone();
+        match maybe_sender {
+            Some(sender) => Ok(sender),
+            None => Err(self.closed_sender_error().await),
+        }
+    }
+
+    // Acquire `sender` before `pending_rpc` to match `pump()` cleanup and prevent TOCTOU hangs.
+    async fn begin_rpc_call(
         &self,
         persistent_prompt_session: Option<String>,
-    ) -> (u64, oneshot::Receiver<Result<serde_json::Value, String>>) {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        lock(&self.pending_rpc).insert(
-            id,
-            PendingRpc {
-                tx,
-                persistent_prompt_session,
-            },
-        );
-        (id, rx)
+    ) -> Result<
+        (
+            mpsc::Sender<JsonRpcMessage>,
+            u64,
+            oneshot::Receiver<Result<serde_json::Value, String>>,
+        ),
+        StdioRunnerError,
+    > {
+        let started = {
+            let sender_guard = lock(&self.sender);
+            sender_guard.as_ref().cloned().map(|sender| {
+                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = oneshot::channel();
+                lock(&self.pending_rpc).insert(
+                    id,
+                    PendingRpc {
+                        tx,
+                        persistent_prompt_session,
+                    },
+                );
+                (sender, id, rx)
+            })
+        };
+        match started {
+            Some(tuple) => Ok(tuple),
+            None => Err(self.closed_sender_error().await),
+        }
     }
 
     async fn rpc_call_inner(
@@ -104,8 +177,7 @@ impl AcpStdioDriver {
         params: Option<serde_json::Value>,
         persistent_prompt_session: Option<String>,
     ) -> Result<serde_json::Value, StdioRunnerError> {
-        let sender = self.current_sender()?;
-        let (id, rx) = self.register_pending_rpc(persistent_prompt_session);
+        let (sender, id, rx) = self.begin_rpc_call(persistent_prompt_session).await?;
 
         let request = JsonRpcMessage::Request(JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -116,23 +188,29 @@ impl AcpStdioDriver {
 
         if sender.send(request).await.is_err() {
             lock(&self.pending_rpc).remove(&id);
-            return Err(StdioRunnerError::CommunicationError(
-                "agent input channel closed".into(),
-            ));
+            return Err(self.send_failed_error().await);
         }
 
         match rx.await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(message)) => {
-                if !self.runner.is_running() {
+                if self.shut_down.load(Ordering::SeqCst) {
                     Err(StdioRunnerError::ProcessTerminated(message))
+                } else if !self.runner.is_running() {
+                    Err(self.terminated_error(&message).await)
                 } else {
                     Err(StdioRunnerError::CommunicationError(message))
                 }
             }
-            Err(_) => Err(StdioRunnerError::ProcessTerminated(
-                "agent process closed before replying".into(),
-            )),
+            Err(_) => {
+                if self.shut_down.load(Ordering::SeqCst) {
+                    Err(StdioRunnerError::ProcessTerminated(
+                        "driver is shut down".into(),
+                    ))
+                } else {
+                    Err(self.terminated_error("agent process closed its output").await)
+                }
+            }
         }
     }
 
@@ -219,11 +297,10 @@ impl AcpStdioDriver {
         session_id: &str,
         prompt: &str,
     ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, StdioRunnerError> {
-        let sender = self.current_sender()?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let session_id_owned = session_id.to_string();
+        let (sender, id, rpc_rx) = self.begin_rpc_call(None).await?;
         lock(&self.session_sinks).insert(session_id_owned.clone(), event_tx.clone());
-        let (id, rpc_rx) = self.register_pending_rpc(None);
 
         let request = JsonRpcMessage::Request(JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -238,9 +315,7 @@ impl AcpStdioDriver {
         if sender.send(request).await.is_err() {
             lock(&self.pending_rpc).remove(&id);
             remove_sink_if_same(&self.session_sinks, &session_id_owned, &event_tx);
-            return Err(StdioRunnerError::CommunicationError(
-                "agent input channel closed".into(),
-            ));
+            return Err(self.send_failed_error().await);
         }
 
         let sinks_for_waiter = Arc::clone(&self.session_sinks);
@@ -268,7 +343,7 @@ impl AcpStdioDriver {
         request_id: serde_json::Value,
         option_id: Option<&str>,
     ) -> Result<(), StdioRunnerError> {
-        let sender = self.current_sender()?;
+        let sender = self.current_sender().await?;
         let result = match option_id {
             Some(opt) => serde_json::json!({
                 "outcome": {
@@ -294,7 +369,7 @@ impl AcpStdioDriver {
     }
 
     pub async fn cancel_session(&self, session_id: &str) -> Result<(), StdioRunnerError> {
-        let sender = self.current_sender()?;
+        let sender = self.current_sender().await?;
         let notification = JsonRpcMessage::Notification(JsonRpcNotification {
             jsonrpc: JSONRPC_VERSION.to_string(),
             method: "session/cancel".to_string(),
@@ -358,6 +433,7 @@ impl AcpStdioDriver {
     }
 
     pub async fn shutdown(&self) -> Result<(), StdioRunnerError> {
+        self.shut_down.store(true, Ordering::SeqCst);
         {
             let mut sender_guard = lock(&self.sender);
             sender_guard.take();
@@ -423,6 +499,10 @@ impl AgentDriver for AcpStdioDriver {
         AcpStdioDriver::recent_stderr(self)
     }
 
+    fn exit_status(&self) -> Option<String> {
+        AcpStdioDriver::exit_status(self)
+    }
+
     fn subscribe_session(&self, session_id: &str) -> mpsc::UnboundedReceiver<DriverEvent> {
         AcpStdioDriver::subscribe_session(self, session_id)
     }
@@ -478,6 +558,9 @@ impl AgentDriverFactory for StdioAgentDriverFactory {
         if let Some(cwd) = &config.cwd {
             proc_cfg = proc_cfg.with_current_dir(cwd);
         }
+        for key in &config.env_remove {
+            proc_cfg = proc_cfg.without_env(key);
+        }
         if !config.env.is_empty() {
             proc_cfg = proc_cfg.with_env(config.env.clone());
         }
@@ -498,6 +581,44 @@ fn remove_sink_if_same(
     {
         guard.remove(session_id);
     }
+}
+
+pub(super) fn format_stderr_snippet(lines: Vec<String>) -> Option<String> {
+    let tail: Vec<&str> = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(MAX_STDERR_SNIPPET_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    let joined = tail.join(" | ");
+    if joined.chars().count() <= MAX_STDERR_SNIPPET_CHARS {
+        return Some(joined);
+    }
+    let truncated: String = joined.chars().take(MAX_STDERR_SNIPPET_CHARS).collect();
+    Some(format!("{truncated}..."))
+}
+
+pub(super) fn format_terminated_detail(
+    base: &str,
+    exit_status: Option<&str>,
+    stderr: Option<&str>,
+) -> String {
+    let mut msg = base.to_string();
+    if let Some(status) = exit_status {
+        msg.push_str(&format!(" ({status})"));
+    }
+    if let Some(err) = stderr {
+        msg.push_str(": ");
+        msg.push_str(err);
+    }
+    msg
 }
 
 fn fail_pending_rpcs(pending_rpc: &PendingRpcMap, reason: &str) {
@@ -596,10 +717,15 @@ async fn pump(
         }
     }
 
-    {
+    let pending_entries: Vec<_> = {
         let mut sender_guard = lock(&sender);
         sender_guard.take();
         lock(&persistent_sinks).clear();
+        lock(&pending_rpc).drain().map(|(_, entry)| entry).collect()
+    };
+    for entry in pending_entries {
+        let _ = entry
+            .tx
+            .send(Err("agent process closed its output".to_string()));
     }
-    fail_pending_rpcs(&pending_rpc, "agent process closed its output");
 }

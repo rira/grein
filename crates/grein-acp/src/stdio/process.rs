@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use super::lock;
 use super::protocol::{JsonRpcMessage, JsonRpcNotification, StdioRunnerError};
@@ -22,6 +22,7 @@ pub struct StdioProcessConfig {
     pub args: Vec<String>,
     pub current_dir: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
 }
 
 impl StdioProcessConfig {
@@ -34,6 +35,7 @@ impl StdioProcessConfig {
             args: args.into_iter().map(Into::into).collect(),
             current_dir: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
         }
     }
 
@@ -44,6 +46,11 @@ impl StdioProcessConfig {
 
     pub fn with_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
         self.env.extend(env);
+        self
+    }
+
+    pub fn without_env(mut self, key: impl Into<String>) -> Self {
+        self.env_remove.push(key.into());
         self
     }
 }
@@ -59,7 +66,44 @@ pub struct StdioProcessRunner {
     stdout_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcMessage>>>>,
     notification_rx: Option<mpsc::Receiver<JsonRpcNotification>>,
     stderr_lines: Arc<Mutex<VecDeque<String>>>,
+    stderr_done: Arc<Notify>,
+    stderr_finished: Arc<AtomicBool>,
+    last_exit_status: Arc<Mutex<Option<std::process::ExitStatus>>>,
     is_running_flag: Arc<AtomicBool>,
+}
+
+async fn read_lossy_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> Option<String> {
+    buf.clear();
+    match reader.read_until(b'\n', buf).await {
+        Ok(0) | Err(_) => {
+            buf.clear();
+            None
+        }
+        Ok(_) => {
+            let line = String::from_utf8_lossy(buf)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            buf.clear();
+            Some(line)
+        }
+    }
+}
+
+fn format_exit_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal {sig}");
+        }
+    }
+    status.to_string()
 }
 
 impl StdioProcessRunner {
@@ -72,6 +116,9 @@ impl StdioProcessRunner {
 
         if let Some(dir) = &config.current_dir {
             cmd.current_dir(dir);
+        }
+        for key in &config.env_remove {
+            cmd.env_remove(key);
         }
         for (key, val) in &config.env {
             cmd.env(key, val);
@@ -100,6 +147,9 @@ impl StdioProcessRunner {
             mpsc::channel::<JsonRpcNotification>(NOTIFICATION_CAPACITY);
         let is_running_flag = Arc::new(AtomicBool::new(true));
         let stderr_lines = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_BUFFER_LINES)));
+        let stderr_done = Arc::new(Notify::new());
+        let stderr_finished = Arc::new(AtomicBool::new(false));
+        let last_exit_status = Arc::new(Mutex::new(None));
 
         // Writer: newline-delimited JSON-RPC 2.0 envelopes.
         tokio::spawn(async move {
@@ -126,8 +176,9 @@ impl StdioProcessRunner {
         // Reader: decode and validate frames in strict arrival order.
         let flag_clone = Arc::clone(&is_running_flag);
         tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            while let Some(line) = read_lossy_line(&mut reader, &mut buf).await {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -153,9 +204,12 @@ impl StdioProcessRunner {
 
         // Stderr drain: never let the child block on a full OS pipe.
         let buffer = Arc::clone(&stderr_lines);
+        let stderr_done_clone = Arc::clone(&stderr_done);
+        let stderr_finished_clone = Arc::clone(&stderr_finished);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            while let Some(line) = read_lossy_line(&mut reader, &mut buf).await {
                 tracing::debug!(target: "grein_acp::stderr", "{line}");
                 let mut guard = lock(&buffer);
                 if guard.len() >= STDERR_BUFFER_LINES {
@@ -163,6 +217,8 @@ impl StdioProcessRunner {
                 }
                 guard.push_back(line);
             }
+            stderr_finished_clone.store(true, Ordering::SeqCst);
+            stderr_done_clone.notify_waiters();
         });
 
         Ok(Self {
@@ -176,6 +232,9 @@ impl StdioProcessRunner {
             stdout_rx: Arc::new(Mutex::new(Some(stdout_rx))),
             notification_rx: Some(notification_rx),
             stderr_lines,
+            stderr_done,
+            stderr_finished,
+            last_exit_status,
             is_running_flag,
         })
     }
@@ -218,22 +277,27 @@ impl StdioProcessRunner {
         lock(&self.raw_rx).take()
     }
 
+    fn harvest_exit_status(&self) -> Option<bool> {
+        let mut guard = lock(&self.child);
+        let child = guard.as_mut()?;
+        match child.try_wait() {
+            Ok(None) => Some(true),
+            Ok(Some(status)) => {
+                *lock(&self.last_exit_status) = Some(status);
+                self.is_running_flag.store(false, Ordering::SeqCst);
+                Some(false)
+            }
+            Err(_) => Some(false),
+        }
+    }
+
     pub fn is_running(&self) -> bool {
-        if !self.is_running_flag.load(Ordering::SeqCst) {
+        let flag_running = self.is_running_flag.load(Ordering::SeqCst);
+        if !flag_running && lock(&self.last_exit_status).is_some() {
             return false;
         }
-        let mut guard = lock(&self.child);
-        match guard.as_mut() {
-            Some(child) => match child.try_wait() {
-                Ok(None) => true,
-                Ok(Some(_)) => {
-                    self.is_running_flag.store(false, Ordering::SeqCst);
-                    false
-                }
-                Err(_) => false,
-            },
-            None => false,
-        }
+        let child_running = self.harvest_exit_status().unwrap_or(false);
+        flag_running && child_running
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -243,6 +307,37 @@ impl StdioProcessRunner {
     /// Most recent stderr lines captured from the child (bounded).
     pub fn recent_stderr(&self) -> Vec<String> {
         lock(&self.stderr_lines).iter().cloned().collect()
+    }
+
+    pub async fn wait_for_stderr_briefly(&self, timeout: Duration) {
+        if self.stderr_finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let notified = self.stderr_done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.stderr_finished.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, notified).await;
+    }
+
+    pub(super) async fn harvest_exit_status_briefly(&self, max_wait: Duration) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        while lock(&self.last_exit_status).is_none() && lock(&self.child).is_some() {
+            let _ = self.harvest_exit_status();
+            if lock(&self.last_exit_status).is_some() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    pub fn exit_status_summary(&self) -> Option<String> {
+        if lock(&self.last_exit_status).is_none() {
+            let _ = self.harvest_exit_status();
+        }
+        lock(&self.last_exit_status).map(format_exit_status)
     }
 
     /// Takes the notification stream; available once.
@@ -279,6 +374,7 @@ impl StdioProcessRunner {
                     child.wait().await.map_err(StdioRunnerError::SpawnFailed)?
                 }
             };
+            *lock(&self.last_exit_status) = Some(status);
             self.is_running_flag.store(false, Ordering::SeqCst);
             Ok(status)
         } else {
