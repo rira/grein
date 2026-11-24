@@ -60,10 +60,11 @@ fn kinds(agents: &[AcpAgent]) -> Vec<AcpAgentKind> {
 }
 
 #[test]
-fn test_path_discovery_preserves_agy_and_claude() {
+fn test_path_discovery_preserves_agy_and_claude_acp_adapters_and_ignores_plain_claude() {
     let fx = Fixture::new();
     let agy = fx.add_binary("agy");
-    let claude = fx.add_binary("claude");
+    let _plain_claude = fx.add_binary("claude");
+    let claude_acp = fx.add_binary("claude-agent-acp");
     let search = fx.search_path();
 
     let agents = discover_acp_agents(Some(&search));
@@ -74,11 +75,17 @@ fn test_path_discovery_preserves_agy_and_claude() {
         .find(|a| a.kind == AcpAgentKind::Agy)
         .expect("agy discovered");
     assert_eq!(agy_found.executable_path, agy);
+    assert!(agy_found.args.is_empty());
     let claude_found = agents
         .iter()
         .find(|a| a.kind == AcpAgentKind::Claude)
-        .expect("claude discovered");
-    assert_eq!(claude_found.executable_path, claude);
+        .expect("claude-agent-acp discovered");
+    assert_eq!(claude_found.executable_path, claude_acp);
+    assert!(claude_found.args.is_empty());
+
+    let only_plain = Fixture::new();
+    only_plain.add_binary("claude");
+    assert!(discover_acp_agents(Some(&only_plain.search_path())).is_empty());
 }
 
 #[test]
@@ -97,7 +104,7 @@ fn test_none_config_path_falls_back_to_path_discovery() {
 #[test]
 fn test_missing_config_file_falls_back_to_path_discovery() {
     let fx = Fixture::new();
-    let claude = fx.add_binary("claude");
+    let claude_acp = fx.add_binary("claude-code-acp");
     let search = fx.search_path();
     let missing = fx.missing_config();
 
@@ -105,14 +112,15 @@ fn test_missing_config_file_falls_back_to_path_discovery() {
 
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].kind, AcpAgentKind::Claude);
-    assert_eq!(agents[0].executable_path, claude);
+    assert_eq!(agents[0].executable_path, claude_acp);
+    assert!(agents[0].args.is_empty());
 }
 
 #[test]
 fn test_empty_config_falls_back_to_path_discovery() {
     let fx = Fixture::new();
     let agy = fx.add_binary("agy");
-    let claude = fx.add_binary("claude");
+    let claude_acp = fx.add_binary("claude-agent-acp");
     let search = fx.search_path();
     let cfg = fx.write_config("# no agents declared\n\n[ui]\ntheme = \"dark\"\n");
 
@@ -124,14 +132,14 @@ fn test_empty_config_falls_back_to_path_discovery() {
         .any(|a| a.kind == AcpAgentKind::Agy && a.executable_path == agy));
     assert!(agents
         .iter()
-        .any(|a| a.kind == AcpAgentKind::Claude && a.executable_path == claude));
+        .any(|a| a.kind == AcpAgentKind::Claude && a.executable_path == claude_acp));
 }
 
 #[test]
 fn test_agents_array_of_tables_parsed_with_executable_and_path_fields() {
     let fx = Fixture::new();
     // PATH contains an agent that must NOT show up, since config declares agents.
-    fx.add_binary("claude");
+    fx.add_binary("claude-agent-acp");
     let search = fx.search_path();
     let cfg = fx.write_config(
         r#"
@@ -181,6 +189,35 @@ command = ["/usr/local/bin/claude", "--acp", "--verbose"]
     assert_eq!(
         agents[0].executable_path,
         PathBuf::from("/usr/local/bin/claude")
+    );
+    assert_eq!(
+        agents[0].args,
+        vec!["--acp".to_string(), "--verbose".to_string()]
+    );
+}
+
+#[test]
+fn test_agents_entry_with_npx_claude_acp_preserves_command_args() {
+    let fx = Fixture::new();
+    let cfg = fx.write_config(
+        r#"
+[[agents]]
+name = "claude"
+command = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+"#,
+    );
+
+    let agents = resolve_agents_configuration(Some(&cfg), None).expect("resolve");
+
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].kind, AcpAgentKind::Claude);
+    assert_eq!(agents[0].executable_path, PathBuf::from("npx"));
+    assert_eq!(
+        agents[0].args,
+        vec![
+            "-y".to_string(),
+            "@agentclientprotocol/claude-agent-acp".to_string()
+        ]
     );
 }
 

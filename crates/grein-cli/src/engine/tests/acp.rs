@@ -64,18 +64,31 @@ fn test_acp_backend_config_discover_default_env_overrides_and_fallback() {
 
     let only_claude_dir = temp.path().join("only_claude");
     std::fs::create_dir_all(&only_claude_dir).expect("mkdir claude");
-    let only_claude =
+    let _only_claude =
         write_executable_script(&only_claude_dir, "claude", "#!/bin/sh\nexit 0\n");
-    let fallback_claude = AcpBackendConfig::discover_default_from(
+    let plain_claude_only = AcpBackendConfig::discover_default_from(
         temp.path().to_path_buf(),
         None,
         None,
         None,
         Some(&only_claude_dir.to_string_lossy()),
+    );
+    assert_eq!(plain_claude_only, None);
+
+    let claude_acp_dir = temp.path().join("claude_acp");
+    std::fs::create_dir_all(&claude_acp_dir).expect("mkdir claude_acp");
+    let claude_acp_bin =
+        write_executable_script(&claude_acp_dir, "claude-agent-acp", "#!/bin/sh\nexit 0\n");
+    let fallback_claude = AcpBackendConfig::discover_default_from(
+        temp.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Some(&claude_acp_dir.to_string_lossy()),
     )
-    .expect("fallback claude");
-    assert_eq!(fallback_claude.command, only_claude.to_string_lossy());
-    assert_eq!(fallback_claude.args, vec!["--acp"]);
+    .expect("fallback claude-agent-acp");
+    assert_eq!(fallback_claude.command, claude_acp_bin.to_string_lossy());
+    assert!(fallback_claude.args.is_empty());
     assert_eq!(fallback_claude.auth_method, None);
     let _ = claude_path;
 
@@ -621,4 +634,303 @@ done
         .filter(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
         .count();
     assert_eq!(session_new_count, 1, "must reuse single ACP session");
+}
+
+#[tokio::test]
+async fn test_ensure_driver_surfaces_stderr_and_exit_code_and_strips_claudecode_env() {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use grein_acp::{
+        AcpInitializeResult, AcpSessionInfo, AcpSpawnConfig, AgentDriver, AgentDriverError,
+        AgentDriverFactory, DriverEvent,
+    };
+    use grein_core::storage::sqlite::SqliteStorage;
+
+    use super::super::{EngineDependencies, EngineError};
+
+    static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvRestoreGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvRestoreGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, _)| (*k, std::env::var_os(k)))
+                .collect();
+            for (k, v) in vars {
+                std::env::set_var(k, v);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    struct SpyFactory {
+        captured: Arc<Mutex<Vec<AcpSpawnConfig>>>,
+    }
+
+    struct DummyDriver;
+
+    #[async_trait]
+    impl AgentDriver for DummyDriver {
+        fn is_running(&self) -> bool {
+            true
+        }
+        async fn initialize(&self) -> Result<AcpInitializeResult, AgentDriverError> {
+            Ok(AcpInitializeResult {
+                protocol_version: 1,
+                agent_name: Some("spy".into()),
+                agent_version: Some("1.0".into()),
+                supports_system_prompt_append: false,
+                auth_method_ids: Vec::new(),
+            })
+        }
+        async fn authenticate(&self, _method_id: &str) -> Result<(), AgentDriverError> {
+            Ok(())
+        }
+        async fn new_session(
+            &self,
+            _cwd: &Path,
+            _system_prompt_append: Option<&str>,
+        ) -> Result<AcpSessionInfo, AgentDriverError> {
+            Err(AgentDriverError::Protocol("mock session/new error".into()))
+        }
+        async fn send_prompt(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+        ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, AgentDriverError> {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            Ok(rx)
+        }
+        async fn respond_permission(
+            &self,
+            _request_id: Value,
+            _option_id: Option<&str>,
+        ) -> Result<(), AgentDriverError> {
+            Ok(())
+        }
+        async fn cancel_session(&self, _session_id: &str) -> Result<(), AgentDriverError> {
+            Ok(())
+        }
+        async fn close_session(&self, _session_id: &str) -> Result<(), AgentDriverError> {
+            Ok(())
+        }
+        fn recent_stderr(&self) -> Vec<String> {
+            vec![
+                "stderr line one".to_string(),
+                "stderr line two".to_string(),
+            ]
+        }
+        fn exit_status(&self) -> Option<String> {
+            Some("exit status 9".to_string())
+        }
+        async fn shutdown(&self) -> Result<(), AgentDriverError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AgentDriverFactory for SpyFactory {
+        async fn spawn(
+            &self,
+            config: &AcpSpawnConfig,
+        ) -> Result<Arc<dyn AgentDriver>, AgentDriverError> {
+            self.captured.lock().unwrap().push(config.clone());
+            Ok(Arc::new(DummyDriver))
+        }
+    }
+
+    use tokio::sync::mpsc;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    // 1. Verify spawn config strips CLAUDECODE & CLAUDE_CODE_ENTRYPOINT and new_session surfaces stderr + exit status.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let spy_storage = Arc::new(SqliteStorage::in_memory().expect("in-memory"));
+    let mut spy_deps = EngineDependencies::for_storage(
+        spy_storage,
+        temp.path().to_path_buf(),
+        Some(AcpBackendConfig {
+            command: "/bin/true".to_string(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        }),
+    );
+    spy_deps.agent_factory = Arc::new(SpyFactory {
+        captured: Arc::clone(&captured),
+    });
+    let spy_engine = InProcessEngine::with_dependencies(spy_deps).expect("spy engine");
+    let spy_main = spy_engine.ensure_main_thread().await.expect("spy main");
+    let new_sess_err = spy_engine
+        .send_turn_for_thread(&spy_main.thread_id, "trigger new_session")
+        .await
+        .expect_err("new_session must error");
+    assert!(
+        matches!(&new_sess_err, EngineError::Transport(msg)
+            if msg.contains("ACP new_session failed:")
+                && msg.contains("exit status 9")
+                && msg.contains("stderr line one | stderr line two")),
+        "unexpected new_session error: {new_sess_err}"
+    );
+    {
+        let recorded = captured.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].env_remove.contains(&"CLAUDECODE".to_string()),
+            "env_remove missing CLAUDECODE: {:?}",
+            recorded[0].env_remove
+        );
+        assert!(
+            recorded[0]
+                .env_remove
+                .contains(&"CLAUDE_CODE_ENTRYPOINT".to_string()),
+            "env_remove missing CLAUDE_CODE_ENTRYPOINT: {:?}",
+            recorded[0].env_remove
+        );
+    }
+
+    // 2. Verify real child process failure during initialize surfaces stderr and exit status without duplication.
+    let fail_script = write_executable_script(
+        temp.path(),
+        "fail_init.sh",
+        "#!/bin/sh\nprintf 'error: unknown option --acp\\n' >&2\nexit 23\n",
+    );
+    let fail_engine = InProcessEngine::open_with_config(
+        &temp.path().join("fail_init.db"),
+        temp.path().to_path_buf(),
+        Some(AcpBackendConfig {
+            command: fail_script.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        }),
+    )
+    .expect("open fail engine");
+    let fail_main = fail_engine.ensure_main_thread().await.expect("fail main");
+    let init_err = fail_engine
+        .send_turn_for_thread(&fail_main.thread_id, "hello")
+        .await
+        .expect_err("initialize must fail");
+    match init_err {
+        EngineError::Transport(msg) => {
+            assert!(msg.contains("ACP initialize failed:"), "msg: {msg}");
+            assert!(msg.contains("exit status 23"), "msg: {msg}");
+            assert_eq!(
+                msg.matches("error: unknown option --acp").count(),
+                1,
+                "stderr snippet should appear once without duplication: {msg}"
+            );
+        }
+        other => panic!("expected Transport error, got {other:?}"),
+    }
+
+    // 3. Verify real child process spawned via ensure_driver does not inherit CLAUDECODE or CLAUDE_CODE_ENTRYPOINT.
+    let env_capture = temp.path().join("child_env.txt");
+    let env_script = write_executable_script(
+        temp.path(),
+        "check_env.sh",
+        &format!(
+            "#!/bin/sh\n{{\n  printf 'CLAUDECODE=%s\\n' \"${{CLAUDECODE-__UNSET__}}\"\n  printf 'CLAUDE_CODE_ENTRYPOINT=%s\\n' \"${{CLAUDE_CODE_ENTRYPOINT-__UNSET__}}\"\n}} > {:?}\nexit 1\n",
+            env_capture.to_string_lossy()
+        ),
+    );
+    {
+        let _lock = CLAUDE_ENV_LOCK.lock().await;
+        let _guard = EnvRestoreGuard::set(&[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode"),
+        ]);
+        let env_engine = InProcessEngine::open_with_config(
+            &temp.path().join("env_strip.db"),
+            temp.path().to_path_buf(),
+            Some(AcpBackendConfig {
+                command: env_script.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                auth_method: None,
+                cwd: temp.path().to_path_buf(),
+            }),
+        )
+        .expect("open env engine");
+        let env_main = env_engine.ensure_main_thread().await.expect("env main");
+        let _ = env_engine
+            .send_turn_for_thread(&env_main.thread_id, "check env")
+            .await;
+    }
+    let captured_env = std::fs::read_to_string(&env_capture).expect("read child_env.txt");
+    assert!(
+        captured_env.contains("CLAUDECODE=__UNSET__"),
+        "expected CLAUDECODE stripped, got:\n{captured_env}"
+    );
+    assert!(
+        captured_env.contains("CLAUDE_CODE_ENTRYPOINT=__UNSET__"),
+        "expected CLAUDE_CODE_ENTRYPOINT stripped, got:\n{captured_env}"
+    );
+}
+
+#[tokio::test]
+async fn test_new_session_json_rpc_error_surfaces_child_stderr() {
+    use super::super::EngineError;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+    rest=${line#*\"id\":}; id=${rest%%,*}; id=${id%%\}*}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"mock","version":"1.0"},"authMethods":[],"agentCapabilities":{}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            printf 'Claude Code cannot be launched inside another Claude Code session.\n' >&2
+            sleep 0.05
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"session rejected"}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+    let script_path = write_executable_script(temp.path(), "mock_new_sess_stderr.sh", script);
+    let engine = InProcessEngine::open_with_config(
+        &temp.path().join("new_sess_stderr.db"),
+        temp.path().to_path_buf(),
+        Some(AcpBackendConfig {
+            command: script_path.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            auth_method: None,
+            cwd: temp.path().to_path_buf(),
+        }),
+    )
+    .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let err = engine
+        .send_turn_for_thread(&main.thread_id, "hello")
+        .await
+        .expect_err("new_session must fail");
+    match err {
+        EngineError::Transport(msg) => {
+            assert!(msg.contains("ACP new_session failed:"), "msg: {msg}");
+            assert!(msg.contains("session rejected"), "msg: {msg}");
+            assert!(
+                msg.contains("Claude Code cannot be launched inside another Claude Code session."),
+                "expected stderr in new_session failure: {msg}"
+            );
+        }
+        other => panic!("expected Transport error, got {other:?}"),
+    }
 }

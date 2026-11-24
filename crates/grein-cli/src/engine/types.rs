@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grein_acp::{
-    AcpConfigOption, AcpPermissionOption, AcpSessionInfo, AgentDriverError, AgentDriverFactory,
+    AcpConfigOption, AcpPermissionOption, AcpSessionInfo, AgentDriver, AgentDriverError,
+    AgentDriverFactory,
 };
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, Thread, ThreadKind};
 pub use grein_core::port::dto::{
@@ -158,7 +159,11 @@ impl AcpBackendConfig {
         if let Some(claude) = agents.iter().find(|a| a.kind == AcpAgentKind::Claude) {
             return Some(Self {
                 command: claude.executable_path.to_string_lossy().into_owned(),
-                args: claude_acp_args(&claude.executable_path),
+                args: if claude.args.is_empty() {
+                    claude_acp_args(&claude.executable_path)
+                } else {
+                    claude.args.clone()
+                },
                 auth_method: auth_override.unwrap_or(None),
                 cwd,
             });
@@ -513,6 +518,55 @@ pub(super) fn is_unsupported_method_error(err: &AgentDriverError) -> bool {
         || msg.contains("unknown method")
 }
 
+pub(super) fn format_driver_failure(
+    prefix: &str,
+    err: &dyn std::fmt::Display,
+    driver: &dyn AgentDriver,
+) -> String {
+    const MAX_STDERR_LINES: usize = 3;
+    const MAX_STDERR_CHARS: usize = 300;
+
+    let err_str = err.to_string();
+    let mut msg = format!("{prefix}: {err_str}");
+
+    if let Some(status) = driver
+        .exit_status()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        if !err_str.contains(&status) {
+            msg.push_str(&format!(" ({status})"));
+        }
+    }
+
+    let stderr_lines = driver.recent_stderr();
+    let tail: Vec<&str> = stderr_lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(MAX_STDERR_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if !tail.is_empty() {
+        let joined = tail.join(" | ");
+        let snippet = if joined.chars().count() <= MAX_STDERR_CHARS {
+            joined
+        } else {
+            let truncated: String = joined.chars().take(MAX_STDERR_CHARS).collect();
+            format!("{truncated}...")
+        };
+        if !err_str.contains(&snippet) && !tail.iter().all(|line| err_str.contains(line)) {
+            msg.push_str("; stderr: ");
+            msg.push_str(&snippet);
+        }
+    }
+
+    msg
+}
+
 pub(super) fn driver_err_to_engine(err: AgentDriverError) -> EngineError {
     match err {
         AgentDriverError::Terminated(msg) => EngineError::Transport(msg),
@@ -579,17 +633,15 @@ mod tests {
             p
         };
 
-        let claude = make_exec(&early, "claude");
+        let _claude = make_exec(&early, "claude");
         let early_only = super::AcpBackendConfig::discover_default_from(
             temp.path().to_path_buf(),
             None,
             None,
             None,
             Some(&early.to_string_lossy()),
-        )
-        .expect("claude config");
-        assert_eq!(early_only.command, claude.to_string_lossy());
-        assert_eq!(early_only.args, vec!["--acp".to_string()]);
+        );
+        assert_eq!(early_only, None);
 
         let code_acp = make_exec(&late, "claude-code-acp");
         let search = std::env::join_paths([&early, &late])
@@ -618,5 +670,106 @@ mod tests {
         .expect("claude-agent-acp config");
         assert_eq!(with_agent_acp.command, agent_acp.to_string_lossy());
         assert!(with_agent_acp.args.is_empty());
+    }
+
+    #[test]
+    fn format_driver_failure_appends_and_caps_stderr_without_duplication() {
+        use std::path::Path;
+        use async_trait::async_trait;
+        use grein_acp::{
+            AcpInitializeResult, AcpSessionInfo, AgentDriver, AgentDriverError, DriverEvent,
+        };
+        use tokio::sync::mpsc;
+
+        struct StubDriver {
+            stderr: Vec<String>,
+            status: Option<String>,
+        }
+
+        #[async_trait]
+        impl AgentDriver for StubDriver {
+            fn is_running(&self) -> bool {
+                false
+            }
+            async fn initialize(&self) -> Result<AcpInitializeResult, AgentDriverError> {
+                unreachable!()
+            }
+            async fn authenticate(&self, _method_id: &str) -> Result<(), AgentDriverError> {
+                unreachable!()
+            }
+            async fn new_session(
+                &self,
+                _cwd: &Path,
+                _system_prompt_append: Option<&str>,
+            ) -> Result<AcpSessionInfo, AgentDriverError> {
+                unreachable!()
+            }
+            async fn send_prompt(
+                &self,
+                _session_id: &str,
+                _prompt: &str,
+            ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, AgentDriverError> {
+                unreachable!()
+            }
+            async fn respond_permission(
+                &self,
+                _request_id: serde_json::Value,
+                _option_id: Option<&str>,
+            ) -> Result<(), AgentDriverError> {
+                unreachable!()
+            }
+            async fn cancel_session(&self, _session_id: &str) -> Result<(), AgentDriverError> {
+                unreachable!()
+            }
+            async fn close_session(&self, _session_id: &str) -> Result<(), AgentDriverError> {
+                unreachable!()
+            }
+            fn recent_stderr(&self) -> Vec<String> {
+                self.stderr.clone()
+            }
+            fn exit_status(&self) -> Option<String> {
+                self.status.clone()
+            }
+            async fn shutdown(&self) -> Result<(), AgentDriverError> {
+                Ok(())
+            }
+        }
+
+        let dup_driver = StubDriver {
+            stderr: vec!["error: unknown option '--acp'".into()],
+            status: Some("exit status 1".into()),
+        };
+        let embedded = AgentDriverError::Terminated(
+            "agent process closed its output (exit status 1): error: unknown option '--acp'".into(),
+        );
+        let deduped = super::format_driver_failure("ACP initialize failed", &embedded, &dup_driver);
+        assert_eq!(deduped.matches("exit status 1").count(), 1, "{deduped}");
+        assert_eq!(
+            deduped.matches("error: unknown option '--acp'").count(),
+            1,
+            "{deduped}"
+        );
+
+        let long_driver = StubDriver {
+            stderr: vec![
+                "old-ignored".into(),
+                "  ".into(),
+                "line-2".into(),
+                "line-3".into(),
+                "x".repeat(340),
+            ],
+            status: Some("exit status 2".into()),
+        };
+        let capped = super::format_driver_failure(
+            "ACP new_session failed",
+            &AgentDriverError::Timeout,
+            &long_driver,
+        );
+        assert!(!capped.contains("old-ignored"), "{capped}");
+        assert!(capped.contains("line-2 | line-3 | "), "{capped}");
+        assert!(capped.contains("(exit status 2)"), "{capped}");
+        assert!(capped.ends_with("..."), "{capped}");
+        let stderr_part = capped.split("; stderr: ").nth(1).expect("stderr suffix");
+        assert_eq!(stderr_part.chars().count(), 303, "{stderr_part}");
     }
 }

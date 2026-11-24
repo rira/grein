@@ -211,6 +211,10 @@ impl PluginRegistry<Frozen> {
                 p.executable_path().map(|path| AcpAgent {
                     kind: p.kind(),
                     executable_path: path.to_path_buf(),
+                    args: p
+                        .acp_backend_config(Path::new("."))
+                        .map(|cfg| cfg.args)
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -550,6 +554,7 @@ mod tests {
                 AcpAgent {
                     kind: AcpAgentKind::Custom,
                     executable_path: PathBuf::from("/opt/alpha"),
+                    args: Vec::new(),
                 },
             )))
             .unwrap();
@@ -559,6 +564,7 @@ mod tests {
                 AcpAgent {
                     kind: AcpAgentKind::Custom,
                     executable_path: PathBuf::from("/opt/beta"),
+                    args: Vec::new(),
                 },
             )))
             .unwrap();

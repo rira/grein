@@ -449,9 +449,12 @@ fn test_discovery_ignores_non_executable_and_directories_and_toml_edge_cases() {
     fs::write(&non_exec, "#!/bin/sh\n").unwrap();
     set_mode(&non_exec, 0o644);
 
-    // Directory named `claude` -> ignored
-    fs::create_dir_all(bin_dir.join("claude")).unwrap();
-    set_mode(&bin_dir.join("claude"), 0o755);
+    // Directory named `claude-agent-acp` -> ignored; plain executable `claude` -> ignored
+    fs::create_dir_all(bin_dir.join("claude-agent-acp")).unwrap();
+    set_mode(&bin_dir.join("claude-agent-acp"), 0o755);
+    let plain_claude = bin_dir.join("claude");
+    fs::write(&plain_claude, "#!/bin/sh\n").unwrap();
+    set_mode(&plain_claude, 0o755);
 
     let search = bin_dir.to_string_lossy().to_string();
     assert!(discover_acp_agents(Some(&search)).is_empty());
@@ -470,7 +473,9 @@ fn test_discovery_ignores_non_executable_and_directories_and_toml_edge_cases() {
         resolved[0].executable_path,
         PathBuf::from("/opt/my\tbin\n\\\"x\"\r")
     );
+    assert!(resolved[0].args.is_empty());
     assert_eq!(resolved[1].kind, AcpAgentKind::Claude);
+    assert!(resolved[1].args.is_empty());
 
     // Parser error branches
     let bad_cases = [

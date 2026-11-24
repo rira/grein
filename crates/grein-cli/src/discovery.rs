@@ -25,16 +25,14 @@ const CLAUDE_NATIVE_ACP_STEMS: &[&str] = &["claude-agent-acp", "claude-code-acp"
 
 const DISCOVERY_CANDIDATES: &[(AcpAgentKind, &[&str])] = &[
     (AcpAgentKind::Agy, &["agy"]),
-    (
-        AcpAgentKind::Claude,
-        &["claude-agent-acp", "claude-code-acp", "claude"],
-    ),
+    (AcpAgentKind::Claude, CLAUDE_NATIVE_ACP_STEMS),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpAgent {
     pub kind: AcpAgentKind,
     pub executable_path: PathBuf,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +75,7 @@ fn find_kind_executable(
                 return Some(AcpAgent {
                     kind,
                     executable_path: candidate_path,
+                    args: Vec::new(),
                 });
             }
         }
@@ -107,15 +106,8 @@ pub fn discover_acp_agents(search_path: Option<&str>) -> Vec<AcpAgent> {
     discovered
 }
 
-pub(crate) fn claude_acp_args(executable: &Path) -> Vec<String> {
-    let stem = executable
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|s| s.trim().to_ascii_lowercase());
-    match stem.as_deref() {
-        Some(s) if CLAUDE_NATIVE_ACP_STEMS.contains(&s) => Vec::new(),
-        _ => vec!["--acp".to_string()],
-    }
+pub(crate) fn claude_acp_args(_executable: &Path) -> Vec<String> {
+    Vec::new()
 }
 
 /// A parsed TOML value (only the shapes relevant to agent declarations).
@@ -323,9 +315,11 @@ fn into_agent(raw: RawAgent) -> Option<AcpAgent> {
         Some(label) => kind_from_label(label),
         None => kind_from_label(&executable),
     };
+    let args = raw.command.get(1..).unwrap_or_default().to_vec();
     Some(AcpAgent {
         kind,
         executable_path: PathBuf::from(executable),
+        args,
     })
 }
 
@@ -390,6 +384,7 @@ mod tests {
             vec![AcpAgent {
                 kind: AcpAgentKind::Claude,
                 executable_path: late_acp,
+                args: Vec::new(),
             }]
         );
     }
@@ -416,6 +411,7 @@ mod tests {
             vec![AcpAgent {
                 kind: AcpAgentKind::Claude,
                 executable_path: late_code_acp,
+                args: Vec::new(),
             }]
         );
     }
@@ -450,6 +446,7 @@ mod tests {
             vec![AcpAgent {
                 kind: AcpAgentKind::Claude,
                 executable_path: linked_agent_acp,
+                args: Vec::new(),
             }]
         );
     }
@@ -473,18 +470,50 @@ mod tests {
     }
 
     #[test]
-    fn claude_acp_args_omits_flag_for_native_acp_adapters() {
+    fn plain_claude_cli_is_never_discovered_on_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let _plain_claude = write_exec(&bin_dir, "claude");
+
+        let search = bin_dir.to_string_lossy().into_owned();
+        let discovered = discover_acp_agents(Some(&search));
+        assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn claude_acp_args_always_returns_empty_without_invalid_acp_flag() {
         assert!(claude_acp_args(Path::new("claude-agent-acp")).is_empty());
         assert!(claude_acp_args(Path::new("/nix/store/abc/bin/claude-agent-acp")).is_empty());
         assert!(claude_acp_args(Path::new("/usr/local/bin/claude-code-acp")).is_empty());
         assert!(claude_acp_args(Path::new("CLAUDE-CODE-ACP.exe")).is_empty());
+        assert!(claude_acp_args(Path::new("/usr/bin/claude")).is_empty());
+        assert!(claude_acp_args(Path::new("claude")).is_empty());
+        assert!(claude_acp_args(Path::new("/opt/wrapped-claude-acp")).is_empty());
+    }
+
+    #[test]
+    fn toml_command_array_preserves_trailing_args_on_acp_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = temp.path().join("grein.toml");
+        fs::write(
+            &cfg_path,
+            "[[agents]]\nname = \"claude\"\ncommand = [\"npx\", \"-y\", \"@agentclientprotocol/claude-agent-acp\"]\n",
+        )
+        .expect("write cfg");
+
+        let resolved =
+            resolve_agents_configuration(Some(&cfg_path), None).expect("resolve agents");
         assert_eq!(
-            claude_acp_args(Path::new("/usr/bin/claude")),
-            vec!["--acp".to_string()]
-        );
-        assert_eq!(
-            claude_acp_args(Path::new("claude")),
-            vec!["--acp".to_string()]
+            resolved,
+            vec![AcpAgent {
+                kind: AcpAgentKind::Claude,
+                executable_path: PathBuf::from("npx"),
+                args: vec![
+                    "-y".to_string(),
+                    "@agentclientprotocol/claude-agent-acp".to_string()
+                ],
+            }]
         );
     }
 }

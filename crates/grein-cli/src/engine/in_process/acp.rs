@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 
 use super::super::types::{
     acp_config_option_to_core, driver_err_to_engine, extract_model_and_mode_from_options,
-    is_internal_root_node, is_unsupported_method_error, merge_updated_config_options,
-    normalize_session_config_options, parse_typed_id, storage_err, AcpBackendConfig,
-    AgentMetaEntry, EngineError, ACP_SYSTEM_PROMPT_MAX_CHARS,
+    format_driver_failure, is_internal_root_node, is_unsupported_method_error,
+    merge_updated_config_options, normalize_session_config_options, parse_typed_id, storage_err,
+    AcpBackendConfig, AgentMetaEntry, EngineError, ACP_SYSTEM_PROMPT_MAX_CHARS,
 };
 use super::listener::spawn_session_listener_with_observer;
 use super::providers::AcpProviderRuntime;
@@ -183,10 +183,11 @@ impl EngineRuntime {
         let info = match driver.new_session(&session_cwd, append_opt).await {
             Ok(info) => info,
             Err(err) => {
+                let msg = format_driver_failure("ACP new_session failed", &err, driver.as_ref());
                 provider
                     .invalidate_driver_if_dead(&driver, driver_gen, &self.state)
                     .await;
-                return Err(EngineError::Transport(format!("ACP new_session failed: {err}")));
+                return Err(EngineError::Transport(msg));
             }
         };
 

@@ -9,8 +9,8 @@ use grein_core::port::dto::{AgentProviderInfo, EngineStreamEvent};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::super::types::{
-    parse_typed_id, storage_err, AcpBackendConfig, EngineError, RegisteredAgentProvider,
-    CLOSE_SESSION_TIMEOUT,
+    format_driver_failure, parse_typed_id, storage_err, AcpBackendConfig, EngineError,
+    RegisteredAgentProvider, CLOSE_SESSION_TIMEOUT,
 };
 use super::{DriverSlot, EngineDependencies, EngineRuntime, EngineState, InProcessEngine};
 use crate::subagent_watch::SubagentObserverPort;
@@ -111,7 +111,10 @@ impl AcpProviderRuntime {
             *guard = None;
         }
 
-        let mut spawn_cfg = AcpSpawnConfig::new(&cfg.command, cfg.args.clone()).with_cwd(&cfg.cwd);
+        let mut spawn_cfg = AcpSpawnConfig::new(&cfg.command, cfg.args.clone())
+            .with_cwd(&cfg.cwd)
+            .without_env("CLAUDECODE")
+            .without_env("CLAUDE_CODE_ENTRYPOINT");
         if let Some(method) = cfg.auth_method.as_deref().filter(|m| !m.is_empty()) {
             spawn_cfg = spawn_cfg.with_auth_method(method);
         }
@@ -119,17 +122,18 @@ impl AcpProviderRuntime {
             EngineError::Transport(format!("failed to spawn ACP agent `{}`: {e}", cfg.command))
         })?;
         if let Err(e) = driver.initialize().await {
+            let msg = format_driver_failure("ACP initialize failed", &e, driver.as_ref());
             let _ = driver.shutdown().await;
             *guard = None;
-            return Err(EngineError::Transport(format!("ACP initialize failed: {e}")));
+            return Err(EngineError::Transport(msg));
         }
         if let Some(method) = cfg.auth_method.as_deref().filter(|m| !m.is_empty()) {
             if let Err(e) = driver.authenticate(method).await {
+                let prefix = format!("ACP authenticate ({method}) failed");
+                let msg = format_driver_failure(&prefix, &e, driver.as_ref());
                 let _ = driver.shutdown().await;
                 *guard = None;
-                return Err(EngineError::Transport(format!(
-                    "ACP authenticate ({method}) failed: {e}"
-                )));
+                return Err(EngineError::Transport(msg));
             }
         }
         let generation = gen_seq.fetch_add(1, Ordering::Relaxed);

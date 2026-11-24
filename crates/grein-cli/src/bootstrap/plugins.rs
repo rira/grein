@@ -159,7 +159,10 @@ impl AgentPlugin for ClaudeAgentPlugin {
     }
 
     fn install_hint(&self) -> Option<String> {
-        Some("nix shell --impure nixpkgs#claude-agent-acp".into())
+        Some(
+            "npm install -g @agentclientprotocol/claude-agent-acp (or: NIXPKGS_ALLOW_UNFREE=1 nix shell --impure nixpkgs#claude-agent-acp)"
+                .into(),
+        )
     }
 
     fn executable_path(&self) -> Option<&Path> {
@@ -256,10 +259,14 @@ impl CustomAcpAgentPlugin {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("custom");
-        let args = match agent.kind {
-            AcpAgentKind::Agy => vec!["acp".to_string(), "--stdio".to_string()],
-            AcpAgentKind::Claude => claude_acp_args(&agent.executable_path),
-            AcpAgentKind::Custom => Vec::new(),
+        let args = if agent.args.is_empty() {
+            match agent.kind {
+                AcpAgentKind::Agy => vec!["acp".to_string(), "--stdio".to_string()],
+                AcpAgentKind::Claude => claude_acp_args(&agent.executable_path),
+                AcpAgentKind::Custom => Vec::new(),
+            }
+        } else {
+            agent.args
         };
         let auth_method = match agent.kind {
             AcpAgentKind::Agy => Some("oauth-personal".to_string()),
@@ -469,7 +476,7 @@ mod tests {
         assert_eq!(claude.kind(), AcpAgentKind::Claude);
         let claude_cfg = claude.acp_backend_config(cwd).expect("claude cfg");
         assert_eq!(claude_cfg.command, "/usr/bin/claude");
-        assert_eq!(claude_cfg.args, vec!["--acp"]);
+        assert!(claude_cfg.args.is_empty());
         assert_eq!(claude_cfg.auth_method, None);
     }
 
@@ -489,6 +496,7 @@ mod tests {
         assert_eq!(resolved[0].kind(), AcpAgentKind::Custom);
         let cfg = resolved[0].acp_backend_config(temp.path()).expect("cfg");
         assert_eq!(cfg.command, "/opt/my-acp");
+        assert_eq!(cfg.args, vec!["--stdio"]);
 
         let from_env = CustomAcpAgentPlugin::from_env(
             Some("/usr/local/bin/custom-acp".into()),
@@ -538,12 +546,13 @@ mod tests {
         assert_eq!(claude.display_name(), "Claude Code");
         assert_eq!(
             claude.install_hint().as_deref(),
-            Some("nix shell --impure nixpkgs#claude-agent-acp")
+            Some("npm install -g @agentclientprotocol/claude-agent-acp (or: NIXPKGS_ALLOW_UNFREE=1 nix shell --impure nixpkgs#claude-agent-acp)")
         );
-        assert_eq!(
-            claude.acp_backend_config(cwd).expect("claude cfg").args,
-            vec!["--acp"]
-        );
+        assert!(claude
+            .acp_backend_config(cwd)
+            .expect("claude cfg")
+            .args
+            .is_empty());
 
         let claude_agent_acp =
             ClaudeAgentPlugin::new(Some(PathBuf::from("/usr/local/bin/claude-agent-acp")), None);
@@ -573,6 +582,7 @@ mod tests {
             AcpAgent {
                 kind: AcpAgentKind::Custom,
                 executable_path: PathBuf::from("/opt/my-acp"),
+                args: Vec::new(),
             },
         );
         assert_eq!(custom_discovered.short_name(), "my-acp");
@@ -583,6 +593,7 @@ mod tests {
             AcpAgent {
                 kind: AcpAgentKind::Claude,
                 executable_path: PathBuf::from("/opt/bin/claude-agent-acp"),
+                args: Vec::new(),
             },
         );
         assert!(custom_claude_acp
@@ -591,9 +602,93 @@ mod tests {
             .args
             .is_empty());
 
+        let custom_agy_default = CustomAcpAgentPlugin::from_discovered(
+            2,
+            AcpAgent {
+                kind: AcpAgentKind::Agy,
+                executable_path: PathBuf::from("/opt/bin/agy"),
+                args: Vec::new(),
+            },
+        );
+        assert_eq!(
+            custom_agy_default
+                .acp_backend_config(cwd)
+                .expect("custom agy cfg")
+                .args,
+            vec!["acp", "--stdio"]
+        );
+
+        let custom_agy_override = CustomAcpAgentPlugin::from_discovered(
+            3,
+            AcpAgent {
+                kind: AcpAgentKind::Agy,
+                executable_path: PathBuf::from("/opt/bin/agy"),
+                args: vec!["--custom-arg".to_string()],
+            },
+        );
+        assert_eq!(
+            custom_agy_override
+                .acp_backend_config(cwd)
+                .expect("custom agy override cfg")
+                .args,
+            vec!["--custom-arg"]
+        );
+
         let explicit_id =
             CustomAcpAgentPlugin::new("bespoke", AcpAgentKind::Custom, None, Vec::new(), None);
         assert_eq!(explicit_id.short_name(), "bespoke");
         assert_eq!(explicit_id.display_name(), "Custom (bespoke)");
+    }
+
+    #[test]
+    fn claude_discovery_ignores_plain_claude_and_custom_plugin_preserves_npx_args() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let plain_claude = bin_dir.join("claude");
+        fs::write(&plain_claude, "#!/bin/sh\nexit 0\n").expect("write claude");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&plain_claude).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&plain_claude, perms).unwrap();
+        }
+        let search_plain = bin_dir.to_string_lossy().into_owned();
+        let unavailable = ClaudeAgentPlugin::discover(Some(&search_plain), None);
+        assert!(!unavailable.is_available());
+        assert_eq!(unavailable.executable_path(), None);
+        assert_eq!(unavailable.acp_backend_config(temp.path()), None);
+
+        let adapter_bin = bin_dir.join("claude-agent-acp");
+        fs::write(&adapter_bin, "#!/bin/sh\nexit 0\n").expect("write adapter");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&adapter_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&adapter_bin, perms).unwrap();
+        }
+        let available = ClaudeAgentPlugin::discover(Some(&search_plain), None);
+        assert!(available.is_available());
+        assert_eq!(available.executable_path(), Some(adapter_bin.as_path()));
+        assert!(available
+            .acp_backend_config(temp.path())
+            .expect("adapter cfg")
+            .args
+            .is_empty());
+
+        let cfg_path = temp.path().join("agents.toml");
+        fs::write(
+            &cfg_path,
+            "[[agents]]\nname = \"claude\"\ncommand = [\"npx\", \"-y\", \"@agentclientprotocol/claude-agent-acp\"]\n",
+        )
+        .expect("write cfg");
+        let resolved = CustomAcpAgentPlugin::resolve_from_config(Some(&cfg_path), None)
+            .expect("resolve from config");
+        assert_eq!(resolved.len(), 1);
+        let cfg = resolved[0].acp_backend_config(temp.path()).expect("npx cfg");
+        assert_eq!(cfg.command, "npx");
+        assert_eq!(cfg.args, vec!["-y", "@agentclientprotocol/claude-agent-acp"]);
     }
 }
