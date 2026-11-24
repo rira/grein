@@ -211,6 +211,13 @@ pub trait DaemonEngine: Send + Sync {
         title: Option<&str>,
     ) -> Result<ThreadSummary, EngineError>;
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError>;
+    async fn create_root_thread_in_cwd(
+        &self,
+        title: Option<&str>,
+        _cwd: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.create_root_thread(title).await
+    }
     async fn rename_thread(
         &self,
         thread_id: &str,
@@ -356,6 +363,12 @@ pub trait DaemonEngine: Send + Sync {
         Err(EngineError::Protocol(
             "pty_restart not supported".to_string(),
         ))
+    }
+    async fn list_recent_user_prompts(&self, _limit: usize) -> Result<Vec<String>, EngineError> {
+        Ok(Vec::new())
+    }
+    async fn list_workspace_files(&self, _root: Option<&str>) -> Result<Vec<String>, EngineError> {
+        Ok(Vec::new())
     }
 }
 

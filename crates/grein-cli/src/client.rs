@@ -106,9 +106,20 @@ impl DaemonClient {
         &mut self,
         title: Option<&str>,
     ) -> Result<Value, std::io::Error> {
+        self.session_create_root_thread_in_cwd(title, None).await
+    }
+
+    pub async fn session_create_root_thread_in_cwd(
+        &mut self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
         let mut params = serde_json::Map::new();
         if let Some(t) = title {
             params.insert("title".to_string(), json!(t));
+        }
+        if let Some(dir) = cwd {
+            params.insert("cwd".to_string(), json!(dir));
         }
         self.json_rpc("session.create_root_thread", Value::Object(params))
             .await
@@ -323,6 +334,30 @@ impl DaemonClient {
             json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
         )
         .await
+    }
+
+    pub async fn session_list_recent_prompts(
+        &mut self,
+        limit: Option<usize>,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(l) = limit {
+            params.insert("limit".to_string(), json!(l));
+        }
+        self.json_rpc("session.list_recent_prompts", Value::Object(params))
+            .await
+    }
+
+    pub async fn session_list_workspace_files(
+        &mut self,
+        root: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(r) = root {
+            params.insert("root".to_string(), json!(r));
+        }
+        self.json_rpc("session.list_workspace_files", Value::Object(params))
+            .await
     }
 
     async fn send_command(&mut self, cmd: &str) -> Result<String, std::io::Error> {

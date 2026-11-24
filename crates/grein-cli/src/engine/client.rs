@@ -80,6 +80,17 @@ impl DaemonEngine for EngineClient {
         }
     }
 
+    async fn create_root_thread_in_cwd(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        match self {
+            Self::InProcess(e) => e.create_root_thread_in_cwd(title, cwd).await,
+            Self::Socket(e) => e.create_root_thread_in_cwd(title, cwd).await,
+        }
+    }
+
     async fn rename_thread(
         &self,
         thread_id: &str,
@@ -349,6 +360,20 @@ impl DaemonEngine for EngineClient {
                 DaemonEngine::pty_restart(e.as_ref(), thread_id, rows, cols).await
             }
             Self::Socket(e) => DaemonEngine::pty_restart(e, thread_id, rows, cols).await,
+        }
+    }
+
+    async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::list_recent_user_prompts(e.as_ref(), limit).await,
+            Self::Socket(e) => DaemonEngine::list_recent_user_prompts(e, limit).await,
+        }
+    }
+
+    async fn list_workspace_files(&self, root: Option<&str>) -> Result<Vec<String>, EngineError> {
+        match self {
+            Self::InProcess(e) => DaemonEngine::list_workspace_files(e.as_ref(), root).await,
+            Self::Socket(e) => DaemonEngine::list_workspace_files(e, root).await,
         }
     }
 }

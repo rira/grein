@@ -78,6 +78,16 @@ impl UnixSocketEngineClient {
         )
     }
 
+    fn is_optional_autocomplete_rpc(method: &str) -> bool {
+        matches!(
+            method,
+            "session.list_recent_prompts"
+                | "list_recent_prompts"
+                | "session.list_workspace_files"
+                | "list_workspace_files"
+        )
+    }
+
     fn parse_rpc_response(method: &str, line: &str) -> Result<Value, EngineError> {
         let response: Value =
             serde_json::from_str(line.trim()).map_err(|e| EngineError::Protocol(e.to_string()))?;
@@ -87,6 +97,9 @@ impl UnixSocketEngineClient {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown rpc error");
+            if code == Some(-32601) && Self::is_optional_autocomplete_rpc(method) {
+                return Ok(json!([]));
+            }
             if code == Some(-32601) && Self::is_stale_daemon_terminal_rpc(method) {
                 return Err(EngineError::Protocol(format!(
                     "running `grein daemon` appears outdated and needs to be restarted (`{method}`: {message})"
@@ -263,6 +276,22 @@ impl UnixSocketEngineClient {
     ) -> Result<TuiPtyScreenSnapshot, EngineError> {
         DaemonEngine::pty_restart(self, thread_id, rows, cols).await
     }
+
+    pub async fn create_root_thread_in_cwd(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::create_root_thread_in_cwd(self, title, cwd).await
+    }
+
+    pub async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
+        DaemonEngine::list_recent_user_prompts(self, limit).await
+    }
+
+    pub async fn list_workspace_files(&self, root: Option<&str>) -> Result<Vec<String>, EngineError> {
+        DaemonEngine::list_workspace_files(self, root).await
+    }
 }
 
 #[async_trait]
@@ -317,11 +346,22 @@ impl DaemonEngine for UnixSocketEngineClient {
     }
 
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::create_root_thread_in_cwd(self, title, None).await
+    }
+
+    async fn create_root_thread_in_cwd(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
         let mut params = serde_json::Map::new();
         if let Some(title) = title {
             params.insert("title".to_string(), json!(title));
         }
-        self.call_typed("session.create_root_thread", Value::Object(params))
+        if let Some(cwd) = cwd {
+            params.insert("cwd".to_string(), json!(cwd));
+        }
+        self.call_dedicated_typed("session.create_root_thread", Value::Object(params))
             .await
     }
 
@@ -656,5 +696,19 @@ impl DaemonEngine for UnixSocketEngineClient {
             json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
         )
         .await
+    }
+
+    async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
+        self.call_dedicated_typed("session.list_recent_prompts", json!({"limit": limit}))
+            .await
+    }
+
+    async fn list_workspace_files(&self, root: Option<&str>) -> Result<Vec<String>, EngineError> {
+        let mut params = serde_json::Map::new();
+        if let Some(root) = root {
+            params.insert("root".to_string(), json!(root));
+        }
+        self.call_dedicated_typed("session.list_workspace_files", Value::Object(params))
+            .await
     }
 }

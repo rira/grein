@@ -195,7 +195,9 @@ impl EngineRuntime {
         .with_title(default_title)
         .with_custom_name(custom_name);
         thread.parent_thread_id = parent_thread_id;
-        thread.cwd = cwd;
+        if let Some(dir) = cwd {
+            thread = thread.with_cwd(dir);
+        }
         self.storage.insert_thread(&thread).map_err(storage_err)?;
         self.storage
             .get_thread(thread.id)
@@ -354,10 +356,34 @@ impl InProcessEngine {
         Ok(summary)
     }
 
-    pub(super) async fn create_root_thread_impl(
+    pub(super) async fn create_root_thread_in_cwd_impl(
         &self,
         title: Option<&str>,
+        cwd: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
+        let resolved_cwd = match cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let path = PathBuf::from(raw);
+                if !path.is_dir() {
+                    return Err(EngineError::InvalidParams(format!(
+                        "root cwd does not exist or is not a directory: {}",
+                        path.display()
+                    )));
+                }
+                let canonical = std::fs::canonicalize(&path).map_err(|e| {
+                    EngineError::InvalidParams(format!(
+                        "failed to resolve root cwd {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                let dir_str = canonical.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    EngineError::InvalidParams("root cwd is not valid UTF-8".to_string())
+                })?;
+                Some(dir_str)
+            }
+            None => None,
+        };
+
         let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
         let explicit_custom = normalize_custom_name(title);
         let meta_before = self.runtime.compute_thread_metadata()?;
@@ -386,7 +412,7 @@ impl InProcessEngine {
             explicit_custom,
             None,
             ThreadKind::Agent,
-            None,
+            resolved_cwd,
         )?;
         {
             let mut state = self.runtime.lock()?;
@@ -406,6 +432,33 @@ impl InProcessEngine {
         self.runtime
             .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
         Ok(summary)
+    }
+
+    pub(super) async fn list_recent_user_prompts_impl(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, EngineError> {
+        self.runtime
+            .storage
+            .list_recent_user_prompts(limit)
+            .map_err(storage_err)
+    }
+
+    pub(super) async fn list_workspace_files_impl(
+        &self,
+        root: Option<&str>,
+    ) -> Result<Vec<String>, EngineError> {
+        let fallback = self.runtime.cwd.clone();
+        let explicit = root
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        tokio::task::spawn_blocking(move || {
+            let target_root = explicit.filter(|p| p.is_dir()).unwrap_or(fallback);
+            grein_workspace::list_workspace_files(&target_root, 5_000)
+        })
+        .await
+        .map_err(|e| EngineError::Transport(format!("list_workspace_files task panicked: {e}")))
     }
 
     pub(super) async fn rename_thread_impl(

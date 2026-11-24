@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use grein_cli::engine::{
-    truncate_chars_with_ellipsis, DaemonEngine, PermissionDecisionPayload,
+    truncate_chars_with_ellipsis, DaemonEngine, EngineError, PermissionDecisionPayload,
+    ThreadSummary,
 };
 use grein_tui::engine_port::{
     AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, PtyScreenSnapshot,
@@ -14,6 +15,8 @@ use tokio::sync::{mpsc, Mutex};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_autocomplete;
 #[cfg(test)]
 mod tests_session_prefs;
 
@@ -109,6 +112,37 @@ impl<E: DaemonEngine> EngineClientPort<E> {
                 None
             }
         }
+    }
+
+    async fn finish_created_root(&self, created: ThreadSummary) -> HydratedThread {
+        let hydrated = HydratedThread {
+            id: created.thread_id,
+            title: created.title,
+            custom_name: created.custom_name,
+            turns: Vec::new(),
+        };
+        if !self.has_live_stream.load(Ordering::SeqCst) {
+            self.emit(TuiEngineEvent::ThreadCreated {
+                thread: hydrated.clone(),
+            });
+            let _ = self.fetch_and_emit_thread_metadata().await;
+        }
+        hydrated
+    }
+}
+
+fn is_unsupported_engine_error(err: &EngineError) -> bool {
+    match err {
+        EngineError::Protocol(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("-32601")
+                || lower.contains("method not found")
+                || lower.contains("not supported")
+                || lower.contains("unsupported")
+                || lower.contains("unimplemented")
+                || lower.contains("unknown method")
+        }
+        _ => false,
     }
 }
 
@@ -342,19 +376,22 @@ where
 
     async fn create_root(&self, title: Option<&str>) -> io::Result<HydratedThread> {
         let created = self.client.create_root_thread(title).await.map_err(to_io)?;
-        let hydrated = HydratedThread {
-            id: created.thread_id,
-            title: created.title,
-            custom_name: created.custom_name,
-            turns: Vec::new(),
+        Ok(self.finish_created_root(created).await)
+    }
+
+    async fn create_root_in_cwd(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        let created = match self.client.create_root_thread_in_cwd(title, cwd).await {
+            Ok(created) => created,
+            Err(err) if is_unsupported_engine_error(&err) => {
+                self.client.create_root_thread(title).await.map_err(to_io)?
+            }
+            Err(err) => return Err(to_io(err)),
         };
-        if !self.has_live_stream.load(Ordering::SeqCst) {
-            self.emit(TuiEngineEvent::ThreadCreated {
-                thread: hydrated.clone(),
-            });
-            let _ = self.fetch_and_emit_thread_metadata().await;
-        }
-        Ok(hydrated)
+        Ok(self.finish_created_root(created).await)
     }
 
     async fn rename_thread(&self, thread_id: &str, title: &str) -> io::Result<()> {
@@ -641,6 +678,22 @@ where
             store.set_ui_pref(key, value).map_err(to_io)?;
         }
         Ok(())
+    }
+
+    async fn list_recent_user_prompts(&self, limit: usize) -> io::Result<Vec<String>> {
+        match self.client.list_recent_user_prompts(limit).await {
+            Ok(prompts) => Ok(prompts),
+            Err(err) if is_unsupported_engine_error(&err) => Ok(Vec::new()),
+            Err(err) => Err(to_io(err)),
+        }
+    }
+
+    async fn list_workspace_files(&self, root: Option<&str>) -> io::Result<Vec<String>> {
+        match self.client.list_workspace_files(root).await {
+            Ok(files) => Ok(files),
+            Err(err) if is_unsupported_engine_error(&err) => Ok(Vec::new()),
+            Err(err) => Err(to_io(err)),
+        }
     }
 
     async fn pty_scroll(&self, thread_id: &str, delta: isize) -> io::Result<PtyScreenSnapshot> {

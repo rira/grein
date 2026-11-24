@@ -2025,6 +2025,166 @@ done
     );
 }
 
+#[tokio::test]
+async fn test_switch_thread_worktree_agent_none_cwd_to_primary_preserves_acp_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_root = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    init_test_git_repo(&repo_root);
+    let canonical_repo = std::fs::canonicalize(&repo_root).expect("canonical repo");
+    let canonical_repo_str = canonical_repo.to_string_lossy().to_string();
+
+    let db_path = temp.path().join("primary_noop.db");
+    let capture_path = temp.path().join("primary_noop_capture.jsonl");
+    let mock_script = format!(
+        r#"#!/bin/sh
+export GREIN_CAPTURE={capture:?}
+sess_counter=0
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$GREIN_CAPTURE"
+    rest=${{line#*\"id\":}}; id=${{rest%%,*}}; id=${{id%%\}}*}}
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentInfo":{{"name":"mock","version":"1.0"}},"authMethods":[],"agentCapabilities":{{}}}}}}\n' "$id"
+            ;;
+        *'"method":"session/new"'*)
+            sess_counter=$((sess_counter+1))
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"sess-%s"}}}}\n' "$id" "$sess_counter"
+            ;;
+        *'"method":"session/close"'*)
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+            ;;
+        *'"method":"session/prompt"'*)
+            case "$line" in
+                *'"sessionId":"sess-1"'*) sid="sess-1" ;;
+                *) sid="sess-2" ;;
+            esac
+            printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"%s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"ok"}}}}}}}}\n' "$sid"
+            printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id"
+            ;;
+    esac
+done
+"#,
+        capture = capture_path.to_string_lossy()
+    );
+    let script_path = write_executable_script(temp.path(), "mock_primary_noop.sh", &mock_script);
+    let cfg = AcpBackendConfig {
+        command: script_path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        auth_method: None,
+        cwd: canonical_repo.clone(),
+    };
+
+    let engine = InProcessEngine::open_with_config(&db_path, canonical_repo.clone(), Some(cfg))
+        .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("ensure main");
+
+    // Verify fresh Agent thread starts with cwd == None.
+    let main_meta = engine
+        .thread_metadata()
+        .await
+        .expect("meta")
+        .into_iter()
+        .find(|m| m.thread_id == main.thread_id)
+        .expect("main meta");
+    assert_eq!(main_meta.cwd, None);
+
+    engine
+        .send_turn_for_thread(&main.thread_id, "turn 1 on primary")
+        .await
+        .expect("turn 1");
+
+    let storage = grein_core::storage::sqlite::SqliteStorage::open(&db_path).expect("open db");
+    let main_tid: grein_core::model::ThreadId =
+        serde_json::from_value(serde_json::Value::String(main.thread_id.clone()))
+            .expect("parse ThreadId");
+    assert_eq!(
+        storage
+            .get_thread(main_tid)
+            .expect("get_thread")
+            .expect("main thread")
+            .acp_session_id
+            .as_deref(),
+        Some("sess-1")
+    );
+
+    // Switching a thread with cwd == None to the already-active primary worktree must NOT reset ACP.
+    let switched = engine
+        .switch_thread_worktree(&main.thread_id, &canonical_repo_str)
+        .await
+        .expect("switch to primary");
+    assert_eq!(switched, canonical_repo_str);
+
+    let capture_after_noop = std::fs::read_to_string(&capture_path).expect("read capture");
+    assert!(
+        !capture_after_noop.contains(r#""method":"session/close""#),
+        "switching None-cwd Agent thread to active primary worktree must not close ACP session: {capture_after_noop}"
+    );
+    assert_eq!(
+        storage
+            .get_thread(main_tid)
+            .expect("get_thread")
+            .expect("main thread")
+            .acp_session_id
+            .as_deref(),
+        Some("sess-1"),
+        "acp_session_id must remain preserved across primary-worktree no-op"
+    );
+
+    engine
+        .send_turn_for_thread(&main.thread_id, "turn 2 after primary noop")
+        .await
+        .expect("turn 2");
+    let capture_after_turn2 = std::fs::read_to_string(&capture_path).expect("read capture 2");
+    assert_eq!(
+        capture_after_turn2
+            .matches(r#""method":"session/new""#)
+            .count(),
+        1,
+        "must reuse sess-1 instead of creating a second session: {capture_after_turn2}"
+    );
+    assert_eq!(
+        capture_after_turn2
+            .matches(r#""sessionId":"sess-1""#)
+            .count(),
+        2,
+        "both prompts must run on sess-1: {capture_after_turn2}"
+    );
+
+    // Switching to an actual secondary worktree still resets and opens sess-2.
+    let wt_dir = temp.path().join("wt_other");
+    let wt_status = Command::new("git")
+        .args(["worktree", "add", "-b", "feat/other"])
+        .arg(&wt_dir)
+        .current_dir(&canonical_repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("git worktree add");
+    assert!(wt_status.success(), "git worktree add failed");
+    let canonical_wt = std::fs::canonicalize(&wt_dir).expect("canonical wt");
+
+    let switched_other = engine
+        .switch_thread_worktree(&main.thread_id, &canonical_wt.to_string_lossy())
+        .await
+        .expect("switch to secondary worktree");
+    assert_eq!(switched_other, canonical_wt.to_string_lossy().as_ref());
+    let capture_after_real_switch =
+        std::fs::read_to_string(&capture_path).expect("read capture after switch");
+    assert!(
+        capture_after_real_switch.contains(r#""method":"session/close""#),
+        "switching to a different worktree must still close old ACP session: {capture_after_real_switch}"
+    );
+    assert_eq!(
+        storage
+            .get_thread(main_tid)
+            .expect("get_thread")
+            .expect("main thread")
+            .acp_session_id,
+        None
+    );
+}
+
 async fn sub_term_pid_check(engine: &InProcessEngine, thread_id: &str, wt_path: &str) {
     engine
         .pty_write(thread_id, b"printf '\\nNOOP_PID=%s\\n' \"$$\"\n".to_vec())
