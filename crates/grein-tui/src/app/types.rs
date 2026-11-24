@@ -1,4 +1,5 @@
 use crossterm::event::KeyEvent;
+use ratatui::text::Line;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
@@ -7,6 +8,8 @@ use crate::engine_port::{
     ThreadMeta, WorktreeEntry,
 };
 use crate::keymap::Keymap;
+use crate::markdown::LineMeta;
+use crate::selection::{PaneRects, PaneSelection};
 use crate::theme::{ThemePalette, ThemePickerModal, ThemePreset};
 use crate::transcript::{ThreadTranscript, TranscriptViewport};
 
@@ -535,6 +538,13 @@ pub struct App {
     pub autocomplete_recent_prompts: Vec<String>,
     pub composer_completion: Option<crate::autocomplete::ActiveCompletion>,
     pub composer_completion_dismissed: bool,
+    pub pane_rects: PaneRects,
+    pub last_transcript_scroll_y: usize,
+    pub last_rendered_lines: Vec<Line<'static>>,
+    pub last_rendered_meta: Vec<LineMeta>,
+    pub pane_selection: Option<PaneSelection>,
+    pub last_click_info: Option<(u64, u16, u16, u8)>,
+    pub frozen_pty_snapshot: Option<(String, PtyScreenSnapshot)>,
 }
 
 pub type AppState = App;
@@ -633,6 +643,13 @@ impl Default for App {
             autocomplete_recent_prompts: Vec::new(),
             composer_completion: None,
             composer_completion_dismissed: false,
+            pane_rects: PaneRects::default(),
+            last_transcript_scroll_y: 0,
+            last_rendered_lines: Vec::new(),
+            last_rendered_meta: Vec::new(),
+            pane_selection: None,
+            last_click_info: None,
+            frozen_pty_snapshot: None,
         }
     }
 }

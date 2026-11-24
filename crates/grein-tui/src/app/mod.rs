@@ -2,6 +2,7 @@ mod commands;
 mod completion;
 mod editing;
 mod input;
+mod mouse;
 mod navigation;
 mod pickers;
 #[cfg(test)]

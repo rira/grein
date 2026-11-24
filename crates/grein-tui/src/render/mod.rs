@@ -14,16 +14,18 @@ pub(crate) use composer::{
 };
 pub use help_modal::{fuzzy_match_positions, HelpEntry};
 pub use layout::{border_style, compute_app_layout, compute_sidebar_width, render_markdown_lines};
-pub use panes::build_transcript_wrapped_lines;
+pub use panes::{build_transcript_wrapped_lines, build_transcript_wrapped_lines_with_meta};
 pub use sidebar::render_tree_view;
 
 use crate::app::{AppAction, AppState, PaneFocus, SidebarView};
 use crate::engine_port::SubagentSnapshot;
 use crate::layout::subagent_strip_height;
+use crate::markdown::LineMeta;
 use crate::search::{highlight_lines_with_matches, TranscriptSearchState};
+use crate::selection::{apply_selection_highlight, PaneRects, SelectionPane};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
@@ -41,7 +43,7 @@ use sidebar::{render_tree_view_inner, selected_tree_thread, TreeRenderResult};
 
 /// Renders the application state into the terminal frame.
 pub fn render(f: &mut Frame, state: &AppState) {
-    let _ = render_app_inner(f, state);
+    let _ = render_app_inner(f, state, false);
 }
 
 /// Renders the application state into the terminal frame and updates viewport scroll bounds.
@@ -51,7 +53,7 @@ pub fn render_mut(f: &mut Frame, state: &mut AppState) {
 
 /// Renders all active workspace panes, auto-growing the Composer pane for multi-line input.
 pub fn render_app(f: &mut Frame, state: &AppState) {
-    let _ = render_app_inner(f, state);
+    let _ = render_app_inner(f, state, false);
 }
 
 struct RenderMetrics {
@@ -70,10 +72,14 @@ struct RenderMetrics {
     terminal_inner_size: Option<(u16, u16)>,
     display_is_preview: bool,
     updated_search: Option<TranscriptSearchState>,
+    pane_rects: PaneRects,
+    transcript_scroll_y: usize,
+    rendered_lines: Vec<Line<'static>>,
+    rendered_meta: Vec<LineMeta>,
 }
 
 pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
-    let metrics = render_app_inner(f, state);
+    let metrics = render_app_inner(f, state, true);
     state
         .transcript_viewport_mut(&metrics.thread_id)
         .set_max_scroll(metrics.max_scroll as usize);
@@ -85,6 +91,10 @@ pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
     state.composer_scroll_y = metrics.composer_scroll_y;
     state.last_composer_inner_width = metrics.composer_inner_width;
     state.last_frame_area = Some(metrics.frame_area);
+    state.pane_rects = metrics.pane_rects;
+    state.last_transcript_scroll_y = metrics.transcript_scroll_y;
+    state.last_rendered_lines = metrics.rendered_lines;
+    state.last_rendered_meta = metrics.rendered_meta;
     if let Some(updated_search) = metrics.updated_search {
         state.transcript_search = updated_search;
     }
@@ -112,7 +122,7 @@ pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
     }
 }
 
-fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
+fn render_app_inner(f: &mut Frame, state: &AppState, capture_lines: bool) -> RenderMetrics {
     let theme = &state.theme_palette;
     if theme.bg != Color::Reset {
         f.render_widget(
@@ -192,6 +202,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             worktree_scroll: state.worktree_scroll_offset,
             cursor_pos: None,
             overflow_line: None,
+            tree_inner: None,
         }
     } else {
         render_tree_view_inner(f, layout.tree_area, state)
@@ -203,13 +214,21 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
     let mut updated_search: Option<TranscriptSearchState> = None;
     let mut worktree_diff_scroll = state.worktree_diff_scroll;
     let mut worktree_diff_max_scroll = state.worktree_diff_max_scroll;
+    let right_inner: Option<Rect>;
+    let mut transcript_scroll_y_usize = 0usize;
+    let mut rendered_lines: Vec<Line<'static>> = Vec::new();
+    let mut rendered_meta: Vec<LineMeta> = Vec::new();
 
     if showing_worktrees_diff {
-        let (ws, wmax) = render_worktree_diff_pane(f, layout.transcript_area, state);
-        worktree_diff_scroll = ws;
-        worktree_diff_max_scroll = wmax;
+        let diff_res =
+            render_worktree_diff_pane(f, layout.transcript_area, state, capture_lines);
+        worktree_diff_scroll = diff_res.scroll_y;
+        worktree_diff_max_scroll = diff_res.max_scroll;
+        right_inner = diff_res.inner_rect;
+        rendered_lines = diff_res.lines;
+        rendered_meta = diff_res.meta;
     } else if display_is_terminal {
-        terminal_inner_size = render_terminal_pane(
+        right_inner = render_terminal_pane(
             f,
             layout.transcript_area,
             state,
@@ -217,6 +236,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             preview.map(|(_, title)| title),
             terminal_focused,
         );
+        terminal_inner_size = right_inner.map(|r| (r.height, r.width));
     } else {
         let transcript_borders = if state.sidebar_hidden {
             Borders::TOP | Borders::BOTTOM
@@ -230,7 +250,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         };
         transcript_inner_height = layout.transcript_area.height.saturating_sub(2);
 
-        let wrapped_lines = build_transcript_wrapped_lines(
+        let (wrapped_lines, wrapped_meta) = build_transcript_wrapped_lines_with_meta(
             state,
             display_thread_id,
             transcript_inner_width as usize,
@@ -263,6 +283,7 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         } else {
             (vp.scroll_offset() as u16).min(max_scroll_u16)
         };
+        transcript_scroll_y_usize = transcript_scroll_y as usize;
         let transcript_title = match preview {
             Some((_, title)) => {
                 format!(
@@ -280,13 +301,35 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         if theme.panel_bg != Color::Reset {
             transcript_block = transcript_block.style(Style::default().bg(theme.panel_bg));
         }
+        let transcript_inner = transcript_block.inner(layout.transcript_area);
+        right_inner = (transcript_inner.width > 0 && transcript_inner.height > 0)
+            .then_some(transcript_inner);
+        if capture_lines {
+            rendered_lines = wrapped_lines.clone();
+            rendered_meta = wrapped_meta;
+        }
         let transcript_widget = Paragraph::new(wrapped_lines)
             .block(transcript_block)
             .scroll((transcript_scroll_y, 0));
         f.render_widget(transcript_widget, layout.transcript_area);
+        if let Some(inner) = right_inner {
+            if let Some(ref sel) = state.pane_selection {
+                if sel.pane == SelectionPane::Transcript {
+                    apply_selection_highlight(
+                        f.buffer_mut(),
+                        inner,
+                        transcript_scroll_y_usize,
+                        sel,
+                        theme.selection_bg,
+                        theme.selection_fg,
+                    );
+                }
+            }
+        }
     }
 
     let mut composer_scroll_y = state.composer_scroll_y;
+    let mut composer_inner: Option<Rect> = None;
     if let Some(composer_layout) = composer_layout {
         let composer_inner_width = layout.composer_area.width.saturating_sub(2);
         let active_completion = state.composer_completion.as_ref().filter(|ac| {
@@ -328,6 +371,8 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
             composer_scroll_y = composer_layout.cursor_row + 1 - inner_height;
         }
 
+        let c_inner = composer_block.inner(layout.composer_area);
+        composer_inner = (c_inner.width > 0 && c_inner.height > 0).then_some(c_inner);
         let composer_widget = Paragraph::new(composer_layout.lines)
             .block(composer_block)
             .scroll((composer_scroll_y, 0));
@@ -461,5 +506,13 @@ fn render_app_inner(f: &mut Frame, state: &AppState) -> RenderMetrics {
         terminal_inner_size,
         display_is_preview: preview.is_some(),
         updated_search,
+        pane_rects: PaneRects {
+            tree_inner: tree_result.tree_inner,
+            right_inner,
+            composer_inner,
+        },
+        transcript_scroll_y: transcript_scroll_y_usize,
+        rendered_lines,
+        rendered_meta,
     }
 }
