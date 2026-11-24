@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 mod acp;
 mod acp_session;
+mod hardening;
+mod in_process_hardening;
 mod pty;
 mod rpc;
 mod thread_merge;

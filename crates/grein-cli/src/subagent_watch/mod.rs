@@ -11,6 +11,8 @@ use tokio::sync::Notify;
 mod parser;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_hardening;
 
 pub use parser::{extract_created_subagent, shorten_model_name, DiscoveredSubagent};
 
