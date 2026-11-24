@@ -1,4 +1,8 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+
+use crate::engine_port::{PtyMouseEncoding, PtyMouseMode};
 
 fn xterm_modifier(modifiers: KeyModifiers) -> u8 {
     let mut mask = 0u8;
@@ -153,6 +157,91 @@ pub fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
         out
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn mouse_modifier_bits(modifiers: KeyModifiers) -> u8 {
+    let mut bits = 0u8;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        bits |= 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        bits |= 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        bits |= 16;
+    }
+    bits
+}
+
+pub fn encode_mouse_event(
+    event: MouseEvent,
+    local_col: u16,
+    local_row: u16,
+    mode: PtyMouseMode,
+    encoding: PtyMouseEncoding,
+) -> Option<Vec<u8>> {
+    if mode == PtyMouseMode::None {
+        return None;
+    }
+
+    let (base_code, is_release) = match (mode, event.kind) {
+        (_, MouseEventKind::Down(button)) => (mouse_button_code(button), false),
+        (_, MouseEventKind::ScrollUp) => (64, false),
+        (_, MouseEventKind::ScrollDown) => (65, false),
+        (
+            PtyMouseMode::PressRelease | PtyMouseMode::ButtonMotion | PtyMouseMode::AnyMotion,
+            MouseEventKind::Up(button),
+        ) => {
+            let code = if encoding == PtyMouseEncoding::Sgr {
+                mouse_button_code(button)
+            } else {
+                3
+            };
+            (code, true)
+        }
+        (PtyMouseMode::ButtonMotion | PtyMouseMode::AnyMotion, MouseEventKind::Drag(button)) => {
+            (mouse_button_code(button) + 32, false)
+        }
+        (PtyMouseMode::AnyMotion, MouseEventKind::Moved) => (35, false),
+        _ => return None,
+    };
+
+    let cb = base_code | mouse_modifier_bits(event.modifiers);
+    match encoding {
+        PtyMouseEncoding::Sgr => {
+            let suffix = if is_release { 'm' } else { 'M' };
+            let col = u32::from(local_col) + 1;
+            let row = u32::from(local_row) + 1;
+            Some(format!("\x1b[<{cb};{col};{row}{suffix}").into_bytes())
+        }
+        PtyMouseEncoding::Default => {
+            let cx = u8::try_from(local_col.min(222)).unwrap_or(222) + 33;
+            let cy = u8::try_from(local_row.min(222)).unwrap_or(222) + 33;
+            Some(vec![0x1b, b'[', b'M', cb.saturating_add(32), cx, cy])
+        }
+        PtyMouseEncoding::Utf8 => {
+            let mut out = Vec::with_capacity(9);
+            out.extend_from_slice(b"\x1b[M");
+            let mut buf = [0u8; 4];
+            for val in [
+                u32::from(cb) + 32,
+                u32::from(local_col) + 33,
+                u32::from(local_row) + 33,
+            ] {
+                let ch = char::from_u32(val)?;
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
     }
 }
 
@@ -489,5 +578,259 @@ mod tests {
             state: KeyEventState::NONE,
         };
         assert_eq!(encode_key_event(repeat_altgr, false), Some(b"{".to_vec()));
+    }
+
+    fn mouse(kind: MouseEventKind, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 99,
+            row: 88,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn encodes_sgr_mouse_press_release_drag_wheel_moved_and_modifiers() {
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+                0,
+                0,
+                PtyMouseMode::Press,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<0;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Middle),
+                    KeyModifiers::NONE
+                ),
+                9,
+                4,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<1;10;5M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Down(MouseButton::Right), KeyModifiers::NONE),
+                299,
+                249,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<2;300;250M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Up(MouseButton::Right), KeyModifiers::SHIFT),
+                5,
+                6,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<6;6;7m".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    KeyModifiers::SHIFT | KeyModifiers::ALT
+                ),
+                10,
+                20,
+                PtyMouseMode::ButtonMotion,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<44;11;21M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(
+                    MouseEventKind::Moved,
+                    KeyModifiers::ALT | KeyModifiers::CONTROL
+                ),
+                2,
+                3,
+                PtyMouseMode::AnyMotion,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<59;3;4M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::ScrollUp, KeyModifiers::CONTROL),
+                1,
+                2,
+                PtyMouseMode::Press,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<80;2;3M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(
+                    MouseEventKind::ScrollDown,
+                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL
+                ),
+                1,
+                2,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Sgr,
+            ),
+            Some(b"\x1b[<93;2;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn encodes_x10_default_and_utf8_mouse_encodings() {
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+                0,
+                0,
+                PtyMouseMode::Press,
+                PtyMouseEncoding::Default,
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 33, 33])
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Up(MouseButton::Right), KeyModifiers::NONE),
+                5,
+                6,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Default,
+            ),
+            Some(vec![0x1b, b'[', b'M', 35, 38, 39])
+        );
+        assert_eq!(
+            encode_mouse_event(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Middle),
+                    KeyModifiers::NONE
+                ),
+                222,
+                300,
+                PtyMouseMode::Press,
+                PtyMouseEncoding::Default,
+            ),
+            Some(vec![0x1b, b'[', b'M', 33, 255, 255])
+        );
+
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE),
+                0,
+                0,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Utf8,
+            ),
+            Some(vec![0x1b, b'[', b'M', 35, 33, 33])
+        );
+        let mut expected_utf8 = b"\x1b[M ".to_vec();
+        expected_utf8.extend_from_slice('\u{0085}'.encode_utf8(&mut [0; 4]).as_bytes());
+        expected_utf8.extend_from_slice('\u{00e9}'.encode_utf8(&mut [0; 4]).as_bytes());
+        assert_eq!(
+            encode_mouse_event(
+                mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+                100,
+                200,
+                PtyMouseMode::Press,
+                PtyMouseEncoding::Utf8,
+            ),
+            Some(expected_utf8)
+        );
+    }
+
+    #[test]
+    fn filters_mouse_events_by_protocol_mode() {
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE);
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), KeyModifiers::NONE);
+        let moved = mouse(MouseEventKind::Moved, KeyModifiers::NONE);
+        let wheel_up = mouse(MouseEventKind::ScrollUp, KeyModifiers::NONE);
+        let wheel_down = mouse(MouseEventKind::ScrollDown, KeyModifiers::NONE);
+        let wheel_left = mouse(MouseEventKind::ScrollLeft, KeyModifiers::NONE);
+
+        for ev in [down, up, drag, moved, wheel_up, wheel_down, wheel_left] {
+            assert_eq!(
+                encode_mouse_event(ev, 0, 0, PtyMouseMode::None, PtyMouseEncoding::Sgr),
+                None
+            );
+        }
+
+        assert!(encode_mouse_event(down, 0, 0, PtyMouseMode::Press, PtyMouseEncoding::Sgr).is_some());
+        assert!(
+            encode_mouse_event(wheel_up, 0, 0, PtyMouseMode::Press, PtyMouseEncoding::Sgr).is_some()
+        );
+        assert!(
+            encode_mouse_event(wheel_down, 0, 0, PtyMouseMode::Press, PtyMouseEncoding::Sgr)
+                .is_some()
+        );
+        assert_eq!(
+            encode_mouse_event(up, 0, 0, PtyMouseMode::Press, PtyMouseEncoding::Sgr),
+            None
+        );
+        assert_eq!(
+            encode_mouse_event(drag, 0, 0, PtyMouseMode::Press, PtyMouseEncoding::Sgr),
+            None
+        );
+        assert_eq!(
+            encode_mouse_event(moved, 0, 0, PtyMouseMode::Press, PtyMouseEncoding::Sgr),
+            None
+        );
+
+        assert!(
+            encode_mouse_event(up, 0, 0, PtyMouseMode::PressRelease, PtyMouseEncoding::Sgr)
+                .is_some()
+        );
+        assert_eq!(
+            encode_mouse_event(drag, 0, 0, PtyMouseMode::PressRelease, PtyMouseEncoding::Sgr),
+            None
+        );
+        assert_eq!(
+            encode_mouse_event(
+                moved,
+                0,
+                0,
+                PtyMouseMode::PressRelease,
+                PtyMouseEncoding::Sgr
+            ),
+            None
+        );
+
+        assert!(
+            encode_mouse_event(drag, 0, 0, PtyMouseMode::ButtonMotion, PtyMouseEncoding::Sgr)
+                .is_some()
+        );
+        assert_eq!(
+            encode_mouse_event(
+                moved,
+                0,
+                0,
+                PtyMouseMode::ButtonMotion,
+                PtyMouseEncoding::Sgr
+            ),
+            None
+        );
+
+        assert!(
+            encode_mouse_event(moved, 0, 0, PtyMouseMode::AnyMotion, PtyMouseEncoding::Sgr)
+                .is_some()
+        );
+        assert_eq!(
+            encode_mouse_event(
+                wheel_left,
+                0,
+                0,
+                PtyMouseMode::AnyMotion,
+                PtyMouseEncoding::Sgr
+            ),
+            None
+        );
     }
 }

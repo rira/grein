@@ -11,3 +11,4 @@ pub mod teardown;
 pub mod worktrees;
 
 pub use files::list_workspace_files;
+pub use pty_session::{PtyMouseEncoding, PtyMouseMode};

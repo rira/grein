@@ -128,6 +128,9 @@ fn test_pty_snapshot_serde_defaults_new_fields() {
     let snap: PtyScreenSnapshot = serde_json::from_str(json).expect("deserialize legacy snapshot");
     assert_eq!(snap.scrollback_offset, 0);
     assert_eq!(snap.cwd, None);
+    assert!(snap.row_wrapped.is_empty());
+    assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::None);
+    assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Default);
 }
 
 #[test]
@@ -193,13 +196,13 @@ fn test_process_pty_bytes_split_chunks_and_scrollback_edge_cases() {
 
     // Pin viewport while new line scrolls in
     assert_eq!(state.clamp_scrollback_offset(3), 3);
-    let pinned_first = state.scrollback[state.scrollback.len() - 3][0]
+    let pinned_first = state.scrollback[state.scrollback.len() - 3].0[0]
         .contents
         .clone();
     process_pty_bytes(b"NEW\n", &mut scanner, &mut state, &mut responses);
     assert_eq!(state.scrollback_offset, 4);
     assert_eq!(
-        state.scrollback[state.scrollback.len() - state.scrollback_offset][0].contents,
+        state.scrollback[state.scrollback.len() - state.scrollback_offset].0[0].contents,
         pinned_first
     );
 
@@ -398,14 +401,17 @@ fn test_pty_state_resize_clamping_eviction_and_cols_one_wrap() {
 
     // Eviction past 1000 scrollback rows
     for i in 0..1050usize {
-        state.push_scrollback_row(vec![PtyCell {
-            contents: i.to_string(),
-            ..PtyCell::default()
-        }]);
+        state.push_scrollback_row(
+            vec![PtyCell {
+                contents: i.to_string(),
+                ..PtyCell::default()
+            }],
+            i % 2 == 0,
+        );
     }
     assert_eq!(state.scrollback.len(), 1000);
-    assert_eq!(state.scrollback.front().expect("front")[0].contents, "50");
-    assert_eq!(state.scrollback.back().expect("back")[0].contents, "1049");
+    assert_eq!(state.scrollback.front().expect("front").0[0].contents, "50");
+    assert_eq!(state.scrollback.back().expect("back").0[0].contents, "1049");
 
     // cols == 1 wrap scroll and cols == 4 / cols == 3 wide-char wrap
     let mut scanner = TerminalScanner::default();
@@ -423,4 +429,71 @@ fn test_pty_state_resize_clamping_eviction_and_cols_one_wrap() {
     assert!(three_col.scrollback.is_empty());
     process_pty_bytes(b"XY", &mut scanner, &mut three_col, &mut responses);
     assert_eq!(three_col.scrollback.len(), 1);
+}
+
+#[test]
+fn test_snapshot_tracks_row_wrapped_and_mouse_protocol() {
+    let mut scanner = TerminalScanner::default();
+    let mut state = PtyState::new(3, 5);
+    let mut responses = Vec::new();
+
+    process_pty_bytes(
+        b"12345abcde\r\n67890fghij",
+        &mut scanner,
+        &mut state,
+        &mut responses,
+    );
+    assert_eq!(state.scrollback.len(), 1);
+    let live_snap = state.snapshot();
+    assert_eq!(live_snap.row_wrapped, vec![false, true, false]);
+    assert_eq!(live_snap.mouse_protocol_mode, crate::PtyMouseMode::None);
+    assert_eq!(
+        live_snap.mouse_protocol_encoding,
+        crate::PtyMouseEncoding::Default
+    );
+
+    assert_eq!(state.clamp_scrollback_offset(1), 1);
+    let scrolled_snap = state.snapshot();
+    assert_eq!(scrolled_snap.row_wrapped, vec![true, false, true]);
+    assert_eq!(scrolled_snap.cells.len(), scrolled_snap.row_wrapped.len());
+
+    process_pty_bytes(b"\x1b[?1000h", &mut scanner, &mut state, &mut responses);
+    let snap = state.snapshot();
+    assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::PressRelease);
+    assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Default);
+
+    process_pty_bytes(
+        b"\x1b[?1002h\x1b[?1005h",
+        &mut scanner,
+        &mut state,
+        &mut responses,
+    );
+    let snap = state.snapshot();
+    assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::ButtonMotion);
+    assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Utf8);
+
+    process_pty_bytes(
+        b"\x1b[?1003h\x1b[?1006h",
+        &mut scanner,
+        &mut state,
+        &mut responses,
+    );
+    let snap = state.snapshot();
+    assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::AnyMotion);
+    assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Sgr);
+
+    process_pty_bytes(
+        b"\x1b[?9h\x1b[?1006l",
+        &mut scanner,
+        &mut state,
+        &mut responses,
+    );
+    let snap = state.snapshot();
+    assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::Press);
+    assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Default);
+
+    process_pty_bytes(b"\x1b[?9l", &mut scanner, &mut state, &mut responses);
+    let snap = state.snapshot();
+    assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::None);
+    assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Default);
 }

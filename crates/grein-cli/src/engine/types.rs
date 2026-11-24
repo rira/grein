@@ -9,11 +9,13 @@ use grein_acp::{
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, Thread, ThreadKind, ThreadStatus};
 use grein_tui::engine_port::{
     AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentSlashCommand,
-    PtyCell as TuiPtyCell, PtyColor as TuiPtyColor,
-    PtyScreenSnapshot as TuiPtyScreenSnapshot, ThreadMeta, TuiEngineEvent, WorktreeEntry,
+    PtyCell as TuiPtyCell, PtyColor as TuiPtyColor, PtyMouseEncoding as TuiPtyMouseEncoding,
+    PtyMouseMode as TuiPtyMouseMode, PtyScreenSnapshot as TuiPtyScreenSnapshot, ThreadMeta,
+    TuiEngineEvent, WorktreeEntry,
 };
 use grein_workspace::pty_session::{
-    PtyCell as WsPtyCell, PtyColor as WsPtyColor, PtyScreenSnapshot as WsPtyScreenSnapshot,
+    PtyCell as WsPtyCell, PtyColor as WsPtyColor, PtyMouseEncoding as WsPtyMouseEncoding,
+    PtyMouseMode as WsPtyMouseMode, PtyScreenSnapshot as WsPtyScreenSnapshot,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -471,6 +473,24 @@ fn pty_cell_to_tui(cell: WsPtyCell) -> TuiPtyCell {
     }
 }
 
+fn pty_mouse_mode_to_tui(mode: WsPtyMouseMode) -> TuiPtyMouseMode {
+    match mode {
+        WsPtyMouseMode::None => TuiPtyMouseMode::None,
+        WsPtyMouseMode::Press => TuiPtyMouseMode::Press,
+        WsPtyMouseMode::PressRelease => TuiPtyMouseMode::PressRelease,
+        WsPtyMouseMode::ButtonMotion => TuiPtyMouseMode::ButtonMotion,
+        WsPtyMouseMode::AnyMotion => TuiPtyMouseMode::AnyMotion,
+    }
+}
+
+fn pty_mouse_encoding_to_tui(encoding: WsPtyMouseEncoding) -> TuiPtyMouseEncoding {
+    match encoding {
+        WsPtyMouseEncoding::Default => TuiPtyMouseEncoding::Default,
+        WsPtyMouseEncoding::Utf8 => TuiPtyMouseEncoding::Utf8,
+        WsPtyMouseEncoding::Sgr => TuiPtyMouseEncoding::Sgr,
+    }
+}
+
 pub(super) fn pty_snapshot_to_tui(snap: WsPtyScreenSnapshot) -> TuiPtyScreenSnapshot {
     TuiPtyScreenSnapshot {
         rows: snap.rows,
@@ -490,6 +510,9 @@ pub(super) fn pty_snapshot_to_tui(snap: WsPtyScreenSnapshot) -> TuiPtyScreenSnap
         exit_code: snap.exit_code,
         scrollback_offset: snap.scrollback_offset,
         cwd: snap.cwd,
+        row_wrapped: snap.row_wrapped,
+        mouse_protocol_mode: pty_mouse_mode_to_tui(snap.mouse_protocol_mode),
+        mouse_protocol_encoding: pty_mouse_encoding_to_tui(snap.mouse_protocol_encoding),
     }
 }
 
@@ -766,6 +789,43 @@ pub(super) fn stdio_err_to_engine(err: StdioRunnerError) -> EngineError {
                 EngineError::InvalidParams(msg)
             } else {
                 EngineError::Transport(msg)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pty_snapshot_to_tui_maps_row_wrapped_and_mouse_protocol() {
+        let mode_cases = [
+            (WsPtyMouseMode::None, TuiPtyMouseMode::None),
+            (WsPtyMouseMode::Press, TuiPtyMouseMode::Press),
+            (WsPtyMouseMode::PressRelease, TuiPtyMouseMode::PressRelease),
+            (WsPtyMouseMode::ButtonMotion, TuiPtyMouseMode::ButtonMotion),
+            (WsPtyMouseMode::AnyMotion, TuiPtyMouseMode::AnyMotion),
+        ];
+        for (ws_mode, tui_mode) in mode_cases {
+            let enc_cases = [
+                (WsPtyMouseEncoding::Default, TuiPtyMouseEncoding::Default),
+                (WsPtyMouseEncoding::Utf8, TuiPtyMouseEncoding::Utf8),
+                (WsPtyMouseEncoding::Sgr, TuiPtyMouseEncoding::Sgr),
+            ];
+            for (ws_enc, tui_enc) in enc_cases {
+                let ws_snap = WsPtyScreenSnapshot {
+                    rows: 2,
+                    cols: 3,
+                    row_wrapped: vec![true, false],
+                    mouse_protocol_mode: ws_mode,
+                    mouse_protocol_encoding: ws_enc,
+                    ..WsPtyScreenSnapshot::default()
+                };
+                let mapped = pty_snapshot_to_tui(ws_snap);
+                assert_eq!(mapped.row_wrapped, vec![true, false]);
+                assert_eq!(mapped.mouse_protocol_mode, tui_mode);
+                assert_eq!(mapped.mouse_protocol_encoding, tui_enc);
             }
         }
     }
