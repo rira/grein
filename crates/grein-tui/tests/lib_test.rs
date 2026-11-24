@@ -2,6 +2,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use grein_tui::app::{App, FocusedPane};
 use grein_tui::runner::handle_key_event;
 
+#[path = "support/sqlite_persistence.rs"]
+mod sqlite_persistence;
+use sqlite_persistence::AppSqlitePersistenceExt;
+
 #[test]
 fn test_composer_enter_updates_transcript_anchors_and_sqlite() {
     let mut app = App::new();

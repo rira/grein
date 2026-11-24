@@ -29,19 +29,27 @@ use std::sync::Arc;
 pub use app::{
     AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, FocusDirection, FocusPane,
     FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm, PendingThreadDelete,
-    RenamePromptState, SidebarLayoutConfig, SidebarMode, ThreadItem, TreeAction, TuiComponent,
-    TuiError,
+    RenamePromptState, SidebarLayoutConfig, SidebarMode, ThreadItem, TreeAction, TuiError,
+    TuiServices,
 };
-pub use engine_port::{TuiEnginePort, UserPreferencesSnapshot};
+pub use clipboard::ClipboardPort;
+pub use engine_port::{PreferencesPort, TuiEnginePort, UserPreferencesSnapshot};
 pub use keymap::{BindableAction, KeyChord, Keymap};
 pub use runner::{draw_frame, draw_frame_mut, handle_event, handle_key_event, TerminalGuard};
 pub use theme::{ThemePalette, ThemePickerModal, ThemePreset};
 pub use transcript::{TranscriptMessage, TranscriptPane};
 
 pub async fn run_with_engine(engine: Arc<dyn TuiEnginePort>) -> std::io::Result<()> {
+    run_with_engine_and_services(engine, TuiServices::default()).await
+}
+
+pub async fn run_with_engine_and_services(
+    engine: Arc<dyn TuiEnginePort>,
+    services: TuiServices,
+) -> std::io::Result<()> {
     let _guard = runner::TerminalGuard::new()?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
-    let app = app::App::new();
+    let app = app::App::with_services(services);
     runner::run_with_engine(&mut terminal, app, engine).await
 }

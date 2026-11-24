@@ -23,10 +23,10 @@ impl App {
     }
 
     pub fn read_primary_or_clipboard(&self) -> Result<String, String> {
-        match crate::clipboard::read_primary_selection() {
+        match self.services.clipboard.read_primary() {
             Ok(s) if !s.is_empty() => Ok(s),
-            Ok(_) => crate::clipboard::read_from_clipboard().or(Ok(String::new())),
-            Err(_) => crate::clipboard::read_from_clipboard(),
+            Ok(_) => self.services.clipboard.read_clipboard().or(Ok(String::new())),
+            Err(_) => self.services.clipboard.read_clipboard(),
         }
     }
 

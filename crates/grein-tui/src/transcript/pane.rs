@@ -1,4 +1,4 @@
-use crate::{AppAction, AppEvent, PaneFocus, TuiComponent};
+use crate::{AppAction, AppEvent, PaneFocus};
 use crossterm::event::KeyCode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,19 +115,5 @@ impl TranscriptPane {
             },
             _ => None,
         }
-    }
-}
-
-impl TuiComponent for TranscriptPane {
-    fn is_focused(&self) -> bool {
-        self.focused
-    }
-
-    fn handle_event(&mut self, event: &AppEvent) -> bool {
-        self.handle_event(event)
-    }
-
-    fn dispatch_key(&mut self, event: &AppEvent) -> Option<AppAction> {
-        self.dispatch_key(event)
     }
 }

@@ -10,6 +10,10 @@ use grein_tui::engine_port::{
 };
 use tokio::sync::mpsc;
 
+#[path = "support/sqlite_persistence.rs"]
+mod sqlite_persistence;
+use sqlite_persistence::AppSqlitePersistenceExt;
+
 /// Plain test double: records dispatched prompts, replays a scripted event stream
 /// and hydrates from a fixed session. No shell execution, no mockall.
 struct RecordingEngine {

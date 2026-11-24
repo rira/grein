@@ -32,7 +32,7 @@ pub use types::{
     AnchorItem, App, AppAction, AppConfig, AppEvent, AppState, ConfigPickerModal, FocusDirection,
     FocusPane, FocusedPane, PaneFocus, PendingPermission, PendingQuitConfirm, PendingThreadDelete,
     PendingWorktreeDelete, RenamePromptState, SidebarLayoutConfig, SidebarMode, SidebarView,
-    ThreadDisplayParts, ThreadItem, TreeAction, TuiComponent, TuiError, WorktreeAutocompleteItem,
+    ThreadDisplayParts, ThreadItem, TreeAction, TuiError, TuiServices, WorktreeAutocompleteItem,
     WorktreeRow,
 };
 #[allow(unused_imports)]
@@ -46,7 +46,14 @@ use crossterm::event::KeyEvent;
 
 impl App {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_services(TuiServices::default())
+    }
+
+    pub fn with_services(services: TuiServices) -> Self {
+        Self {
+            services,
+            ..Self::default()
+        }
     }
 
     pub fn with_config(config: AppConfig) -> Self {

@@ -23,6 +23,10 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+#[path = "support/sqlite_persistence.rs"]
+mod sqlite_persistence;
+use sqlite_persistence::AppSqlitePersistenceExt;
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }

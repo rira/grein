@@ -1,19 +1,70 @@
 use crossterm::event::KeyEvent;
 use ratatui::text::Line;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use thiserror::Error;
 
+use crate::clipboard::{ChainedClipboardDriver, ClipboardPort};
 use crate::engine_port::{
     AgentConfigChoice, AgentConfigOption, AgentSlashCommand, PtyScreenSnapshot, SubagentSnapshot,
     ThreadMeta, WorktreeEntry,
 };
 use crate::keymap::Keymap;
 use crate::markdown::LineMeta;
+use crate::pager::{DefaultPagerRunner, PagerRunner};
 use crate::selection::{PaneRects, PaneSelection};
 use crate::theme::{ThemePalette, ThemePickerModal, ThemePreset};
 use crate::transcript::{ThreadTranscript, TranscriptViewport};
 
 use super::threads::is_generic_agent_placeholder;
+
+#[derive(Clone)]
+pub struct TuiServices {
+    pub clipboard: Arc<dyn ClipboardPort>,
+    pub pager: Arc<dyn PagerRunner>,
+}
+
+impl TuiServices {
+    pub fn new(clipboard: Arc<dyn ClipboardPort>, pager: Arc<dyn PagerRunner>) -> Self {
+        Self { clipboard, pager }
+    }
+
+    pub fn with_clipboard(mut self, clipboard: Arc<dyn ClipboardPort>) -> Self {
+        self.clipboard = clipboard;
+        self
+    }
+
+    pub fn with_pager(mut self, pager: Arc<dyn PagerRunner>) -> Self {
+        self.pager = pager;
+        self
+    }
+}
+
+impl Default for TuiServices {
+    fn default() -> Self {
+        Self {
+            clipboard: Arc::new(ChainedClipboardDriver::default()),
+            pager: Arc::new(DefaultPagerRunner::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for TuiServices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiServices")
+            .field("clipboard", &"<dyn ClipboardPort>")
+            .field("pager", &"<dyn PagerRunner>")
+            .finish()
+    }
+}
+
+impl PartialEq for TuiServices {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TuiServices {}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TuiError {
@@ -326,12 +377,6 @@ pub enum AppAction {
     },
 }
 
-pub trait TuiComponent {
-    fn is_focused(&self) -> bool;
-    fn handle_event(&mut self, event: &AppEvent) -> bool;
-    fn dispatch_key(&mut self, event: &AppEvent) -> Option<AppAction>;
-}
-
 #[allow(non_upper_case_globals)]
 impl FocusedPane {
     pub const Sidebar: Self = Self::Tree;
@@ -471,6 +516,7 @@ pub struct App {
     pub pending_permissions: VecDeque<PendingPermission>,
     pub pending_actions: VecDeque<AppAction>,
     pub config: AppConfig,
+    pub services: TuiServices,
     pub thread_meta: HashMap<String, ThreadMeta>,
     pub thread_subagents: HashMap<String, Vec<SubagentSnapshot>>,
     pub thread_agent_meta: HashMap<String, (Option<String>, Option<String>)>,
@@ -576,6 +622,7 @@ impl Default for App {
             pending_permissions: VecDeque::new(),
             pending_actions: VecDeque::new(),
             config: AppConfig::default(),
+            services: TuiServices::default(),
             thread_meta: HashMap::new(),
             thread_subagents: HashMap::new(),
             thread_agent_meta: HashMap::new(),

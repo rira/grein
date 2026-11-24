@@ -1,11 +1,10 @@
 mod dispatch;
 mod engine_events;
-mod persistence;
 mod transcript_sync;
 mod tree_order;
 
 pub use engine_events::{apply_engine_event, apply_hydrated_session};
-pub use transcript_sync::now_epoch_ms;
+pub use transcript_sync::{collect_turns, now_epoch_ms, render_node, sync_thread_blocks_md};
 pub use tree_order::{
     compute_ordered_thread_entries, compute_ordered_thread_entries_with_folds,
     compute_ordered_thread_indices, rebuild_tree_nodes, FoldedThreadEntry, OrderedThreadEntry,
@@ -32,15 +31,14 @@ use tokio::sync::mpsc;
 
 use crate::app::{
     find_config_option, match_config_choice, App, AppAction, FocusedPane, TreeAction, TuiError,
+    TuiServices,
 };
 use crate::engine_port::{TuiEngineEvent, TuiEnginePort};
 
 use dispatch::{
     cache_snapshot_options, drain_pending_actions, handle_streamed_engine_event, RunnerLocalEvent,
 };
-use transcript_sync::{
-    ensure_paragraph_break, sync_thread_blocks_md, with_thread_transcript_mut,
-};
+use transcript_sync::{ensure_paragraph_break, with_thread_transcript_mut};
 use tree_order::rebuild_tree_nodes as rebuild_nodes;
 
 pub struct TerminalGuard {
@@ -191,6 +189,17 @@ pub async fn run_with_engine<B: Backend>(
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
     result
+}
+
+pub async fn run_with_engine_events_and_services<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    engine: Arc<dyn TuiEnginePort>,
+    services: TuiServices,
+    key_rx: mpsc::UnboundedReceiver<Event>,
+) -> io::Result<()> {
+    app.services = services;
+    run_with_engine_events(terminal, app, engine, key_rx).await
 }
 
 pub async fn run_with_engine_events<B: Backend>(

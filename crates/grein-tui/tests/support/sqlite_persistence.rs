@@ -5,14 +5,17 @@ use grein_core::model::{
     AnchorId, AuthorRole, BlackboardEntryId, ConversationNode, NodeId, ThreadId,
 };
 use grein_core::storage::sqlite::SqliteStorage;
+use grein_tui::app::{normalize_custom_name, App, ThreadItem};
+use grein_tui::runner::{collect_turns, render_node, sync_thread_blocks_md};
+use grein_tui::transcript::{ThreadTranscript, TranscriptBlock};
 
-use crate::app::{normalize_custom_name, App, ThreadItem};
-use crate::transcript::{ThreadTranscript, TranscriptBlock};
+pub trait AppSqlitePersistenceExt {
+    fn persist_state_to_sqlite(&self, db_path: &Path);
+    fn load_state_from_sqlite(&mut self, db_path: &Path);
+}
 
-use super::transcript_sync::{collect_turns, render_node, sync_thread_blocks_md};
-
-impl App {
-    pub fn persist_state_to_sqlite(&self, db_path: &Path) {
+impl AppSqlitePersistenceExt for App {
+    fn persist_state_to_sqlite(&self, db_path: &Path) {
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -128,7 +131,7 @@ impl App {
         }
     }
 
-    pub fn load_state_from_sqlite(&mut self, db_path: &Path) {
+    fn load_state_from_sqlite(&mut self, db_path: &Path) {
         if !db_path.exists() {
             return;
         }
