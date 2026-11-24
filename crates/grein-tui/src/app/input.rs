@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::keymap::BindableAction;
 use crate::search::SearchDirection;
@@ -8,127 +8,6 @@ use super::transcript_ops::{CopyMode, TranscriptScroll};
 use super::types::{App, AppAction, FocusedPane, PendingThreadDelete, SidebarView, TreeAction};
 
 impl App {
-    pub fn handle_mouse_event(&mut self, mouse: MouseEvent) -> bool {
-        let is_up = match mouse.kind {
-            MouseEventKind::ScrollUp => true,
-            MouseEventKind::ScrollDown => false,
-            _ => return false,
-        };
-        self.sync_focus_in();
-        if self.show_help_modal {
-            if is_up {
-                self.help_scroll_offset = self.help_scroll_offset.saturating_sub(3);
-            } else {
-                self.help_scroll_offset = self.help_scroll_offset.saturating_add(3);
-            }
-            self.sync_focus_out();
-            return true;
-        }
-        if self.has_active_modal() {
-            self.sync_focus_out();
-            return false;
-        }
-        let delta: isize = if is_up { 3 } else { -3 };
-        let over_tree_pane = self.focused_pane == FocusedPane::Tree
-            && self.last_frame_area.is_none_or(|area| {
-                if self.sidebar_hidden || area.width == 0 || area.height == 0 {
-                    false
-                } else {
-                    let sub_count = self
-                        .thread_subagents
-                        .get(&self.active_thread_id)
-                        .map_or(0, Vec::len);
-                    let strip_h = crate::layout::subagent_strip_height(sub_count);
-                    let composer_hidden = self.active_is_terminal()
-                        || (self.focused_pane == FocusedPane::Tree
-                            && !self.sidebar_hidden
-                            && self.sidebar_view == SidebarView::Worktrees)
-                        || self.pending_rename_thread_id.is_some();
-                    let layout =
-                        crate::render::compute_app_layout(self, area, strip_h, composer_hidden);
-                    !layout
-                        .transcript_area
-                        .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-                }
-            });
-
-        if self.focused_pane == FocusedPane::Tree
-            && !self.sidebar_hidden
-            && self.sidebar_view == SidebarView::Worktrees
-            && !over_tree_pane
-        {
-            if is_up {
-                self.worktree_diff_scroll = self.worktree_diff_scroll.saturating_sub(3);
-            } else {
-                self.worktree_diff_scroll = self
-                    .worktree_diff_scroll
-                    .saturating_add(3)
-                    .min(self.worktree_diff_max_scroll);
-            }
-            self.sync_focus_out();
-            return true;
-        }
-
-        if self.active_is_terminal() && !over_tree_pane {
-            self.pending_actions.push_back(AppAction::PtyScroll {
-                thread_id: self.active_thread_id.clone(),
-                delta,
-            });
-            self.sync_focus_out();
-            return true;
-        }
-
-        if over_tree_pane {
-            if self.sidebar_view == SidebarView::Worktrees {
-                let row_count = self.visible_worktree_rows().len();
-                if row_count > 0 {
-                    if is_up {
-                        self.worktree_selected_idx = self.worktree_selected_idx.saturating_sub(1);
-                    } else if self.worktree_selected_idx + 1 < row_count {
-                        self.worktree_selected_idx += 1;
-                    }
-                    self.maybe_fetch_selected_worktree_diff(false);
-                }
-                self.sync_focus_out();
-                return true;
-            }
-            let target_id = self.selected_tree_thread_info().0;
-            if self.is_terminal_thread(&target_id)
-                && self.last_frame_area.is_some()
-                && self.active_is_terminal()
-            {
-                self.pending_actions.push_back(AppAction::PtyScroll {
-                    thread_id: target_id,
-                    delta,
-                });
-            } else if is_up {
-                self.tree.select_previous();
-                let (sel_id, _) = self.selected_tree_thread_info();
-                self.maybe_request_pty_snapshot(&sel_id);
-            } else {
-                self.tree.select_next();
-                let (sel_id, _) = self.selected_tree_thread_info();
-                self.maybe_request_pty_snapshot(&sel_id);
-            }
-            self.sync_focus_out();
-            return true;
-        }
-
-        let target_id = self.transcript_scroll_target_id();
-        if self.is_terminal_thread(&target_id) {
-            self.pending_actions.push_back(AppAction::PtyScroll {
-                thread_id: target_id,
-                delta,
-            });
-        } else if is_up {
-            self.scroll_target_transcript(TranscriptScroll::Up(3));
-        } else {
-            self.scroll_target_transcript(TranscriptScroll::Down(3));
-        }
-        self.sync_focus_out();
-        true
-    }
-
     pub fn handle_key_tree(&mut self, key: KeyEvent) -> Option<TreeAction> {
         self.handle_key_tree_with_prefix(key, false)
     }
@@ -416,6 +295,8 @@ impl App {
                     self.pending_actions.push_back(AppAction::CancelTurn {
                         thread_id: self.active_thread_id.clone(),
                     });
+                } else {
+                    self.clear_pane_selection();
                 }
                 self.sync_focus_out();
                 return true;
@@ -503,6 +384,9 @@ impl App {
                         self.clamp_worktree_selection();
                         self.maybe_fetch_selected_worktree_diff(false);
                     }
+                    (KeyCode::Char('v' | 'V'), true, false) => {
+                        self.paste_from_clipboard();
+                    }
                     (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
                         self.worktree_filter_query.push(c);
                         self.clamp_worktree_selection();
@@ -527,6 +411,9 @@ impl App {
                     (KeyCode::Backspace, false, false) => {
                         self.transcript_search.query.pop();
                         self.recompute_transcript_search_and_scroll();
+                    }
+                    (KeyCode::Char('v' | 'V'), true, false) => {
+                        self.paste_from_clipboard();
                     }
                     (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
                         self.transcript_search.query.push(c);
@@ -689,6 +576,9 @@ impl App {
                 (KeyCode::Backspace, false, false) => {
                     self.transcript_search.query.pop();
                     self.recompute_transcript_search_and_scroll();
+                }
+                (KeyCode::Char('v' | 'V'), true, false) => {
+                    self.paste_from_clipboard();
                 }
                 (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
                     self.transcript_search.query.push(c);

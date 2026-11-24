@@ -160,6 +160,7 @@ impl App {
     }
 
     pub fn toggle_sidebar_zoom(&mut self) {
+        self.clear_pane_selection();
         self.sidebar_hidden = !self.sidebar_hidden;
         if self.sidebar_hidden && self.focused_pane == FocusedPane::Tree {
             self.palette_active = false;

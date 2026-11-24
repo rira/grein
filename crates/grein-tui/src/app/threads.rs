@@ -427,6 +427,7 @@ impl App {
         self.rename_prompt = None;
         self.composer_desired_col = None;
         self.pending_g_prefix = false;
+        self.clear_pane_selection();
         if target_thread != self.active_thread_id {
             self.transcript_search.clear();
         }

@@ -542,6 +542,7 @@ fn render_worktrees_view(
             worktree_scroll: state.worktree_scroll_offset,
             cursor_pos: None,
             overflow_line: None,
+            tree_inner: None,
         };
     }
 
@@ -603,6 +604,7 @@ fn render_worktrees_view(
             worktree_scroll: state.worktree_scroll_offset,
             cursor_pos,
             overflow_line: None,
+            tree_inner: None,
         };
     }
 
@@ -661,6 +663,7 @@ fn render_worktrees_view(
         worktree_scroll: scroll_offset as usize,
         cursor_pos,
         overflow_line,
+        tree_inner: (list_area.width > 0 && list_area.height > 0).then_some(list_area),
     }
 }
 
@@ -673,6 +676,7 @@ pub(super) struct TreeRenderResult {
     pub(super) worktree_scroll: usize,
     pub(super) cursor_pos: Option<Position>,
     pub(super) overflow_line: Option<(u16, u16, Line<'static>)>,
+    pub(super) tree_inner: Option<Rect>,
 }
 
 pub(super) fn render_tree_view_inner(
@@ -822,6 +826,7 @@ pub(super) fn render_tree_view_inner(
             worktree_scroll: state.worktree_scroll_offset,
             cursor_pos: None,
             overflow_line: None,
+            tree_inner: None,
         };
     }
 
@@ -859,5 +864,6 @@ pub(super) fn render_tree_view_inner(
         worktree_scroll: state.worktree_scroll_offset,
         cursor_pos,
         overflow_line,
+        tree_inner: (list_area.width > 0 && list_area.height > 0).then_some(list_area),
     }
 }

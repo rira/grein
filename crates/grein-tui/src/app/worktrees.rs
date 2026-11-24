@@ -314,6 +314,7 @@ impl App {
     }
 
     pub fn toggle_worktrees_sidebar_view(&mut self) {
+        self.clear_pane_selection();
         self.pending_rename_thread_id = None;
         self.rename_prompt = None;
         self.pending_g_prefix = false;
@@ -350,6 +351,7 @@ impl App {
     }
 
     pub fn open_worktrees_sidebar_view(&mut self, filter_query: Option<String>) {
+        self.clear_pane_selection();
         self.pending_rename_thread_id = None;
         self.rename_prompt = None;
         self.pending_g_prefix = false;

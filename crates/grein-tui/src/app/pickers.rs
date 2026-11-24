@@ -483,6 +483,9 @@ impl App {
                 prompt.buffer.remove(pos);
                 prompt.cursor = pos;
             }
+            (KeyCode::Char('v' | 'V'), true, false) => {
+                self.paste_from_clipboard();
+            }
             (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
                 prompt.buffer.insert(pos, c);
                 prompt.cursor = pos + c.len_utf8();

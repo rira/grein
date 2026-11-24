@@ -855,6 +855,9 @@ impl App {
                 self.palette_cursor = pos;
                 self.palette_match_idx = 0;
             }
+            (KeyCode::Char('v' | 'V'), true, false) => {
+                self.paste_from_clipboard();
+            }
             (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
                 self.palette_input.insert(pos, c);
                 self.palette_cursor = pos + c.len_utf8();

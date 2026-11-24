@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -52,7 +52,12 @@ impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
         if io::stdout().is_terminal() && io::stdin().is_terminal() {
             enable_raw_mode()?;
-            execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+            execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableMouseCapture
+            )?;
             let keyboard_enhanced =
                 if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
                     execute!(
@@ -85,7 +90,12 @@ impl Drop for TerminalGuard {
                 let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
             }
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
         }
     }
 }
@@ -114,6 +124,7 @@ pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
         }
         Event::Resize(w, h) => {
             app.last_frame_area = Some(ratatui::layout::Rect::new(0, 0, w, h));
+            app.clear_pane_selection();
             app.maybe_queue_terminal_resize();
         }
         _ => {}

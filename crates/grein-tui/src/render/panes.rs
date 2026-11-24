@@ -1,6 +1,8 @@
 use crate::app::{shorten_terminal_cwd, worktree_display_label, AppState};
 use crate::engine_port::{PtyCell, PtyColor};
+use crate::markdown::LineMeta;
 use crate::search::{SearchDirection, TranscriptSearchState};
+use crate::selection::{apply_selection_highlight, SelectionPane};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -8,6 +10,14 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use super::layout::{rounded_block, themed_border_style};
+
+pub(super) struct WorktreeDiffRenderResult {
+    pub(super) scroll_y: u16,
+    pub(super) max_scroll: u16,
+    pub(super) inner_rect: Option<Rect>,
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) meta: Vec<LineMeta>,
+}
 
 fn map_pty_color(color: PtyColor) -> Color {
     match color {
@@ -43,7 +53,7 @@ pub(super) fn render_terminal_pane(
     display_thread_id: &str,
     preview_title: Option<&str>,
     terminal_focused: bool,
-) -> Option<(u16, u16)> {
+) -> Option<Rect> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
@@ -116,7 +126,14 @@ pub(super) fn render_terminal_pane(
         return None;
     }
 
-    if let Some(snap) = state.pty_screens.get(display_thread_id) {
+    let snap_opt = state
+        .frozen_pty_snapshot
+        .as_ref()
+        .filter(|(tid, _)| tid == display_thread_id)
+        .map(|(_, snap)| snap)
+        .or_else(|| state.pty_screens.get(display_thread_id));
+
+    if let Some(snap) = snap_opt {
         let buf = f.buffer_mut();
         for r in 0..inner.height {
             let Some(row) = snap.cells.get(r as usize) else {
@@ -147,6 +164,19 @@ pub(super) fn render_terminal_pane(
             }
         }
 
+        if let Some(ref sel) = state.pane_selection {
+            if sel.pane == SelectionPane::Terminal {
+                apply_selection_highlight(
+                    buf,
+                    inner,
+                    0,
+                    sel,
+                    theme.selection_bg,
+                    theme.selection_fg,
+                );
+            }
+        }
+
         if terminal_focused
             && preview_title.is_none()
             && !snap.hide_cursor
@@ -173,16 +203,23 @@ pub(super) fn render_terminal_pane(
         );
     }
 
-    Some((inner.height, inner.width))
+    Some(inner)
 }
 
 pub(super) fn render_worktree_diff_pane(
     f: &mut Frame,
     area: Rect,
     state: &AppState,
-) -> (u16, u16) {
+    capture_lines: bool,
+) -> WorktreeDiffRenderResult {
     if area.width == 0 || area.height == 0 {
-        return (0, 0);
+        return WorktreeDiffRenderResult {
+            scroll_y: 0,
+            max_scroll: 0,
+            inner_rect: None,
+            lines: Vec::new(),
+            meta: Vec::new(),
+        };
     }
     let theme = &state.theme_palette;
     let selected = state.selected_worktree_entry();
@@ -300,18 +337,50 @@ pub(super) fn render_worktree_diff_pane(
     f.render_widget(block, area);
 
     if inner.width == 0 || inner.height == 0 {
-        return (0, 0);
+        return WorktreeDiffRenderResult {
+            scroll_y: 0,
+            max_scroll: 0,
+            inner_rect: None,
+            lines: Vec::new(),
+            meta: Vec::new(),
+        };
     }
 
-    let wrapped =
-        crate::markdown::wrap_styled_lines(std::mem::take(&mut raw_lines), inner.width as usize);
+    let (wrapped, meta) = crate::markdown::wrap_styled_lines_with_meta(
+        std::mem::take(&mut raw_lines),
+        inner.width as usize,
+    );
     let max_scroll = wrapped
         .len()
         .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     let scroll_y = state.worktree_diff_scroll.min(max_scroll);
+    let cached_lines = if capture_lines {
+        wrapped.clone()
+    } else {
+        Vec::new()
+    };
+    let cached_meta = if capture_lines { meta } else { Vec::new() };
     f.render_widget(Paragraph::new(wrapped).scroll((scroll_y, 0)), inner);
-    (scroll_y, max_scroll)
+    if let Some(ref sel) = state.pane_selection {
+        if sel.pane == SelectionPane::WorktreeDiff {
+            apply_selection_highlight(
+                f.buffer_mut(),
+                inner,
+                scroll_y as usize,
+                sel,
+                theme.selection_bg,
+                theme.selection_fg,
+            );
+        }
+    }
+    WorktreeDiffRenderResult {
+        scroll_y,
+        max_scroll,
+        inner_rect: Some(inner),
+        lines: cached_lines,
+        meta: cached_meta,
+    }
 }
 
 /// Builds the pre-wrapped styled transcript lines for `display_thread_id` at `inner_width`.
@@ -320,6 +389,15 @@ pub fn build_transcript_wrapped_lines(
     display_thread_id: &str,
     inner_width: usize,
 ) -> Vec<Line<'static>> {
+    build_transcript_wrapped_lines_with_meta(state, display_thread_id, inner_width).0
+}
+
+/// Builds the pre-wrapped styled transcript lines and wrap metadata for `display_thread_id`.
+pub fn build_transcript_wrapped_lines_with_meta(
+    state: &AppState,
+    display_thread_id: &str,
+    inner_width: usize,
+) -> (Vec<Line<'static>>, Vec<LineMeta>) {
     let active_id = state.active_thread_id();
     let display_md: &str = if display_thread_id == active_id {
         &state.active_transcript_md
@@ -374,7 +452,7 @@ pub fn build_transcript_wrapped_lines(
         ));
     }
 
-    crate::markdown::wrap_styled_lines(transcript_lines, inner_width)
+    crate::markdown::wrap_styled_lines_with_meta(transcript_lines, inner_width)
 }
 
 pub(super) fn recompute_search_for_render(

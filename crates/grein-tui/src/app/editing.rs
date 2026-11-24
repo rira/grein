@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::types::{App, AppAction, FocusedPane};
+use super::types::{App, AppAction, FocusedPane, SidebarView};
 
 pub(crate) fn is_altgr_char(c: char, ctrl: bool, alt: bool) -> bool {
     (!ctrl && !alt) || (ctrl && alt && !c.is_ascii_control())
@@ -72,6 +72,17 @@ pub fn next_word_boundary(buf: &str, pos: usize) -> usize {
 }
 
 impl App {
+    pub(super) fn paste_from_clipboard(&mut self) -> bool {
+        match crate::clipboard::read_from_clipboard() {
+            Ok(text) if !text.is_empty() => self.handle_paste_event(&text),
+            Ok(_) => false,
+            Err(err) => {
+                self.status_notice = Some(format!("Paste failed: {err}"));
+                false
+            }
+        }
+    }
+
     pub fn handle_paste_event(&mut self, text: &str) -> bool {
         self.sync_focus_in();
         if self.has_active_modal() {
@@ -95,10 +106,50 @@ impl App {
             self.sync_focus_out();
             return true;
         }
+        if self.focused_pane == FocusedPane::Tree {
+            let single_line: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            if let Some(ref mut prompt) = self.rename_prompt {
+                let pos = clamp_char_boundary(&prompt.buffer, prompt.cursor);
+                prompt.buffer.insert_str(pos, &single_line);
+                prompt.cursor = pos + single_line.len();
+                self.sync_focus_out();
+                return true;
+            }
+            if self.palette_active {
+                let pos = clamp_char_boundary(&self.palette_input, self.palette_cursor);
+                self.palette_input.insert_str(pos, &single_line);
+                self.palette_cursor = pos + single_line.len();
+                self.palette_match_idx = 0;
+                self.sync_focus_out();
+                return true;
+            }
+            if self.sidebar_view == SidebarView::Worktrees && self.worktree_filter_active {
+                self.worktree_filter_query.push_str(&single_line);
+                self.clamp_worktree_selection();
+                self.maybe_fetch_selected_worktree_diff(false);
+                self.sync_focus_out();
+                return true;
+            }
+            if self.transcript_search.editing {
+                self.transcript_search.query.push_str(&single_line);
+                self.recompute_transcript_search_and_scroll();
+                self.sync_focus_out();
+                return true;
+            }
+            return false;
+        }
+        if self.transcript_search.editing {
+            let single_line: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            self.transcript_search.query.push_str(&single_line);
+            self.recompute_transcript_search_and_scroll();
+            self.sync_focus_out();
+            return true;
+        }
         if self.focused_pane == FocusedPane::Composer {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             let pos = clamp_char_boundary(&self.input_buffer, self.cursor_position);
-            self.input_buffer.insert_str(pos, text);
-            self.cursor_position = pos + text.len();
+            self.input_buffer.insert_str(pos, &normalized);
+            self.cursor_position = pos + normalized.len();
             self.composer_desired_col = None;
             self.composer_completion_dismissed = false;
             self.sync_worktree_autocomplete(true);
@@ -290,6 +341,10 @@ impl App {
                 } else {
                     self.cursor_position = pos;
                 }
+                true
+            }
+            (KeyCode::Char('v' | 'V'), true, false) => {
+                self.paste_from_clipboard();
                 true
             }
             (KeyCode::Char(c), _, _) if is_altgr_char(c, ctrl, alt) => {
