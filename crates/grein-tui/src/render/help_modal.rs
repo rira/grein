@@ -197,6 +197,19 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
     let scroll_down = km.display_for(BindableAction::ScrollDown);
     let prev_sib = km.display_for(BindableAction::PrevSibling);
     let next_sib = km.display_for(BindableAction::NextSibling);
+    let compact_ac = |a| {
+        km.display_for(a)
+            .replace("Ctrl+", "C-")
+            .replace("Shift+Tab", "S-Tab")
+            .replace(", ", "/")
+    };
+    let ac_label = format!(
+        "{}, {}/{}/{}",
+        compact_ac(BindableAction::AcceptCompletion),
+        compact_ac(BindableAction::NextCompletion),
+        compact_ac(BindableAction::PrevCompletion),
+        compact_ac(BindableAction::DismissCompletion)
+    );
     let scroll_label = format!("{scroll_up} / {scroll_down}");
     let sib_label = format!("{prev_sib} / {next_sib}");
     let manage_scroll_desc = format!("Full/half-page preview; {scroll_up}/{scroll_down} scroll");
@@ -245,7 +258,7 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         },
         HelpEntry {
             section: WRITE_SEC,
-            keys: "Tab / Ctrl+Y, S-Tab/C-n/p/e".to_string(),
+            keys: ac_label,
             description: "Autocomplete accept / cycle / dismiss".to_string(),
             keywords: "autocomplete ghost tab shift+tab ctrl+y ctrl+n ctrl+p ctrl+e completion word vim",
         },

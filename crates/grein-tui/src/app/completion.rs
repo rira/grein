@@ -142,37 +142,38 @@ impl App {
 
     pub(super) fn execute_autocomplete_command(&mut self, rest: &str) {
         let arg = rest.trim().to_ascii_lowercase();
-        match arg.as_str() {
-            "" | "status" => {
+        let target = match arg.as_str() {
+            "" => Some(!self.composer_autocomplete_enabled),
+            "status" => {
                 let state = if self.composer_autocomplete_enabled {
                     "on"
                 } else {
                     "off"
                 };
                 self.status_notice = Some(format!("Composer autocomplete: {state}"));
+                None
             }
-            "on" | "true" | "1" | "yes" => {
-                self.composer_autocomplete_enabled = true;
-                self.composer_completion_dismissed = false;
-                self.sync_composer_completion();
-                self.pending_actions.push_back(AppAction::SaveUiPreference {
-                    key: "composer_autocomplete".to_string(),
-                    value: "on".to_string(),
-                });
-                self.status_notice = Some("Composer autocomplete: on".to_string());
-            }
-            "off" | "false" | "0" | "no" => {
-                self.composer_autocomplete_enabled = false;
-                self.composer_completion = None;
-                self.pending_actions.push_back(AppAction::SaveUiPreference {
-                    key: "composer_autocomplete".to_string(),
-                    value: "off".to_string(),
-                });
-                self.status_notice = Some("Composer autocomplete: off".to_string());
-            }
+            "on" | "true" | "1" | "yes" => Some(true),
+            "off" | "false" | "0" | "no" => Some(false),
             _ => {
                 self.status_notice = Some("Usage: /autocomplete [on|off|status]".to_string());
+                None
             }
+        };
+        if let Some(enabled) = target {
+            self.composer_autocomplete_enabled = enabled;
+            if enabled {
+                self.composer_completion_dismissed = false;
+                self.sync_composer_completion();
+            } else {
+                self.composer_completion = None;
+            }
+            let val = if enabled { "on" } else { "off" };
+            self.pending_actions.push_back(AppAction::SaveUiPreference {
+                key: "composer_autocomplete".to_string(),
+                value: val.to_string(),
+            });
+            self.status_notice = Some(format!("Composer autocomplete: {val}"));
         }
     }
 }

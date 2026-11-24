@@ -338,8 +338,10 @@ impl App {
             return;
         }
         let Some(preset) = ThemePreset::from_str(trimmed) else {
+            let names: Vec<&str> = ThemePreset::all().iter().map(ThemePreset::as_str).collect();
             self.status_notice = Some(format!(
-                "Unknown theme '{trimmed}'. Available: tokyo-night, catppuccin-mocha, nord, ansi"
+                "Unknown theme '{trimmed}'. Available: {}",
+                names.join(", ")
             ));
             return;
         };
