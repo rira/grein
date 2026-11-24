@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grein_core::model::{AuthorRole, ConversationNode, NodeId};
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_core::port::dto::TuiEngineEvent;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -10,7 +10,7 @@ use tokio::time::timeout;
 
 use super::super::rpc::rpc_error;
 use super::super::{
-    dispatch_json_rpc, AcpBackendConfig, DaemonEngine, InProcessEngine, UnixSocketEngineClient,
+    dispatch_json_rpc, AcpBackendConfig, InProcessEngine, UnixSocketEngineClient,
 };
 use super::write_executable_script;
 use crate::client::connect_to_daemon;

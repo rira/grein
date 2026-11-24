@@ -3,10 +3,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use grein_tui::engine_port::{SubagentSnapshot, SubagentStatus, TuiEngineEvent};
+use grein_core::port::dto::{SubagentSnapshot, SubagentStatus, TuiEngineEvent};
 use serde_json::{json, Value};
 
-use super::{shorten_model_name, SubagentWatcher};
+use super::{shorten_model_name, NoopSubagentObserver, SubagentObserverPort, SubagentWatcher};
 
 fn write_jsonl(path: &Path, lines: &[Value]) {
     if let Some(parent) = path.parent() {
@@ -276,4 +276,31 @@ async fn detects_child_terminal_completion_and_stops_polling_when_empty() {
     )));
     // Polling task should automatically stop once no subagents are running.
     assert!(!watcher.state.lock().unwrap().polling_active);
+}
+
+#[test]
+fn noop_subagent_observer_implements_port_safely() {
+    let observer: Arc<dyn SubagentObserverPort> = Arc::new(NoopSubagentObserver::new());
+    let events = Arc::new(Mutex::new(Vec::<TuiEngineEvent>::new()));
+    let events_cb = Arc::clone(&events);
+    observer.attach_emitter(Arc::new(move |ev| events_cb.lock().unwrap().push(ev)));
+    observer.register_subagent(
+        "t-1",
+        SubagentSnapshot {
+            id: "s-1".to_string(),
+            role: "Helper".to_string(),
+            agent_type: "research".to_string(),
+            model: None,
+            activity: None,
+            status: SubagentStatus::Running,
+            started_at_ms: 1,
+        },
+    );
+    observer.ingest_tool_output("t-1", "s-1", "output");
+    observer.update_activity_if_unlinked("t-1", "s-1", "step");
+    assert!(!observer.is_confirmed_running("t-1", "s-1"));
+    observer.mark_terminal("t-1", "s-1", SubagentStatus::Completed, None);
+    observer.clear_thread("t-1");
+    observer.shutdown();
+    assert!(events.lock().unwrap().is_empty());
 }

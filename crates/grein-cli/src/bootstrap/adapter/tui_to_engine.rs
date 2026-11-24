@@ -3,24 +3,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use grein_cli::engine::{
-    truncate_chars_with_ellipsis, DaemonEngine, EngineError, PermissionDecisionPayload,
+use crate::engine::{
+    truncate_chars_with_ellipsis, EngineError, GreinEngine, PermissionDecisionPayload,
     ThreadSummary,
 };
+use grein_core::port::outbound::PreferenceRepository;
 use grein_tui::engine_port::{
     AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, PtyScreenSnapshot,
     ThreadMeta, TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot, WorktreeEntry,
 };
 use tokio::sync::{mpsc, Mutex};
-
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod tests_autocomplete;
-#[cfg(test)]
-mod tests_hardening;
-#[cfg(test)]
-mod tests_session_prefs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialSessionMode {
@@ -28,16 +20,17 @@ pub enum InitialSessionMode {
     Agent,
 }
 
-/// Adapts an engine client (any `DaemonEngine`) to the TUI engine port.
-pub(super) struct EngineClientPort<E> {
-    client: E,
+/// Adapts an engine client (any [`GreinEngine`]) to [`TuiEnginePort`].
+pub struct EngineClientPort<E> {
+    pub(super) client: E,
+    prefs: Arc<dyn PreferenceRepository>,
     initial_mode: InitialSessionMode,
     events_tx: mpsc::UnboundedSender<TuiEngineEvent>,
     pub(super) events_rx: Mutex<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>>,
     has_live_stream: AtomicBool,
     in_flight_turns: Arc<AtomicUsize>,
     buffered_sync_errors: Arc<StdMutex<Vec<String>>>,
-    suppressed_sync_errors: Arc<StdMutex<Vec<(String, Instant)>>>,
+    pub(super) suppressed_sync_errors: Arc<StdMutex<Vec<(String, Instant)>>>,
 }
 
 impl<E> EngineClientPort<E> {
@@ -46,10 +39,23 @@ impl<E> EngineClientPort<E> {
         Self::new_with_mode(client, InitialSessionMode::Agent)
     }
 
-    pub(super) fn new_with_mode(client: E, initial_mode: InitialSessionMode) -> Self {
+    pub fn new_with_mode(client: E, initial_mode: InitialSessionMode) -> Self {
+        Self::new_with_mode_and_prefs(
+            client,
+            initial_mode,
+            Arc::new(super::LazyPrefsRepository::from_env()),
+        )
+    }
+
+    pub fn new_with_mode_and_prefs(
+        client: E,
+        initial_mode: InitialSessionMode,
+        prefs: Arc<dyn PreferenceRepository>,
+    ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
             client,
+            prefs,
             initial_mode,
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
@@ -65,7 +71,7 @@ impl<E> EngineClientPort<E> {
     }
 }
 
-impl<E: DaemonEngine> EngineClientPort<E> {
+impl<E: GreinEngine> EngineClientPort<E> {
     async fn load_hydrated_turns(&self, thread_id: &str) -> io::Result<Vec<HydratedTurn>> {
         let entries = self
             .client
@@ -84,7 +90,7 @@ impl<E: DaemonEngine> EngineClientPort<E> {
 
     async fn hydrate_summaries(
         &self,
-        summaries: Vec<grein_cli::engine::ThreadSummary>,
+        summaries: Vec<ThreadSummary>,
     ) -> io::Result<Vec<HydratedThread>> {
         let mut threads = Vec::with_capacity(summaries.len());
         for summary in summaries {
@@ -159,7 +165,7 @@ fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
 #[async_trait::async_trait]
 impl<E> TuiEnginePort for EngineClientPort<E>
 where
-    E: DaemonEngine + Send + Sync + 'static,
+    E: GreinEngine + Send + Sync + 'static,
 {
     async fn hydrate_session(&self) -> io::Result<HydratedSession> {
         let summaries = self.client.list_threads().await.map_err(to_io)?;
@@ -638,47 +644,32 @@ where
     }
 
     async fn load_preferences(&self) -> io::Result<UserPreferencesSnapshot> {
-        let Some(path) = grein_core::default_prefs_db_path() else {
-            return Ok(UserPreferencesSnapshot::default());
-        };
-        if !path.exists() {
-            return Ok(UserPreferencesSnapshot::default());
-        }
-        let store = grein_core::UserPrefsStore::open(&path).map_err(to_io)?;
         Ok(UserPreferencesSnapshot {
-            theme: store.theme().map_err(to_io)?,
-            theme_overrides: store.theme_prefs().map_err(to_io)?,
-            keybindings: store.keybindings().map_err(to_io)?,
-            ui: store.ui_prefs().map_err(to_io)?,
+            theme: self.prefs.theme().map_err(to_io)?,
+            theme_overrides: self.prefs.theme_prefs().map_err(to_io)?,
+            keybindings: self.prefs.keybindings().map_err(to_io)?,
+            ui: self.prefs.ui_prefs().map_err(to_io)?,
         })
     }
 
     async fn save_theme_preference(&self, theme: &str) -> io::Result<()> {
-        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
-            store.clear_theme_prefs().map_err(to_io)?;
-            store.set_theme(theme).map_err(to_io)?;
-        }
+        self.prefs.clear_theme_prefs().map_err(to_io)?;
+        self.prefs.set_theme(theme).map_err(to_io)?;
         Ok(())
     }
 
     async fn save_keybinding_preference(&self, action: &str, binding: &str) -> io::Result<()> {
-        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
-            store.set_keybinding(action, binding).map_err(to_io)?;
-        }
+        self.prefs.set_keybinding(action, binding).map_err(to_io)?;
         Ok(())
     }
 
     async fn remove_keybinding_preference(&self, action: &str) -> io::Result<()> {
-        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
-            let _ = store.remove_keybinding(action).map_err(to_io)?;
-        }
+        let _ = self.prefs.remove_keybinding(action).map_err(to_io)?;
         Ok(())
     }
 
     async fn save_ui_preference(&self, key: &str, value: &str) -> io::Result<()> {
-        if let Some(store) = grein_core::UserPrefsStore::open_default().map_err(to_io)? {
-            store.set_ui_pref(key, value).map_err(to_io)?;
-        }
+        self.prefs.set_ui_pref(key, value).map_err(to_io)?;
         Ok(())
     }
 

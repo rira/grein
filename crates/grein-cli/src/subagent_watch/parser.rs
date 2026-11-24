@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use grein_tui::engine_port::SubagentStatus;
+use grein_core::port::dto::SubagentStatus;
 use serde_json::Value;
 
 use super::TrackedEntry;

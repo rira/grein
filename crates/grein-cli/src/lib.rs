@@ -1,4 +1,5 @@
 pub mod args;
+pub mod bootstrap;
 pub mod client;
 pub mod daemon;
 pub mod discovery;

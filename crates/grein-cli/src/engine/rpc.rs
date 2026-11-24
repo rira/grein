@@ -1,7 +1,8 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::types::{DaemonEngine, EngineError, PermissionDecisionPayload};
+use super::ports::GreinEngine;
+use super::types::{EngineError, PermissionDecisionPayload};
 
 pub(super) fn to_json<T: Serialize>(value: &T) -> Result<Value, EngineError> {
     serde_json::to_value(value).map_err(|e| EngineError::Protocol(e.to_string()))
@@ -19,7 +20,7 @@ pub(super) fn rpc_error(id: Value, code: i64, message: String) -> Value {
 }
 
 async fn route(
-    engine: &dyn DaemonEngine,
+    engine: &dyn GreinEngine,
     method: &str,
     params: &Value,
 ) -> Result<Option<Value>, EngineError> {
@@ -256,7 +257,7 @@ fn parse_req_isize(params: &Value, key: &str) -> Result<isize, EngineError> {
 }
 
 /// Handles one JSON-RPC 2.0 request line and returns the serialized response.
-pub async fn dispatch_json_rpc(engine: &dyn DaemonEngine, line: &str) -> String {
+pub async fn dispatch_json_rpc(engine: &dyn GreinEngine, line: &str) -> String {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return rpc_error(Value::Null, -32700, format!("parse error: {e}")).to_string(),

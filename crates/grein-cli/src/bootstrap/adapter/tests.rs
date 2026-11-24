@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use grein_cli::engine::{
-    AcpBackendConfig, AgentMetaEntry, DaemonEngine, EngineError, EngineEvent, InProcessEngine,
-    PermissionDecisionPayload, SessionSnapshot, ShellCommandResult, ThreadSummary,
+use crate::engine::{
+    AcpBackendConfig, AgentMetaEntry, AgentTurnPort, EngineError, EngineEvent, EngineEventPort,
+    InProcessEngine, PermissionDecisionPayload, SessionSnapshot, ThreadSummary, ThreadUseCasePort,
     TranscriptEntry, TurnDispatchResult,
 };
 use grein_tui::engine_port::{
@@ -206,10 +206,7 @@ async fn test_engine_client_port_forwards_async_background_errors() {
     }
 
     #[async_trait::async_trait]
-    impl DaemonEngine for BgErrorEngine {
-        async fn ping(&self) -> Result<(), EngineError> {
-            Ok(())
-        }
+    impl ThreadUseCasePort for BgErrorEngine {
         async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
             Ok(ThreadSummary {
                 thread_id: "t-1".into(),
@@ -219,20 +216,6 @@ async fn test_engine_client_port_forwards_async_background_errors() {
                 active_leaf_id: "n-1".into(),
                 merged: false,
                 status: Default::default(),
-            })
-        }
-        async fn send_turn(&self, _prompt: &str) -> Result<TurnDispatchResult, EngineError> {
-            Ok(TurnDispatchResult {
-                node_id: "n-2".into(),
-            })
-        }
-        async fn send_turn_for_thread(
-            &self,
-            _thread_id: &str,
-            _prompt: &str,
-        ) -> Result<TurnDispatchResult, EngineError> {
-            Ok(TurnDispatchResult {
-                node_id: "n-2".into(),
             })
         }
         async fn fork_thread(
@@ -284,6 +267,27 @@ async fn test_engine_client_port_forwards_async_background_errors() {
         ) -> Result<ThreadSummary, EngineError> {
             unreachable!()
         }
+        async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnPort for BgErrorEngine {
+        async fn send_turn(&self, _prompt: &str) -> Result<TurnDispatchResult, EngineError> {
+            Ok(TurnDispatchResult {
+                node_id: "n-2".into(),
+            })
+        }
+        async fn send_turn_for_thread(
+            &self,
+            _thread_id: &str,
+            _prompt: &str,
+        ) -> Result<TurnDispatchResult, EngineError> {
+            Ok(TurnDispatchResult {
+                node_id: "n-2".into(),
+            })
+        }
         async fn resolve_permission(
             &self,
             _decision: PermissionDecisionPayload,
@@ -293,15 +297,12 @@ async fn test_engine_client_port_forwards_async_background_errors() {
         async fn cancel_turn(&self, _thread_id: &str) -> Result<(), EngineError> {
             Ok(())
         }
-        async fn run_shell_command(
-            &self,
-            _thread_id: &str,
-            _command: &str,
-        ) -> Result<ShellCommandResult, EngineError> {
-            unreachable!()
-        }
-        async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
-            unreachable!()
+    }
+
+    #[async_trait::async_trait]
+    impl EngineEventPort for BgErrorEngine {
+        async fn ping(&self) -> Result<(), EngineError> {
+            Ok(())
         }
         async fn subscribe_events(
             &self,
@@ -309,6 +310,8 @@ async fn test_engine_client_port_forwards_async_background_errors() {
             Ok(self.rx.lock().await.take())
         }
     }
+
+    super::impl_default_auxiliary_ports!(BgErrorEngine);
 
     let (tx, rx) = mpsc::unbounded_channel();
     let port = EngineClientPort::new(BgErrorEngine {
@@ -402,8 +405,7 @@ async fn test_engine_client_port_offline_fallbacks_and_metadata_error_forwarding
 
     struct FailingMetaEngine;
     #[async_trait::async_trait]
-    impl DaemonEngine for FailingMetaEngine {
-        async fn ping(&self) -> Result<(), EngineError> { Ok(()) }
+    impl ThreadUseCasePort for FailingMetaEngine {
         async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
             Ok(ThreadSummary {
                 thread_id: "t-1".into(),
@@ -415,8 +417,6 @@ async fn test_engine_client_port_offline_fallbacks_and_metadata_error_forwarding
                 status: Default::default(),
             })
         }
-        async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
-        async fn send_turn_for_thread(&self, _: &str, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
         async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
         async fn fork_thread_with_title(&self, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
         async fn create_root_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
@@ -428,14 +428,23 @@ async fn test_engine_client_port_offline_fallbacks_and_metadata_error_forwarding
         async fn get_thread_transcript(&self, _: &str) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
         async fn merge_thread(&self, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
         async fn merge_thread_with_summary(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
-        async fn resolve_permission(&self, _: PermissionDecisionPayload) -> Result<EngineEvent, EngineError> { unreachable!() }
-        async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> { Ok(()) }
-        async fn run_shell_command(&self, _: &str, _: &str) -> Result<ShellCommandResult, EngineError> { unreachable!() }
         async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> { unreachable!() }
         async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
             Err(EngineError::Storage("metadata db failure".to_string()))
         }
     }
+    #[async_trait::async_trait]
+    impl AgentTurnPort for FailingMetaEngine {
+        async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+        async fn send_turn_for_thread(&self, _: &str, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+        async fn resolve_permission(&self, _: PermissionDecisionPayload) -> Result<EngineEvent, EngineError> { unreachable!() }
+        async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> { Ok(()) }
+    }
+    #[async_trait::async_trait]
+    impl EngineEventPort for FailingMetaEngine {
+        async fn ping(&self) -> Result<(), EngineError> { Ok(()) }
+    }
+    super::impl_default_auxiliary_ports!(FailingMetaEngine);
 
     let err_port = EngineClientPort::new(FailingMetaEngine);
     let mut err_rx = err_port.subscribe_events().await.expect("subscribe");
@@ -461,8 +470,7 @@ async fn test_engine_client_port_hydrates_cached_options_commands_and_config_rpc
     struct CachedMetaEngine;
 
     #[async_trait::async_trait]
-    impl DaemonEngine for CachedMetaEngine {
-        async fn ping(&self) -> Result<(), EngineError> { Ok(()) }
+    impl ThreadUseCasePort for CachedMetaEngine {
         async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
             Ok(ThreadSummary {
                 thread_id: "t-cached".into(),
@@ -474,8 +482,6 @@ async fn test_engine_client_port_hydrates_cached_options_commands_and_config_rpc
                 status: Default::default(),
             })
         }
-        async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
-        async fn send_turn_for_thread(&self, _: &str, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
         async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
         async fn fork_thread_with_title(&self, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
         async fn create_root_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
@@ -487,10 +493,15 @@ async fn test_engine_client_port_hydrates_cached_options_commands_and_config_rpc
         async fn get_thread_transcript(&self, _: &str) -> Result<Vec<TranscriptEntry>, EngineError> { Ok(Vec::new()) }
         async fn merge_thread(&self, _: &str) -> Result<ThreadSummary, EngineError> { unreachable!() }
         async fn merge_thread_with_summary(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
+        async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> { unreachable!() }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnPort for CachedMetaEngine {
+        async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
+        async fn send_turn_for_thread(&self, _: &str, _: &str) -> Result<TurnDispatchResult, EngineError> { unreachable!() }
         async fn resolve_permission(&self, _: PermissionDecisionPayload) -> Result<EngineEvent, EngineError> { unreachable!() }
         async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> { Ok(()) }
-        async fn run_shell_command(&self, _: &str, _: &str) -> Result<ShellCommandResult, EngineError> { unreachable!() }
-        async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> { unreachable!() }
         async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
             Ok(vec![AgentMetaEntry {
                 thread_id: "t-cached".into(),
@@ -540,6 +551,12 @@ async fn test_engine_client_port_hydrates_cached_options_commands_and_config_rpc
             })
         }
     }
+
+    #[async_trait::async_trait]
+    impl EngineEventPort for CachedMetaEngine {
+        async fn ping(&self) -> Result<(), EngineError> { Ok(()) }
+    }
+    super::impl_default_auxiliary_ports!(CachedMetaEngine);
 
     let port = EngineClientPort::new(CachedMetaEngine);
     let session = port.hydrate_session().await.expect("hydrate");

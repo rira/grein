@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use clap::Parser;
-use grein_cli::args::{Cli, Command};
-use grein_cli::engine::InProcessEngine;
+use crate::args::{Cli, Command};
+use crate::engine::InProcessEngine;
 use grein_tui::engine_port::{TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot};
 
 use super::{EngineClientPort, InitialSessionMode};
@@ -22,6 +22,43 @@ fn test_cli_agent_flag_defaults_false_and_parses_true() {
     let standalone_agent = Cli::try_parse_from(["grein", "--agent", "standalone"])
         .expect("parse --agent standalone");
     assert!(standalone_agent.agent);
+}
+
+#[tokio::test]
+async fn test_engine_client_port_uses_injected_in_memory_preference_repository() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let session_db = temp.path().join("session.db");
+    let engine = InProcessEngine::open_with_config(&session_db, temp.path().to_path_buf(), None)
+        .expect("open engine");
+    let prefs = std::sync::Arc::new(grein_core::UserPrefsStore::in_memory().expect("in-memory prefs"));
+    let port = EngineClientPort::new_with_mode_and_prefs(
+        engine,
+        InitialSessionMode::Agent,
+        prefs,
+    );
+
+    assert_eq!(
+        port.load_preferences().await.expect("initial load"),
+        UserPreferencesSnapshot::default()
+    );
+    port.save_theme_preference("nord").await.expect("theme");
+    port.save_keybinding_preference("quit", "q")
+        .await
+        .expect("keybinding");
+    port.save_ui_preference("sidebar_width", "34")
+        .await
+        .expect("ui");
+
+    let snap = port.load_preferences().await.expect("reload");
+    assert_eq!(snap.theme.as_deref(), Some("nord"));
+    assert_eq!(snap.keybindings.get("quit").map(String::as_str), Some("q"));
+    assert_eq!(snap.ui.get("sidebar_width").map(String::as_str), Some("34"));
+
+    port.remove_keybinding_preference("quit")
+        .await
+        .expect("remove keybinding");
+    let reloaded = port.load_preferences().await.expect("reload 2");
+    assert!(!reloaded.keybindings.contains_key("quit"));
 }
 
 #[tokio::test]
@@ -189,7 +226,7 @@ fn test_cli_parses_doctor_settings_and_theme_subcommands() {
     let doc = Cli::try_parse_from(["grein", "doctor", "--json"]).expect("parse doctor");
     assert_eq!(
         doc.command,
-        Some(Command::Doctor(grein_cli::args::DoctorArgs { json: true }))
+        Some(Command::Doctor(crate::args::DoctorArgs { json: true }))
     );
 
     let set_exp = Cli::try_parse_from([
@@ -203,7 +240,7 @@ fn test_cli_parses_doctor_settings_and_theme_subcommands() {
     .expect("parse settings export");
     match set_exp.command {
         Some(Command::Settings(s)) => match s.command {
-            grein_cli::args::SettingsCommand::Export(args) => {
+            crate::args::SettingsCommand::Export(args) => {
                 assert_eq!(args.file.as_deref(), Some(std::path::Path::new("out.json")));
                 assert_eq!(args.format, None);
                 assert_eq!(args.only, vec!["theme".to_string(), "ui".to_string()]);
@@ -225,9 +262,9 @@ fn test_cli_parses_doctor_settings_and_theme_subcommands() {
     .expect("parse settings import");
     match set_imp.command {
         Some(Command::Settings(s)) => match s.command {
-            grein_cli::args::SettingsCommand::Import(args) => {
+            crate::args::SettingsCommand::Import(args) => {
                 assert_eq!(args.file, std::path::PathBuf::from("-"));
-                assert_eq!(args.format, grein_cli::args::InputFormatArg::Json);
+                assert_eq!(args.format, crate::args::InputFormatArg::Json);
                 assert!(args.replace);
             }
             other => panic!("unexpected settings command: {other:?}"),
@@ -239,9 +276,9 @@ fn test_cli_parses_doctor_settings_and_theme_subcommands() {
         .expect("parse theme export");
     match theme_exp.command {
         Some(Command::Theme(t)) => match t.command {
-            grein_cli::args::ThemeCommand::Export(args) => {
+            crate::args::ThemeCommand::Export(args) => {
                 assert_eq!(args.file, None);
-                assert_eq!(args.format, Some(grein_cli::args::OutputFormatArg::Toml));
+                assert_eq!(args.format, Some(crate::args::OutputFormatArg::Toml));
             }
             other => panic!("unexpected theme command: {other:?}"),
         },
@@ -253,9 +290,9 @@ fn test_cli_parses_doctor_settings_and_theme_subcommands() {
             .expect("parse theme import");
     match theme_imp.command {
         Some(Command::Theme(t)) => match t.command {
-            grein_cli::args::ThemeCommand::Import(args) => {
+            crate::args::ThemeCommand::Import(args) => {
                 assert_eq!(args.file, std::path::PathBuf::from("colleague.toml"));
-                assert_eq!(args.format, grein_cli::args::InputFormatArg::Auto);
+                assert_eq!(args.format, crate::args::InputFormatArg::Auto);
                 assert!(args.replace);
             }
             other => panic!("unexpected theme command: {other:?}"),

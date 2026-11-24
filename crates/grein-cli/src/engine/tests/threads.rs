@@ -1,14 +1,16 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use grein_core::model::{AnchorId, AuthorRole, ConversationNode, NodeId, ThreadId};
+use grein_core::port::dto::TuiEngineEvent;
 use grein_core::storage::sqlite::SqliteStorage;
-use grein_tui::engine_port::TuiEngineEvent;
 use grein_workspace::git_status::RepoGitStatus;
+use grein_workspace::port::{GitCliInspector, GitInspectorPort};
 
 use super::super::types::parse_typed_id;
-use super::super::{DaemonEngine, InProcessEngine};
+use super::super::{EngineDependencies, InProcessEngine};
 
 #[tokio::test]
 async fn test_thread_metadata_inference_branch_local_turns_and_offline_root() {
@@ -62,7 +64,7 @@ async fn test_thread_metadata_inference_branch_local_turns_and_offline_root() {
     let root_leaf = engine2
         .runtime
         .storage
-        .get_thread(root_tid)
+        .get_thread(&root_tid)
         .unwrap()
         .unwrap()
         .active_leaf_id;
@@ -91,7 +93,7 @@ async fn test_thread_metadata_inference_branch_local_turns_and_offline_root() {
     engine2
         .runtime
         .storage
-        .update_thread_leaf(root_tid, a1)
+        .update_thread_leaf(&root_tid, &a1)
         .unwrap();
 
     let child = engine2
@@ -124,7 +126,7 @@ async fn test_thread_metadata_inference_branch_local_turns_and_offline_root() {
     engine2
         .runtime
         .storage
-        .update_thread_leaf(child_tid, ca1)
+        .update_thread_leaf(&child_tid, &ca1)
         .unwrap();
 
     let child_turns = engine2
@@ -154,7 +156,7 @@ async fn test_thread_metadata_inference_branch_local_turns_and_offline_root() {
     engine2
         .runtime
         .storage
-        .update_thread_leaf(gc_tid, gu1)
+        .update_thread_leaf(&gc_tid, &gu1)
         .unwrap();
 
     let gc_turns = engine2
@@ -393,8 +395,65 @@ async fn test_compute_thread_metadata_deduplicates_git_status_per_unique_path() 
     let canonical_sub = std::fs::canonicalize(&sub_dir).expect("canonical sub");
     let db_path = temp.path().join("dedup_git.db");
 
-    let engine = InProcessEngine::open_with_config(&db_path, canonical_root.clone(), None)
-        .expect("open");
+    struct CountingInspector {
+        canonical_root: PathBuf,
+        canonical_sub: PathBuf,
+        total_calls: Arc<AtomicUsize>,
+        calls_per_path: Arc<std::sync::Mutex<HashMap<PathBuf, usize>>>,
+    }
+
+    impl GitInspectorPort for CountingInspector {
+        fn resolve_primary_repo_root(&self, path: &Path) -> Option<PathBuf> {
+            GitCliInspector::new().resolve_primary_repo_root(path)
+        }
+
+        fn resolve_worktree_toplevel(&self, path: &Path) -> Option<PathBuf> {
+            GitCliInspector::new().resolve_worktree_toplevel(path)
+        }
+
+        fn inspect_git_status(&self, path: &Path) -> Option<RepoGitStatus> {
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .calls_per_path
+                .lock()
+                .unwrap()
+                .entry(path.to_path_buf())
+                .or_insert(0) += 1;
+            if path == self.canonical_root.as_path() {
+                Some(RepoGitStatus {
+                    branch: Some("main".to_string()),
+                    dirty_count: 2,
+                    is_worktree: false,
+                })
+            } else if path == self.canonical_sub.as_path() {
+                Some(RepoGitStatus {
+                    branch: Some("feat/sub".to_string()),
+                    dirty_count: 5,
+                    is_worktree: true,
+                })
+            } else {
+                None
+            }
+        }
+
+        fn list_workspace_files(&self, root: &Path, max_entries: usize) -> Vec<String> {
+            GitCliInspector::new().list_workspace_files(root, max_entries)
+        }
+    }
+
+    let total_calls = Arc::new(AtomicUsize::new(0));
+    let calls_per_path: Arc<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    let storage = Arc::new(SqliteStorage::open(&db_path).expect("open sqlite"));
+    let mut deps = EngineDependencies::for_storage(storage, canonical_root.clone(), None);
+    deps.git_inspector = Arc::new(CountingInspector {
+        canonical_root: canonical_root.clone(),
+        canonical_sub: canonical_sub.clone(),
+        total_calls: Arc::clone(&total_calls),
+        calls_per_path: Arc::clone(&calls_per_path),
+    });
+    let engine = InProcessEngine::with_dependencies(deps).expect("open");
     let main = engine.ensure_main_thread().await.expect("main");
     let _branch1 = engine
         .fork_thread_with_title(Some(&main.thread_id), Some("b1"))
@@ -425,36 +484,13 @@ async fn test_compute_thread_metadata_deduplicates_git_status_per_unique_path() 
         .await
         .expect("t2");
 
-    let total_calls = AtomicUsize::new(0);
-    let calls_per_path: std::sync::Mutex<HashMap<PathBuf, usize>> =
-        std::sync::Mutex::new(HashMap::new());
+    total_calls.store(0, Ordering::SeqCst);
+    calls_per_path.lock().unwrap().clear();
 
     let meta = engine
-        .runtime
-        .compute_thread_metadata_with_inspector(|path| {
-            total_calls.fetch_add(1, Ordering::SeqCst);
-            *calls_per_path
-                .lock()
-                .unwrap()
-                .entry(path.to_path_buf())
-                .or_insert(0) += 1;
-            if path == canonical_root.as_path() {
-                Some(RepoGitStatus {
-                    branch: Some("main".to_string()),
-                    dirty_count: 2,
-                    is_worktree: false,
-                })
-            } else if path == canonical_sub.as_path() {
-                Some(RepoGitStatus {
-                    branch: Some("feat/sub".to_string()),
-                    dirty_count: 5,
-                    is_worktree: true,
-                })
-            } else {
-                None
-            }
-        })
-        .expect("compute_thread_metadata_with_inspector");
+        .thread_metadata()
+        .await
+        .expect("thread_metadata");
 
     assert_eq!(meta.len(), 5);
     assert_eq!(
@@ -627,7 +663,7 @@ async fn test_list_recent_user_prompts_and_workspace_files_in_process() {
     let leaf = engine
         .runtime
         .storage
-        .get_thread(main_tid)
+        .get_thread(&main_tid)
         .unwrap()
         .unwrap()
         .active_leaf_id;
@@ -737,7 +773,7 @@ async fn test_create_root_thread_in_cwd_persists_cwd_and_rejects_invalid_paths()
         engine
             .runtime
             .storage
-            .get_thread(blank_tid)
+            .get_thread(&blank_tid)
             .unwrap()
             .unwrap()
             .cwd,
@@ -754,7 +790,7 @@ async fn test_create_root_thread_in_cwd_persists_cwd_and_rejects_invalid_paths()
         engine
             .runtime
             .storage
-            .get_thread(scoped_tid)
+            .get_thread(&scoped_tid)
             .unwrap()
             .unwrap()
             .cwd

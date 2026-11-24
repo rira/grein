@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_core::port::dto::TuiEngineEvent;
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
-use super::super::{AcpBackendConfig, DaemonEngine, InProcessEngine, PermissionDecisionPayload};
+use super::super::{AcpBackendConfig, InProcessEngine, PermissionDecisionPayload};
 use super::write_executable_script;
 
 #[test]

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use grein_tui::engine_port::{SubagentSnapshot, SubagentStatus, TuiEngineEvent};
+use grein_core::port::dto::{SubagentSnapshot, SubagentStatus, TuiEngineEvent};
 use serde_json::json;
 
 use super::parser::{

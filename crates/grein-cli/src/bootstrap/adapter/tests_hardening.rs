@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use grein_cli::engine::{
-    DaemonEngine, EngineError, EngineEvent, PermissionDecisionPayload, SessionSnapshot,
-    ShellCommandResult, ThreadSummary, TranscriptEntry, TurnDispatchResult,
+use crate::engine::{
+    AgentTurnPort, AutocompleteContextPort, EngineError, EngineEvent, EngineEventPort,
+    PermissionDecisionPayload, SessionSnapshot, ShellCommandResult, ShellUseCasePort,
+    TerminalPtyUseCasePort, ThreadSummary, ThreadUseCasePort, TranscriptEntry, TurnDispatchResult,
+    WorktreeUseCasePort,
 };
 use grein_core::model::ThreadKind;
 use grein_tui::engine_port::{
@@ -38,10 +40,7 @@ impl MockPortEngine {
 }
 
 #[async_trait::async_trait]
-impl DaemonEngine for MockPortEngine {
-    async fn ping(&self) -> Result<(), EngineError> {
-        Ok(())
-    }
+impl ThreadUseCasePort for MockPortEngine {
     async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
         Ok(ThreadSummary {
             thread_id: "t-main".into(),
@@ -51,28 +50,6 @@ impl DaemonEngine for MockPortEngine {
             active_leaf_id: "n-1".into(),
             merged: false,
             status: Default::default(),
-        })
-    }
-    async fn send_turn(&self, _prompt: &str) -> Result<TurnDispatchResult, EngineError> {
-        Ok(TurnDispatchResult {
-            node_id: "n-turn".into(),
-        })
-    }
-    async fn send_turn_for_thread(
-        &self,
-        _thread_id: &str,
-        _prompt: &str,
-    ) -> Result<TurnDispatchResult, EngineError> {
-        let gate = self.state.lock().unwrap().hold_turn.clone();
-        if let Some((started, release)) = gate {
-            started.notify_one();
-            release.notified().await;
-        }
-        if let Some(msg) = self.state.lock().unwrap().turn_error.take() {
-            return Err(EngineError::Transport(msg));
-        }
-        Ok(TurnDispatchResult {
-            node_id: "n-turn".into(),
         })
     }
     async fn fork_thread(
@@ -158,6 +135,38 @@ impl DaemonEngine for MockPortEngine {
             status: Default::default(),
         })
     }
+    async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
+        unreachable!()
+    }
+    async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
+        Ok(self.state.lock().unwrap().thread_meta.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnPort for MockPortEngine {
+    async fn send_turn(&self, _prompt: &str) -> Result<TurnDispatchResult, EngineError> {
+        Ok(TurnDispatchResult {
+            node_id: "n-turn".into(),
+        })
+    }
+    async fn send_turn_for_thread(
+        &self,
+        _thread_id: &str,
+        _prompt: &str,
+    ) -> Result<TurnDispatchResult, EngineError> {
+        let gate = self.state.lock().unwrap().hold_turn.clone();
+        if let Some((started, release)) = gate {
+            started.notify_one();
+            release.notified().await;
+        }
+        if let Some(msg) = self.state.lock().unwrap().turn_error.take() {
+            return Err(EngineError::Transport(msg));
+        }
+        Ok(TurnDispatchResult {
+            node_id: "n-turn".into(),
+        })
+    }
     async fn resolve_permission(
         &self,
         decision: PermissionDecisionPayload,
@@ -169,30 +178,6 @@ impl DaemonEngine for MockPortEngine {
     }
     async fn cancel_turn(&self, _thread_id: &str) -> Result<(), EngineError> {
         Ok(())
-    }
-    async fn run_shell_command(
-        &self,
-        _thread_id: &str,
-        command: &str,
-    ) -> Result<ShellCommandResult, EngineError> {
-        Ok(ShellCommandResult {
-            command: command.into(),
-            stdout: "out".into(),
-            stderr: String::new(),
-            exit_code: 0,
-            timed_out: false,
-        })
-    }
-    async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
-        unreachable!()
-    }
-    async fn subscribe_events(
-        &self,
-    ) -> Result<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>, EngineError> {
-        Ok(self.rx.lock().await.take())
-    }
-    async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
-        Ok(self.state.lock().unwrap().thread_meta.clone())
     }
     async fn set_agent_config(
         &self,
@@ -213,6 +198,27 @@ impl DaemonEngine for MockPortEngine {
             available_commands: Vec::new(),
         })
     }
+}
+
+#[async_trait::async_trait]
+impl ShellUseCasePort for MockPortEngine {
+    async fn run_shell_command(
+        &self,
+        _thread_id: &str,
+        command: &str,
+    ) -> Result<ShellCommandResult, EngineError> {
+        Ok(ShellCommandResult {
+            command: command.into(),
+            stdout: "out".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TerminalPtyUseCasePort for MockPortEngine {
     async fn pty_scroll(
         &self,
         _thread_id: &str,
@@ -237,6 +243,10 @@ impl DaemonEngine for MockPortEngine {
             ..Default::default()
         })
     }
+}
+
+#[async_trait::async_trait]
+impl WorktreeUseCasePort for MockPortEngine {
     async fn ensure_thread_worktree(&self, _thread_id: &str) -> Result<String, EngineError> {
         Ok("/tmp/wt-mock".into())
     }
@@ -269,6 +279,20 @@ impl DaemonEngine for MockPortEngine {
     }
     async fn prune_worktrees(&self) -> Result<String, EngineError> {
         Ok("pruned 0".into())
+    }
+}
+
+impl AutocompleteContextPort for MockPortEngine {}
+
+#[async_trait::async_trait]
+impl EngineEventPort for MockPortEngine {
+    async fn ping(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+    async fn subscribe_events(
+        &self,
+    ) -> Result<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>, EngineError> {
+        Ok(self.rx.lock().await.take())
     }
 }
 
