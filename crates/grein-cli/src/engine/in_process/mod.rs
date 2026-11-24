@@ -28,6 +28,8 @@ mod acp;
 mod acp_turns;
 mod listener;
 mod pty;
+#[cfg(test)]
+mod tests_listener;
 mod threads;
 mod worktree;
 

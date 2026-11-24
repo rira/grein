@@ -18,6 +18,8 @@ mod tests;
 #[cfg(test)]
 mod tests_autocomplete;
 #[cfg(test)]
+mod tests_hardening;
+#[cfg(test)]
 mod tests_session_prefs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
