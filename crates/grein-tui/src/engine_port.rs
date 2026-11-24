@@ -71,6 +71,24 @@ pub struct WorktreeEntry {
     pub attached_thread_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PtyMouseMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PtyMouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
 /// Terminal foreground/background color captured from VT100 emulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PtyColor {
@@ -111,6 +129,12 @@ pub struct PtyScreenSnapshot {
     pub scrollback_offset: usize,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub row_wrapped: Vec<bool>,
+    #[serde(default)]
+    pub mouse_protocol_mode: PtyMouseMode,
+    #[serde(default)]
+    pub mouse_protocol_encoding: PtyMouseEncoding,
 }
 
 impl PtyScreenSnapshot {
@@ -527,5 +551,34 @@ pub trait TuiEnginePort: Send + Sync {
         _cwd: Option<&str>,
     ) -> io::Result<HydratedThread> {
         self.create_root(title).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pty_screen_snapshot_serde_defaults_new_fields() {
+        let legacy_json = r#"{
+            "rows": 24,
+            "cols": 80,
+            "cells": [],
+            "cursor_row": 0,
+            "cursor_col": 0,
+            "hide_cursor": false,
+            "application_cursor": false,
+            "bracketed_paste": false,
+            "alternate_screen": false,
+            "exited": false,
+            "exit_code": null
+        }"#;
+        let snap: PtyScreenSnapshot =
+            serde_json::from_str(legacy_json).expect("deserialize legacy snapshot");
+        assert_eq!(snap.scrollback_offset, 0);
+        assert_eq!(snap.cwd, None);
+        assert!(snap.row_wrapped.is_empty());
+        assert_eq!(snap.mouse_protocol_mode, PtyMouseMode::None);
+        assert_eq!(snap.mouse_protocol_encoding, PtyMouseEncoding::Default);
     }
 }

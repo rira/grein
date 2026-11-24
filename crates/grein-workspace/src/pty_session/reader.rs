@@ -219,7 +219,10 @@ pub(super) fn process_pty_bytes(
             && prev_pos.0 == rows - 1
             && prev_pos.1 >= cols.saturating_sub(2);
         let candidate_row0 = if candidate_lf_scroll || candidate_wrap_scroll {
-            Some(capture_screen_row(guard.parser.screen(), 0, cols))
+            Some((
+                capture_screen_row(guard.parser.screen(), 0, cols),
+                guard.parser.screen().row_wrapped(0),
+            ))
         } else {
             None
         };
@@ -230,7 +233,12 @@ pub(super) fn process_pty_bytes(
                 let actual = count.min(rows);
                 Some(
                     (0..actual)
-                        .map(|r| capture_screen_row(guard.parser.screen(), r, cols))
+                        .map(|r| {
+                            (
+                                capture_screen_row(guard.parser.screen(), r, cols),
+                                guard.parser.screen().row_wrapped(r),
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 )
             }
@@ -242,16 +250,16 @@ pub(super) fn process_pty_bytes(
             guard.scrollback_offset = 0;
         }
 
-        if let Some(row0) = candidate_row0 {
+        if let Some((row0, row0_wrapped)) = candidate_row0 {
             let scrolled = candidate_lf_scroll
                 || did_wrap_scroll(guard.parser.screen(), rows, cols, prev_pos.1);
             if scrolled {
-                guard.push_scrollback_row(row0);
+                guard.push_scrollback_row(row0, row0_wrapped);
             }
         }
         if let Some(su_rows) = candidate_su_rows {
-            for row in su_rows {
-                guard.push_scrollback_row(row);
+            for (row, wrapped) in su_rows {
+                guard.push_scrollback_row(row, wrapped);
             }
         }
         if let Some(ev) = event {

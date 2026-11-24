@@ -26,14 +26,14 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use self::reader::spawn_reader_thread;
-use self::state::{capture_screen_row, fit_row_to_cols, PtyState};
+use self::state::PtyState;
 #[cfg(unix)]
 use self::unix::{
     build_pty_command, create_wake_pipe, open_pty_pair, reset_child_signals, resolve_shell,
     send_signal_to_process_group, set_nonblocking, set_pty_winsize, write_all_to_fd, ChildProcess,
 };
 
-pub use state::{PtyCell, PtyColor, PtyScreenSnapshot};
+pub use state::{PtyCell, PtyColor, PtyMouseEncoding, PtyMouseMode, PtyScreenSnapshot};
 
 #[cfg(unix)]
 const DROP_SIGHUP_GRACE: Duration = Duration::from_millis(100);
@@ -302,50 +302,10 @@ impl InteractivePtySession {
 
     /// Captures a consistent snapshot of the current VT100 screen and exit state.
     pub fn snapshot(&self) -> PtyScreenSnapshot {
-        let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let screen = guard.parser.screen();
-        let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let alternate_screen = screen.alternate_screen();
-        let scrollback_offset = if alternate_screen {
-            0
-        } else {
-            guard.scrollback_offset.min(guard.scrollback.len())
-        };
-
-        let row_count = usize::from(rows);
-        let from_scrollback = scrollback_offset.min(row_count);
-        let sb_start = guard.scrollback.len().saturating_sub(scrollback_offset);
-
-        let mut cells = Vec::with_capacity(row_count);
-        for idx in 0..from_scrollback {
-            if let Some(sb_row) = guard.scrollback.get(sb_start + idx) {
-                cells.push(fit_row_to_cols(sb_row, cols));
-            }
-        }
-        let live_rows = row_count.saturating_sub(from_scrollback);
-        for r in 0..rows {
-            if usize::from(r) >= live_rows {
-                break;
-            }
-            cells.push(capture_screen_row(screen, r, cols));
-        }
-
-        PtyScreenSnapshot {
-            rows,
-            cols,
-            cells,
-            cursor_row,
-            cursor_col,
-            hide_cursor: screen.hide_cursor(),
-            application_cursor: screen.application_cursor(),
-            bracketed_paste: screen.bracketed_paste(),
-            alternate_screen,
-            exited: guard.exited,
-            exit_code: guard.exit_code,
-            scrollback_offset,
-            cwd: guard.current_cwd.clone(),
-        }
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot()
     }
 
     /// Returns the OS process ID of the spawned shell child process.
