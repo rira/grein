@@ -289,7 +289,8 @@ impl InProcessEngine {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned);
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.runtime.cwd.clone());
 
         let (canonical_target, changed) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, bool), EngineError> {
             let canonical_target = std::fs::canonicalize(&raw_target).map_err(|_| {
@@ -312,9 +313,7 @@ impl InProcessEngine {
                 )));
             }
 
-            let cur_toplevel = cur_cwd
-                .as_deref()
-                .and_then(|c| resolve_worktree_toplevel(Path::new(c)));
+            let cur_toplevel = resolve_worktree_toplevel(&cur_cwd);
             let changed = cur_toplevel.as_ref() != Some(&canonical_target);
             Ok((canonical_target, changed))
         })

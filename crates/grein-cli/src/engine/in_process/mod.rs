@@ -390,6 +390,14 @@ impl InProcessEngine {
         DaemonEngine::create_root_thread(self, title).await
     }
 
+    pub async fn create_root_thread_in_cwd(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        DaemonEngine::create_root_thread_in_cwd(self, title, cwd).await
+    }
+
     pub async fn rename_thread(
         &self,
         thread_id: &str,
@@ -520,6 +528,14 @@ impl InProcessEngine {
     ) -> Result<TuiPtyScreenSnapshot, EngineError> {
         DaemonEngine::pty_restart(self, thread_id, rows, cols).await
     }
+
+    pub async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
+        DaemonEngine::list_recent_user_prompts(self, limit).await
+    }
+
+    pub async fn list_workspace_files(&self, root: Option<&str>) -> Result<Vec<String>, EngineError> {
+        DaemonEngine::list_workspace_files(self, root).await
+    }
 }
 
 #[async_trait]
@@ -561,7 +577,15 @@ impl DaemonEngine for InProcessEngine {
     }
 
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
-        self.create_root_thread_impl(title).await
+        DaemonEngine::create_root_thread_in_cwd(self, title, None).await
+    }
+
+    async fn create_root_thread_in_cwd(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.create_root_thread_in_cwd_impl(title, cwd).await
     }
 
     async fn rename_thread(
@@ -736,5 +760,13 @@ impl DaemonEngine for InProcessEngine {
         cols: u16,
     ) -> Result<TuiPtyScreenSnapshot, EngineError> {
         self.pty_restart_impl(thread_id, rows, cols).await
+    }
+
+    async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
+        self.list_recent_user_prompts_impl(limit).await
+    }
+
+    async fn list_workspace_files(&self, root: Option<&str>) -> Result<Vec<String>, EngineError> {
+        self.list_workspace_files_impl(root).await
     }
 }

@@ -50,9 +50,10 @@ async fn route(
             let title = params.get("title").and_then(Value::as_str);
             to_json(&engine.fork_thread_with_title(source, title).await?)?
         }
-        "session.create_root_thread" => {
+        "session.create_root_thread" | "session.create_root" => {
             let title = params.get("title").and_then(Value::as_str);
-            to_json(&engine.create_root_thread(title).await?)?
+            let cwd = params.get("cwd").and_then(Value::as_str);
+            to_json(&engine.create_root_thread_in_cwd(title, cwd).await?)?
         }
         "session.rename_thread" => {
             let thread_id = required_str(params, "thread_id")?;
@@ -205,9 +206,27 @@ async fn route(
             let cols = parse_opt_u16(params, "cols", 80)?;
             to_json(&engine.pty_restart(thread_id, rows, cols).await?)?
         }
+        "session.list_recent_prompts" | "list_recent_prompts" => {
+            let limit = parse_opt_usize(params, "limit", 200)?;
+            to_json(&engine.list_recent_user_prompts(limit).await?)?
+        }
+        "session.list_workspace_files" | "list_workspace_files" => {
+            let root = params.get("root").and_then(Value::as_str);
+            to_json(&engine.list_workspace_files(root).await?)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+fn parse_opt_usize(params: &Value, key: &str, default: usize) -> Result<usize, EngineError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| EngineError::InvalidParams(format!("invalid usize param `{key}`"))),
+    }
 }
 
 fn parse_opt_u16(params: &Value, key: &str, default: u16) -> Result<u16, EngineError> {

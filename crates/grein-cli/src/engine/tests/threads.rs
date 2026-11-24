@@ -588,3 +588,203 @@ async fn test_rename_thread_sets_and_clears_custom_name_without_touching_title()
             if thread_id == &term.thread_id && custom_name.is_none()
     )));
 }
+
+#[tokio::test]
+async fn test_list_recent_user_prompts_and_workspace_files_in_process() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary_repo = temp.path().join("primary");
+    let secondary_repo = temp.path().join("secondary");
+    std::fs::create_dir_all(primary_repo.join("src")).expect("mkdir primary/src");
+    std::fs::create_dir_all(&secondary_repo).expect("mkdir secondary");
+
+    let run_git = |dir: &std::path::Path, args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git failed: {:?}", args);
+    };
+    run_git(&primary_repo, &["init"]);
+    run_git(&primary_repo, &["config", "user.name", "Grein Test"]);
+    run_git(&primary_repo, &["config", "user.email", "test@grein.dev"]);
+    std::fs::write(primary_repo.join(".gitignore"), "*.tmp\n").expect("gitignore");
+    std::fs::write(primary_repo.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+    std::fs::write(primary_repo.join("skip.tmp"), "ignored\n").expect("skip.tmp");
+
+    run_git(&secondary_repo, &["init"]);
+    run_git(&secondary_repo, &["config", "user.name", "Grein Test"]);
+    run_git(&secondary_repo, &["config", "user.email", "test@grein.dev"]);
+    std::fs::write(secondary_repo.join("worktree_file.txt"), "wt\n").expect("wt file");
+
+    let db_path = temp.path().join("autocomplete.db");
+    let engine = InProcessEngine::open_with_config(&db_path, primary_repo.clone(), None)
+        .expect("open engine");
+    let main = engine.ensure_main_thread().await.expect("ensure main");
+    let main_tid: ThreadId = parse_typed_id(&main.thread_id).unwrap();
+    let leaf = engine
+        .runtime
+        .storage
+        .get_thread(main_tid)
+        .unwrap()
+        .unwrap()
+        .active_leaf_id;
+
+    let n1 = ConversationNode::new(NodeId::new(), Some(leaf), AuthorRole::User, "alpha".into());
+    let n2 = ConversationNode::new(
+        NodeId::new(),
+        Some(n1.id),
+        AuthorRole::Assistant,
+        "assistant should not appear".into(),
+    );
+    let n3 = ConversationNode::new(NodeId::new(), Some(n2.id), AuthorRole::User, "   ".into());
+    let n4 = ConversationNode::new(NodeId::new(), Some(n3.id), AuthorRole::User, "beta".into());
+    let n5 = ConversationNode::new(NodeId::new(), Some(n4.id), AuthorRole::User, "alpha".into());
+    for node in [&n1, &n2, &n3, &n4, &n5] {
+        engine.runtime.storage.insert_node(node).unwrap();
+    }
+
+    assert!(engine
+        .list_recent_user_prompts(0)
+        .await
+        .expect("limit 0")
+        .is_empty());
+    assert_eq!(
+        engine
+            .list_recent_user_prompts(10)
+            .await
+            .expect("prompts"),
+        vec!["alpha", "beta"]
+    );
+    assert_eq!(
+        engine
+            .list_recent_user_prompts(1)
+            .await
+            .expect("prompts limit 1"),
+        vec!["alpha"]
+    );
+
+    let default_files = engine
+        .list_workspace_files(None)
+        .await
+        .expect("files default");
+    assert!(default_files.contains(&"src/main.rs".to_string()));
+    assert!(!default_files.contains(&"skip.tmp".to_string()));
+
+    let fallback_files = engine
+        .list_workspace_files(Some("/nonexistent/grein_missing_root"))
+        .await
+        .expect("missing root falls back to runtime cwd");
+    assert_eq!(fallback_files, default_files);
+
+    let sec_files = engine
+        .list_workspace_files(Some(&secondary_repo.to_string_lossy()))
+        .await
+        .expect("secondary files");
+    assert_eq!(sec_files, vec!["worktree_file.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn test_create_root_thread_in_cwd_persists_cwd_and_rejects_invalid_paths() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary_dir = temp.path().join("primary_ws");
+    let work_dir = temp.path().join("wt_ws");
+    let not_a_dir = temp.path().join("plain_file.txt");
+    std::fs::create_dir_all(&primary_dir).expect("mkdir primary");
+    std::fs::create_dir_all(&work_dir).expect("mkdir work");
+    std::fs::write(&not_a_dir, "hello").expect("write file");
+    let canonical_work = std::fs::canonicalize(&work_dir).expect("canonical work");
+    let canonical_work_str = canonical_work.to_string_lossy().to_string();
+    let db_path = temp.path().join("root_cwd.db");
+
+    let engine = InProcessEngine::open_with_config(&db_path, primary_dir.clone(), None)
+        .expect("open engine");
+    let _main = engine.ensure_main_thread().await.expect("main");
+    let mut rx = engine.subscribe_tui_events();
+
+    let count_before = engine.list_threads().await.expect("list before").len();
+    let nodes_before = engine.runtime.storage.list_nodes().unwrap().len();
+
+    let err_missing = engine
+        .create_root_thread_in_cwd(Some("Missing"), Some("/nonexistent/grein_nope_root"))
+        .await
+        .expect_err("missing dir must fail");
+    assert!(matches!(err_missing, super::super::EngineError::InvalidParams(_)));
+
+    let err_file = engine
+        .create_root_thread_in_cwd(Some("File"), Some(&not_a_dir.to_string_lossy()))
+        .await
+        .expect_err("file path must fail");
+    assert!(matches!(err_file, super::super::EngineError::InvalidParams(_)));
+
+    assert_eq!(
+        engine.list_threads().await.expect("list after invalid").len(),
+        count_before
+    );
+    assert_eq!(
+        engine.runtime.storage.list_nodes().unwrap().len(),
+        nodes_before
+    );
+
+    let blank_cwd_root = engine
+        .create_root_thread_in_cwd(Some("Blank Cwd"), Some("   "))
+        .await
+        .expect("blank cwd treated as None");
+    let blank_tid: ThreadId = parse_typed_id(&blank_cwd_root.thread_id).unwrap();
+    assert_eq!(
+        engine
+            .runtime
+            .storage
+            .get_thread(blank_tid)
+            .unwrap()
+            .unwrap()
+            .cwd,
+        None
+    );
+
+    let scoped = engine
+        .create_root_thread_in_cwd(Some("Scoped Root"), Some(&work_dir.to_string_lossy()))
+        .await
+        .expect("create_root_thread_in_cwd");
+    assert_eq!(scoped.custom_name.as_deref(), Some("Scoped Root"));
+    let scoped_tid: ThreadId = parse_typed_id(&scoped.thread_id).unwrap();
+    assert_eq!(
+        engine
+            .runtime
+            .storage
+            .get_thread(scoped_tid)
+            .unwrap()
+            .unwrap()
+            .cwd
+            .as_deref(),
+        Some(canonical_work_str.as_str())
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(events.iter().any(|e| matches!(
+        e,
+        TuiEngineEvent::ThreadCreated { thread } if thread.id == scoped.thread_id
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        TuiEngineEvent::ThreadMetadataUpdated { meta }
+            if meta.iter().any(|m| {
+                m.thread_id == scoped.thread_id
+                    && m.cwd.as_deref() == Some(canonical_work_str.as_str())
+            })
+    )));
+
+    drop(engine);
+    let reopened = InProcessEngine::open_with_config(&db_path, primary_dir, None).expect("reopen");
+    let meta = reopened.thread_metadata().await.expect("reopened meta");
+    let persisted = meta
+        .iter()
+        .find(|m| m.thread_id == scoped.thread_id)
+        .expect("persisted meta");
+    assert_eq!(persisted.cwd.as_deref(), Some(canonical_work_str.as_str()));
+}
