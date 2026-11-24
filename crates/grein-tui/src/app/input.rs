@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::keymap::BindableAction;
+use crate::keymap::{BindableAction, UNSUPPORTED_KEY_MODIFIERS};
 use crate::search::SearchDirection;
 
 use super::editing::is_altgr_char;
@@ -18,7 +18,9 @@ impl App {
         had_g_prefix: bool,
     ) -> Option<TreeAction> {
         self.sync_focus_in();
-        if self.focused_pane != FocusedPane::Tree {
+        if self.focused_pane != FocusedPane::Tree
+            || key.modifiers.intersects(UNSUPPORTED_KEY_MODIFIERS)
+        {
             return None;
         }
 
@@ -178,7 +180,7 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
-        if key.kind == KeyEventKind::Release {
+        if key.kind == KeyEventKind::Release || key.modifiers.intersects(UNSUPPORTED_KEY_MODIFIERS) {
             return false;
         }
         self.sync_focus_in();
@@ -653,11 +655,11 @@ impl App {
                 self.sync_focus_out();
                 return true;
             }
-            (KeyCode::Up | KeyCode::Char('k'), false, false) => {
+            (KeyCode::Up | KeyCode::Char('k'), false, false) if !shift => {
                 self.scroll_target_transcript(TranscriptScroll::Up(1));
                 return true;
             }
-            (KeyCode::Down | KeyCode::Char('j'), false, false) => {
+            (KeyCode::Down | KeyCode::Char('j'), false, false) if !shift => {
                 self.scroll_target_transcript(TranscriptScroll::Down(1));
                 return true;
             }

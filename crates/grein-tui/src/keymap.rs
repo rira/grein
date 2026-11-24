@@ -5,6 +5,10 @@ use std::str::FromStr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
+pub(crate) const UNSUPPORTED_KEY_MODIFIERS: KeyModifiers = KeyModifiers::SUPER
+    .union(KeyModifiers::HYPER)
+    .union(KeyModifiers::META);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyChord {
     pub code: KeyCode,
@@ -20,7 +24,8 @@ impl KeyChord {
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         let alt = modifiers.contains(KeyModifiers::ALT);
         let shift = modifiers.contains(KeyModifiers::SHIFT);
-        let mut norm_mods = KeyModifiers::NONE;
+        let extra = modifiers.intersection(UNSUPPORTED_KEY_MODIFIERS);
+        let mut norm_mods = extra;
         if ctrl {
             norm_mods |= KeyModifiers::CONTROL;
         }
@@ -33,7 +38,7 @@ impl KeyChord {
                 modifiers: norm_mods,
             },
             KeyCode::Tab => {
-                if shift && !ctrl && !alt {
+                if shift && !ctrl && !alt && extra.is_empty() {
                     Self {
                         code: KeyCode::BackTab,
                         modifiers: KeyModifiers::NONE,
@@ -49,7 +54,7 @@ impl KeyChord {
                 }
             }
             KeyCode::Char(c) => {
-                if ctrl || alt {
+                if ctrl || alt || !extra.is_empty() {
                     if shift {
                         norm_mods |= KeyModifiers::SHIFT;
                         Self {
@@ -82,9 +87,15 @@ impl KeyChord {
         }
     }
 
+    pub fn from_event(key: KeyEvent) -> Option<Self> {
+        if key.modifiers.intersects(UNSUPPORTED_KEY_MODIFIERS) {
+            return None;
+        }
+        Some(Self::normalize(key.code, key.modifiers))
+    }
+
     pub fn matches(&self, key: KeyEvent) -> bool {
-        let ev = Self::normalize(key.code, key.modifiers);
-        *self == ev
+        Self::from_event(key).is_some_and(|ev| *self == ev)
     }
 
     pub fn parse(spec: &str) -> Result<Self, String> {
@@ -557,22 +568,25 @@ impl Keymap {
         }
     }
 
-    pub fn match_write_key(&self, key: KeyEvent) -> Option<BindableAction> {
+    fn match_key_where<F>(&self, key: KeyEvent, predicate: F) -> Option<BindableAction>
+    where
+        F: Fn(BindableAction) -> bool,
+    {
+        let ev = KeyChord::from_event(key)?;
         for (&action, chords) in &self.bindings {
-            if action.is_write_action() && chords.iter().any(|c| c.matches(key)) {
+            if predicate(action) && chords.contains(&ev) {
                 return Some(action);
             }
         }
         None
     }
 
+    pub fn match_write_key(&self, key: KeyEvent) -> Option<BindableAction> {
+        self.match_key_where(key, BindableAction::is_write_action)
+    }
+
     pub fn match_composer_completion_key(&self, key: KeyEvent) -> Option<BindableAction> {
-        for (&action, chords) in &self.bindings {
-            if action.is_composer_completion() && chords.iter().any(|c| c.matches(key)) {
-                return Some(action);
-            }
-        }
-        None
+        self.match_key_where(key, BindableAction::is_composer_completion)
     }
 
     pub fn chords_for(&self, action: BindableAction) -> &[KeyChord] {
@@ -633,5 +647,76 @@ impl Keymap {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_event_rejects_super_hyper_meta_and_preserves_normalize_flags() {
+        let shift_up = KeyChord::new(KeyCode::Up, KeyModifiers::SHIFT);
+        let plain_tab = KeyChord::new(KeyCode::Tab, KeyModifiers::NONE);
+        let backtab = KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE);
+        let upper_a = KeyChord::new(KeyCode::Char('A'), KeyModifiers::NONE);
+
+        for extra in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            let mod_shift_up = KeyEvent::new(KeyCode::Up, extra | KeyModifiers::SHIFT);
+            assert_eq!(KeyChord::from_event(mod_shift_up), None);
+            assert!(!shift_up.matches(mod_shift_up));
+            assert_ne!(KeyChord::new(KeyCode::Up, extra | KeyModifiers::SHIFT), shift_up);
+
+            let mod_tab = KeyEvent::new(KeyCode::Tab, extra);
+            assert_eq!(KeyChord::from_event(mod_tab), None);
+            assert!(!plain_tab.matches(mod_tab));
+            assert_ne!(KeyChord::new(KeyCode::Tab, extra), plain_tab);
+
+            let mod_shift_tab = KeyEvent::new(KeyCode::Tab, extra | KeyModifiers::SHIFT);
+            assert_eq!(KeyChord::from_event(mod_shift_tab), None);
+            assert!(!backtab.matches(mod_shift_tab));
+            assert_ne!(KeyChord::new(KeyCode::Tab, extra | KeyModifiers::SHIFT), backtab);
+
+            let mod_shift_a = KeyEvent::new(KeyCode::Char('a'), extra | KeyModifiers::SHIFT);
+            assert_eq!(KeyChord::from_event(mod_shift_a), None);
+            assert!(!upper_a.matches(mod_shift_a));
+            assert_ne!(KeyChord::new(KeyCode::Char('a'), extra | KeyModifiers::SHIFT), upper_a);
+        }
+    }
+
+    #[test]
+    fn from_event_preserves_shift_chars_tab_and_altgr() {
+        assert_eq!(
+            KeyChord::from_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT)),
+            Some(KeyChord {
+                code: KeyCode::Char('A'),
+                modifiers: KeyModifiers::NONE,
+            })
+        );
+        assert_eq!(
+            KeyChord::from_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(KeyChord {
+                code: KeyCode::BackTab,
+                modifiers: KeyModifiers::NONE,
+            })
+        );
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            KeyChord::from_event(KeyEvent::new(KeyCode::Char('@'), altgr)),
+            Some(KeyChord {
+                code: KeyCode::Char('@'),
+                modifiers: altgr,
+            })
+        );
+        assert_eq!(
+            KeyChord::from_event(KeyEvent::new(
+                KeyCode::Char('{'),
+                altgr | KeyModifiers::SHIFT
+            )),
+            Some(KeyChord {
+                code: KeyCode::Char('{'),
+                modifiers: altgr | KeyModifiers::SHIFT,
+            })
+        );
     }
 }

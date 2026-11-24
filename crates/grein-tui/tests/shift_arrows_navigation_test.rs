@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use grein_core::ThreadKind;
-use grein_tui::app::{App, AppAction, FocusedPane, SidebarView};
+use grein_tui::app::{App, AppAction, FocusedPane, PendingPermission, SidebarView};
 use grein_tui::engine_port::{
     HydratedSession, HydratedThread, PtyScreenSnapshot, ThreadMeta, TuiEngineEvent, WorktreeEntry,
 };
@@ -491,4 +491,174 @@ fn test_help_modal_at_110x30_fits_without_scroll_and_displays_shift_arrows() {
         screen.contains("Esc, q, ?, or Enter to close"),
         "Help modal must fit cleanly without scrolling at 110x30:\n{screen}"
     );
+}
+
+#[test]
+fn test_unbound_shift_arrows_in_legacy_transcript_do_not_scroll() {
+    let mut app = build_tree_app();
+    app.transcript_viewport_mut("r1").set_max_scroll(50);
+    app.transcript_viewport_mut("r1").scroll_up(25);
+    app.set_focus(FocusedPane::Transcript);
+
+    // Plain Up/Down scroll the legacy Transcript pane when unbound
+    assert!(app.handle_key_event(key(KeyCode::Up)));
+    assert_eq!(app.transcript_viewport("r1").scroll_offset(), 24);
+    assert!(app.handle_key_event(key(KeyCode::Down)));
+    assert_eq!(app.transcript_viewport("r1").scroll_offset(), 25);
+
+    // Unbind tree_up/down/parent/child; Shift+Up/Down must NOT fall through to plain Up/Down
+    for action in [
+        BindableAction::TreeUp,
+        BindableAction::TreeDown,
+        BindableAction::TreeParent,
+        BindableAction::TreeChild,
+    ] {
+        app.keymap.bind(action, "none").unwrap();
+    }
+
+    assert!(!app.handle_key_event(shift(KeyCode::Up)));
+    assert_eq!(app.transcript_viewport("r1").scroll_offset(), 25);
+    assert!(!app.handle_key_event(shift(KeyCode::Down)));
+    assert_eq!(app.transcript_viewport("r1").scroll_offset(), 25);
+    assert_eq!(app.active_thread_id(), "r1");
+    assert_eq!(app.focused_pane(), FocusedPane::Transcript);
+}
+
+#[test]
+fn test_super_hyper_meta_modifiers_never_alias_shift_or_plain_arrows() {
+    let km = Keymap::default();
+    let shift_up_chord = KeyChord::new(KeyCode::Up, KeyModifiers::SHIFT);
+
+    for extra in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+        let mod_shift_up = KeyEvent::new(KeyCode::Up, extra | KeyModifiers::SHIFT);
+        let mod_up = KeyEvent::new(KeyCode::Up, extra);
+        let mod_down = KeyEvent::new(KeyCode::Down, extra);
+        let mod_shift_down = KeyEvent::new(KeyCode::Down, extra | KeyModifiers::SHIFT);
+        let mod_tab = KeyEvent::new(KeyCode::Tab, extra);
+        let mod_shift_tab = KeyEvent::new(KeyCode::Tab, extra | KeyModifiers::SHIFT);
+        let mod_ctrl_g = KeyEvent::new(KeyCode::Char('g'), extra | KeyModifiers::CONTROL);
+        let mod_alt_z = KeyEvent::new(KeyCode::Char('z'), extra | KeyModifiers::ALT);
+
+        assert!(!shift_up_chord.matches(mod_shift_up));
+        assert_eq!(km.match_write_key(mod_shift_up), None);
+        assert_eq!(km.match_write_key(mod_up), None);
+        assert_eq!(km.match_write_key(mod_shift_down), None);
+        assert_eq!(km.match_write_key(mod_down), None);
+        assert_eq!(km.match_write_key(mod_ctrl_g), None);
+        assert_eq!(km.match_write_key(mod_alt_z), None);
+        assert_eq!(km.match_composer_completion_key(mod_tab), None);
+        assert_eq!(km.match_composer_completion_key(mod_shift_tab), None);
+    }
+
+    // Valid CONTROL, ALT, SHIFT, and AltGr chords continue to match/ignore properly
+    assert_eq!(
+        km.match_write_key(shift(KeyCode::Up)),
+        Some(BindableAction::TreeUp)
+    );
+    assert_eq!(
+        km.match_write_key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )),
+        None
+    );
+
+    // Central key router must reject SUPER/HYPER/META across all panes
+    let mut app = build_tree_app();
+    app.input_buffer = "line1\nline2".to_string();
+    app.cursor_position = 8;
+    app.transcript_viewport_mut("r1").set_max_scroll(50);
+    app.transcript_viewport_mut("r1").scroll_up(25);
+
+    // 1. Composer
+    app.set_focus(FocusedPane::Composer);
+    for ev in [
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER | KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER | KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::HYPER),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::META),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+    ] {
+        assert!(!app.handle_key_event(ev), "Composer should ignore {ev:?}");
+    }
+    assert_eq!(app.active_thread_id(), "r1");
+    assert_eq!(app.cursor_position, 8);
+    assert_eq!(app.input_buffer, "line1\nline2");
+
+    // AltGr remains intact in Composer
+    assert!(app.handle_key_event(KeyEvent::new(
+        KeyCode::Char('@'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    assert_eq!(app.input_buffer, "line1\nli@ne2");
+
+    // 2. Tree (Grein & Worktrees)
+    app.set_focus(FocusedPane::Tree);
+    app.tree.select_index(1);
+    for ev in [
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER | KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER),
+    ] {
+        assert!(!app.handle_key_event(ev), "Tree should ignore {ev:?}");
+        assert!(app.handle_key_tree(ev).is_none());
+    }
+    assert_eq!(app.active_thread_id(), "r1");
+    assert_eq!(app.tree.selected_index(), Some(1));
+
+    // 3. Legacy Transcript
+    app.set_focus(FocusedPane::Transcript);
+    for ev in [
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER | KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER | KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER),
+    ] {
+        assert!(!app.handle_key_event(ev), "Transcript should ignore {ev:?}");
+    }
+    assert_eq!(app.active_thread_id(), "r1");
+    assert_eq!(app.transcript_viewport("r1").scroll_offset(), 25);
+
+    // 4. Terminal (primary & alternate screen)
+    app.switch_thread("t1");
+    assert_eq!(app.focused_pane(), FocusedPane::Terminal);
+    app.pending_actions.clear();
+    assert!(!app.handle_key_event(KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    app.pty_screens.insert(
+        "t1".to_string(),
+        PtyScreenSnapshot {
+            alternate_screen: true,
+            ..PtyScreenSnapshot::default()
+        },
+    );
+    assert!(!app.handle_key_event(KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert_eq!(app.active_thread_id(), "t1");
+    assert!(app.pending_actions.is_empty());
+
+    // 5. Worktrees Tree view and active modals also ignore SUPER/HYPER/META
+    app.set_focus(FocusedPane::Tree);
+    app.sidebar_view = SidebarView::Worktrees;
+    app.worktree_selected_idx = 0;
+    assert!(!app.handle_key_event(KeyEvent::new(
+        KeyCode::Down,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT
+    )));
+    assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER)));
+    assert_eq!(app.sidebar_view, SidebarView::Worktrees);
+    assert_eq!(app.worktree_selected_idx, 0);
+
+    app.push_permission(PendingPermission {
+        request_id: "perm-1".to_string(),
+        description: "Test".to_string(),
+    });
+    assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SUPER)));
+    assert!(app.pending_permission.is_some());
+    assert!(app.pending_actions.is_empty());
 }
