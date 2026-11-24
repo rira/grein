@@ -95,18 +95,21 @@ fn setup_app() -> App {
                     title: "Main Trunk".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-agent".to_string(),
                     title: "Auth Agent".to_string(),
                     custom_name: Some("Auth".to_string()),
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Terminal".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
             ],
         },
@@ -668,6 +671,7 @@ async fn test_runner_hydrates_autocomplete_context_and_creates_root_in_cwd() {
                     title: "Main".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 }],
             })
         }
@@ -727,6 +731,7 @@ async fn test_runner_hydrates_autocomplete_context_and_creates_root_in_cwd() {
                 title: "Root".to_string(),
                 custom_name: None,
                 turns: Vec::new(),
+                agent_provider: None,
             })
         }
     }

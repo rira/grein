@@ -55,24 +55,28 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     },
                 ],
                 custom_name: None,
+                agent_provider: None,
             },
             HydratedThread {
                 id: "t-child".to_string(),
                 title: "Child Context".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             },
             HydratedThread {
                 id: "t-grandchild".to_string(),
                 title: "Grandchild".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             },
             HydratedThread {
                 id: "t-sibling".to_string(),
                 title: "Second Child".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             },
         ],
     };
@@ -91,6 +95,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -102,6 +107,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "t-grandchild".to_string(),
@@ -113,6 +119,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "t-sibling".to_string(),
@@ -124,6 +131,7 @@ fn test_tree_is_context_only_nested_and_scrollable() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -192,6 +200,7 @@ fn test_tree_vertical_scrolling_keeps_selected_context_visible() {
             title: format!("Branch-{i:02}"),
             turns: Vec::new(),
                      custom_name: None,
+                     agent_provider: None,
         })
         .collect();
     apply_hydrated_session(
@@ -247,6 +256,7 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -280,6 +290,7 @@ fn test_branch_deletion_key_command_and_sole_thread_guard() {
                 title: "Feature".to_string(),
                 turns: Vec::new(),
                         custom_name: None,
+                        agent_provider: None,
             },
         },
     );
@@ -363,12 +374,14 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                         title: "Main".to_string(),
                         turns: Vec::new(),
                         custom_name: None,
+                        agent_provider: None,
                     },
                     HydratedThread {
                         id: "t-2".to_string(),
                         title: "Side".to_string(),
                         turns: Vec::new(),
                         custom_name: None,
+                        agent_provider: None,
                     },
                 ],
             })
@@ -401,6 +414,7 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "t-2".to_string(),
@@ -412,6 +426,7 @@ async fn test_engine_port_delete_thread_and_thread_metadata_roundtrip() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
             ])
         }
@@ -480,6 +495,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     title: "Main Trunk".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
@@ -490,6 +506,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                         content: "branch local question".to_string(),
                     }],
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -508,6 +525,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -519,6 +537,7 @@ fn test_fork_banner_renders_in_forked_transcript_only() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -571,12 +590,14 @@ fn test_layout_with_chrome_and_subagent_strip_auto_hide_and_overflow() {
                     title: "Main".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Other".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -657,6 +678,7 @@ fn test_bottom_status_bar_minimal_composer_and_live_activity() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -854,6 +876,7 @@ fn test_live_branch_preview_and_rune_lore() {
                         content: "main branch prompt".to_string(),
                     }],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-alt".to_string(),
@@ -864,6 +887,7 @@ fn test_live_branch_preview_and_rune_lore() {
                         content: "feature preview prompt".to_string(),
                     }],
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -923,42 +947,49 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     title: "Main".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "b1".to_string(),
                     title: "Branch A".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "b2".to_string(),
                     title: "Branch B".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "g1".to_string(),
                     title: "Grandchild".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "gg1".to_string(),
                     title: "Great-Grand".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "r2".to_string(),
                     title: "Root 2".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "r2c".to_string(),
                     title: "Root2 Child".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -977,6 +1008,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "b1".to_string(),
@@ -988,6 +1020,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "b2".to_string(),
@@ -999,6 +1032,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "g1".to_string(),
@@ -1010,6 +1044,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "gg1".to_string(),
@@ -1021,6 +1056,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "r2".to_string(),
@@ -1032,6 +1068,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "r2c".to_string(),
@@ -1043,6 +1080,7 @@ fn test_multi_root_three_level_connectors_and_joined_badge_rendering() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -1118,12 +1156,14 @@ fn test_root_create_rename_and_global_alt_n_alt_r_f2_shortcuts() {
                     title: "Main".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
                     title: "Side Work".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -1230,12 +1270,14 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     title: "Main".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
                     title: "Auth Fix".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -1254,6 +1296,7 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "t-child".to_string(),
@@ -1265,6 +1308,7 @@ fn test_join_merge_commands_hotkey_event_and_help_modal() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },

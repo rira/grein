@@ -69,6 +69,7 @@ fn make_meta(id: &str, parent: Option<&str>, kind: ThreadKind, cwd: Option<&str>
         git_branch: None,
         git_dirty: 0,
         custom_name: None,
+        agent_provider: None,
     }
 }
 
@@ -154,6 +155,7 @@ fn test_full_height_sidebar_singular_plural_footer_and_worktree_git_badges() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             }],
         },
     );
@@ -191,6 +193,7 @@ fn test_full_height_sidebar_singular_plural_footer_and_worktree_git_badges() {
                 title: "Terminal".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             },
         },
     );
@@ -288,6 +291,7 @@ fn test_unified_naming_uuid_redaction_and_inline_rename_clearing() {
                 title: "Test Conversation".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             }],
         },
     );
@@ -311,6 +315,7 @@ fn test_unified_naming_uuid_redaction_and_inline_rename_clearing() {
                 title: "Branch".to_string(),
                 turns: Vec::new(),
                 custom_name: None,
+                agent_provider: None,
             },
         },
     );
@@ -372,30 +377,35 @@ fn test_dim_root_numbers_alt_siblings_alt_screen_passthrough_and_preview_target(
                     title: "Root One".to_string(),
                     turns: vec![],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "c1".to_string(),
                     title: "Child A".to_string(),
                     turns: vec![],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "c2".to_string(),
                     title: "Child B".to_string(),
                     turns: vec![],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t1".to_string(),
                     title: "Terminal".to_string(),
                     turns: vec![],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "r2".to_string(),
                     title: "Root Two".to_string(),
                     turns: vec![],
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -518,6 +528,7 @@ async fn test_e2e_terminal_error_sets_visible_status_notice() {
                     title: "Terminal".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 }],
             })
         }

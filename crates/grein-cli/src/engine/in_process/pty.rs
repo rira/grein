@@ -494,6 +494,7 @@ impl InProcessEngine {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
                 custom_name: summary.custom_name.clone(),
+                agent_provider: summary.agent_provider.clone(),
                 turns: Vec::new(),
             },
         });

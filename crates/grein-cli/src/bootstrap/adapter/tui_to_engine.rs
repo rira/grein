@@ -99,6 +99,7 @@ impl<E: GreinEngine> EngineClientPort<E> {
                 id: summary.thread_id,
                 title: summary.title,
                 custom_name: summary.custom_name,
+                agent_provider: summary.agent_provider,
                 turns,
             });
         }
@@ -127,6 +128,7 @@ impl<E: GreinEngine> EngineClientPort<E> {
             id: created.thread_id,
             title: created.title,
             custom_name: created.custom_name,
+            agent_provider: created.agent_provider,
             turns: Vec::new(),
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {
@@ -188,6 +190,7 @@ where
                         id: term.thread_id.clone(),
                         title: term.title,
                         custom_name: term.custom_name,
+                        agent_provider: term.agent_provider,
                         turns: Vec::new(),
                     };
                     (term.thread_id, vec![hydrated])
@@ -202,6 +205,7 @@ where
                             id: main.thread_id.clone(),
                             title: main.title,
                             custom_name: main.custom_name,
+                            agent_provider: main.agent_provider,
                             turns,
                         });
                     }
@@ -348,6 +352,7 @@ where
                     id: forked.thread_id.clone(),
                     title: forked.title,
                     custom_name: forked.custom_name,
+                    agent_provider: forked.agent_provider,
                     turns,
                 },
             });
@@ -371,6 +376,7 @@ where
             id: forked.thread_id,
             title: forked.title,
             custom_name: forked.custom_name,
+            agent_provider: forked.agent_provider,
             turns,
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {
@@ -554,6 +560,7 @@ where
             id: created.thread_id,
             title: created.title,
             custom_name: created.custom_name,
+            agent_provider: created.agent_provider,
             turns: Vec::new(),
         };
         if !self.has_live_stream.load(Ordering::SeqCst) {

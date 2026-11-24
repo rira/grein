@@ -33,7 +33,9 @@ pub use app::{
     TuiServices,
 };
 pub use clipboard::ClipboardPort;
-pub use engine_port::{PreferencesPort, TuiEnginePort, UserPreferencesSnapshot};
+pub use engine_port::{
+    AgentProviderInfo, PreferencesPort, TuiEnginePort, UserPreferencesSnapshot,
+};
 pub use keymap::{BindableAction, KeyChord, Keymap};
 pub use runner::{draw_frame, draw_frame_mut, handle_event, handle_key_event, TerminalGuard};
 pub use theme::{ThemePalette, ThemePickerModal, ThemePreset};

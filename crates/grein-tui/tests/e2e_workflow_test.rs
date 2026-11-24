@@ -47,6 +47,7 @@ impl MockLiveEngine {
                 title: title.to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
             thread_meta: vec![ThreadMeta {
                 thread_id: trunk_id.to_string(),
@@ -58,6 +59,7 @@ impl MockLiveEngine {
                 git_branch: None,
                 git_dirty: 0,
                                   custom_name: None,
+                                  agent_provider: None,
             }],
             active_thread_id: trunk_id.to_string(),
             turn_completed_notify: Arc::new(Notify::new()),
@@ -231,6 +233,7 @@ impl TuiEnginePort for MockLiveEngine {
             title: resolved_title,
             turns: Vec::new(),
                                custom_name: None,
+                               agent_provider: None,
         });
         guard.thread_meta.push(ThreadMeta {
             thread_id: id.clone(),
@@ -242,6 +245,7 @@ impl TuiEnginePort for MockLiveEngine {
             git_branch: None,
             git_dirty: 0,
                                    custom_name: None,
+                                   agent_provider: None,
         });
         guard.active_thread_id = id.clone();
         Ok(id)
@@ -261,6 +265,7 @@ impl TuiEnginePort for MockLiveEngine {
             title: resolved_title,
             turns: Vec::new(),
                          custom_name: None,
+                         agent_provider: None,
         };
         guard.threads.push(thread.clone());
         guard.thread_meta.push(ThreadMeta {
@@ -273,6 +278,7 @@ impl TuiEnginePort for MockLiveEngine {
             git_branch: None,
             git_dirty: 0,
                                    custom_name: None,
+                                   agent_provider: None,
         });
         guard.active_thread_id = id;
         Ok(thread)
@@ -989,18 +995,21 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
                 },
             ],
             custom_name: None,
+            agent_provider: None,
         },
         HydratedThread {
             id: "t-child".to_string(),
             title: "Auth Child".to_string(),
             turns: Vec::new(),
             custom_name: None,
+            agent_provider: None,
         },
         HydratedThread {
             id: "t-grand".to_string(),
             title: "JWT Grandchild".to_string(),
             turns: Vec::new(),
             custom_name: None,
+            agent_provider: None,
         },
     ];
     let meta = vec![
@@ -1014,6 +1023,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
         ThreadMeta {
             thread_id: "t-child".to_string(),
@@ -1025,6 +1035,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
         ThreadMeta {
             thread_id: "t-grand".to_string(),
@@ -1036,6 +1047,7 @@ async fn test_e2e_context_only_nested_tree_and_gfm_table_transcript() {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     ];
     let engine = MockLiveEngine::new_with_session("t-grand", threads, meta);
@@ -1139,6 +1151,7 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
                 title: format!("Branch-{i:02}"),
                 turns: Vec::new(),
                          custom_name: None,
+                         agent_provider: None,
             })
             .collect();
         let meta = (0..14)
@@ -1152,6 +1165,7 @@ async fn test_e2e_tree_vertical_scrolling_short_viewport() {
                 git_branch: None,
                 git_dirty: 0,
                          custom_name: None,
+                         agent_provider: None,
             })
             .collect();
         (threads, meta)
@@ -1601,6 +1615,7 @@ async fn test_e2e_subagent_strip_and_bottom_status_bar_live_activity() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -1831,6 +1846,7 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
                     title: "Main".to_string(),
                     turns: Vec::new(),
                                   custom_name: None,
+                                  agent_provider: None,
                 }],
             })
         }
@@ -1856,6 +1872,7 @@ async fn test_e2e_optimistic_fork_nesting_startup_subscription_order_and_metadat
                 git_branch: None,
                 git_dirty: 0,
                         custom_name: None,
+                        agent_provider: None,
             }])
         }
         async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
@@ -2079,6 +2096,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 content: long_lines,
             }],
             custom_name: None,
+            agent_provider: None,
         },
         HydratedThread {
             id: "b1".to_string(),
@@ -2089,6 +2107,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 content: preview_lines,
             }],
             custom_name: None,
+            agent_provider: None,
         },
         HydratedThread {
             id: "b2".to_string(),
@@ -2099,6 +2118,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 content: "MARKER_BRANCH_1B".to_string(),
             }],
             custom_name: None,
+            agent_provider: None,
         },
         HydratedThread {
             id: "r2".to_string(),
@@ -2109,6 +2129,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 content: "MARKER_ROOT_TWO".to_string(),
             }],
             custom_name: None,
+            agent_provider: None,
         },
         HydratedThread {
             id: "r3".to_string(),
@@ -2119,6 +2140,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
                 content: "MARKER_LONE_ROOT".to_string(),
             }],
             custom_name: None,
+            agent_provider: None,
         },
     ];
     let meta = vec![
@@ -2132,6 +2154,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
         ThreadMeta {
             thread_id: "b1".to_string(),
@@ -2143,6 +2166,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
         ThreadMeta {
             thread_id: "b2".to_string(),
@@ -2154,6 +2178,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
         ThreadMeta {
             thread_id: "r2".to_string(),
@@ -2165,6 +2190,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
         ThreadMeta {
             thread_id: "r3".to_string(),
@@ -2176,6 +2202,7 @@ async fn test_e2e_compact_keymap_branch_cycling_root_switching_scroll_and_join_g
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     ];
 

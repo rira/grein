@@ -128,18 +128,21 @@ fn setup_multi_repo_app() -> App {
                     title: "Main".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-auth".to_string(),
                     title: "Auth".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-term".to_string(),
                     title: "Shell".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -780,6 +783,7 @@ impl TuiEnginePort for MockWorktreeEngine {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         })
     }

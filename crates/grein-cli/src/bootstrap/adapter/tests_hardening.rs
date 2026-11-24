@@ -50,6 +50,7 @@ impl ThreadUseCasePort for MockPortEngine {
             active_leaf_id: "n-1".into(),
             merged: false,
             status: Default::default(),
+            agent_provider: None,
         })
     }
     async fn fork_thread(
@@ -76,6 +77,7 @@ impl ThreadUseCasePort for MockPortEngine {
             active_leaf_id: "n-1".into(),
             merged: false,
             status: Default::default(),
+            agent_provider: None,
         })
     }
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
@@ -87,6 +89,7 @@ impl ThreadUseCasePort for MockPortEngine {
             active_leaf_id: "n-r".into(),
             merged: false,
             status: Default::default(),
+            agent_provider: None,
         })
     }
     async fn rename_thread(
@@ -102,6 +105,7 @@ impl ThreadUseCasePort for MockPortEngine {
             active_leaf_id: "n-1".into(),
             merged: false,
             status: Default::default(),
+            agent_provider: None,
         })
     }
     async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
@@ -133,6 +137,7 @@ impl ThreadUseCasePort for MockPortEngine {
             active_leaf_id: "n-1".into(),
             merged: true,
             status: Default::default(),
+            agent_provider: None,
         })
     }
     async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
@@ -309,6 +314,7 @@ async fn test_fork_thread_uuid_vs_title_heuristic_and_non_live_events() {
         git_branch: None,
         git_dirty: 0,
         custom_name: None,
+        agent_provider: None,
     }];
     let port = EngineClientPort::new(engine);
 
@@ -476,6 +482,7 @@ async fn test_non_live_fallbacks_and_merge_truncation_and_target_resolution() {
         git_branch: None,
         git_dirty: 0,
         custom_name: None,
+        agent_provider: None,
     }];
     let port = EngineClientPort::new(engine);
 

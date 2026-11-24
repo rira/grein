@@ -147,6 +147,7 @@ impl EngineRuntime {
                 git_branch,
                 git_dirty,
                 custom_name: normalize_custom_name(thread.custom_name.as_deref()),
+                agent_provider: thread.agent_provider.clone(),
             });
         }
 
@@ -337,6 +338,7 @@ impl InProcessEngine {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
                 custom_name: summary.custom_name.clone(),
+                agent_provider: summary.agent_provider.clone(),
                 turns,
             },
         });
@@ -415,6 +417,7 @@ impl InProcessEngine {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
                 custom_name: summary.custom_name.clone(),
+                agent_provider: summary.agent_provider.clone(),
                 turns: Vec::new(),
             },
         });

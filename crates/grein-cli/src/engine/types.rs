@@ -187,6 +187,7 @@ pub(super) fn thread_to_summary(thread: &Thread, is_first: bool) -> ThreadSummar
         thread_id: thread.id.0.to_string(),
         title,
         custom_name: normalize_custom_name(thread.custom_name.as_deref()),
+        agent_provider: thread.agent_provider.clone(),
         parent_node_id: thread.parent_node_id.0.to_string(),
         active_leaf_id: thread.active_leaf_id.0.to_string(),
         merged: thread.merged,

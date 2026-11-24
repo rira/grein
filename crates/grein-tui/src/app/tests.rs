@@ -63,6 +63,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.thread_meta.insert(
@@ -77,6 +78,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.thread_meta.insert(
@@ -91,6 +93,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.thread_meta.insert(
@@ -105,6 +108,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.thread_meta.insert(
@@ -119,6 +123,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.thread_meta.insert(
@@ -133,6 +138,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.thread_meta.insert(
@@ -147,6 +153,7 @@ fn multi_root_app() -> App {
             git_branch: None,
             git_dirty: 0,
             custom_name: None,
+            agent_provider: None,
         },
     );
     app.sync_anchors();

@@ -124,6 +124,7 @@ impl TuiEnginePort for FailingMockEngine {
                 title: "Main".to_string(),
                 custom_name: None,
                 turns: Vec::new(),
+                agent_provider: None,
             }],
         }))
     }
@@ -177,6 +178,7 @@ impl TuiEnginePort for FailingMockEngine {
                 .to_string(),
             custom_name: None,
             turns: Vec::new(),
+            agent_provider: None,
         })
     }
 
@@ -276,6 +278,7 @@ impl TuiEnginePort for FailingMockEngine {
             title: title.unwrap_or("New Root").to_string(),
             custom_name: None,
             turns: Vec::new(),
+            agent_provider: None,
         })
     }
 
@@ -360,6 +363,7 @@ impl TuiEnginePort for FailingMockEngine {
             title: "Terminal".to_string(),
             custom_name: None,
             turns: Vec::new(),
+            agent_provider: None,
         })
     }
 
@@ -571,6 +575,7 @@ fn single_thread_session(id: &str, title: &str) -> HydratedSession {
             title: title.to_string(),
             custom_name: None,
             turns: Vec::new(),
+            agent_provider: None,
         }],
     }
 }
@@ -786,12 +791,14 @@ async fn test_merge_failure_aborts_and_merge_fallback_completes_when_event_omitt
                     title: "Main".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-child".to_string(),
                     title: "Child".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
             ],
         };
@@ -943,12 +950,14 @@ async fn test_cancel_turn_permission_delete_and_rename_failures() {
                 title: "Main".to_string(),
                 custom_name: None,
                 turns: Vec::new(),
+                agent_provider: None,
             },
             HydratedThread {
                 id: "t-2".to_string(),
                 title: "KeepMe".to_string(),
                 custom_name: None,
                 turns: Vec::new(),
+                agent_provider: None,
             },
         ],
     };
@@ -1587,12 +1596,14 @@ async fn test_open_config_picker_live_update_delete_close_and_thread_merged_edge
                     title: "One".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Two".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
             ],
         },
@@ -1737,12 +1748,14 @@ async fn test_open_config_picker_live_update_delete_close_and_thread_merged_edge
                 title: "Main".to_string(),
                 custom_name: None,
                 turns: Vec::new(),
+                agent_provider: None,
             },
             HydratedThread {
                 id: "t-2".to_string(),
                 title: "Branch".to_string(),
                 custom_name: None,
                 turns: Vec::new(),
+                agent_provider: None,
             },
         ],
     });
@@ -1813,12 +1826,14 @@ async fn test_open_config_picker_live_update_delete_close_and_thread_merged_edge
                     title: "Alpha".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Beta".to_string(),
                     custom_name: None,
                     turns: Vec::new(),
+                    agent_provider: None,
                 },
             ],
         },

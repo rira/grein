@@ -150,6 +150,7 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
                 active_leaf_id: "n-1".into(),
                 merged: false,
                 status: ThreadStatus::Idle,
+                agent_provider: None,
             })
         }
         async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> {
@@ -171,6 +172,7 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
                 active_leaf_id: "n-2".into(),
                 merged: false,
                 status: ThreadStatus::Idle,
+                agent_provider: None,
             })
         }
         async fn create_root_thread_in_cwd(

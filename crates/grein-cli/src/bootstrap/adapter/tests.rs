@@ -216,6 +216,7 @@ async fn test_engine_client_port_forwards_async_background_errors() {
                 active_leaf_id: "n-1".into(),
                 merged: false,
                 status: Default::default(),
+                agent_provider: None,
             })
         }
         async fn fork_thread(
@@ -415,6 +416,7 @@ async fn test_engine_client_port_offline_fallbacks_and_metadata_error_forwarding
                 active_leaf_id: "n-1".into(),
                 merged: false,
                 status: Default::default(),
+                agent_provider: None,
             })
         }
         async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }
@@ -480,6 +482,7 @@ async fn test_engine_client_port_hydrates_cached_options_commands_and_config_rpc
                 active_leaf_id: "n-1".into(),
                 merged: false,
                 status: Default::default(),
+                agent_provider: None,
             })
         }
         async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> { unreachable!() }

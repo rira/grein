@@ -146,6 +146,7 @@ fn dispatch_action(
                             git_branch: None,
                             git_dirty: 0,
                             custom_name: None,
+                            agent_provider: thread.agent_provider.clone(),
                         };
                         let _ = local_ev_tx.send(RunnerLocalEvent::Engine(
                             TuiEngineEvent::ThreadCreated { thread },
@@ -178,6 +179,7 @@ fn dispatch_action(
                                 git_branch: None,
                                 git_dirty: 0,
                                 custom_name: thread.custom_name.clone(),
+                                agent_provider: thread.agent_provider.clone(),
                             };
                             let _ = local_ev_tx
                                 .send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));
@@ -391,6 +393,7 @@ fn dispatch_action(
                             git_branch: None,
                             git_dirty: 0,
                             custom_name: None,
+                            agent_provider: None,
                         };
                         let _ =
                             local_ev_tx.send(RunnerLocalEvent::OptimisticThreadMeta(optimistic));

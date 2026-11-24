@@ -291,12 +291,14 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
                         content: "inspect files".to_string(),
                     }],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "t-2".to_string(),
                     title: "Side".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -453,6 +455,7 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
                 title: "Root".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -468,6 +471,7 @@ fn test_structured_thread_blocks_wiring_ctrl_o_toggle_and_markdown_fallback() {
                     content: "branch work".to_string(),
                 }],
                         custom_name: None,
+                        agent_provider: None,
             },
         },
     );
@@ -524,6 +528,7 @@ fn test_exact_transcript_scroll_no_bottom_clipping_and_submit_auto_scroll() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -673,6 +678,7 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
                 title: "Main".to_string(),
                 turns: Vec::new(),
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -780,6 +786,7 @@ async fn test_config_picker_modal_arguments_commands_and_status_bar() {
             title: "Main".to_string(),
             turns: Vec::new(),
                           custom_name: None,
+                          agent_provider: None,
         }],
     };
     let engine = ConfigMockEngine::new(session);
@@ -972,6 +979,7 @@ fn test_borderless_sides_zoom_layout_and_clipboard_copy_modes() {
                     },
                 ],
                               custom_name: None,
+                              agent_provider: None,
             }],
         },
     );
@@ -1095,18 +1103,21 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                         content: "root1 reply".to_string(),
                     }],
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "b1".to_string(),
                     title: "Branch 1".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
                 HydratedThread {
                     id: "r2".to_string(),
                     title: "Root 2".to_string(),
                     turns: Vec::new(),
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },
@@ -1125,6 +1136,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "b1".to_string(),
@@ -1136,6 +1148,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
                 ThreadMeta {
                     thread_id: "r2".to_string(),
@@ -1147,6 +1160,7 @@ fn test_os_safe_keymap_ctrl_b_tree_keys_and_scrollable_help_modal() {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 },
             ],
         },

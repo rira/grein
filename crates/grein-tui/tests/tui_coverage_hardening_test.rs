@@ -67,6 +67,7 @@ fn make_meta(id: &str, parent: Option<&str>, kind: ThreadKind) -> ThreadMeta {
         git_branch: None,
         git_dirty: 0,
         custom_name: None,
+        agent_provider: None,
     }
 }
 

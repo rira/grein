@@ -121,6 +121,7 @@ impl TuiEnginePort for SqliteBackedEngine {
                 title: "persisted".to_string(),
                 turns,
                               custom_name: None,
+                              agent_provider: None,
             }],
         })
     }
@@ -166,6 +167,7 @@ fn sample_session() -> HydratedSession {
                 },
             ],
                           custom_name: None,
+                          agent_provider: None,
         }],
     }
 }
@@ -494,6 +496,7 @@ fn test_apply_engine_event_routes_branches_streaming_tools_shell_and_ignores_bla
                 title: "Forked".to_string(),
                 turns: Vec::new(),
                         custom_name: None,
+                        agent_provider: None,
             },
         },
     );

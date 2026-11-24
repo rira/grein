@@ -3,10 +3,10 @@ use std::io;
 use tokio::sync::mpsc;
 
 pub use grein_core::port::dto::{
-    AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentSlashCommand, HydratedSession,
-    HydratedThread, HydratedTurn, PtyCell, PtyColor, PtyMouseEncoding, PtyMouseMode,
-    PtyScreenSnapshot, SubagentSnapshot, SubagentStatus, ThreadMeta, ThreadStatus, TuiEngineEvent,
-    UserPreferencesSnapshot, WorktreeEntry,
+    AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentProviderInfo,
+    AgentSlashCommand, HydratedSession, HydratedThread, HydratedTurn, PtyCell, PtyColor,
+    PtyMouseEncoding, PtyMouseMode, PtyScreenSnapshot, SubagentSnapshot, SubagentStatus,
+    ThreadMeta, ThreadStatus, TuiEngineEvent, UserPreferencesSnapshot, WorktreeEntry,
 };
 
 /// Service provider interface for loading and persisting user preferences.
@@ -44,6 +44,7 @@ pub trait TuiEnginePort: Send + Sync {
                 .unwrap_or("Branch")
                 .to_string(),
             custom_name: None,
+            agent_provider: None,
             turns: Vec::new(),
         })
     }
@@ -238,6 +239,36 @@ pub trait TuiEnginePort: Send + Sync {
         _cwd: Option<&str>,
     ) -> io::Result<HydratedThread> {
         self.create_root(title).await
+    }
+
+    async fn list_agent_providers(&self) -> io::Result<Vec<AgentProviderInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn create_agent_thread(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        _parent_thread_id: Option<&str>,
+        _agent_provider: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        self.create_root_in_cwd(title, cwd).await
+    }
+
+    async fn fork_branch_with_provider(
+        &self,
+        source_thread_id: &str,
+        title: Option<&str>,
+        _agent_provider: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        self.fork_branch(source_thread_id, title).await
+    }
+
+    async fn switch_thread_provider(&self, _thread_id: &str, _provider: &str) -> io::Result<String> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "switch_thread_provider not supported",
+        ))
     }
 }
 

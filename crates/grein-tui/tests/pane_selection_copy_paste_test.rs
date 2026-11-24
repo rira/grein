@@ -38,6 +38,7 @@ fn make_meta(id: &str, parent: Option<&str>, kind: ThreadKind) -> ThreadMeta {
         git_branch: None,
         git_dirty: 0,
         custom_name: None,
+        agent_provider: None,
     }
 }
 
@@ -1000,6 +1001,7 @@ async fn test_run_with_engine_events_and_services_injects_clipboard_port() {
                         role: "Assistant".to_string(),
                         content: "from-runner".to_string(),
                     }],
+                    agent_provider: None,
                 }],
             })
         }

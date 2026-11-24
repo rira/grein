@@ -611,6 +611,7 @@ impl App {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 };
                 thread_display_parts_with_home(&item, Some(&synth), home_dir, elide_sidebar)
             }

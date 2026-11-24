@@ -382,6 +382,7 @@ pub fn apply_engine_event(app: &mut App, event: TuiEngineEvent) {
                     git_branch: None,
                     git_dirty: 0,
                     custom_name: None,
+                    agent_provider: None,
                 });
             let source_title = app.display_title_for(&thread_id, &thread_id);
             if has_target {

@@ -742,6 +742,21 @@ impl SessionRepository for StubSessionRepository {
         Ok(())
     }
 
+    fn update_thread_agent_provider(
+        &self,
+        thread_id: &ThreadId,
+        provider: Option<&str>,
+    ) -> CoreResult<()> {
+        let mut st = self.state.lock().unwrap();
+        let t = st
+            .threads
+            .iter_mut()
+            .find(|t| t.id == *thread_id)
+            .ok_or_else(|| CoreError::ThreadNotFound(thread_id.to_string()))?;
+        t.agent_provider = provider.map(ToOwned::to_owned);
+        Ok(())
+    }
+
     fn delete_thread(&self, thread_id: &ThreadId) -> CoreResult<bool> {
         let mut st = self.state.lock().unwrap();
         let before = st.threads.len();
