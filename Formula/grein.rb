@@ -1,5 +1,5 @@
 class Grein < Formula
-  desc "Terminal-native workspace for branching AI sessions, git worktrees, and embedded shells"
+  desc "Terminal workspace for branching AI sessions, git worktrees, and shells"
   homepage "https://github.com/rira/grein"
   url "https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz"
   # Update after tagging v0.1.0: curl -sL https://github.com/rira/grein/archive/refs/tags/v0.1.0.tar.gz | sha256sum
@@ -7,9 +7,6 @@ class Grein < Formula
   license "MIT"
 
   depends_on "rust" => :build
-  depends_on "pkg-config" => :build
-
-  uses_from_macos "sqlite"
 
   def install
     system "cargo", "install", *std_cargo_args(path: "crates/grein-cli")
