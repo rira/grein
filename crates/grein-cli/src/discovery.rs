@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,26 @@ pub enum AcpAgentKind {
     Claude,
     Custom,
 }
+
+impl AcpAgentKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agy => "agy",
+            Self::Claude => "claude",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+const CLAUDE_NATIVE_ACP_STEMS: &[&str] = &["claude-agent-acp", "claude-code-acp"];
+
+const DISCOVERY_CANDIDATES: &[(AcpAgentKind, &[&str])] = &[
+    (AcpAgentKind::Agy, &["agy"]),
+    (
+        AcpAgentKind::Claude,
+        &["claude-agent-acp", "claude-code-acp", "claude"],
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpAgent {
@@ -41,6 +62,28 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+fn find_kind_executable(
+    kind: AcpAgentKind,
+    candidate_names: &[&str],
+    dirs: &[PathBuf],
+) -> Option<AcpAgent> {
+    for name in candidate_names {
+        for dir in dirs {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate_path = dir.join(name);
+            if is_executable_file(&candidate_path) {
+                return Some(AcpAgent {
+                    kind,
+                    executable_path: candidate_path,
+                });
+            }
+        }
+    }
+    None
+}
+
 pub fn discover_acp_agents(search_path: Option<&str>) -> Vec<AcpAgent> {
     let dirs: Vec<PathBuf> = match search_path {
         Some(p) => std::env::split_paths(p).collect(),
@@ -49,24 +92,30 @@ pub fn discover_acp_agents(search_path: Option<&str>) -> Vec<AcpAgent> {
             .unwrap_or_default(),
     };
 
-    let candidates = [("agy", AcpAgentKind::Agy), ("claude", AcpAgentKind::Claude)];
-
     let mut discovered = Vec::new();
+    let mut seen_kinds = HashSet::new();
 
-    for (name, kind) in candidates {
-        for dir in &dirs {
-            let candidate_path = dir.join(name);
-            if is_executable_file(&candidate_path) {
-                discovered.push(AcpAgent {
-                    kind,
-                    executable_path: candidate_path,
-                });
-                break;
-            }
+    for &(kind, candidate_names) in DISCOVERY_CANDIDATES {
+        if !seen_kinds.insert(kind) {
+            continue;
+        }
+        if let Some(agent) = find_kind_executable(kind, candidate_names, &dirs) {
+            discovered.push(agent);
         }
     }
 
     discovered
+}
+
+pub(crate) fn claude_acp_args(executable: &Path) -> Vec<String> {
+    let stem = executable
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim().to_ascii_lowercase());
+    match stem.as_deref() {
+        Some(s) if CLAUDE_NATIVE_ACP_STEMS.contains(&s) => Vec::new(),
+        _ => vec!["--acp".to_string()],
+    }
 }
 
 /// A parsed TOML value (only the shapes relevant to agent declarations).
@@ -252,14 +301,15 @@ fn parse_agents(contents: &str) -> Result<Vec<RawAgent>, String> {
     Ok(agents)
 }
 
-fn kind_from_label(label: &str) -> AcpAgentKind {
-    let stem = Path::new(label)
+pub(crate) fn kind_from_label(label: &str) -> AcpAgentKind {
+    let trimmed = label.trim();
+    let stem = Path::new(trimmed)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or(label);
+        .unwrap_or(trimmed);
     match stem.trim().to_ascii_lowercase().as_str() {
         "agy" => AcpAgentKind::Agy,
-        "claude" => AcpAgentKind::Claude,
+        s if s == "claude" || CLAUDE_NATIVE_ACP_STEMS.contains(&s) => AcpAgentKind::Claude,
         _ => AcpAgentKind::Custom,
     }
 }
@@ -298,5 +348,143 @@ pub fn resolve_agents_configuration<P: AsRef<Path>>(
         Ok(discover_acp_agents(search_path))
     } else {
         Ok(agents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_exec(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write exec");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).expect("chmod");
+        }
+        path
+    }
+
+    #[test]
+    fn claude_agent_acp_in_later_path_beats_claude_in_earlier_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let early = temp.path().join("early");
+        let late = temp.path().join("late");
+        fs::create_dir_all(&early).unwrap();
+        fs::create_dir_all(&late).unwrap();
+
+        let _early_claude = write_exec(&early, "claude");
+        let late_acp = write_exec(&late, "claude-agent-acp");
+
+        let search = std::env::join_paths([&early, &late])
+            .expect("join_paths")
+            .to_string_lossy()
+            .into_owned();
+        let discovered = discover_acp_agents(Some(&search));
+
+        assert_eq!(
+            discovered,
+            vec![AcpAgent {
+                kind: AcpAgentKind::Claude,
+                executable_path: late_acp,
+            }]
+        );
+    }
+
+    #[test]
+    fn claude_code_acp_beats_claude_when_claude_agent_acp_is_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let early = temp.path().join("early");
+        let late = temp.path().join("late");
+        fs::create_dir_all(&early).unwrap();
+        fs::create_dir_all(&late).unwrap();
+
+        let _early_claude = write_exec(&early, "claude");
+        let late_code_acp = write_exec(&late, "claude-code-acp");
+
+        let search = std::env::join_paths([&early, &late])
+            .expect("join_paths")
+            .to_string_lossy()
+            .into_owned();
+        let discovered = discover_acp_agents(Some(&search));
+
+        assert_eq!(
+            discovered,
+            vec![AcpAgent {
+                kind: AcpAgentKind::Claude,
+                executable_path: late_code_acp,
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_duplicate_path_entries_discover_cleanly_without_duplicates() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir1 = temp.path().join("dir1");
+        let dir2 = temp.path().join("dir2");
+        let target_dir = temp.path().join("targets");
+        fs::create_dir_all(&dir1).unwrap();
+        fs::create_dir_all(&dir2).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let _code_acp = write_exec(&dir1, "claude-code-acp");
+        let real_agent_acp = write_exec(&target_dir, "real-claude-agent-acp");
+        let linked_agent_acp = dir2.join("claude-agent-acp");
+        symlink(&real_agent_acp, &linked_agent_acp).expect("symlink executable");
+        symlink(target_dir.join("missing"), dir1.join("agy")).expect("broken symlink");
+
+        let search = std::env::join_paths([&dir1, &dir2, &dir1])
+            .expect("join_paths")
+            .to_string_lossy()
+            .into_owned();
+        let discovered = discover_acp_agents(Some(&search));
+
+        assert_eq!(
+            discovered,
+            vec![AcpAgent {
+                kind: AcpAgentKind::Claude,
+                executable_path: linked_agent_acp,
+            }]
+        );
+    }
+
+    #[test]
+    fn kind_from_label_maps_claude_acp_aliases_and_preserves_existing() {
+        assert_eq!(kind_from_label("agy"), AcpAgentKind::Agy);
+        assert_eq!(kind_from_label("AGY"), AcpAgentKind::Agy);
+        assert_eq!(kind_from_label("/usr/bin/agy"), AcpAgentKind::Agy);
+        assert_eq!(kind_from_label("claude"), AcpAgentKind::Claude);
+        assert_eq!(kind_from_label("claude-agent-acp"), AcpAgentKind::Claude);
+        assert_eq!(kind_from_label("claude-code-acp"), AcpAgentKind::Claude);
+        assert_eq!(
+            kind_from_label("/nix/store/123-claude/bin/CLAUDE-AGENT-ACP"),
+            AcpAgentKind::Claude
+        );
+        assert_eq!(kind_from_label("custom-tool"), AcpAgentKind::Custom);
+        assert_eq!(AcpAgentKind::Agy.label(), "agy");
+        assert_eq!(AcpAgentKind::Claude.label(), "claude");
+        assert_eq!(AcpAgentKind::Custom.label(), "custom");
+    }
+
+    #[test]
+    fn claude_acp_args_omits_flag_for_native_acp_adapters() {
+        assert!(claude_acp_args(Path::new("claude-agent-acp")).is_empty());
+        assert!(claude_acp_args(Path::new("/nix/store/abc/bin/claude-agent-acp")).is_empty());
+        assert!(claude_acp_args(Path::new("/usr/local/bin/claude-code-acp")).is_empty());
+        assert!(claude_acp_args(Path::new("CLAUDE-CODE-ACP.exe")).is_empty());
+        assert_eq!(
+            claude_acp_args(Path::new("/usr/bin/claude")),
+            vec!["--acp".to_string()]
+        );
+        assert_eq!(
+            claude_acp_args(Path::new("claude")),
+            vec!["--acp".to_string()]
+        );
     }
 }
