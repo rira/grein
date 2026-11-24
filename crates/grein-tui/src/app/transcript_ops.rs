@@ -261,7 +261,7 @@ impl App {
     pub(super) fn finish_copy_to_clipboard(&mut self, kind: &str, text: String) {
         let char_count = text.chars().count();
         self.last_copied_text = Some(text.clone());
-        match crate::clipboard::copy_to_clipboard(&text) {
+        match self.services.clipboard.copy(&text) {
             Ok(backend) => {
                 self.status_notice =
                     Some(format!("Copied {kind} ({char_count} chars) via {backend}"));

@@ -73,7 +73,7 @@ pub fn next_word_boundary(buf: &str, pos: usize) -> usize {
 
 impl App {
     pub(super) fn paste_from_clipboard(&mut self) -> bool {
-        match crate::clipboard::read_from_clipboard() {
+        match self.services.clipboard.read_clipboard() {
             Ok(text) if !text.is_empty() => self.handle_paste_event(&text),
             Ok(_) => false,
             Err(err) => {

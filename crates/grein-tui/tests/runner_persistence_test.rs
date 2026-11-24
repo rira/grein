@@ -7,6 +7,10 @@ use grein_core::model::{
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_tui::app::{App, ThreadItem};
 
+#[path = "support/sqlite_persistence.rs"]
+mod sqlite_persistence;
+use sqlite_persistence::AppSqlitePersistenceExt;
+
 fn temp_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "grein-runner-persist-{tag}-{}.sqlite3",

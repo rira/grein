@@ -4,6 +4,10 @@ use grein_tui::runner::handle_key_event;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+#[path = "support/sqlite_persistence.rs"]
+mod sqlite_persistence;
+use sqlite_persistence::AppSqlitePersistenceExt;
+
 #[test]
 fn test_terminal_guard_raii_lifecycle() {
     let guard = grein_tui::runner::TerminalGuard::new();

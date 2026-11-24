@@ -13,7 +13,7 @@ pub(super) const AGENT_HEADER: &str = "## Agent (agy)";
 pub(super) const ASSISTANT_HEADER: &str = "## Assistant";
 
 /// Structured view of the transcript: ordered (role, content) turns.
-pub(super) fn collect_turns(transcript: &str) -> Vec<(AuthorRole, String)> {
+pub fn collect_turns(transcript: &str) -> Vec<(AuthorRole, String)> {
     let mut turns: Vec<(AuthorRole, String)> = Vec::new();
     let mut current: Option<(AuthorRole, String)> = None;
 
@@ -41,7 +41,7 @@ pub(super) fn collect_turns(transcript: &str) -> Vec<(AuthorRole, String)> {
     turns
 }
 
-pub(super) fn render_node(role: &AuthorRole, content: &str) -> String {
+pub fn render_node(role: &AuthorRole, content: &str) -> String {
     match role {
         AuthorRole::User => format!("{USER_PREFIX}{content}\n\n"),
         _ => format!("{AGENT_HEADER}\n{content}\n\n"),
@@ -111,7 +111,7 @@ where
     }
 }
 
-pub(super) fn sync_thread_blocks_md(app: &mut App, thread_id: &str) {
+pub fn sync_thread_blocks_md(app: &mut App, thread_id: &str) {
     let md = if thread_id == app.active_thread_id {
         app.active_transcript_md.clone()
     } else {

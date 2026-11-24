@@ -890,3 +890,240 @@ impl AppTestExt for App {
         self.set_focus(FocusedPane::Tree);
     }
 }
+
+struct InjectedTestClipboard {
+    copied: Mutex<Vec<String>>,
+    clipboard_result: Mutex<Result<String, String>>,
+    primary_result: Mutex<Result<String, String>>,
+}
+
+impl InjectedTestClipboard {
+    fn new(clipboard: Result<&str, &str>, primary: Result<&str, &str>) -> Self {
+        Self {
+            copied: Mutex::new(Vec::new()),
+            clipboard_result: Mutex::new(
+                clipboard.map(str::to_string).map_err(str::to_string),
+            ),
+            primary_result: Mutex::new(primary.map(str::to_string).map_err(str::to_string)),
+        }
+    }
+
+    fn copied(&self) -> Vec<String> {
+        self.copied.lock().unwrap().clone()
+    }
+
+    fn set_primary(&self, primary: Result<&str, &str>) {
+        *self.primary_result.lock().unwrap() =
+            primary.map(str::to_string).map_err(str::to_string);
+    }
+}
+
+impl grein_tui::ClipboardPort for InjectedTestClipboard {
+    fn copy(&self, text: &str) -> Result<String, String> {
+        self.copied.lock().unwrap().push(text.to_string());
+        Ok("injected-test".to_string())
+    }
+
+    fn read_clipboard(&self) -> Result<String, String> {
+        self.clipboard_result.lock().unwrap().clone()
+    }
+
+    fn read_primary(&self) -> Result<String, String> {
+        self.primary_result.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn test_app_with_services_injected_clipboard_copy_ctrl_v_and_middle_click_without_env() {
+    use std::sync::Arc;
+    use grein_tui::TuiServices;
+
+    let clip = Arc::new(InjectedTestClipboard::new(
+        Ok("injected\r\nclip"),
+        Ok("injected-primary"),
+    ));
+    let services = TuiServices::default().with_clipboard(clip.clone());
+    let mut app = App::with_services(services);
+    let default_app = App::new();
+    assert_eq!(app, default_app, "TuiServices PartialEq preserves App equality");
+
+    app.active_thread_id = "t1".to_string();
+    app.threads = vec![
+        ThreadItem {
+            id: "t1".to_string(),
+            title: "Alpha".to_string(),
+            custom_name: None,
+            anchors: Vec::new(),
+        },
+        ThreadItem {
+            id: "term1".to_string(),
+            title: "Shell".to_string(),
+            custom_name: None,
+            anchors: Vec::new(),
+        },
+    ];
+    app.thread_meta
+        .insert("t1".to_string(), make_meta("t1", None, ThreadKind::Agent));
+    app.thread_meta.insert(
+        "term1".to_string(),
+        make_meta("term1", Some("t1"), ThreadKind::Terminal),
+    );
+    app.active_transcript_md = "# User: hi\n\n## Assistant\nreply payload\n\n".to_string();
+    app.thread_transcripts
+        .insert("t1".to_string(), app.active_transcript_md.clone());
+    app.sync_anchors();
+    app.select_active_thread_in_tree();
+
+    // 1. Copy via /copy routes through injected ClipboardPort
+    app.submit_composer_prompt("/copy");
+    assert_eq!(clip.copied(), vec!["reply payload".to_string()]);
+    assert_eq!(app.last_copied_text.as_deref(), Some("reply payload"));
+    assert_eq!(
+        app.status_notice.as_deref(),
+        Some("Copied last reply (13 chars) via injected-test")
+    );
+
+    // 2. Ctrl+V in Composer reads from injected ClipboardPort
+    app.set_focus(FocusedPane::Composer);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+    assert_eq!(app.input_buffer, "injected\nclip");
+
+    // 3. Ctrl+V in rename prompt, palette, worktree filter, and search all use injected ClipboardPort
+    app.set_focus(FocusedPane::Tree);
+    app.rename_prompt = Some(RenamePromptState {
+        thread_id: "t1".to_string(),
+        buffer: String::new(),
+        cursor: 0,
+    });
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        app.rename_prompt.as_ref().unwrap().buffer,
+        "injectedclip"
+    );
+    app.rename_prompt = None;
+
+    app.open_command_palette("");
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+    assert_eq!(app.palette_input, "injectedclip");
+    app.palette_active = false;
+
+    // 4. Middle click reads primary from injected ClipboardPort, then falls back to clipboard
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    draw_app(&mut terminal, &mut app);
+    let composer_inner = app.pane_rects.composer_inner.unwrap();
+    app.input_buffer.clear();
+    app.cursor_position = 0;
+    app.set_focus(FocusedPane::Tree);
+    assert!(app.handle_mouse_event(mouse(
+        MouseEventKind::Down(MouseButton::Middle),
+        composer_inner.x + 1,
+        composer_inner.y,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(app.focused_pane(), FocusedPane::Composer);
+    assert_eq!(app.input_buffer, "injected-primary");
+
+    clip.set_primary(Err("primary unavailable"));
+    app.input_buffer.clear();
+    app.cursor_position = 0;
+    assert!(app.handle_mouse_event(mouse(
+        MouseEventKind::Down(MouseButton::Middle),
+        composer_inner.x + 1,
+        composer_inner.y,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(app.input_buffer, "injected\nclip");
+}
+
+#[tokio::test]
+async fn test_run_with_engine_events_and_services_injects_clipboard_port() {
+    use std::io;
+    use std::sync::Arc;
+    use crossterm::event::Event;
+    use grein_tui::engine_port::{
+        HydratedSession, HydratedThread, HydratedTurn, TuiEngineEvent, TuiEnginePort,
+    };
+    use grein_tui::runner::run_with_engine_events_and_services;
+    use grein_tui::TuiServices;
+    use tokio::sync::mpsc;
+
+    struct MinimalEngine;
+    #[async_trait::async_trait]
+    impl TuiEnginePort for MinimalEngine {
+        async fn hydrate_session(&self) -> io::Result<HydratedSession> {
+            Ok(HydratedSession {
+                active_thread_id: "t-1".to_string(),
+                threads: vec![HydratedThread {
+                    id: "t-1".to_string(),
+                    title: "Main".to_string(),
+                    custom_name: None,
+                    turns: vec![HydratedTurn {
+                        id: "turn-1".to_string(),
+                        role: "Assistant".to_string(),
+                        content: "from-runner".to_string(),
+                    }],
+                }],
+            })
+        }
+
+        async fn send_turn(&self, _thread_id: &str, _prompt: &str) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn fork_thread(&self, _thread_id: &str, _anchor_id: &str) -> io::Result<String> {
+            Ok("t-2".to_string())
+        }
+
+        async fn merge_thread(&self, _source_id: &str, _target_id: &str) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn resolve_permission(&self, _request_id: &str, _approved: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe_events(&self) -> io::Result<mpsc::UnboundedReceiver<TuiEngineEvent>> {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            Ok(rx)
+        }
+    }
+
+    let clip = Arc::new(InjectedTestClipboard::new(
+        Ok("/copy"),
+        Ok("unused-primary"),
+    ));
+    let services = TuiServices::default().with_clipboard(clip.clone());
+    let engine: Arc<dyn TuiEnginePort> = Arc::new(MinimalEngine);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let (key_tx, key_rx) = mpsc::unbounded_channel();
+
+    // Ctrl+V pastes "/copy", then Enter copies thread transcript (empty or notice), then Ctrl+G + q quits.
+    key_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    key_tx
+        .send(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        .unwrap();
+    key_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    key_tx
+        .send(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    drop(key_tx);
+
+    run_with_engine_events_and_services(&mut terminal, App::new(), engine, services, key_rx)
+        .await
+        .unwrap();
+
+    assert_eq!(clip.copied(), vec!["from-runner".to_string()]);
+}

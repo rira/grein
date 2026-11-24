@@ -53,34 +53,6 @@ impl PagerRunner for DefaultPagerRunner {
     }
 }
 
-#[cfg(test)]
-pub struct MockPagerRunner<F>
-where
-    F: Fn(&str) -> io::Result<()> + Send + Sync,
-{
-    handler: F,
-}
-
-#[cfg(test)]
-impl<F> MockPagerRunner<F>
-where
-    F: Fn(&str) -> io::Result<()> + Send + Sync,
-{
-    pub fn new(handler: F) -> Self {
-        Self { handler }
-    }
-}
-
-#[cfg(test)]
-impl<F> PagerRunner for MockPagerRunner<F>
-where
-    F: Fn(&str) -> io::Result<()> + Send + Sync,
-{
-    fn run_pager(&self, payload: &str) -> io::Result<()> {
-        (self.handler)(payload)
-    }
-}
-
 pub type Pager = DefaultPagerRunner;
 
 #[cfg(test)]
@@ -89,15 +61,40 @@ mod tests {
     use crate::diff_card::DiffCard;
     use std::sync::Mutex;
 
+    struct StubPagerRunner<F>
+    where
+        F: Fn(&str) -> io::Result<()> + Send + Sync,
+    {
+        handler: F,
+    }
+
+    impl<F> StubPagerRunner<F>
+    where
+        F: Fn(&str) -> io::Result<()> + Send + Sync,
+    {
+        fn new(handler: F) -> Self {
+            Self { handler }
+        }
+    }
+
+    impl<F> PagerRunner for StubPagerRunner<F>
+    where
+        F: Fn(&str) -> io::Result<()> + Send + Sync,
+    {
+        fn run_pager(&self, payload: &str) -> io::Result<()> {
+            (self.handler)(payload)
+        }
+    }
+
     #[test]
-    fn test_mock_pager_runner_works_with_diff_card() {
+    fn test_stub_pager_runner_works_with_diff_card() {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&captured);
         let diff = "--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-old\n+new\n";
 
         let card = DiffCard::builder()
             .diff_content(diff)
-            .pager_runner(MockPagerRunner::new(move |payload: &str| {
+            .pager_runner(StubPagerRunner::new(move |payload: &str| {
                 if let Ok(mut guard) = sink.lock() {
                     guard.push(payload.to_string());
                 }
@@ -107,7 +104,7 @@ mod tests {
 
         assert_eq!(card.diff_content(), diff);
 
-        let runner = MockPagerRunner::new(|payload: &str| {
+        let runner = StubPagerRunner::new(|payload: &str| {
             if payload.is_empty() {
                 Err(io::Error::new(io::ErrorKind::InvalidInput, "empty payload"))
             } else {
@@ -118,7 +115,7 @@ mod tests {
         assert!(runner.run_pager("").is_err());
 
         let recording_sink = Arc::clone(&captured);
-        let recording = MockPagerRunner::new(move |payload: &str| {
+        let recording = StubPagerRunner::new(move |payload: &str| {
             if let Ok(mut guard) = recording_sink.lock() {
                 guard.push(payload.to_string());
             }

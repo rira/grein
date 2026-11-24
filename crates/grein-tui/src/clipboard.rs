@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 const BASE64_TABLE: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -43,6 +44,297 @@ fn write_osc52_to<W: Write>(writer: &mut W, text: &str, in_tmux: bool) -> std::i
     let seq = encode_osc52(text, in_tmux);
     writer.write_all(seq.as_bytes())?;
     writer.flush()
+}
+
+pub trait ClipboardPort: Send + Sync {
+    fn copy(&self, text: &str) -> Result<String, String>;
+    fn read_clipboard(&self) -> Result<String, String>;
+    fn read_primary(&self) -> Result<String, String>;
+}
+
+impl<T: ClipboardPort + ?Sized> ClipboardPort for Arc<T> {
+    fn copy(&self, text: &str) -> Result<String, String> {
+        (**self).copy(text)
+    }
+
+    fn read_clipboard(&self) -> Result<String, String> {
+        (**self).read_clipboard()
+    }
+
+    fn read_primary(&self) -> Result<String, String> {
+        (**self).read_primary()
+    }
+}
+
+impl<T: ClipboardPort + ?Sized> ClipboardPort for Box<T> {
+    fn copy(&self, text: &str) -> Result<String, String> {
+        (**self).copy(text)
+    }
+
+    fn read_clipboard(&self) -> Result<String, String> {
+        (**self).read_clipboard()
+    }
+
+    fn read_primary(&self) -> Result<String, String> {
+        (**self).read_primary()
+    }
+}
+
+pub trait ClipboardWriterBackend: Send + Sync {
+    fn name(&self) -> &str;
+    fn write(&self, text: &str) -> Result<(), String>;
+    fn is_fallback(&self) -> bool {
+        false
+    }
+}
+
+pub trait ClipboardReaderBackend: Send + Sync {
+    fn name(&self) -> &str;
+    fn read(&self) -> Result<String, String>;
+}
+
+enum Osc52Target {
+    StdoutFromEnv,
+    Sink {
+        in_tmux: bool,
+        sink: Arc<Mutex<Vec<u8>>>,
+    },
+}
+
+pub struct Osc52Backend {
+    target: Osc52Target,
+}
+
+impl Osc52Backend {
+    pub fn from_env() -> Self {
+        Self {
+            target: Osc52Target::StdoutFromEnv,
+        }
+    }
+
+    pub fn with_sink(in_tmux: bool, sink: Arc<Mutex<Vec<u8>>>) -> Self {
+        Self {
+            target: Osc52Target::Sink { in_tmux, sink },
+        }
+    }
+}
+
+impl Default for Osc52Backend {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl ClipboardWriterBackend for Osc52Backend {
+    fn name(&self) -> &str {
+        "osc52"
+    }
+
+    fn write(&self, text: &str) -> Result<(), String> {
+        match &self.target {
+            Osc52Target::StdoutFromEnv => {
+                if !std::io::stdout().is_terminal() {
+                    return Err("osc52: stdout is not a terminal".to_string());
+                }
+                let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+                let mut stdout = std::io::stdout().lock();
+                write_osc52_to(&mut stdout, text, in_tmux).map_err(|err| format!("osc52: {err}"))
+            }
+            Osc52Target::Sink { in_tmux, sink } => {
+                let mut guard = sink
+                    .lock()
+                    .map_err(|err| format!("osc52 sink lock: {err}"))?;
+                write_osc52_to(&mut *guard, text, *in_tmux).map_err(|err| format!("osc52: {err}"))
+            }
+        }
+    }
+
+    fn is_fallback(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandClipboardBackend {
+    program: String,
+    args: Vec<String>,
+}
+
+impl CommandClipboardBackend {
+    pub fn new(
+        program: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl ClipboardWriterBackend for CommandClipboardBackend {
+    fn name(&self) -> &str {
+        &self.program
+    }
+
+    fn write(&self, text: &str) -> Result<(), String> {
+        let arg_refs: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        try_clipboard_command(&self.program, &arg_refs, text)
+    }
+}
+
+impl ClipboardReaderBackend for CommandClipboardBackend {
+    fn name(&self) -> &str {
+        &self.program
+    }
+
+    fn read(&self) -> Result<String, String> {
+        let arg_refs: Vec<&str> = self.args.iter().map(String::as_str).collect();
+        try_clipboard_read_command(&self.program, &arg_refs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ChainedClipboardDriver {
+    writers: Vec<Arc<dyn ClipboardWriterBackend>>,
+    clipboard_readers: Vec<Arc<dyn ClipboardReaderBackend>>,
+    primary_readers: Vec<Arc<dyn ClipboardReaderBackend>>,
+}
+
+impl ChainedClipboardDriver {
+    pub fn new(
+        writers: Vec<Arc<dyn ClipboardWriterBackend>>,
+        clipboard_readers: Vec<Arc<dyn ClipboardReaderBackend>>,
+        primary_readers: Vec<Arc<dyn ClipboardReaderBackend>>,
+    ) -> Self {
+        Self {
+            writers,
+            clipboard_readers,
+            primary_readers,
+        }
+    }
+
+    pub fn from_slices(
+        writers: &[Arc<dyn ClipboardWriterBackend>],
+        clipboard_readers: &[Arc<dyn ClipboardReaderBackend>],
+        primary_readers: &[Arc<dyn ClipboardReaderBackend>],
+    ) -> Self {
+        Self::new(
+            writers.to_vec(),
+            clipboard_readers.to_vec(),
+            primary_readers.to_vec(),
+        )
+    }
+
+    pub fn for_platform(is_macos: bool, has_wayland: bool) -> Self {
+        let mut writers: Vec<Arc<dyn ClipboardWriterBackend>> =
+            vec![Arc::new(Osc52Backend::from_env())];
+        for &(program, args) in native_clipboard_candidates(is_macos, has_wayland) {
+            writers.push(Arc::new(CommandClipboardBackend::new(
+                program,
+                args.iter().copied(),
+            )));
+        }
+
+        let clipboard_readers = native_clipboard_read_candidates(is_macos, has_wayland)
+            .iter()
+            .map(|&(program, args)| {
+                Arc::new(CommandClipboardBackend::new(program, args.iter().copied()))
+                    as Arc<dyn ClipboardReaderBackend>
+            })
+            .collect::<Vec<_>>();
+
+        let primary_readers = native_primary_read_candidates(is_macos, has_wayland)
+            .iter()
+            .map(|&(program, args)| {
+                Arc::new(CommandClipboardBackend::new(program, args.iter().copied()))
+                    as Arc<dyn ClipboardReaderBackend>
+            })
+            .collect::<Vec<_>>();
+
+        Self::new(writers, clipboard_readers, primary_readers)
+    }
+
+    pub fn writer_names(&self) -> Vec<&str> {
+        self.writers.iter().map(|w| w.name()).collect()
+    }
+
+    pub fn clipboard_reader_names(&self) -> Vec<&str> {
+        self.clipboard_readers.iter().map(|r| r.name()).collect()
+    }
+
+    pub fn primary_reader_names(&self) -> Vec<&str> {
+        self.primary_readers.iter().map(|r| r.name()).collect()
+    }
+}
+
+impl Default for ChainedClipboardDriver {
+    fn default() -> Self {
+        Self::for_platform(cfg!(target_os = "macos"), has_wayland_display())
+    }
+}
+
+impl ClipboardPort for ChainedClipboardDriver {
+    fn copy(&self, text: &str) -> Result<String, String> {
+        let mut fallback_success: Option<String> = None;
+        let mut fallback_errors = Vec::new();
+        let mut errors = Vec::new();
+
+        for writer in &self.writers {
+            match writer.write(text) {
+                Ok(()) => {
+                    if writer.is_fallback() {
+                        if fallback_success.is_none() {
+                            fallback_success = Some(writer.name().to_string());
+                        }
+                    } else {
+                        return Ok(writer.name().to_string());
+                    }
+                }
+                Err(err) => {
+                    if writer.is_fallback() {
+                        fallback_errors.push(err);
+                    } else {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(name) = fallback_success {
+            Ok(name)
+        } else if !errors.is_empty() {
+            Err(errors.join("; "))
+        } else if !fallback_errors.is_empty() {
+            Err(fallback_errors.join("; "))
+        } else {
+            Err("no clipboard backend available".to_string())
+        }
+    }
+
+    fn read_clipboard(&self) -> Result<String, String> {
+        read_with_backends(&self.clipboard_readers)
+    }
+
+    fn read_primary(&self) -> Result<String, String> {
+        read_with_backends(&self.primary_readers)
+    }
+}
+
+fn read_with_backends(readers: &[Arc<dyn ClipboardReaderBackend>]) -> Result<String, String> {
+    let mut errors = Vec::new();
+    for reader in readers {
+        match reader.read() {
+            Ok(text) => return Ok(text),
+            Err(err) => errors.push(err),
+        }
+    }
+
+    if errors.is_empty() {
+        Err("no clipboard backend available".to_string())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 fn has_wayland_display() -> bool {
@@ -147,103 +439,101 @@ fn try_clipboard_read_command(program: &str, args: &[&str]) -> Result<String, St
     }
 }
 
-fn read_from_candidates(
-    candidates: &[(&'static str, &'static [&'static str])],
-) -> Result<String, String> {
-    let mut errors = Vec::new();
-    for &(program, args) in candidates {
-        match try_clipboard_read_command(program, args) {
-            Ok(text) => return Ok(text),
-            Err(err) => errors.push(err),
-        }
-    }
-
-    if errors.is_empty() {
-        Err("no clipboard backend available".to_string())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-pub fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
-    let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
-    let osc_written = if std::io::stdout().is_terminal() {
-        let mut stdout = std::io::stdout().lock();
-        write_osc52_to(&mut stdout, text, in_tmux).is_ok()
-    } else {
-        false
-    };
-
-    let candidates = native_clipboard_candidates(cfg!(target_os = "macos"), has_wayland_display());
-
-    let mut errors = Vec::new();
-    for &(program, args) in candidates {
-        match try_clipboard_command(program, args, text) {
-            Ok(()) => return Ok(program),
-            Err(err) => errors.push(err),
-        }
-    }
-
-    if osc_written {
-        Ok("osc52")
-    } else if errors.is_empty() {
-        Err("no clipboard backend available".to_string())
-    } else {
-        Err(errors.join("; "))
-    }
+pub fn copy_to_clipboard(text: &str) -> Result<String, String> {
+    ChainedClipboardDriver::default().copy(text)
 }
 
 pub fn read_from_clipboard() -> Result<String, String> {
-    let candidates =
-        native_clipboard_read_candidates(cfg!(target_os = "macos"), has_wayland_display());
-    read_from_candidates(candidates)
+    ChainedClipboardDriver::default().read_clipboard()
 }
 
 pub fn read_primary_selection() -> Result<String, String> {
-    let candidates =
-        native_primary_read_candidates(cfg!(target_os = "macos"), has_wayland_display());
-    read_from_candidates(candidates)
+    ChainedClipboardDriver::default().read_primary()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::sync::Mutex;
-
     use super::*;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvRestoreGuard {
-        prev_path: Option<OsString>,
-        prev_wayland: Option<OsString>,
+    struct StaticWriter {
+        name: &'static str,
+        result: Result<(), String>,
+        recorded: Arc<Mutex<Vec<String>>>,
+        fallback: bool,
     }
 
-    impl EnvRestoreGuard {
-        fn capture_and_set(path: &str, wayland: Option<&str>) -> Self {
-            let guard = Self {
-                prev_path: std::env::var_os("PATH"),
-                prev_wayland: std::env::var_os("WAYLAND_DISPLAY"),
-            };
-            std::env::set_var("PATH", path);
-            match wayland {
-                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-                None => std::env::remove_var("WAYLAND_DISPLAY"),
-            }
-            guard
+    impl StaticWriter {
+        fn ok(
+            name: &'static str,
+            recorded: Arc<Mutex<Vec<String>>>,
+        ) -> Arc<dyn ClipboardWriterBackend> {
+            Arc::new(Self {
+                name,
+                result: Ok(()),
+                recorded,
+                fallback: false,
+            })
+        }
+
+        fn err(
+            name: &'static str,
+            msg: &str,
+            recorded: Arc<Mutex<Vec<String>>>,
+        ) -> Arc<dyn ClipboardWriterBackend> {
+            Arc::new(Self {
+                name,
+                result: Err(format!("{name}: {msg}")),
+                recorded,
+                fallback: false,
+            })
         }
     }
 
-    impl Drop for EnvRestoreGuard {
-        fn drop(&mut self) {
-            match &self.prev_path {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
+    impl ClipboardWriterBackend for StaticWriter {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn write(&self, text: &str) -> Result<(), String> {
+            if let Ok(mut guard) = self.recorded.lock() {
+                guard.push(format!("{}:{text}", self.name));
             }
-            match &self.prev_wayland {
-                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
-                None => std::env::remove_var("WAYLAND_DISPLAY"),
-            }
+            self.result.clone()
+        }
+
+        fn is_fallback(&self) -> bool {
+            self.fallback
+        }
+    }
+
+    struct StaticReader {
+        name: &'static str,
+        result: Result<String, String>,
+    }
+
+    impl StaticReader {
+        fn ok(name: &'static str, text: &str) -> Arc<dyn ClipboardReaderBackend> {
+            Arc::new(Self {
+                name,
+                result: Ok(text.to_string()),
+            })
+        }
+
+        fn err(name: &'static str, msg: &str) -> Arc<dyn ClipboardReaderBackend> {
+            Arc::new(Self {
+                name,
+                result: Err(format!("{name}: {msg}")),
+            })
+        }
+    }
+
+    impl ClipboardReaderBackend for StaticReader {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn read(&self) -> Result<String, String> {
+            self.result.clone()
         }
     }
 
@@ -270,97 +560,137 @@ mod tests {
     }
 
     #[test]
-    fn test_native_clipboard_candidates_selection() {
-        assert_eq!(native_clipboard_candidates(true, false)[0].0, "pbcopy");
-        assert_eq!(native_clipboard_candidates(false, true)[0].0, "wl-copy");
-        let x11 = native_clipboard_candidates(false, false);
-        assert_eq!(x11[0], ("xclip", &["-selection", "clipboard"][..]));
-        assert_eq!(x11[1], ("xsel", &["--clipboard", "--input"][..]));
+    fn test_for_platform_registers_expected_backend_chains() {
+        let mac = ChainedClipboardDriver::for_platform(true, false);
+        assert_eq!(mac.writer_names(), vec!["osc52", "pbcopy"]);
+        assert_eq!(mac.clipboard_reader_names(), vec!["pbpaste"]);
+        assert_eq!(mac.primary_reader_names(), vec!["pbpaste"]);
+
+        let wayland = ChainedClipboardDriver::for_platform(false, true);
+        assert_eq!(
+            wayland.writer_names(),
+            vec!["osc52", "wl-copy", "xclip", "xsel"]
+        );
+        assert_eq!(
+            wayland.clipboard_reader_names(),
+            vec!["wl-paste", "xclip", "xsel"]
+        );
+        assert_eq!(
+            wayland.primary_reader_names(),
+            vec!["wl-paste", "xclip", "xsel"]
+        );
+
+        let x11 = ChainedClipboardDriver::for_platform(false, false);
+        assert_eq!(x11.writer_names(), vec!["osc52", "xclip", "xsel"]);
+        assert_eq!(x11.clipboard_reader_names(), vec!["xclip", "xsel"]);
+        assert_eq!(x11.primary_reader_names(), vec!["xclip", "xsel"]);
     }
 
     #[test]
-    fn test_native_clipboard_and_primary_read_candidates_selection() {
-        assert_eq!(
-            native_clipboard_read_candidates(true, false),
-            &[("pbpaste", &[][..])]
-        );
-        assert_eq!(
-            native_clipboard_read_candidates(false, true),
-            &[
-                ("wl-paste", &["--no-newline"][..]),
-                ("xclip", &["-o", "-selection", "clipboard"][..]),
-                ("xsel", &["--clipboard", "--output"][..]),
-            ]
-        );
-        assert_eq!(
-            native_clipboard_read_candidates(false, false),
-            &[
-                ("xclip", &["-o", "-selection", "clipboard"][..]),
-                ("xsel", &["--clipboard", "--output"][..]),
-            ]
+    fn test_chained_driver_copy_prefers_native_over_osc52_and_falls_back_cleanly() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let driver = ChainedClipboardDriver::new(
+            vec![
+                Arc::new(Osc52Backend::with_sink(false, Arc::clone(&sink)))
+                    as Arc<dyn ClipboardWriterBackend>,
+                StaticWriter::err("wl-copy", "missing", Arc::clone(&recorded)),
+                StaticWriter::ok("xclip", Arc::clone(&recorded)),
+                StaticWriter::ok("xsel", Arc::clone(&recorded)),
+            ],
+            vec![],
+            vec![],
         );
 
+        assert_eq!(driver.copy("hello"), Ok("xclip".to_string()));
+        assert_eq!(*sink.lock().unwrap(), b"\x1b]52;c;aGVsbG8=\x07");
         assert_eq!(
-            native_primary_read_candidates(true, false),
-            &[("pbpaste", &[][..])]
+            *recorded.lock().unwrap(),
+            vec!["wl-copy:hello".to_string(), "xclip:hello".to_string()]
+        );
+
+        let osc_sink = Arc::new(Mutex::new(Vec::new()));
+        let osc_only_fallback = ChainedClipboardDriver::new(
+            vec![
+                Arc::new(Osc52Backend::with_sink(true, Arc::clone(&osc_sink)))
+                    as Arc<dyn ClipboardWriterBackend>,
+                StaticWriter::err("wl-copy", "missing", Arc::new(Mutex::new(Vec::new()))),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(osc_only_fallback.copy("abc"), Ok("osc52".to_string()));
+        assert_eq!(
+            *osc_sink.lock().unwrap(),
+            b"\x1bPtmux;\x1b\x1b]52;c;YWJj\x07\x1b\\"
+        );
+
+        let empty = ChainedClipboardDriver::new(vec![], vec![], vec![]);
+        assert_eq!(
+            empty.copy("x"),
+            Err("no clipboard backend available".to_string())
         );
         assert_eq!(
-            native_primary_read_candidates(false, true),
-            &[
-                ("wl-paste", &["--primary", "--no-newline"][..]),
-                ("xclip", &["-o", "-selection", "primary"][..]),
-                ("xsel", &["--primary", "--output"][..]),
-            ]
+            empty.read_clipboard(),
+            Err("no clipboard backend available".to_string())
         );
         assert_eq!(
-            native_primary_read_candidates(false, false),
-            &[
-                ("xclip", &["-o", "-selection", "primary"][..]),
-                ("xsel", &["--primary", "--output"][..]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_clipboard_read_command_and_candidate_fallback() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let missing =
-            try_clipboard_read_command("/nonexistent/grein-missing-clipboard-tool", &["--flag"]);
-        assert!(missing.is_err());
-
-        let failing = try_clipboard_read_command("false", &[]);
-        assert!(failing.unwrap_err().contains("exited with"));
-
-        let empty_ok = try_clipboard_read_command("true", &[]);
-        assert_eq!(empty_ok, Ok(String::new()));
-
-        let text_ok = try_clipboard_read_command("sh", &["-c", "printf 'line1\\nline2'"]);
-        assert_eq!(text_ok, Ok("line1\nline2".to_string()));
-
-        let bad_utf8 = try_clipboard_read_command("sh", &["-c", "printf '\\377'"]);
-        assert!(bad_utf8.unwrap_err().contains("utf8"));
-
-        let fallback = read_from_candidates(&[
-            ("/nonexistent/grein-missing-clipboard-tool", &[]),
-            ("false", &[]),
-            ("sh", &["-c", "printf 'from-fallback'"]),
-        ]);
-        assert_eq!(fallback, Ok("from-fallback".to_string()));
-
-        let all_fail = read_from_candidates(&[("false", &[]), ("/nonexistent/tool", &[])]);
-        let err = all_fail.unwrap_err();
-        assert!(err.contains("false exited with"));
-        assert!(err.contains("/nonexistent/tool"));
-
-        assert_eq!(
-            read_from_candidates(&[]),
+            empty.read_primary(),
             Err("no clipboard backend available".to_string())
         );
     }
 
     #[test]
-    fn test_base64_all_byte_values_and_clipboard_command_paths() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn test_chained_driver_injected_readers_fallback_and_error_aggregation() {
+        let driver = ChainedClipboardDriver::new(
+            vec![
+                StaticWriter::err("wl-copy", "absent", Arc::new(Mutex::new(Vec::new()))),
+                StaticWriter::err("xclip", "absent", Arc::new(Mutex::new(Vec::new()))),
+            ],
+            vec![
+                StaticReader::err("wl-paste", "absent"),
+                StaticReader::ok("xclip", "clip-text"),
+            ],
+            vec![
+                StaticReader::err("wl-paste", "absent"),
+                StaticReader::err("xclip", "empty"),
+            ],
+        );
+
+        assert_eq!(
+            driver.copy("payload"),
+            Err("wl-copy: absent; xclip: absent".to_string())
+        );
+        assert_eq!(driver.read_clipboard(), Ok("clip-text".to_string()));
+        assert_eq!(
+            driver.read_primary(),
+            Err("wl-paste: absent; xclip: empty".to_string())
+        );
+    }
+
+    #[test]
+    fn test_command_clipboard_backend_read_and_write() {
+        let missing =
+            CommandClipboardBackend::new("/nonexistent/grein-missing-clipboard-tool", ["--flag"]);
+        assert!(missing.read().is_err());
+        assert!(missing.write("payload").is_err());
+
+        let failing = CommandClipboardBackend::new("false", std::iter::empty::<&str>());
+        assert!(failing.read().unwrap_err().contains("exited with"));
+        assert!(failing.write("payload").is_err());
+
+        let empty_ok = CommandClipboardBackend::new("true", std::iter::empty::<&str>());
+        assert_eq!(empty_ok.read(), Ok(String::new()));
+
+        let text_ok = CommandClipboardBackend::new("sh", ["-c", "printf 'line1\\nline2'"]);
+        assert_eq!(text_ok.read(), Ok("line1\nline2".to_string()));
+
+        let bad_utf8 = CommandClipboardBackend::new("sh", ["-c", "printf '\\377'"]);
+        assert!(bad_utf8.read().unwrap_err().contains("utf8"));
+
+        let cat_ok = CommandClipboardBackend::new("cat", std::iter::empty::<&str>());
+        assert!(cat_ok.write("payload").is_ok());
+
         let all_bytes: Vec<u8> = (0u8..=255).collect();
         let encoded = encode_base64(&all_bytes);
         assert_eq!(encoded.len(), 344);
@@ -368,64 +698,5 @@ mod tests {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='));
         assert!(encoded.ends_with('='));
-
-        let missing = try_clipboard_command(
-            "/nonexistent/grein-missing-clipboard-tool",
-            &["--flag"],
-            "payload",
-        );
-        assert!(missing.is_err());
-
-        let failing = try_clipboard_command("false", &[], "payload");
-        assert!(failing.is_err());
-
-        let ok = try_clipboard_command("cat", &[], "payload");
-        assert!(ok.is_ok());
-
-        let _env = EnvRestoreGuard::capture_and_set("", Some("wayland-test"));
-
-        let res = copy_to_clipboard("hello");
-        if std::io::stdout().is_terminal() {
-            assert_eq!(res, Ok("osc52"));
-        } else {
-            let err = res.unwrap_err();
-            assert!(err.contains("wl-copy"));
-            assert!(err.contains("xclip"));
-            assert!(err.contains("xsel"));
-        }
-    }
-
-    #[test]
-    fn test_read_clipboard_and_primary_error_paths_with_empty_path() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        {
-            let _env = EnvRestoreGuard::capture_and_set("", Some("wayland-test"));
-            let clip_err = read_from_clipboard().unwrap_err();
-            let prim_err = read_primary_selection().unwrap_err();
-            if cfg!(target_os = "macos") {
-                assert!(clip_err.contains("pbpaste"));
-                assert!(prim_err.contains("pbpaste"));
-            } else {
-                assert!(clip_err.contains("wl-paste"));
-                assert!(clip_err.contains("xclip"));
-                assert!(clip_err.contains("xsel"));
-                assert!(prim_err.contains("wl-paste"));
-                assert!(prim_err.contains("xclip"));
-                assert!(prim_err.contains("xsel"));
-            }
-        }
-
-        if !cfg!(target_os = "macos") {
-            let _env = EnvRestoreGuard::capture_and_set("", None);
-            let clip_err = read_from_clipboard().unwrap_err();
-            let prim_err = read_primary_selection().unwrap_err();
-            assert!(!clip_err.contains("wl-paste"));
-            assert!(clip_err.contains("xclip"));
-            assert!(clip_err.contains("xsel"));
-            assert!(!prim_err.contains("wl-paste"));
-            assert!(prim_err.contains("xclip"));
-            assert!(prim_err.contains("xsel"));
-        }
     }
 }
