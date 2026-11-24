@@ -96,7 +96,7 @@ Typing `/wt ` or `/worktree ` (single-line) opens the floating **Worktrees** sel
 
 When `composer_autocomplete` is enabled (default `on`), **grein** computes up to 12 ranked ghost-text suggestions at the cursor:
 
-1. **Tier 1 (`SlashOrWorkspace`):** Built-in & ACP-advertised `/slash` commands (at command start), `@file` workspace paths, workspace paths/basenames (`>= 2` chars, up to 5,000 files via `git ls-files` or directory walk), and Git branches/worktrees.
+1. **Tier 1 (`SlashOrWorkspace`):** Built-in & ACP-advertised `/slash` commands (at command start—e.g. typing `/ag` uniquely completes `/agent`), `@file` workspace paths, workspace paths/basenames (`>= 2` chars, up to 5,000 files via `git ls-files` or directory walk), and Git branches/worktrees.
 2. **Tier 2 (`TranscriptOrHistory`):** Col-0 full-line recent prompt recall from SQLite history (`token_start == 0`), plus identifiers extracted from the active transcript (last 256 KB) and recent prompt words (`>= 2` chars).
 3. **Tier 3 (`DictionaryWord`):** Embedded **6,878-word** English & software engineering wordlist (`>= 3` ASCII alphabetic chars, preserving `lowercase`, `Title`, or `UPPERCASE`).
 
@@ -171,6 +171,7 @@ Pressing `Tab` in `MANAGE` mode toggles between `ᛇ Grein` (`MANAGE · GREIN`) 
 | `Esc` | Clear active `/` transcript search if present; otherwise activate selected node into `WRITE` mode |
 | `n` | Create a new root Agent thread (note: when `/` transcript search has an active query, `n` steps to the next search match) |
 | `f` | Fork a child Agent branch from the selected thread |
+| `A` | Open **`Select Agent`** modal targeting the selected or active thread (`Enter` new sibling, `s` switch provider, `d` set default) |
 | `s` / `S` | Spawn a child `>_` Terminal under selected thread (`s`) or a new root `>_` Terminal (`S`) |
 | `w` | Ensure/allocate an isolated worktree (or non-Git shadow snapshot) for the selected thread |
 | `o` | Collapse/expand all tool-call and shell-execution cards in the selected thread's transcript |
@@ -231,14 +232,15 @@ Mouse events are handled when no modal is open (`ShowHelp` intercepts wheel scro
 
 ### Slash Commands & `:` Sidebar Palette
 
-Commands work both from Composer (`/command`) and the `MANAGE` Sidebar Command Palette (`:command`, where `Tab` completes the highlighted suggestion, `↑`/`Ctrl+P` and `↓`/`Ctrl+N` cycle suggestions, `Ctrl+U`/`Ctrl+W`/`Ctrl+A`/`Ctrl+E`/`Ctrl+V` edit, and `Esc`/`Ctrl+C` or `Backspace` on empty closes).
+Commands work both from Composer (`/command`) and the `MANAGE` Sidebar Command Palette (`:command`, where a scrollable 5-row dropdown includes built-in commands plus dynamic `:<provider>` sibling-spawn entries for every registered agent; `Tab` completes the highlighted suggestion, `↑`/`Ctrl+P` and `↓`/`Ctrl+N` cycle suggestions, `Ctrl+U`/`Ctrl+W`/`Ctrl+A`/`Ctrl+E`/`Ctrl+V` edit, and `Esc`/`Ctrl+C` or `Backspace` on empty closes).
 
 | Command | Aliases | Arguments & Effect |
 | :--- | :--- | :--- |
-| `/help` | `/?`, `:help` | Open Help modal with live `/` fuzzy filter |
+| `/help` | `/?`, `:help` | Open Help modal with live `/` fuzzy filter (`A, :, /, ?, z, q` & `/agent /model /mode /effort` rows) |
 | `/zoom` | `:zoom` | Toggle sidebar zoom (`Alt+Z`) |
 | `/copy` | `:copy` | `/copy` (last reply or PTY screen), `/copy code` (last fenced code block), `/copy all` (full transcript) |
 | `/commands` | — | Fetch and display ACP-advertised agent slash commands (`available_commands_update`) |
+| `/agent` | `:agent`, `:<provider> [title]` | Bare `/agent` / `:agent` opens **`Select Agent`** modal. With `<provider> [title]` (or `:<provider> [title]` in palette), spawns a sibling thread inheriting `cwd` and sharing `parent_thread_id` (`None` at root depth 0, `Some(parent)` in sub-trees), then focuses `WRITE · AGENT` |
 | `/model` | — | Open Model picker modal, or pass `<query>` (`[--default\|default] <query>`) to apply directly |
 | `/mode` | — | Open Mode picker modal, or pass `<query>` (`[--default\|default] <query>`) to apply directly |
 | `/thinking` | `/effort` | Open Thinking/Reasoning level picker modal, or pass `<query>` (`[--default\|default] <query>`) |
@@ -278,6 +280,14 @@ Commands work both from Composer (`/command`) and the `MANAGE` Sidebar Command P
   - `↑`/`k`, `↓`/`j`: Move selection.
   - `Tab` / `BackTab` / `d`: Toggle scope between `[This branch only]` and `[Default for new branches]`.
   - `Enter`: Apply config; `Esc` / `q` / `Ctrl+C`: Close.
+- **`Select Agent` Modal (`A` in `MANAGE`, `:agent`, or `/agent`):**
+  - Displays `Active: <provider> · Default: <provider>`, `● ready` / `not found` status with `(active)` / `(default)` / `(active, default)` tags, an `Install:` hint when an unavailable provider is highlighted, and sidebar/status-bar badges (`[<provider>]` in `ᛇ Grein` rows, `<provider> · <mode> · <model>` in the status bar).
+  - `↑` / `k` (`K`) and `↓` / `j` (`J`): Move selection up / down.
+  - `Home` / `End`: Jump to first / last provider.
+  - `Enter`: Spawn a new sibling agent thread using the selected provider (inherits `cwd`, shares `parent_thread_id`, closes modal, and focuses `WRITE · AGENT`). Blocked with an install hint or `PATH` notice if the provider is `not found`.
+  - `s` (`S`): Switch the target agent thread's provider (resets its active ACP session when changed while preserving conversation history; refuses on `>_` shell threads).
+  - `d` (`D`): Set the selected provider as global default (persists `[ui].default_agent_provider` in `UserPrefsStore` `grein.db`; keeps modal open).
+  - `Esc` / `q` (`Q`) / `Ctrl+C`: Close modal (`↑/↓/j/k Select · Enter New sibling · s Switch · d Default · Esc/q Close`).
 
 ### Customizing Keybindings (`:bind`, `:unbind`, `grein.db`)
 

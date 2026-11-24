@@ -8,8 +8,9 @@ This guide covers every implemented workflow and subsystem in **grein** for user
 
 Conversations in **grein** form a Git-like **Pure-Tree Directed Acyclic Graph (DAG)** forest of immutable turn nodes (`ConversationNode`) and explicit branch heads (`Thread`):
 
-- **Independent Roots (`ᛉ`) & Child Branches (`├─` / `└─`):**
+- **Independent Roots (`ᛉ`), Sibling Spawns & Child Branches (`├─` / `└─`):**
   - Top-level roots (`parent_thread_id = None`) are indexed `1..9` in the sidebar and start with completely isolated context. Create a fresh root agent via `n` (`MANAGE`), `Ctrl+G n`, or `/root` (`/new`).
+  - Sibling agent threads in the current tree level spawn via `A` (`Select Agent` modal → `Enter`), `/agent <provider> [title]`, or `:agent` / `:<provider> [title]`, inheriting the target thread's `cwd` and sharing its `parent_thread_id` (`None` at root depth 0, `Some(parent)` inside sub-trees).
   - Child branches fork from the active or selected agent thread via `f` (`MANAGE`) or `/fork` (`/branch`, `/grein`), recording an explicit `parent_thread_id` and `parent_node_id`.
 - **Sibling & Root Isolation:**
   - When compiling prompts, a forked branch inherits only its ancestor trunk up to `parent_node_id` plus its own turns. Sibling branches and separate roots are strictly excluded—no global blackboard scratchpad leaks across tasks.
@@ -91,12 +92,34 @@ Launching `grein` opens directly into `WRITE · SHELL` inside `$SHELL`:
 
 ---
 
-## 6. Headless CLI, ACP Agents & Global Preferences
+## 6. Multi-Provider ACP Agents, Headless CLI & Global Preferences
 
-- **Multi-Agent ACP Discovery:** Inspects `$GREIN_ACP_BIN`, `PATH` (`agy`, `claude`), or custom TOML (`[[agents]]` / `[agent]` with `name`, `kind`, `executable`/`path`, `command`) via `--config`. Reuses local SSO/OAuth credentials with zero API key setup and supports `/model`, `/mode`, `/thinking` (`/effort`), `/commands`, and strict `y`/`n`/`Esc` permission approvals.
+### Zero-Bundling Host Discovery Model
+**grein** never bundles proprietary or unfree ACP agent binaries inside the application or `flake.nix`. Users install and upgrade their preferred agent CLIs on `$PATH` (or point to custom servers via config or environment variables) while reusing local OAuth/SSO credentials with zero API key setup:
+
+- **Antigravity (`agy`):** Discovered on `$PATH` as `agy` and launched via `agy acp --stdio` (default auth `oauth-personal`), with live `Subagents` observation.
+- **Claude Code (`claude`):** Discovered across `$PATH` in strict priority order: **`claude-agent-acp` → `claude-code-acp` → `claude`**. A dedicated ACP adapter (`claude-agent-acp` or `claude-code-acp`) anywhere on `$PATH` takes precedence over `claude` and runs directly with no extra flags; `claude` falls back to `claude --acp`.
+  - To run temporarily without installing globally on Nix:
+    ```bash
+    NIXPKGS_ALLOW_UNFREE=1 nix shell --impure nixpkgs#claude-agent-acp -c grein
+    ```
+- **Custom ACP Servers:** Configure via `$GREIN_ACP_BIN` (with optional `$GREIN_ACP_ARGS` and `$GREIN_ACP_AUTH_METHOD`; setting `$GREIN_ACP_BIN=""` disables ACP) or TOML (`[[agents]]` / `[agent]` with `name`, `kind`, `executable`/`path`, `command` via `--config`).
+
+### Sibling Spawning, Concurrent Sessions & Provider Switching
+- **Sibling-in-Current-Tree Spawning (`Select Agent`, `/agent`, `:<provider>`):**
+  - Open the **`Select Agent`** modal via `A` in `MANAGE`, `:agent` in the sidebar palette, or bare `/agent` in Composer (`/ag` ghost-text autocomplete), or spawn directly via `/agent <provider> [title]` or `:<provider> [title]` (dynamic provider entries appear in the scrollable `:` palette dropdown). Providers match case-insensitively by short ID (`agy`, `claude`, custom stem), `plugin_id`, or display name.
+  - Spawning inherits the target thread's `cwd` and shares its `parent_thread_id` (`None` at root depth 0—adding a root sibling—or `Some(parent)` inside sub-trees), then focuses the new thread in `WRITE · AGENT` (`Composer`). Unavailable providers refuse creation and surface their install hint (for example `nix shell --impure nixpkgs#claude-agent-acp`).
+- **Concurrent Per-Provider Sessions & Per-Thread Switching (`s`):**
+  - The engine maintains independent stdio ACP drivers per provider alongside per-thread session bindings, allowing `agy`, `claude`, and custom ACP agents to run concurrently on separate threads in the same workspace.
+  - Inside `Select Agent`, pressing `s` switches the target agent thread to a different provider (preserving conversation history in SQLite while resetting the active ACP session and stale pending config; refuses on `>_` shell threads).
+- **Persisted Default Provider (`d`) & Provider Badges:**
+  - Pressing `d` in `Select Agent` persists `[ui].default_agent_provider` in `UserPrefsStore` (`grein.db`) for future new threads and pre-highlights the default in the modal.
+  - Agent rows in `ᛇ Grein` show `[<provider>]` badges (e.g., `1 ᛉ Main [claude]`, `└─ Child Branch [agy]`), and the status bar displays `<provider> · <mode> · <model>` alongside `/model`, `/mode`, `/thinking`, `/commands`, and strict `y`/`n`/`Esc` permission approvals.
+
+### Daemon Mode, Global Preferences & Headless CLI
 - **Standalone & Client-Daemon Execution:** Run single-process (`grein` / `grein standalone`) or split Client-Daemon (`grein daemon [--socket <SOCKET>]` + `grein attach [--socket <SOCKET>]`) with SQLite DAG storage in `.grein/session.db`.
-- **Global `UserPrefsStore`:** Persists `theme`, `keybinding`, and `ui` (`sidebar_mode`, `sidebar_min_pct`, `sidebar_max_pct`, `sidebar_fixed_cols`, `sidebar_fixed_pct`, `sidebar_overflow`, `composer_autocomplete`) in `~/.config/grein/grein.db` (overridable via `$GREIN_CONFIG_DB` or `$XDG_CONFIG_HOME/grein/grein.db`).
+- **Global `UserPrefsStore`:** Persists `theme`, `keybinding`, and `ui` (`default_agent_provider`, `sidebar_mode`, `sidebar_min_pct`, `sidebar_max_pct`, `sidebar_fixed_cols`, `sidebar_fixed_pct`, `sidebar_overflow`, `composer_autocomplete`) in `~/.config/grein/grein.db` (overridable via `$GREIN_CONFIG_DB` or `$XDG_CONFIG_HOME/grein/grein.db`).
 - **Headless Inspection & Portable Config CLI:**
-  - `grein doctor [--json]` checks `git`, `$SHELL`, ACP agents, `TERM`/`COLORTERM`/UTF-8 locale, `.grein/session.db`/socket health, and `grein.db`.
-  - `grein status`, `grein threads`, and `grein agents` support `--json` for scripting.
+  - `grein doctor [--json]` checks `git`, `$SHELL`, ACP agents (`$GREIN_ACP_BIN` or `$PATH` discovery), `TERM`/`COLORTERM`/UTF-8 locale, `.grein/session.db`/socket health, and `grein.db`.
+  - `grein status`, `grein threads`, and `grein agents [--config <CONFIG>]` support `--json` for scripting.
   - `grein settings export|import` and `grein theme export|import` support `[FILE]` / `-` (stdout/stdin), `--format <toml|json|auto>`, `--only <sections>`, and merge-patch / `--replace` updates.

@@ -25,7 +25,11 @@ cargo install --path crates/grein-cli --locked
 ### Launch Modes
 
 - `grein` opens terminal-first in `$SHELL` (`GREIN=1`).
-- `grein --agent` starts an ACP agent session.
+- `grein --agent` starts an ACP agent session using your host-installed default provider.
+- **Zero-bundling ACP:** `grein` does not bundle external agent binaries—bring your own on `$PATH`, or run temporarily via Nix:
+  ```bash
+  NIXPKGS_ALLOW_UNFREE=1 nix shell --impure nixpkgs#claude-agent-acp -c grein
+  ```
 - See [`docs/demo.tape`](./docs/demo.tape) for a reproducible [VHS](https://github.com/charmbracelet/vhs) walkthrough.
 
 ---
@@ -35,9 +39,9 @@ cargo install --path crates/grein-cli --locked
 - **`ᛇ Grein` Pure-Tree DAG Sessions:** Independent roots (`1..9`), explicit `parent_thread_id` child forks, sibling isolation, subtree collapsing (`Space`/`h`/`l`/`H`/`L`), `[custom name] auto context` naming, `/join` `DecisionLandmark` synthesis (with KV-cache-friendly `[Joined Context]` delivery), and a live `Subagents` activity strip.
 - **`⎇ Worktrees` & Non-Git Shadow Fallback:** Branch-based `<primary_repo_root>/.grein/worktrees/<branch-slug>` (`<branch>-wt`) isolation, `Target:`-synced `⎇ Worktrees` sidebar (`Tab`), live `⎇ Diff` preview, Composer `/wt` autocomplete, and copy-on-write `.grein/shadow/` snapshots outside Git.
 - **Embedded `>_` PTY Terminals:** 24-bit color VT100 terminal in `$SHELL`, 1,000-line scrollback buffer, `OSC 7` + OS `cwd` sync, `DSR`/`DA1`/`DA2`/`OSC 10`/`11` responses, Swedish `AltGr` UTF-8 input, and automatic `alternate_screen` passthrough (`nvim`/`htop`/`tmux`).
-- **Composer & Autocomplete:** Visual multiline navigation, full readline editing, and Tier 1/2/3 inline ghost-text autocomplete (`/` commands, `@files` & branches, prompt history + transcript tokens, and a 6,878-word dictionary).
+- **Composer & Autocomplete:** Visual multiline navigation, full readline editing, and Tier 1/2/3 inline ghost-text autocomplete (`/` commands including `/ag` → `/agent`, `@files` & branches, prompt history + transcript tokens, and a 6,878-word dictionary).
 - **16 Themes, Fuzzy Help & Copy/Paste:** Live-previewed `:theme` picker with 5-dot swatches and tone tags, `?` Help with `/` fuzzy filter, and pane-scoped mouse drag/double/triple-click selection (`pbcopy`/`wl-copy`/`xclip`/`xsel` + OSC 52).
-- **Agent-Agnostic ACP:** Discovers `agy`, `claude`, `$GREIN_ACP_BIN`, or custom `[[agents]]` configs with zero API key setup, plus runtime `/model`, `/mode`, `/thinking`, and `/commands`.
+- **Multi-Provider Zero-Bundling ACP:** Discovers host `agy`, `claude-agent-acp` → `claude-code-acp` → `claude`, `$GREIN_ACP_BIN`, or custom `[[agents]]` configs with zero API key setup, runs concurrent per-provider sessions, and spawns siblings via `/agent`, `A`, or `:<provider>` alongside `/model`, `/mode`, `/thinking`, and `/commands`.
 
 ---
 
@@ -51,8 +55,9 @@ cargo install --path crates/grein-cli --locked
 | `Alt+Z` | Global (`WRITE` / `MANAGE`) | Hide or show sidebar (`copy zoom`) |
 | `Alt+1..9` | Global (`WRITE` / `MANAGE`) | Jump directly to root thread `1..9` (`AltGr`-safe) |
 | `Shift+↑/↓/←/→` | `WRITE` (non-alt-screen) | Step prev/next sibling (`↑`/`↓`), ascend to parent (`←`), or descend to child (`→`) |
+| `A` / `/agent` | `MANAGE` / `Composer` | Open `Select Agent` modal (`Enter` sibling, `s` switch, `d` default), or spawn directly via `/agent <provider>` / `:<provider>` |
 | `?` | `MANAGE` (or `/?` in Composer) | Open Help modal with live `/` fuzzy filter |
-| `:` | `MANAGE` | Open Sidebar Command Palette (`:theme`, `:sidebar`, `:bind`, `:autocomplete`, …) |
+| `:` | `MANAGE` | Open Sidebar Command Palette (`:agent`, `:<provider>`, `:theme`, `:sidebar`, `:bind`, …) |
 | `Tab` | `MANAGE` / `WRITE · AGENT` | Switch `ᛇ Grein` ↔ `⎇ Worktrees` (`MANAGE`), or accept ghost text (`Composer`) |
 | Mouse drag / 2× / 3× | Right pane | Pane-scoped select & auto-copy (`Alt+drag` overrides PTY mouse; middle-click pastes) |
 
