@@ -461,7 +461,7 @@ fn test_plain_text_skips_wide_continuations_and_trims_trailing_spaces() {
         ],
         ..PtyScreenSnapshot::default()
     };
-    assert_eq!(snap.plain_text(), "📦X Y\n");
+    assert_eq!(snap.plain_text(), "📦X Y");
 }
 
 const SCRUBBED_TERMINAL_ENV_VARS: &[&str] = &[

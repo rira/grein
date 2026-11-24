@@ -1,6 +1,27 @@
 use crate::permissions::{PermissionDecision, ToolInvocationRequest};
 use crate::session::{SessionId, ThreadId};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+/// Outbound policy port for evaluating and recording tool permission decisions.
+pub trait PermissionPolicyPort: Send + Sync {
+    fn evaluate(&self, request: &ToolInvocationRequest) -> PolicyDecision;
+
+    fn evaluate_scoped(
+        &self,
+        session_id: &SessionId,
+        thread_id: &ThreadId,
+        request: &ToolInvocationRequest,
+    ) -> PolicyDecision;
+
+    fn record_decision(
+        &self,
+        session_id: &SessionId,
+        thread_id: &ThreadId,
+        request: &ToolInvocationRequest,
+        decision: PermissionDecision,
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyDecision {
@@ -256,21 +277,24 @@ fn parse_string_array(raw: &str) -> Result<Vec<String>, PolicyError> {
     Ok(items)
 }
 
-#[derive(Debug)]
-pub struct PolicyGate {
-    policy: SecurityPolicy,
+#[derive(Debug, Default)]
+struct ScopedDecisions {
     session_permissions: HashMap<(SessionId, String), PermissionDecision>,
     thread_permissions: HashMap<(SessionId, ThreadId, String), PermissionDecision>,
     once_permissions: HashSet<(SessionId, ThreadId, String)>,
+}
+
+#[derive(Debug)]
+pub struct PolicyGate {
+    policy: SecurityPolicy,
+    scoped: Mutex<ScopedDecisions>,
 }
 
 impl PolicyGate {
     pub fn new(policy: SecurityPolicy) -> Self {
         Self {
             policy,
-            session_permissions: HashMap::new(),
-            thread_permissions: HashMap::new(),
-            once_permissions: HashSet::new(),
+            scoped: Mutex::new(ScopedDecisions::default()),
         }
     }
 
@@ -327,34 +351,7 @@ impl PolicyGate {
         thread_id: &ThreadId,
         request: &ToolInvocationRequest,
     ) -> PolicyDecision {
-        let req_key = request_key(request);
-
-        if let Some(decision) = self
-            .session_permissions
-            .get(&(session_id.clone(), req_key.clone()))
-        {
-            match decision {
-                PermissionDecision::AlwaysSession => return PolicyDecision::Allow,
-                PermissionDecision::Deny => return PolicyDecision::Deny,
-                _ => {}
-            }
-        }
-
-        let thread_key = (session_id.clone(), thread_id.clone(), req_key);
-
-        if let Some(decision) = self.thread_permissions.get(&thread_key) {
-            match decision {
-                PermissionDecision::AlwaysThread => return PolicyDecision::Allow,
-                PermissionDecision::Deny => return PolicyDecision::Deny,
-                _ => {}
-            }
-        }
-
-        if self.once_permissions.remove(&thread_key) {
-            return PolicyDecision::Allow;
-        }
-
-        self.evaluate(request)
+        self.evaluate_scoped_shared(session_id, thread_id, request)
     }
 
     pub fn record_decision(
@@ -364,25 +361,103 @@ impl PolicyGate {
         request: &ToolInvocationRequest,
         decision: PermissionDecision,
     ) {
+        self.record_decision_shared(session_id, thread_id, request, decision);
+    }
+
+    fn evaluate_scoped_shared(
+        &self,
+        session_id: &SessionId,
+        thread_id: &ThreadId,
+        request: &ToolInvocationRequest,
+    ) -> PolicyDecision {
         let req_key = request_key(request);
+        {
+            let mut guard = self.scoped.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(decision) = guard
+                .session_permissions
+                .get(&(session_id.clone(), req_key.clone()))
+            {
+                match decision {
+                    PermissionDecision::AlwaysSession => return PolicyDecision::Allow,
+                    PermissionDecision::Deny => return PolicyDecision::Deny,
+                    _ => {}
+                }
+            }
+
+            let thread_key = (session_id.clone(), thread_id.clone(), req_key);
+
+            if let Some(decision) = guard.thread_permissions.get(&thread_key) {
+                match decision {
+                    PermissionDecision::AlwaysThread => return PolicyDecision::Allow,
+                    PermissionDecision::Deny => return PolicyDecision::Deny,
+                    _ => {}
+                }
+            }
+
+            if guard.once_permissions.remove(&thread_key) {
+                return PolicyDecision::Allow;
+            }
+        }
+
+        self.evaluate(request)
+    }
+
+    fn record_decision_shared(
+        &self,
+        session_id: &SessionId,
+        thread_id: &ThreadId,
+        request: &ToolInvocationRequest,
+        decision: PermissionDecision,
+    ) {
+        let req_key = request_key(request);
+        let mut guard = self.scoped.lock().unwrap_or_else(|p| p.into_inner());
         match decision {
             PermissionDecision::AlwaysSession => {
-                self.session_permissions
+                guard
+                    .session_permissions
                     .insert((session_id.clone(), req_key), decision);
             }
             PermissionDecision::AlwaysThread => {
-                self.thread_permissions
+                guard
+                    .thread_permissions
                     .insert((session_id.clone(), thread_id.clone(), req_key), decision);
             }
             PermissionDecision::AllowOnce => {
-                self.once_permissions
+                guard
+                    .once_permissions
                     .insert((session_id.clone(), thread_id.clone(), req_key));
             }
             PermissionDecision::Deny => {
-                self.session_permissions
+                guard
+                    .session_permissions
                     .insert((session_id.clone(), req_key), decision);
             }
         }
+    }
+}
+
+impl PermissionPolicyPort for PolicyGate {
+    fn evaluate(&self, request: &ToolInvocationRequest) -> PolicyDecision {
+        PolicyGate::evaluate(self, request)
+    }
+
+    fn evaluate_scoped(
+        &self,
+        session_id: &SessionId,
+        thread_id: &ThreadId,
+        request: &ToolInvocationRequest,
+    ) -> PolicyDecision {
+        self.evaluate_scoped_shared(session_id, thread_id, request)
+    }
+
+    fn record_decision(
+        &self,
+        session_id: &SessionId,
+        thread_id: &ThreadId,
+        request: &ToolInvocationRequest,
+        decision: PermissionDecision,
+    ) {
+        self.record_decision_shared(session_id, thread_id, request, decision);
     }
 }
 

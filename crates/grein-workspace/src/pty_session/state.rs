@@ -1,99 +1,10 @@
 use std::collections::VecDeque;
 
-use serde::{Deserialize, Serialize};
+pub use grein_core::port::dto::{
+    PtyCell, PtyColor, PtyMouseEncoding, PtyMouseMode, PtyScreenSnapshot,
+};
 
 const DEFAULT_SCROLLBACK_LEN: usize = 1000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum PtyMouseMode {
-    #[default]
-    None,
-    Press,
-    PressRelease,
-    ButtonMotion,
-    AnyMotion,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum PtyMouseEncoding {
-    #[default]
-    Default,
-    Utf8,
-    Sgr,
-}
-
-/// Terminal foreground or background color stored in a snapshot cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum PtyColor {
-    #[default]
-    Default,
-    Indexed(u8),
-    Rgb(u8, u8, u8),
-}
-
-/// Single rendered cell within a [`PtyScreenSnapshot`].
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct PtyCell {
-    pub contents: String,
-    pub fg: PtyColor,
-    pub bg: PtyColor,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub inverse: bool,
-    pub is_wide_continuation: bool,
-}
-
-/// Immutable point-in-time snapshot of the VT100 terminal screen and process state.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct PtyScreenSnapshot {
-    pub rows: u16,
-    pub cols: u16,
-    pub cells: Vec<Vec<PtyCell>>,
-    pub cursor_row: u16,
-    pub cursor_col: u16,
-    pub hide_cursor: bool,
-    pub application_cursor: bool,
-    pub bracketed_paste: bool,
-    pub alternate_screen: bool,
-    pub exited: bool,
-    pub exit_code: Option<i32>,
-    #[serde(default)]
-    pub scrollback_offset: usize,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub row_wrapped: Vec<bool>,
-    #[serde(default)]
-    pub mouse_protocol_mode: PtyMouseMode,
-    #[serde(default)]
-    pub mouse_protocol_encoding: PtyMouseEncoding,
-}
-
-impl PtyScreenSnapshot {
-    /// Renders the screen grid as plain UTF-8 lines, skipping wide-character
-    /// continuation cells and trimming trailing spaces on each row.
-    pub fn plain_text(&self) -> String {
-        self.cells
-            .iter()
-            .map(|row| {
-                let mut line = String::with_capacity(row.len());
-                for cell in row {
-                    if cell.is_wide_continuation {
-                        continue;
-                    }
-                    if cell.contents.is_empty() {
-                        line.push(' ');
-                    } else {
-                        line.push_str(&cell.contents);
-                    }
-                }
-                line.trim_end_matches(' ').to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
 
 pub(super) struct PtyState {
     pub(super) parser: vt100::Parser,

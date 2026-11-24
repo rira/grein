@@ -1,8 +1,6 @@
-use std::path::Path;
-
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+
+pub use crate::driver::{AcpSpawnConfig, AgentDriver, AgentDriverError, AgentDriverFactory};
 
 pub(super) const JSONRPC_VERSION: &str = "2.0";
 
@@ -268,80 +266,4 @@ pub enum DriverEvent {
         session_id: Option<String>,
         message: String,
     },
-}
-
-/// Pluggable agent backend SPI speaking ACP v1.
-#[async_trait]
-pub trait AgentDriver: Send + Sync {
-    async fn initialize(&self) -> Result<AcpInitializeResult, StdioRunnerError>;
-
-    async fn authenticate(&self, method_id: &str) -> Result<(), StdioRunnerError>;
-
-    async fn new_session(
-        &self,
-        cwd: &Path,
-        system_prompt_append: Option<&str>,
-    ) -> Result<AcpSessionInfo, StdioRunnerError>;
-
-    async fn send_prompt(
-        &self,
-        session_id: &str,
-        prompt: &str,
-    ) -> Result<mpsc::UnboundedReceiver<DriverEvent>, StdioRunnerError>;
-
-    async fn respond_permission(
-        &self,
-        request_id: serde_json::Value,
-        option_id: Option<&str>,
-    ) -> Result<(), StdioRunnerError>;
-
-    async fn cancel_session(&self, session_id: &str) -> Result<(), StdioRunnerError>;
-
-    async fn close_session(&self, session_id: &str) -> Result<(), StdioRunnerError>;
-
-    fn recent_stderr(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn subscribe_session(&self, _session_id: &str) -> mpsc::UnboundedReceiver<DriverEvent> {
-        let (_tx, rx) = mpsc::unbounded_channel();
-        rx
-    }
-
-    async fn submit_prompt(
-        &self,
-        _session_id: &str,
-        _prompt: &str,
-    ) -> Result<(), StdioRunnerError> {
-        Err(StdioRunnerError::CommunicationError(
-            "submit_prompt not supported by this driver".into(),
-        ))
-    }
-
-    async fn set_session_model(
-        &self,
-        _session_id: &str,
-        _model_id: &str,
-    ) -> Result<(), StdioRunnerError> {
-        Err(StdioRunnerError::CommunicationError("not supported".into()))
-    }
-
-    async fn set_session_mode(
-        &self,
-        _session_id: &str,
-        _mode_id: &str,
-    ) -> Result<(), StdioRunnerError> {
-        Err(StdioRunnerError::CommunicationError("not supported".into()))
-    }
-
-    async fn set_config_option(
-        &self,
-        _session_id: &str,
-        _config_id: &str,
-        _value: &str,
-    ) -> Result<Vec<AcpConfigOption>, StdioRunnerError> {
-        Err(StdioRunnerError::CommunicationError("not supported".into()))
-    }
-
-    async fn shutdown(&self) -> Result<(), StdioRunnerError>;
 }
