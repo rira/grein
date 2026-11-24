@@ -26,8 +26,12 @@ cargo install --path crates/grein-cli --locked
 
 - `grein` opens terminal-first in `$SHELL` (`GREIN=1`).
 - `grein --agent` starts an ACP agent session using your host-installed default provider.
-- **Zero-bundling ACP:** `grein` does not bundle external agent binaries—bring your own on `$PATH`, or run temporarily via Nix:
+- **Zero-bundling ACP (Claude Code & custom agents):** `grein` does not bundle external agent binaries. Anthropic's standalone `claude` CLI is **not** an ACP server—install the `claude-agent-acp` (or `claude-code-acp`) adapter binary on `$PATH`, or configure a custom `[[agents]]` entry (such as `command = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]`):
   ```bash
+  # macOS / non-Nix (requires Node >= 22)
+  npm install -g @agentclientprotocol/claude-agent-acp
+
+  # Nix (ephemeral shell without global install)
   NIXPKGS_ALLOW_UNFREE=1 nix shell --impure nixpkgs#claude-agent-acp -c grein
   ```
 - See [`docs/demo.tape`](./docs/demo.tape) for a reproducible [VHS](https://github.com/charmbracelet/vhs) walkthrough.
@@ -41,7 +45,7 @@ cargo install --path crates/grein-cli --locked
 - **Embedded `>_` PTY Terminals:** 24-bit color VT100 terminal in `$SHELL`, 1,000-line scrollback buffer, `OSC 7` + OS `cwd` sync, `DSR`/`DA1`/`DA2`/`OSC 10`/`11` responses, Swedish `AltGr` UTF-8 input, and automatic `alternate_screen` passthrough (`nvim`/`htop`/`tmux`).
 - **Composer & Autocomplete:** Visual multiline navigation, full readline editing, and Tier 1/2/3 inline ghost-text autocomplete (`/` commands including `/ag` → `/agent`, `@files` & branches, prompt history + transcript tokens, and a 6,878-word dictionary).
 - **16 Themes, Fuzzy Help & Copy/Paste:** Live-previewed `:theme` picker with 5-dot swatches and tone tags, `?` Help with `/` fuzzy filter, and pane-scoped mouse drag/double/triple-click selection (`pbcopy`/`wl-copy`/`xclip`/`xsel` + OSC 52).
-- **Multi-Provider Zero-Bundling ACP:** Discovers host `agy`, `claude-agent-acp` → `claude-code-acp` → `claude`, `$GREIN_ACP_BIN`, or custom `[[agents]]` configs with zero API key setup, runs concurrent per-provider sessions, and spawns siblings via `/agent`, `A`, or `:<provider>` alongside `/model`, `/mode`, `/thinking`, and `/commands`.
+- **Multi-Provider Zero-Bundling ACP:** Discovers host `agy`, `claude-agent-acp` → `claude-code-acp` (standalone `claude` CLI is not an ACP server), `$GREIN_ACP_BIN`, or custom `[[agents]]` configs with zero API key setup, runs concurrent per-provider sessions, and spawns siblings via `/agent`, `A`, or `:<provider>` alongside `/model`, `/mode`, `/thinking`, and `/commands`.
 
 ---
 

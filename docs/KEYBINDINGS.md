@@ -332,7 +332,18 @@ Custom keybindings are stored in `~/.config/grein/grein.db` (or `$GREIN_CONFIG_D
 ## 7. Terminal & Multiplexer Notes (macOS & `tmux`)
 
 - **macOS `Option` / `Meta` Keys:** Terminal.app and iTerm2 do not send `ESC` (`Alt`) prefixes for `Option+` by default. Enable **Use Option as Meta key** (Terminal.app → *Settings → Profiles → Keyboard*) or set Left/Right Option to **Esc+** (iTerm2 → *Profiles → Keys*) to use `Alt+Z`, `Alt+1..9`, and `Alt+H/J/K/L`, or use `Ctrl+G` to reach `MANAGE` mode anytime.
+- **macOS `Terminal.app` `Shift+Arrows`:**
+  - **Why plain arrows fire by default:** Apple `Terminal.app` omits modified arrow escapes for `Shift+Up` / `Shift+Down` (and `Shift+Left` / `Shift+Right`) and lacks both the Kitty keyboard protocol and `modifyOtherKeys`, so shifted arrows arrive as plain arrows unless mapped explicitly.
+  - **3-second diagnostic (`cat -v`):** Run `cat -v` and press `Shift+Up` (`Ctrl+C` to exit):
+    - `^[[A` — terminal stripped `Shift` (received as plain `Up`).
+    - `^[[1;2A` — modified arrow sequence received cleanly.
+  - **Custom `Terminal.app` mappings:** Open *Terminal → Settings → Profiles → Keyboard*, click **`+`**, and add:
+    - `Shift+Up` → `\033[1;2A`
+    - `Shift+Down` → `\033[1;2B`
+    - `Shift+Left` → `\033[1;2D`
+    - `Shift+Right` → `\033[1;2C`
+  - **Out-of-the-box terminals & fallback:** Modern macOS terminals (**Ghostty**, **iTerm2 3.5+**, **Kitty**, **WezTerm**, **Alacritty**) support `Shift+Arrows` out of the box. Even on an unconfigured `Terminal.app`, `Ctrl+G` (`MANAGE` mode with `j`/`k`/`h`/`l`) always works.
 - **Running Grein inside `tmux`:**
   - `ChainedClipboardDriver` detects `$TMUX` and automatically wraps `OSC 52` payloads in DCS passthrough (`\x1bPtmux;\x1b\x1b]52;c;...\x07\x1b\\`). Ensure `set -g allow-passthrough on` is enabled in `tmux.conf` if relying on `OSC 52` without a native clipboard binary.
-  - Ensure `set -s extended-keys on` (and `escape-time 10`) in `tmux.conf` if `Shift+Enter` or `Shift+Arrows` are swallowed by `tmux`.
+  - Add both `set -s extended-keys on` **and** `set -g extended-keys-format csi-u` (alongside `escape-time 10`) in `tmux.conf` if `Shift+Enter` or `Shift+Arrows` are swallowed by `tmux`—`tmux 3.5+` defaults to `extended-keys-format xterm`, which emits `CSI 27;...~` sequences that `crossterm 0.28.1` ignores.
 - **Running `tmux` inside Grein's embedded `>_` PTY:** Embedded shells scrub `TMUX` and `TMUX_PANE` on spawn and trigger `alternate_screen` passthrough automatically when you launch nested `tmux`, `nvim`, or `helix` inside a Grein terminal.

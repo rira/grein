@@ -98,10 +98,20 @@ Launching `grein` opens directly into `WRITE · SHELL` inside `$SHELL`:
 **grein** never bundles proprietary or unfree ACP agent binaries inside the application or `flake.nix`. Users install and upgrade their preferred agent CLIs on `$PATH` (or point to custom servers via config or environment variables) while reusing local OAuth/SSO credentials with zero API key setup:
 
 - **Antigravity (`agy`):** Discovered on `$PATH` as `agy` and launched via `agy acp --stdio` (default auth `oauth-personal`), with live `Subagents` observation.
-- **Claude Code (`claude`):** Discovered across `$PATH` in strict priority order: **`claude-agent-acp` → `claude-code-acp` → `claude`**. A dedicated ACP adapter (`claude-agent-acp` or `claude-code-acp`) anywhere on `$PATH` takes precedence over `claude` and runs directly with no extra flags; `claude` falls back to `claude --acp`.
-  - To run temporarily without installing globally on Nix:
+- **Claude Code (`claude`):** Anthropic's standalone `claude` CLI is **not** an ACP server and is not discovered on `$PATH`—you must install the `claude-agent-acp` or `claude-code-acp` adapter binary on `$PATH` (or configure a custom `[[agents]]` entry). Grein searches `$PATH` in strict priority order (**`claude-agent-acp` → `claude-code-acp`**) and launches the adapter directly with no extra flags:
+  - **macOS / non-Nix (Node >= 22):**
+    ```bash
+    npm install -g @agentclientprotocol/claude-agent-acp
+    ```
+  - **Nix (ephemeral shell without global install):**
     ```bash
     NIXPKGS_ALLOW_UNFREE=1 nix shell --impure nixpkgs#claude-agent-acp -c grein
+    ```
+  - **Custom `[[agents]]` entry (`--config`):**
+    ```toml
+    [[agents]]
+    name = "claude-acp"
+    command = ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
     ```
 - **Custom ACP Servers:** Configure via `$GREIN_ACP_BIN` (with optional `$GREIN_ACP_ARGS` and `$GREIN_ACP_AUTH_METHOD`; setting `$GREIN_ACP_BIN=""` disables ACP) or TOML (`[[agents]]` / `[agent]` with `name`, `kind`, `executable`/`path`, `command` via `--config`).
 
