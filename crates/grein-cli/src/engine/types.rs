@@ -1,18 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use grein_acp::{AcpConfigOption, AcpPermissionOption, AcpSessionInfo, AgentDriverError};
+use grein_acp::{
+    AcpConfigOption, AcpPermissionOption, AcpSessionInfo, AgentDriverError, AgentDriverFactory,
+};
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, Thread, ThreadKind};
 pub use grein_core::port::dto::{
-    AgentConfigChoice, AgentConfigOption, AgentMetaEntry, EngineControlEvent as EngineEvent,
-    PermissionDecisionPayload, SessionSnapshot, ShellCommandResult, ThreadSummary,
-    TranscriptEntry, TurnDispatchResult,
+    AgentConfigChoice, AgentConfigOption, AgentMetaEntry, AgentProviderInfo,
+    EngineControlEvent as EngineEvent, PermissionDecisionPayload, SessionSnapshot,
+    ShellCommandResult, ThreadSummary, TranscriptEntry, TurnDispatchResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::discovery::{claude_acp_args, discover_acp_agents, AcpAgentKind};
+use crate::subagent_watch::SubagentObserverPort;
 
 pub(super) const INTERNAL_ROOT_CONTENT: &str = "Session initialized";
 pub(super) const ACP_SYSTEM_PROMPT_MAX_CHARS: usize = 32_000;
@@ -57,6 +61,53 @@ pub struct AcpBackendConfig {
     pub args: Vec<String>,
     pub auth_method: Option<String>,
     pub cwd: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct RegisteredAgentProvider {
+    pub id: String,
+    pub plugin_id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub available: bool,
+    pub executable: Option<String>,
+    pub args: Vec<String>,
+    pub auth_method: Option<String>,
+    pub install_hint: Option<String>,
+    pub driver_factory: Arc<dyn AgentDriverFactory>,
+    pub subagent_observer: Arc<dyn SubagentObserverPort>,
+}
+
+impl RegisteredAgentProvider {
+    pub fn acp_config(&self, cwd: &Path) -> Option<AcpBackendConfig> {
+        if !self.available {
+            return None;
+        }
+        let cmd = self
+            .executable
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        Some(AcpBackendConfig {
+            command: cmd.to_string(),
+            args: self.args.clone(),
+            auth_method: self.auth_method.clone(),
+            cwd: cwd.to_path_buf(),
+        })
+    }
+
+    pub fn to_info(&self, is_default: bool) -> AgentProviderInfo {
+        AgentProviderInfo {
+            id: self.id.clone(),
+            plugin_id: self.plugin_id.clone(),
+            display_name: self.display_name.clone(),
+            kind: self.kind.clone(),
+            available: self.available,
+            executable: self.executable.clone(),
+            is_default,
+            install_hint: self.install_hint.clone(),
+        }
+    }
 }
 
 impl AcpBackendConfig {

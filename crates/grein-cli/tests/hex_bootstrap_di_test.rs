@@ -1438,6 +1438,8 @@ async fn engine_dependencies_constructor_di_isolates_engine_from_disk_pty_and_gi
             auth_method: None,
             cwd: repo_dir.clone(),
         }),
+        providers: Vec::new(),
+        prefs: None,
     };
 
     let engine = Arc::new(InProcessEngine::with_dependencies(deps).expect("with_dependencies"));

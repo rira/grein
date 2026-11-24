@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use grein_core::port::dto::{
-    AgentOptionsSnapshot, EngineStreamEvent, PtyScreenSnapshot, ThreadMeta, WorktreeEntry,
+    AgentOptionsSnapshot, AgentProviderInfo, EngineStreamEvent, PtyScreenSnapshot, ThreadMeta,
+    WorktreeEntry,
 };
 use tokio::sync::mpsc;
 
@@ -36,6 +37,16 @@ impl ThreadUseCasePort for InProcessEngine {
             .await
     }
 
+    async fn fork_thread_with_provider(
+        &self,
+        source_thread_or_node: Option<&str>,
+        title: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.fork_thread_with_provider_impl(source_thread_or_node, title, agent_provider)
+            .await
+    }
+
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
         self.create_root_thread_in_cwd_impl(title, None).await
     }
@@ -46,6 +57,17 @@ impl ThreadUseCasePort for InProcessEngine {
         cwd: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
         self.create_root_thread_in_cwd_impl(title, cwd).await
+    }
+
+    async fn create_agent_thread(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        parent_thread_id: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.create_agent_thread_impl(title, cwd, parent_thread_id, agent_provider)
+            .await
     }
 
     async fn rename_thread(
@@ -147,6 +169,18 @@ impl AgentTurnPort for InProcessEngine {
     ) -> Result<AgentOptionsSnapshot, EngineError> {
         self.set_agent_config_impl(thread_id, config_id, value, set_default)
             .await
+    }
+
+    async fn list_agent_providers(&self) -> Result<Vec<AgentProviderInfo>, EngineError> {
+        self.list_agent_providers_impl().await
+    }
+
+    async fn switch_thread_provider(
+        &self,
+        thread_id: &str,
+        provider: &str,
+    ) -> Result<String, EngineError> {
+        self.switch_thread_provider_impl(thread_id, provider).await
     }
 }
 

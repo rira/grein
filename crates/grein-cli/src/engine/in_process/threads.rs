@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 use super::super::types::{
     is_internal_root_node, node_to_transcript_entry, normalize_custom_name, path_from_node_map,
     parse_typed_id, slugify_anchor, storage_err, thread_to_summary, truncate_chars_with_ellipsis,
-    EngineError, ThreadSummary, TranscriptEntry, CLOSE_SESSION_TIMEOUT, INTERNAL_ROOT_CONTENT,
+    EngineError, ThreadSummary, TranscriptEntry, INTERNAL_ROOT_CONTENT,
 };
 use super::{EngineRuntime, InProcessEngine, SessionListenerCmd};
 
@@ -154,6 +154,7 @@ impl EngineRuntime {
         Ok(meta)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_new_thread_with_anchor(
         &self,
         parent_node_id: NodeId,
@@ -162,6 +163,7 @@ impl EngineRuntime {
         parent_thread_id: Option<ThreadId>,
         kind: ThreadKind,
         cwd: Option<String>,
+        agent_provider: Option<String>,
     ) -> Result<Thread, EngineError> {
         let anchor_title = custom_name.as_deref().unwrap_or(&default_title);
         let anchor_id = AnchorId::new();
@@ -186,6 +188,7 @@ impl EngineRuntime {
         .with_title(default_title)
         .with_custom_name(custom_name);
         thread.parent_thread_id = parent_thread_id;
+        thread.agent_provider = agent_provider;
         if let Some(dir) = cwd {
             thread = thread.with_cwd(dir);
         }
@@ -245,6 +248,12 @@ impl InProcessEngine {
                 .update_thread_leaf(&tid, &leaf_id)
                 .map_err(storage_err)?;
         }
+        if let Some(default_provider) = self.runtime.effective_available_default_provider_id() {
+            self.runtime
+                .storage
+                .update_thread_agent_provider(&tid, Some(&default_provider))
+                .map_err(storage_err)?;
+        }
         state.last_node = Some(leaf_id);
         let created = self
             .runtime
@@ -260,8 +269,18 @@ impl InProcessEngine {
         source_thread_or_node: Option<&str>,
         title: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
+        self.fork_thread_with_provider_impl(source_thread_or_node, title, None)
+            .await
+    }
+
+    pub(super) async fn fork_thread_with_provider_impl(
+        &self,
+        source_thread_or_node: Option<&str>,
+        title: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
         let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
-        let (parent_node_id, parent_thread_id, parent_cwd) =
+        let (parent_node_id, parent_thread_id, parent_cwd, parent_provider) =
             match source_thread_or_node.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(raw) => {
                     if let Some(tid) = parse_typed_id::<ThreadId>(raw) {
@@ -274,14 +293,19 @@ impl InProcessEngine {
                                         .to_string(),
                                 ));
                             }
-                            (thread.active_leaf_id, Some(thread.id), thread.cwd)
+                            (
+                                thread.active_leaf_id,
+                                Some(thread.id),
+                                thread.cwd,
+                                thread.agent_provider,
+                            )
                         } else if let Some(node) = self
                             .runtime
                             .storage
                             .get_node(&NodeId(tid.0))
                             .map_err(storage_err)?
                         {
-                            (node.id, None, None)
+                            (node.id, None, None, None)
                         } else {
                             return Err(EngineError::NotFound(format!("thread or node {raw}")));
                         }
@@ -296,14 +320,24 @@ impl InProcessEngine {
                                 "cannot fork an agent branch from a terminal thread".to_string(),
                             ));
                         }
-                        (first.active_leaf_id, Some(first.id), first.cwd.clone())
+                        (
+                            first.active_leaf_id,
+                            Some(first.id),
+                            first.cwd.clone(),
+                            first.agent_provider.clone(),
+                        )
                     } else if let Some(last_node) = self.runtime.lock()?.last_node {
-                        (last_node, None, None)
+                        (last_node, None, None, None)
                     } else {
                         return Err(EngineError::NotFound("no turns recorded".to_string()));
                     }
                 }
             };
+
+        let resolved_provider = match agent_provider.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(self.runtime.require_available_provider(raw)?.id.clone()),
+            None => parent_provider,
+        };
 
         let explicit_custom = normalize_custom_name(title);
         let default_title = if existing_threads.is_empty() {
@@ -319,6 +353,7 @@ impl InProcessEngine {
             parent_thread_id,
             ThreadKind::Agent,
             parent_cwd,
+            resolved_provider,
         )?;
 
         let turns: Vec<HydratedTurn> = self
@@ -353,6 +388,41 @@ impl InProcessEngine {
         title: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
+        self.create_agent_thread_impl(title, cwd, None, None).await
+    }
+
+    pub(super) async fn create_agent_thread_impl(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        parent_thread_id: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        let parent_thread = match parent_thread_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let pid: ThreadId = parse_typed_id(raw)
+                    .ok_or_else(|| EngineError::NotFound(format!("parent thread {raw}")))?;
+                let thread = self
+                    .runtime
+                    .storage
+                    .get_thread(&pid)
+                    .map_err(storage_err)?
+                    .ok_or_else(|| EngineError::NotFound(format!("parent thread {raw}")))?;
+                if thread.kind == ThreadKind::Terminal {
+                    return Err(EngineError::InvalidParams(
+                        "cannot create an agent thread under a terminal thread".to_string(),
+                    ));
+                }
+                Some(thread)
+            }
+            None => None,
+        };
+
+        let resolved_provider = match agent_provider.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(self.runtime.require_available_provider(raw)?.id.clone()),
+            None => self.runtime.effective_available_default_provider_id(),
+        };
+
         let resolved_cwd = match cwd.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => {
                 let path = PathBuf::from(raw);
@@ -373,24 +443,39 @@ impl InProcessEngine {
                 })?;
                 Some(dir_str)
             }
-            None => None,
+            None => parent_thread.as_ref().and_then(|p| p.cwd.clone()),
         };
 
         let existing_threads = self.runtime.storage.list_threads().map_err(storage_err)?;
         let explicit_custom = normalize_custom_name(title);
         let meta_before = self.runtime.compute_thread_metadata()?;
-        let mut n = meta_before
-            .iter()
-            .filter(|m| m.parent_thread_id.is_none())
-            .count()
-            + 1;
-        while existing_threads
-            .iter()
-            .any(|t| t.title == format!("Root {n}"))
-        {
-            n += 1;
-        }
-        let default_title = format!("Root {n}");
+        let default_title = if parent_thread.is_none() {
+            let mut n = meta_before
+                .iter()
+                .filter(|m| m.parent_thread_id.is_none())
+                .count()
+                + 1;
+            while existing_threads
+                .iter()
+                .any(|t| t.title == format!("Root {n}"))
+            {
+                n += 1;
+            }
+            format!("Root {n}")
+        } else {
+            let mut n = meta_before
+                .iter()
+                .filter(|m| m.parent_thread_id.is_some())
+                .count()
+                + 1;
+            while existing_threads
+                .iter()
+                .any(|t| t.title == format!("Agent {n}"))
+            {
+                n += 1;
+            }
+            format!("Agent {n}")
+        };
 
         let root_node = ConversationNode::new_root(AuthorRole::System, "");
         self.runtime
@@ -402,9 +487,10 @@ impl InProcessEngine {
             root_node.id,
             default_title,
             explicit_custom,
-            None,
+            parent_thread.as_ref().map(|p| p.id),
             ThreadKind::Agent,
             resolved_cwd,
+            resolved_provider,
         )?;
         {
             let mut state = self.runtime.lock()?;
@@ -728,24 +814,15 @@ impl InProcessEngine {
             state
                 .active_acp_sessions
                 .remove(thread_id)
-                .map(|s| (s.session_id.clone(), s.driver_gen))
+                .map(|s| (s.session_id.clone(), s.driver_gen, s.provider_id.clone()))
         };
-        self.runtime.subagent_observer.clear_thread(thread_id);
+        self.runtime.clear_thread_from_all_observers(thread_id);
 
-        if let Some((session_id, driver_gen)) = removed_session {
-            let driver_opt = {
-                let guard = self.runtime.acp_driver.lock().await;
-                guard
-                    .as_ref()
-                    .filter(|s| s.generation == driver_gen && s.driver.is_running())
-                    .map(|s| Arc::clone(&s.driver))
-            };
-            if let Some(driver) = driver_opt {
-                let _ = tokio::time::timeout(
-                    CLOSE_SESSION_TIMEOUT,
-                    driver.close_session(&session_id),
-                )
-                .await;
+        if let Some((session_id, driver_gen, provider_id)) = removed_session {
+            if let Some(provider) = self.runtime.providers.get(&provider_id) {
+                provider
+                    .close_session_if_running(&session_id, driver_gen)
+                    .await;
             }
         }
 

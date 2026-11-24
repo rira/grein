@@ -15,6 +15,23 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, EngineError
         .ok_or_else(|| EngineError::InvalidParams(format!("missing string param `{key}`")))
 }
 
+fn optional_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, EngineError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| EngineError::InvalidParams(format!("invalid string param `{key}`"))),
+    }
+}
+
+fn optional_provider(params: &Value) -> Result<Option<&str>, EngineError> {
+    if let Some(p) = optional_str(params, "agent_provider")? {
+        return Ok(Some(p));
+    }
+    optional_str(params, "provider")
+}
+
 pub(super) fn rpc_error(id: Value, code: i64, message: String) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
@@ -48,13 +65,32 @@ async fn route(
                 .get("parent_node_id")
                 .or_else(|| params.get("source_thread_id"))
                 .and_then(Value::as_str);
-            let title = params.get("title").and_then(Value::as_str);
-            to_json(&engine.fork_thread_with_title(source, title).await?)?
+            let title = optional_str(params, "title")?;
+            let provider = optional_provider(params)?;
+            if provider.is_some() {
+                to_json(
+                    &engine
+                        .fork_thread_with_provider(source, title, provider)
+                        .await?,
+                )?
+            } else {
+                to_json(&engine.fork_thread_with_title(source, title).await?)?
+            }
         }
         "session.create_root_thread" | "session.create_root" => {
-            let title = params.get("title").and_then(Value::as_str);
-            let cwd = params.get("cwd").and_then(Value::as_str);
-            to_json(&engine.create_root_thread_in_cwd(title, cwd).await?)?
+            let title = optional_str(params, "title")?;
+            let cwd = optional_str(params, "cwd")?;
+            let parent_thread_id = optional_str(params, "parent_thread_id")?;
+            let provider = optional_provider(params)?;
+            if parent_thread_id.is_some() || provider.is_some() {
+                to_json(
+                    &engine
+                        .create_agent_thread(title, cwd, parent_thread_id, provider)
+                        .await?,
+                )?
+            } else {
+                to_json(&engine.create_root_thread_in_cwd(title, cwd).await?)?
+            }
         }
         "session.rename_thread" => {
             let thread_id = required_str(params, "thread_id")?;
@@ -106,6 +142,21 @@ async fn route(
                     .set_agent_config(thread_id, config_id, value, set_default)
                     .await?,
             )?
+        }
+        "session.list_agent_providers" | "list_agent_providers" => {
+            to_json(&engine.list_agent_providers().await?)?
+        }
+        "session.switch_thread_provider" | "switch_thread_provider" => {
+            let thread_id = required_str(params, "thread_id")?;
+            let provider = params
+                .get("provider")
+                .or_else(|| params.get("agent_provider"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    EngineError::InvalidParams("missing string param `provider`".to_string())
+                })?;
+            let resolved = engine.switch_thread_provider(thread_id, provider).await?;
+            json!({"provider": resolved})
         }
         "permissions.resolve" => {
             let decision: PermissionDecisionPayload = serde_json::from_value(params.clone())

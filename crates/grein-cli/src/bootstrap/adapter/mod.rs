@@ -1,3 +1,4 @@
+mod providers;
 mod tui_to_engine;
 
 #[cfg(test)]

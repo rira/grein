@@ -17,8 +17,8 @@ use crate::daemon::{resolve_state_dir, run_daemon_with_engine};
 use crate::discovery::{discover_acp_agents, resolve_agents_configuration, AcpAgent, AcpAgentKind};
 use crate::doctor::{handle_doctor_with, DoctorDeps};
 use crate::engine::{
-    EngineDependencies, EngineError, GreinEngine, InProcessEngine, ThreadUseCasePort,
-    UnixSocketEngineClient,
+    EngineDependencies, EngineError, GreinEngine, InProcessEngine, RegisteredAgentProvider,
+    ThreadUseCasePort, UnixSocketEngineClient,
 };
 use crate::headless::{handle_agents_with, handle_status_with, handle_threads_with, HeadlessDeps};
 use crate::settings_cmd::{handle_settings_with, handle_theme_with, SettingsDeps};
@@ -169,6 +169,42 @@ pub fn build_engine_dependencies(
         ),
     };
 
+    let providers: Vec<RegisteredAgentProvider> = registry
+        .agent_plugins()
+        .iter()
+        .map(|agent| {
+            let cfg_opt = if config.acp_explicitly_disabled() {
+                None
+            } else {
+                agent.acp_backend_config(&config.cwd)
+            };
+            let available =
+                !config.acp_explicitly_disabled() && agent.is_available() && cfg_opt.is_some();
+            let executable = if config.acp_explicitly_disabled() {
+                None
+            } else {
+                cfg_opt.as_ref().map(|c| c.command.clone()).or_else(|| {
+                    agent
+                        .executable_path()
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+            };
+            RegisteredAgentProvider {
+                id: agent.short_name(),
+                plugin_id: agent.id().to_string(),
+                display_name: agent.display_name(),
+                kind: agent.kind().label().to_string(),
+                available,
+                executable,
+                args: cfg_opt.as_ref().map(|c| c.args.clone()).unwrap_or_default(),
+                auth_method: cfg_opt.and_then(|c| c.auth_method),
+                install_hint: agent.install_hint(),
+                driver_factory: agent.driver_factory(),
+                subagent_observer: agent.subagent_observer(),
+            }
+        })
+        .collect();
+
     EngineDependencies {
         storage,
         agent_factory,
@@ -180,6 +216,8 @@ pub fn build_engine_dependencies(
         subagent_observer,
         cwd: config.cwd.clone(),
         acp_config,
+        providers,
+        prefs: Some(build_prefs_repository(config)),
     }
 }
 
@@ -271,6 +309,8 @@ pub fn build_headless_deps(
                 subagent_observer: Arc::new(NoopSubagentObserver::new()),
                 cwd: cwd.to_path_buf(),
                 acp_config: None,
+                providers: Vec::new(),
+                prefs: None,
             };
             let engine = InProcessEngine::with_dependencies(deps)?;
             Ok(Arc::new(engine) as Arc<dyn ThreadUseCasePort>)

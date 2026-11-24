@@ -13,6 +13,8 @@ use grein_core::port::dto::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::subagent_watch::SubagentObserverPort;
+
 use super::super::types::{
     acp_config_option_to_core, extract_model_and_mode_from_options, extract_subagent_role,
     extract_subagent_type, extract_tool_call_summary, format_permission_description,
@@ -21,14 +23,13 @@ use super::super::types::{
 use super::{EngineRuntime, PendingPermissionRecord, SessionListenerCmd, TrackedLayer1Subagent};
 
 fn finalize_eligible_subagents(
-    runtime: &EngineRuntime,
+    observer: &dyn SubagentObserverPort,
     thread_id: &str,
     active_subagents: &mut HashMap<String, TrackedLayer1Subagent>,
     current_turn_seq: u64,
     current_wakeup_seq: u64,
     is_unsolicited: bool,
 ) {
-    let watch = runtime.subagent_observer.as_ref();
     let eligible_ids: Vec<String> = active_subagents
         .iter()
         .filter(|(_, sa)| {
@@ -42,8 +43,8 @@ fn finalize_eligible_subagents(
         .collect();
 
     for id in eligible_ids {
-        if !watch.is_confirmed_running(thread_id, &id) {
-            watch.mark_terminal(
+        if !observer.is_confirmed_running(thread_id, &id) {
+            observer.mark_terminal(
                 thread_id,
                 &id,
                 SubagentStatus::Completed,
@@ -73,9 +74,36 @@ fn is_thread_in_isolated_worktree(runtime: &EngineRuntime, tid: ThreadId) -> boo
         || raw.contains("\\.grein\\shadow\\")
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_session_listener(
     runtime: Arc<EngineRuntime>,
+    tid: ThreadId,
+    thread_id: String,
+    session_id: String,
+    driver: Arc<dyn AgentDriver>,
+    initial_leaf_id: NodeId,
+    events: mpsc::UnboundedReceiver<DriverEvent>,
+    cmd_rx: mpsc::UnboundedReceiver<SessionListenerCmd>,
+) -> tokio::task::JoinHandle<()> {
+    let observer = Arc::clone(&runtime.subagent_observer);
+    spawn_session_listener_with_observer(
+        runtime,
+        observer,
+        tid,
+        thread_id,
+        session_id,
+        driver,
+        initial_leaf_id,
+        events,
+        cmd_rx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_session_listener_with_observer(
+    runtime: Arc<EngineRuntime>,
+    subagent_observer: Arc<dyn SubagentObserverPort>,
     tid: ThreadId,
     thread_id: String,
     session_id: String,
@@ -127,7 +155,7 @@ pub(super) fn spawn_session_listener(
             *quiet_deadline = None;
             *wakeup_active = false;
             finalize_eligible_subagents(
-                runtime,
+                subagent_observer.as_ref(),
                 &thread_id,
                 active_subagents,
                 solicited_turn_seq,
@@ -316,7 +344,7 @@ pub(super) fn spawn_session_listener(
                                     thread_id: thread_id.clone(),
                                     subagent: snap.clone(),
                                 });
-                                runtime.subagent_observer.register_subagent(&thread_id, snap);
+                                subagent_observer.register_subagent(&thread_id, snap);
                             }
                         }
                         DriverEvent::ToolCallUpdate {
@@ -361,7 +389,7 @@ pub(super) fn spawn_session_listener(
                                     tool_name: None,
                                 });
 
-                                let watch = runtime.subagent_observer.as_ref();
+                                let watch = subagent_observer.as_ref();
                                 if let Some(sa) = active_subagents.get_mut(&tool_call_id) {
                                     if is_failed {
                                         let reason = if resolved_output.trim().is_empty() {
@@ -509,7 +537,7 @@ pub(super) fn spawn_session_listener(
                             quiet_deadline = None;
                             wakeup_active = false;
                             finalize_eligible_subagents(
-                                &runtime,
+                                subagent_observer.as_ref(),
                                 &thread_id,
                                 &mut active_subagents,
                                 solicited_turn_seq,

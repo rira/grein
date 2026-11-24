@@ -360,6 +360,67 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn session_list_agent_providers(&mut self) -> Result<Value, std::io::Error> {
+        self.json_rpc("session.list_agent_providers", json!({}))
+            .await
+    }
+
+    pub async fn session_switch_thread_provider(
+        &mut self,
+        thread_id: &str,
+        provider: &str,
+    ) -> Result<Value, std::io::Error> {
+        self.json_rpc(
+            "session.switch_thread_provider",
+            json!({"thread_id": thread_id, "provider": provider}),
+        )
+        .await
+    }
+
+    pub async fn session_create_agent_thread(
+        &mut self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        parent_thread_id: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(t) = title {
+            params.insert("title".to_string(), json!(t));
+        }
+        if let Some(c) = cwd {
+            params.insert("cwd".to_string(), json!(c));
+        }
+        if let Some(pid) = parent_thread_id {
+            params.insert("parent_thread_id".to_string(), json!(pid));
+        }
+        if let Some(p) = agent_provider {
+            params.insert("agent_provider".to_string(), json!(p));
+        }
+        self.json_rpc("session.create_root_thread", Value::Object(params))
+            .await
+    }
+
+    pub async fn session_fork_thread_with_provider(
+        &mut self,
+        source_thread_id: Option<&str>,
+        title: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<Value, std::io::Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(s) = source_thread_id {
+            params.insert("source_thread_id".to_string(), json!(s));
+        }
+        if let Some(t) = title {
+            params.insert("title".to_string(), json!(t));
+        }
+        if let Some(p) = agent_provider {
+            params.insert("agent_provider".to_string(), json!(p));
+        }
+        self.json_rpc("session.fork_thread", Value::Object(params))
+            .await
+    }
+
     async fn send_command(&mut self, cmd: &str) -> Result<String, std::io::Error> {
         self.stream.write_all(format!("{cmd}\n").as_bytes()).await?;
         self.stream.flush().await?;

@@ -9,8 +9,9 @@ use crate::engine::{
 };
 use grein_core::port::outbound::PreferenceRepository;
 use grein_tui::engine_port::{
-    AgentOptionsSnapshot, HydratedSession, HydratedThread, HydratedTurn, PtyScreenSnapshot,
-    ThreadMeta, TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot, WorktreeEntry,
+    AgentOptionsSnapshot, AgentProviderInfo, HydratedSession, HydratedThread, HydratedTurn,
+    PtyScreenSnapshot, ThreadMeta, TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot,
+    WorktreeEntry,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -27,7 +28,7 @@ pub struct EngineClientPort<E> {
     initial_mode: InitialSessionMode,
     events_tx: mpsc::UnboundedSender<TuiEngineEvent>,
     pub(super) events_rx: Mutex<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>>,
-    has_live_stream: AtomicBool,
+    pub(super) has_live_stream: AtomicBool,
     in_flight_turns: Arc<AtomicUsize>,
     buffered_sync_errors: Arc<StdMutex<Vec<String>>>,
     pub(super) suppressed_sync_errors: Arc<StdMutex<Vec<(String, Instant)>>>,
@@ -66,13 +67,13 @@ impl<E> EngineClientPort<E> {
         }
     }
 
-    fn emit(&self, event: TuiEngineEvent) {
+    pub(super) fn emit(&self, event: TuiEngineEvent) {
         let _ = self.events_tx.send(event);
     }
 }
 
 impl<E: GreinEngine> EngineClientPort<E> {
-    async fn load_hydrated_turns(&self, thread_id: &str) -> io::Result<Vec<HydratedTurn>> {
+    pub(super) async fn load_hydrated_turns(&self, thread_id: &str) -> io::Result<Vec<HydratedTurn>> {
         let entries = self
             .client
             .get_thread_transcript(thread_id)
@@ -106,7 +107,7 @@ impl<E: GreinEngine> EngineClientPort<E> {
         Ok(threads)
     }
 
-    async fn fetch_and_emit_thread_metadata(&self) -> Option<Vec<ThreadMeta>> {
+    pub(super) async fn fetch_and_emit_thread_metadata(&self) -> Option<Vec<ThreadMeta>> {
         match self.client.thread_metadata().await {
             Ok(meta) => {
                 if !meta.is_empty() {
@@ -123,7 +124,7 @@ impl<E: GreinEngine> EngineClientPort<E> {
         }
     }
 
-    async fn finish_created_root(&self, created: ThreadSummary) -> HydratedThread {
+    pub(super) async fn finish_created_root(&self, created: ThreadSummary) -> HydratedThread {
         let hydrated = HydratedThread {
             id: created.thread_id,
             title: created.title,
@@ -141,7 +142,7 @@ impl<E: GreinEngine> EngineClientPort<E> {
     }
 }
 
-fn is_unsupported_engine_error(err: &EngineError) -> bool {
+pub(super) fn is_unsupported_engine_error(err: &EngineError) -> bool {
     match err {
         EngineError::Protocol(msg) => {
             let lower = msg.to_ascii_lowercase();
@@ -160,7 +161,7 @@ fn error_matches_sync(err_msg: &str, event_msg: &str) -> bool {
     !event_msg.is_empty() && (err_msg == event_msg || err_msg.ends_with(event_msg))
 }
 
-fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
+pub(super) fn to_io<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
 
@@ -366,26 +367,18 @@ where
         source_thread_id: &str,
         title: Option<&str>,
     ) -> io::Result<HydratedThread> {
-        let forked = self
-            .client
-            .fork_thread_with_title(Some(source_thread_id), title)
+        self.fork_branch_with_provider_impl(source_thread_id, title, None)
             .await
-            .map_err(to_io)?;
-        let turns = self.load_hydrated_turns(&forked.thread_id).await?;
-        let hydrated = HydratedThread {
-            id: forked.thread_id,
-            title: forked.title,
-            custom_name: forked.custom_name,
-            agent_provider: forked.agent_provider,
-            turns,
-        };
-        if !self.has_live_stream.load(Ordering::SeqCst) {
-            self.emit(TuiEngineEvent::ThreadCreated {
-                thread: hydrated.clone(),
-            });
-            let _ = self.fetch_and_emit_thread_metadata().await;
-        }
-        Ok(hydrated)
+    }
+
+    async fn fork_branch_with_provider(
+        &self,
+        source_thread_id: &str,
+        title: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        self.fork_branch_with_provider_impl(source_thread_id, title, agent_provider)
+            .await
     }
 
     async fn create_root(&self, title: Option<&str>) -> io::Result<HydratedThread> {
@@ -406,6 +399,25 @@ where
             Err(err) => return Err(to_io(err)),
         };
         Ok(self.finish_created_root(created).await)
+    }
+
+    async fn create_agent_thread(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        parent_thread_id: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> io::Result<HydratedThread> {
+        self.create_agent_thread_impl(title, cwd, parent_thread_id, agent_provider)
+            .await
+    }
+
+    async fn list_agent_providers(&self) -> io::Result<Vec<AgentProviderInfo>> {
+        self.list_agent_providers_impl().await
+    }
+
+    async fn switch_thread_provider(&self, thread_id: &str, provider: &str) -> io::Result<String> {
+        self.switch_thread_provider_impl(thread_id, provider).await
     }
 
     async fn rename_thread(&self, thread_id: &str, title: &str) -> io::Result<()> {

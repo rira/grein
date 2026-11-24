@@ -469,6 +469,7 @@ impl InProcessEngine {
             parent_tid_opt,
             ThreadKind::Terminal,
             Some(resolved_cwd.clone()),
+            None,
         )?;
         let tid = created.id;
         let tid_str = tid.0.to_string();

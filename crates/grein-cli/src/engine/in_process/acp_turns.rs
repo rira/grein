@@ -18,7 +18,7 @@ impl InProcessEngine {
         &self,
         prompt: &str,
     ) -> Result<TurnDispatchResult, EngineError> {
-        if self.runtime.acp_config.is_none() {
+        if !self.runtime.has_any_available_provider() {
             let mut state = self.runtime.lock()?;
             let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
             let target_agent = threads.iter().find(|t| t.kind == ThreadKind::Agent);
@@ -130,13 +130,27 @@ impl InProcessEngine {
             status: "streaming".to_string(),
         });
 
-        let Some(cfg) = self.runtime.acp_config.clone() else {
-            let msg = "no ACP agent configured; install agy or set GREIN_ACP_BIN".to_string();
+        let provider_opt = match self.runtime.resolve_runtime_for_thread(&thread) {
+            Ok(Some(provider)) => provider
+                .acp_config(&self.runtime.cwd)
+                .map(|cfg| (provider, cfg)),
+            Ok(None) => None,
+            Err(err) => {
+                let msg = err.to_string();
+                self.runtime.mark_thread_error(tid, thread_id, &msg);
+                return Err(err);
+            }
+        };
+        let Some((provider, cfg)) = provider_opt else {
+            let msg = "no ACP agent configured".to_string();
             self.runtime.mark_thread_error(tid, thread_id, &msg);
             return Err(EngineError::Transport(msg));
         };
 
-        let (driver, driver_gen) = match self.runtime.ensure_driver(&cfg).await {
+        let (driver, driver_gen) = match provider
+            .ensure_driver(&cfg, &self.runtime.driver_gen_seq)
+            .await
+        {
             Ok(pair) => pair,
             Err(err) => {
                 self.runtime
@@ -147,10 +161,11 @@ impl InProcessEngine {
 
         let existing_handle = {
             let mut state = self.runtime.lock()?;
-            let stale = state
-                .active_acp_sessions
-                .get(thread_id)
-                .is_some_and(|s| s.driver_gen != driver_gen || s.cmd_tx.is_closed());
+            let stale = state.active_acp_sessions.get(thread_id).is_some_and(|s| {
+                s.provider_id != provider.id
+                    || s.driver_gen != driver_gen
+                    || s.cmd_tx.is_closed()
+            });
             if stale {
                 state.active_acp_sessions.remove(thread_id);
             }
@@ -188,6 +203,7 @@ impl InProcessEngine {
                 match self
                     .runtime
                     .ensure_acp_session_for_thread(
+                        &provider,
                         &cfg,
                         tid,
                         thread_id,
@@ -244,8 +260,8 @@ impl InProcessEngine {
         };
 
         if let Some(Err(err)) = submit_res {
-            self.runtime
-                .invalidate_driver_if_dead(&driver, session_handle.driver_gen)
+            provider
+                .invalidate_driver_if_dead(&driver, session_handle.driver_gen, &self.runtime.state)
                 .await;
             let (abort_ack_tx, abort_ack_rx) = oneshot::channel();
             let already_emitted = if session_handle
@@ -272,8 +288,12 @@ impl InProcessEngine {
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => {
-                self.runtime
-                    .invalidate_driver_if_dead(&driver, session_handle.driver_gen)
+                provider
+                    .invalidate_driver_if_dead(
+                        &driver,
+                        session_handle.driver_gen,
+                        &self.runtime.state,
+                    )
                     .await;
                 let msg = "ACP stream closed before PromptCompleted".to_string();
                 self.runtime.mark_thread_error(tid, thread_id, &msg);
@@ -319,25 +339,18 @@ impl InProcessEngine {
     }
 
     pub(super) async fn cancel_turn_impl(&self, thread_id: &str) -> Result<(), EngineError> {
-        let session_id = {
+        let session_info = {
             let state = self.runtime.lock()?;
             state
                 .active_acp_sessions
                 .get(thread_id)
-                .map(|s| s.session_id.clone())
+                .map(|s| (s.session_id.clone(), s.provider_id.clone()))
         };
-        let Some(sid) = session_id else {
+        let Some((sid, provider_id)) = session_info else {
             return Ok(());
         };
-        let driver = {
-            let guard = self.runtime.acp_driver.lock().await;
-            guard.as_ref().map(|s| Arc::clone(&s.driver))
-        };
-        if let Some(driver) = driver {
-            driver
-                .cancel_session(&sid)
-                .await
-                .map_err(|e| EngineError::Transport(format!("cancel_session failed: {e}")))?;
+        if let Some(provider) = self.runtime.providers.get(&provider_id) {
+            provider.cancel_session(&sid).await?;
         }
         Ok(())
     }

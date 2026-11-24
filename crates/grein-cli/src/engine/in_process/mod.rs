@@ -10,10 +10,10 @@ use grein_acp::{
 };
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, ThreadId};
 use grein_core::port::dto::{
-    AgentConfigOption, AgentMetaEntry, AgentOptionsSnapshot, AgentSlashCommand, EngineStreamEvent,
-    PtyScreenSnapshot, SubagentSnapshot, ThreadMeta, WorktreeEntry,
+    AgentConfigOption, AgentMetaEntry, AgentOptionsSnapshot, AgentProviderInfo, AgentSlashCommand,
+    EngineStreamEvent, PtyScreenSnapshot, SubagentSnapshot, ThreadMeta, WorktreeEntry,
 };
-use grein_core::port::outbound::SessionRepository;
+use grein_core::port::outbound::{PreferenceRepository, SessionRepository};
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_workspace::port::{
     GitCliInspector, GitInspectorPort, GitWorktreeDriver, PtyShellExecutor, PtySpawnerPort,
@@ -28,8 +28,8 @@ use super::ports::{
 };
 use super::types::{
     storage_err, AcpBackendConfig, EngineError, EngineEvent, PermissionDecisionPayload,
-    SessionSnapshot, ShellCommandResult, ThreadSummary, TranscriptEntry, TurnDispatchResult,
-    UNSOLICITED_QUIET_TIMEOUT,
+    RegisteredAgentProvider, SessionSnapshot, ShellCommandResult, ThreadSummary, TranscriptEntry,
+    TurnDispatchResult, UNSOLICITED_QUIET_TIMEOUT,
 };
 use crate::subagent_watch::{SubagentObserverPort, SubagentWatcher};
 
@@ -37,11 +37,14 @@ mod acp;
 mod acp_turns;
 mod listener;
 mod ports_impl;
+mod providers;
 mod pty;
 #[cfg(test)]
 mod tests_listener;
 mod threads;
 mod worktree;
+
+use providers::{build_provider_registry, AcpProviderRuntime};
 
 pub struct EngineDependencies {
     pub storage: Arc<dyn SessionRepository>,
@@ -54,6 +57,8 @@ pub struct EngineDependencies {
     pub subagent_observer: Arc<dyn SubagentObserverPort>,
     pub cwd: PathBuf,
     pub acp_config: Option<AcpBackendConfig>,
+    pub providers: Vec<RegisteredAgentProvider>,
+    pub prefs: Option<Arc<dyn PreferenceRepository>>,
 }
 
 impl EngineDependencies {
@@ -75,6 +80,8 @@ impl EngineDependencies {
             subagent_observer: SubagentWatcher::unattached(brain_root),
             cwd,
             acp_config,
+            providers: Vec::new(),
+            prefs: None,
         }
     }
 }
@@ -95,6 +102,7 @@ pub(super) enum SessionListenerCmd {
 }
 
 pub(super) struct ActiveAcpSession {
+    pub(super) provider_id: String,
     pub(super) session_id: String,
     pub(super) driver_gen: u64,
     pub(super) model: Option<String>,
@@ -142,7 +150,7 @@ pub(super) struct EngineState {
     pub(super) active_acp_sessions: HashMap<String, ActiveAcpSession>,
     pub(super) pending_permissions: HashMap<String, PendingPermissionRecord>,
     pub(super) thread_turn_locks: HashMap<String, Arc<AsyncMutex<()>>>,
-    pub(super) default_config: HashMap<String, String>,
+    pub(super) default_config: HashMap<String, HashMap<String, String>>,
     pub(super) pending_thread_config: HashMap<String, HashMap<String, String>>,
 }
 
@@ -163,7 +171,6 @@ pub(super) struct TrackedLayer1Subagent {
 
 pub(in crate::engine) struct EngineRuntime {
     pub(in crate::engine) storage: Arc<dyn SessionRepository>,
-    pub(super) agent_factory: Arc<dyn AgentDriverFactory>,
     pub(super) policy: Option<Arc<dyn PermissionPolicyPort>>,
     pub(super) pty_spawner: Arc<dyn PtySpawnerPort>,
     pub(super) workspace: Arc<dyn WorkspaceIsolationPort>,
@@ -171,8 +178,10 @@ pub(in crate::engine) struct EngineRuntime {
     pub(super) shell: Arc<dyn ShellExecutorPort>,
     pub(super) subagent_observer: Arc<dyn SubagentObserverPort>,
     pub(super) cwd: PathBuf,
-    pub(super) acp_config: Option<AcpBackendConfig>,
-    pub(super) acp_driver: AsyncMutex<Option<DriverSlot>>,
+    pub(in crate::engine::in_process) providers: HashMap<String, Arc<AcpProviderRuntime>>,
+    pub(super) provider_order: Vec<String>,
+    pub(super) default_provider_id: Option<String>,
+    pub(super) prefs: Option<Arc<dyn PreferenceRepository>>,
     pub(super) driver_gen_seq: AtomicU64,
     pub(super) state: Mutex<EngineState>,
     pub(super) tui_subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<EngineStreamEvent>>>>,
@@ -284,7 +293,8 @@ impl Drop for InProcessEngine {
             .map(|mut map| map.drain().map(|(_, s)| s).collect())
             .unwrap_or_default();
         drop(sessions);
-        self.runtime.subagent_observer.shutdown();
+        self.runtime.shutdown_all_observers();
+        self.runtime.shutdown_all_drivers_on_drop();
     }
 }
 
@@ -299,19 +309,30 @@ impl InProcessEngine {
 
         let tui_subscribers =
             Arc::new(Mutex::new(Vec::<mpsc::UnboundedSender<EngineStreamEvent>>::new()));
+        let (providers, provider_order, default_provider_id) = build_provider_registry(&deps);
+
         let subs_for_watch = Arc::clone(&tui_subscribers);
         deps.subagent_observer.attach_emitter(Arc::new(move |ev| {
             if let Ok(mut subs) = subs_for_watch.lock() {
                 subs.retain(|tx| tx.send(ev.clone()).is_ok());
             }
         }));
+        for id in &provider_order {
+            if let Some(provider) = providers.get(id) {
+                let subs_for_provider = Arc::clone(&tui_subscribers);
+                provider.subagent_observer.attach_emitter(Arc::new(move |ev| {
+                    if let Ok(mut subs) = subs_for_provider.lock() {
+                        subs.retain(|tx| tx.send(ev.clone()).is_ok());
+                    }
+                }));
+            }
+        }
 
         let (pty_notify_tx, pty_notify_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             runtime: Arc::new(EngineRuntime {
                 storage: deps.storage,
-                agent_factory: deps.agent_factory,
                 policy: deps.policy,
                 pty_spawner: deps.pty_spawner,
                 workspace: deps.workspace,
@@ -319,8 +340,10 @@ impl InProcessEngine {
                 shell: deps.shell,
                 subagent_observer: deps.subagent_observer,
                 cwd: deps.cwd,
-                acp_config: deps.acp_config,
-                acp_driver: AsyncMutex::new(None),
+                providers,
+                provider_order,
+                default_provider_id,
+                prefs: deps.prefs,
                 driver_gen_seq: AtomicU64::new(1),
                 state: Mutex::new(EngineState {
                     last_node,
@@ -440,6 +463,21 @@ impl InProcessEngine {
         ThreadUseCasePort::fork_thread_with_title(self, source_thread_or_node, title).await
     }
 
+    pub async fn fork_thread_with_provider(
+        &self,
+        source_thread_or_node: Option<&str>,
+        title: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::fork_thread_with_provider(
+            self,
+            source_thread_or_node,
+            title,
+            agent_provider,
+        )
+        .await
+    }
+
     pub async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
         ThreadUseCasePort::create_root_thread(self, title).await
     }
@@ -450,6 +488,23 @@ impl InProcessEngine {
         cwd: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
         ThreadUseCasePort::create_root_thread_in_cwd(self, title, cwd).await
+    }
+
+    pub async fn create_agent_thread(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        parent_thread_id: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::create_agent_thread(
+            self,
+            title,
+            cwd,
+            parent_thread_id,
+            agent_provider,
+        )
+        .await
     }
 
     pub async fn rename_thread(
@@ -535,6 +590,26 @@ impl InProcessEngine {
         set_default: bool,
     ) -> Result<AgentOptionsSnapshot, EngineError> {
         AgentTurnPort::set_agent_config(self, thread_id, config_id, value, set_default).await
+    }
+
+    pub async fn list_agent_providers(&self) -> Result<Vec<AgentProviderInfo>, EngineError> {
+        AgentTurnPort::list_agent_providers(self).await
+    }
+
+    pub async fn switch_thread_provider(
+        &self,
+        thread_id: &str,
+        provider: &str,
+    ) -> Result<String, EngineError> {
+        AgentTurnPort::switch_thread_provider(self, thread_id, provider).await
+    }
+
+    pub async fn shutdown(&self) {
+        if let Ok(mut state) = self.runtime.state.lock() {
+            state.active_acp_sessions.clear();
+        }
+        self.runtime.shutdown_all_drivers().await;
+        self.runtime.shutdown_all_observers();
     }
 
     pub async fn create_terminal(

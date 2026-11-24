@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use grein_core::port::dto::{
-    AgentOptionsSnapshot, EngineStreamEvent, PtyScreenSnapshot, ThreadMeta, WorktreeEntry,
+    AgentOptionsSnapshot, AgentProviderInfo, EngineStreamEvent, PtyScreenSnapshot, ThreadMeta,
+    WorktreeEntry,
 };
 use tokio::sync::mpsc;
 
@@ -80,6 +81,16 @@ impl ThreadUseCasePort for EngineClient {
             .fork_thread_with_title(source_thread_or_node, title)
             .await
     }
+    async fn fork_thread_with_provider(
+        &self,
+        source_thread_or_node: Option<&str>,
+        title: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.inner
+            .fork_thread_with_provider(source_thread_or_node, title, agent_provider)
+            .await
+    }
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
         self.inner.create_root_thread(title).await
     }
@@ -89,6 +100,17 @@ impl ThreadUseCasePort for EngineClient {
         cwd: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
         self.inner.create_root_thread_in_cwd(title, cwd).await
+    }
+    async fn create_agent_thread(
+        &self,
+        title: Option<&str>,
+        cwd: Option<&str>,
+        parent_thread_id: Option<&str>,
+        agent_provider: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.inner
+            .create_agent_thread(title, cwd, parent_thread_id, agent_provider)
+            .await
     }
     async fn rename_thread(
         &self,
@@ -170,6 +192,16 @@ impl AgentTurnPort for EngineClient {
         self.inner
             .set_agent_config(thread_id, config_id, value, set_default)
             .await
+    }
+    async fn list_agent_providers(&self) -> Result<Vec<AgentProviderInfo>, EngineError> {
+        self.inner.list_agent_providers().await
+    }
+    async fn switch_thread_provider(
+        &self,
+        thread_id: &str,
+        provider: &str,
+    ) -> Result<String, EngineError> {
+        self.inner.switch_thread_provider(thread_id, provider).await
     }
 }
 

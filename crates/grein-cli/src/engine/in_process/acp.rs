@@ -1,8 +1,7 @@
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use grein_acp::{AcpSpawnConfig, AgentDriver};
+use grein_acp::AgentDriver;
 use grein_core::model::{NodeId, ThreadId, ThreadKind};
 use grein_core::port::dto::{AgentConfigOption, AgentOptionsSnapshot, EngineStreamEvent};
 use grein_core::sync::ContextCompiler;
@@ -12,30 +11,15 @@ use super::super::types::{
     acp_config_option_to_core, driver_err_to_engine, extract_model_and_mode_from_options,
     is_internal_root_node, is_unsupported_method_error, merge_updated_config_options,
     normalize_session_config_options, parse_typed_id, storage_err, AcpBackendConfig,
-    AgentMetaEntry, EngineError, ACP_SYSTEM_PROMPT_MAX_CHARS, CLOSE_SESSION_TIMEOUT,
+    AgentMetaEntry, EngineError, ACP_SYSTEM_PROMPT_MAX_CHARS,
 };
-use super::listener::spawn_session_listener;
+use super::listener::spawn_session_listener_with_observer;
+use super::providers::AcpProviderRuntime;
 use super::{
-    ActiveAcpSession, ActiveSessionHandle, ConfigTarget, DriverSlot, EngineRuntime, InProcessEngine,
+    ActiveAcpSession, ActiveSessionHandle, ConfigTarget, EngineRuntime, InProcessEngine,
 };
 
 impl EngineRuntime {
-    pub(super) async fn current_driver_if_running(&self) -> Option<(Arc<dyn AgentDriver>, u64)> {
-        let mut guard = self.acp_driver.lock().await;
-        if let Some(slot) = guard.as_ref() {
-            if slot.driver.is_running() {
-                return Some((Arc::clone(&slot.driver), slot.generation));
-            }
-            let dead_gen = slot.generation;
-            *guard = None;
-            if let Ok(mut state) = self.state.lock() {
-                state
-                    .active_acp_sessions
-                    .retain(|_, s| s.driver_gen != dead_gen);
-            }
-        }
-        None
-    }
 
     pub(super) async fn apply_config_to_driver(
         driver: &dyn AgentDriver,
@@ -142,6 +126,7 @@ impl EngineRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn ensure_acp_session_for_thread(
         self: &Arc<Self>,
+        provider: &Arc<AcpProviderRuntime>,
         cfg: &AcpBackendConfig,
         tid: ThreadId,
         thread_id: &str,
@@ -149,14 +134,15 @@ impl EngineRuntime {
         exclude_node_id: Option<NodeId>,
         emit_initial_meta: bool,
     ) -> Result<(Arc<dyn AgentDriver>, ActiveSessionHandle), EngineError> {
-        let (driver, driver_gen) = self.ensure_driver(cfg).await?;
+        let (driver, driver_gen) = provider.ensure_driver(cfg, &self.driver_gen_seq).await?;
 
         {
             let mut state = self.lock()?;
-            let stale = state
-                .active_acp_sessions
-                .get(thread_id)
-                .is_some_and(|s| s.driver_gen != driver_gen || s.cmd_tx.is_closed());
+            let stale = state.active_acp_sessions.get(thread_id).is_some_and(|s| {
+                s.provider_id != provider.id
+                    || s.driver_gen != driver_gen
+                    || s.cmd_tx.is_closed()
+            });
             if stale {
                 state.active_acp_sessions.remove(thread_id);
             }
@@ -197,7 +183,9 @@ impl EngineRuntime {
         let info = match driver.new_session(&session_cwd, append_opt).await {
             Ok(info) => info,
             Err(err) => {
-                self.invalidate_driver_if_dead(&driver, driver_gen).await;
+                provider
+                    .invalidate_driver_if_dead(&driver, driver_gen, &self.state)
+                    .await;
                 return Err(EngineError::Transport(format!("ACP new_session failed: {err}")));
             }
         };
@@ -225,8 +213,9 @@ impl EngineRuntime {
 
         let events_rx = driver.subscribe_session(&info.session_id);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let listener_handle = spawn_session_listener(
+        let listener_handle = spawn_session_listener_with_observer(
             Arc::clone(self),
+            Arc::clone(&provider.subagent_observer),
             tid,
             thread_id.to_string(),
             info.session_id.clone(),
@@ -244,7 +233,11 @@ impl EngineRuntime {
 
         let mut desired_config: Vec<(String, String)> = {
             let mut state = self.lock()?;
-            let mut merged = state.default_config.clone();
+            let mut merged = state
+                .default_config
+                .get(&provider.id)
+                .cloned()
+                .unwrap_or_default();
             if let Some(pending) = state.pending_thread_config.get(thread_id) {
                 for (k, v) in pending {
                     merged.insert(k.clone(), v.clone());
@@ -253,6 +246,7 @@ impl EngineRuntime {
             state.active_acp_sessions.insert(
                 thread_id.to_string(),
                 ActiveAcpSession {
+                    provider_id: provider.id.clone(),
                     session_id: info.session_id.clone(),
                     driver_gen,
                     model: model.clone(),
@@ -349,66 +343,6 @@ impl EngineRuntime {
         Ok((driver, handle))
     }
 
-    pub(super) async fn ensure_driver(
-        &self,
-        cfg: &AcpBackendConfig,
-    ) -> Result<(Arc<dyn AgentDriver>, u64), EngineError> {
-        let mut guard = self.acp_driver.lock().await;
-        if let Some(slot) = guard.as_ref() {
-            if slot.driver.is_running() {
-                return Ok((Arc::clone(&slot.driver), slot.generation));
-            }
-            *guard = None;
-        }
-
-        let mut spawn_cfg = AcpSpawnConfig::new(&cfg.command, cfg.args.clone()).with_cwd(&cfg.cwd);
-        if let Some(method) = cfg.auth_method.as_deref().filter(|m| !m.is_empty()) {
-            spawn_cfg = spawn_cfg.with_auth_method(method);
-        }
-        let driver = self.agent_factory.spawn(&spawn_cfg).await.map_err(|e| {
-            EngineError::Transport(format!("failed to spawn ACP agent `{}`: {e}", cfg.command))
-        })?;
-        if let Err(e) = driver.initialize().await {
-            let _ = driver.shutdown().await;
-            *guard = None;
-            return Err(EngineError::Transport(format!("ACP initialize failed: {e}")));
-        }
-        if let Some(method) = cfg.auth_method.as_deref().filter(|m| !m.is_empty()) {
-            if let Err(e) = driver.authenticate(method).await {
-                let _ = driver.shutdown().await;
-                *guard = None;
-                return Err(EngineError::Transport(format!(
-                    "ACP authenticate ({method}) failed: {e}"
-                )));
-            }
-        }
-        let generation = self.driver_gen_seq.fetch_add(1, Ordering::Relaxed);
-        *guard = Some(DriverSlot {
-            driver: Arc::clone(&driver),
-            generation,
-        });
-        Ok((driver, generation))
-    }
-
-    pub(super) async fn invalidate_driver_if_dead(
-        &self,
-        driver: &Arc<dyn AgentDriver>,
-        generation: u64,
-    ) {
-        if driver.is_running() {
-            return;
-        }
-        let mut guard = self.acp_driver.lock().await;
-        if guard.as_ref().is_some_and(|s| s.generation == generation) {
-            *guard = None;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .active_acp_sessions
-                .retain(|_, s| s.driver_gen != generation);
-        }
-    }
-
     pub(super) async fn reset_thread_acp_session(
         &self,
         tid: ThreadId,
@@ -422,22 +356,13 @@ impl EngineRuntime {
             state
                 .active_acp_sessions
                 .remove(thread_id)
-                .map(|s| (s.session_id.clone(), s.driver_gen))
+                .map(|s| (s.session_id.clone(), s.driver_gen, s.provider_id.clone()))
         };
-        if let Some((session_id, driver_gen)) = old_session {
-            let driver_opt = {
-                let guard = self.acp_driver.lock().await;
-                guard
-                    .as_ref()
-                    .filter(|s| s.generation == driver_gen && s.driver.is_running())
-                    .map(|s| Arc::clone(&s.driver))
-            };
-            if let Some(driver) = driver_opt {
-                let _ = tokio::time::timeout(
-                    CLOSE_SESSION_TIMEOUT,
-                    driver.close_session(&session_id),
-                )
-                .await;
+        if let Some((session_id, driver_gen, provider_id)) = old_session {
+            if let Some(provider) = self.providers.get(&provider_id) {
+                provider
+                    .close_session_if_running(&session_id, driver_gen)
+                    .await;
             }
         }
         Ok(())
@@ -480,7 +405,15 @@ impl InProcessEngine {
             });
         }
 
-        let Some(cfg) = self.runtime.acp_config.clone() else {
+        let provider_opt = self
+            .runtime
+            .resolve_runtime_for_thread(&thread)?
+            .and_then(|provider| {
+                provider
+                    .acp_config(&self.runtime.cwd)
+                    .map(|cfg| (provider, cfg))
+            });
+        let Some((provider, _cfg)) = provider_opt else {
             let state = self.runtime.lock()?;
             return Ok(match state.active_acp_sessions.get(thread_id) {
                 Some(s) => AgentOptionsSnapshot {
@@ -496,10 +429,14 @@ impl InProcessEngine {
             });
         };
 
-        if let Some((_, current_gen)) = self.runtime.current_driver_if_running().await {
+        if let Some((_, current_gen)) = provider.current_driver_if_running(&self.runtime.state).await
+        {
             let state = self.runtime.lock()?;
             if let Some(s) = state.active_acp_sessions.get(thread_id) {
-                if s.driver_gen == current_gen && !s.cmd_tx.is_closed() {
+                if s.provider_id == provider.id
+                    && s.driver_gen == current_gen
+                    && !s.cmd_tx.is_closed()
+                {
                     return Ok(AgentOptionsSnapshot {
                         thread_id: thread_id.to_string(),
                         config_options: s.config_options.clone(),
@@ -516,10 +453,30 @@ impl InProcessEngine {
             .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+        let Some((fresh_provider, fresh_cfg)) = self
+            .runtime
+            .resolve_runtime_for_thread(&fresh_thread)?
+            .and_then(|p| p.acp_config(&self.runtime.cwd).map(|c| (p, c)))
+        else {
+            let state = self.runtime.lock()?;
+            return Ok(match state.active_acp_sessions.get(thread_id) {
+                Some(s) => AgentOptionsSnapshot {
+                    thread_id: thread_id.to_string(),
+                    config_options: s.config_options.clone(),
+                    available_commands: s.available_commands.clone(),
+                },
+                None => AgentOptionsSnapshot {
+                    thread_id: thread_id.to_string(),
+                    config_options: Vec::new(),
+                    available_commands: Vec::new(),
+                },
+            });
+        };
 
         self.runtime
             .ensure_acp_session_for_thread(
-                &cfg,
+                &fresh_provider,
+                &fresh_cfg,
                 tid,
                 thread_id,
                 fresh_thread.active_leaf_id,
@@ -570,23 +527,28 @@ impl InProcessEngine {
             ));
         }
 
-        let Some(cfg) = self.runtime.acp_config.clone() else {
-            return Err(EngineError::Transport(
-                "no ACP agent configured; install agy or set GREIN_ACP_BIN".to_string(),
-            ));
-        };
+        let (provider, cfg) = self
+            .runtime
+            .resolve_runtime_for_thread(&thread)?
+            .and_then(|p| p.acp_config(&self.runtime.cwd).map(|c| (p, c)))
+            .ok_or_else(|| EngineError::Transport("no ACP agent configured".to_string()))?;
 
         let existing = if let Some((driver, current_gen)) =
-            self.runtime.current_driver_if_running().await
+            provider.current_driver_if_running(&self.runtime.state).await
         {
             let state = self.runtime.lock()?;
             state
                 .active_acp_sessions
                 .get(thread_id)
-                .filter(|s| s.driver_gen == current_gen && !s.cmd_tx.is_closed())
+                .filter(|s| {
+                    s.provider_id == provider.id
+                        && s.driver_gen == current_gen
+                        && !s.cmd_tx.is_closed()
+                })
                 .map(|s| {
                     let opt = s.config_options.iter().find(|o| o.id == config_id);
                     (
+                        provider.id.clone(),
                         driver,
                         s.session_id.clone(),
                         opt.is_some_and(|o| o.category.as_deref() == Some("model")),
@@ -597,7 +559,9 @@ impl InProcessEngine {
             None
         };
 
-        let (driver, session_id, is_model_hint, is_mode_hint) = match existing {
+        let _ = cfg;
+        let (resolved_provider_id, driver, session_id, is_model_hint, is_mode_hint) = match existing
+        {
             Some(found) => found,
             None => {
                 let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
@@ -607,10 +571,18 @@ impl InProcessEngine {
                     .get_thread(&tid)
                     .map_err(storage_err)?
                     .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
+                let (fresh_provider, fresh_cfg) = self
+                    .runtime
+                    .resolve_runtime_for_thread(&fresh_thread)?
+                    .and_then(|p| p.acp_config(&self.runtime.cwd).map(|c| (p, c)))
+                    .ok_or_else(|| {
+                        EngineError::Transport("no ACP agent configured".to_string())
+                    })?;
                 let (driver, handle) = self
                     .runtime
                     .ensure_acp_session_for_thread(
-                        &cfg,
+                        &fresh_provider,
+                        &fresh_cfg,
                         tid,
                         thread_id,
                         fresh_thread.active_leaf_id,
@@ -624,6 +596,7 @@ impl InProcessEngine {
                     .get(thread_id)
                     .and_then(|s| s.config_options.iter().find(|o| o.id == config_id));
                 (
+                    fresh_provider.id.clone(),
                     driver,
                     handle.session_id,
                     opt.is_some_and(|o| o.category.as_deref() == Some("model")),
@@ -658,6 +631,8 @@ impl InProcessEngine {
             if set_default {
                 state
                     .default_config
+                    .entry(resolved_provider_id)
+                    .or_default()
                     .insert(config_id.to_string(), value.to_string());
             }
         }
