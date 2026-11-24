@@ -3,14 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use grein_core::model::{AuthorRole, ConversationNode, Thread, ThreadId, ThreadKind, ThreadStatus};
-use grein_tui::engine_port::{
-    HydratedThread, PtyScreenSnapshot as TuiPtyScreenSnapshot, TuiEngineEvent,
-};
-use grein_workspace::pty_session::InteractivePtySession;
+use grein_core::port::dto::{EngineStreamEvent, HydratedThread, PtyScreenSnapshot};
+use grein_workspace::port::TerminalPtyHandle;
 
 use super::super::types::{
-    normalize_custom_name, parse_typed_id, pty_snapshot_to_tui, storage_err, thread_to_summary,
-    EngineError, ThreadSummary, PTY_COALESCE_WINDOW,
+    normalize_custom_name, parse_typed_id, storage_err, thread_to_summary, EngineError,
+    ThreadSummary, PTY_COALESCE_WINDOW,
 };
 use super::{EngineRuntime, InProcessEngine};
 
@@ -80,12 +78,11 @@ impl EngineRuntime {
                 continue;
             };
             let _ = session.poll_os_cwd();
-            let raw_snap = session.snapshot();
-            let raw_cwd = raw_snap.cwd.clone();
-            let snap = pty_snapshot_to_tui(raw_snap);
+            let snap = session.snapshot();
+            let raw_cwd = snap.cwd.clone();
             let exited = snap.exited;
             let exit_code = snap.exit_code;
-            self.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+            self.emit_tui(EngineStreamEvent::PtyScreenUpdated {
                 thread_id: thread_id.clone(),
                 snapshot: snap,
             });
@@ -100,15 +97,15 @@ impl EngineRuntime {
                     .unwrap_or(false);
                 if newly_exited {
                     if let Some(tid) = parse_typed_id::<ThreadId>(&thread_id) {
-                        if self.storage.get_thread(tid).ok().flatten().is_some() {
-                            let _ = self.storage.update_thread_status(tid, ThreadStatus::Idle);
+                        if self.storage.get_thread(&tid).ok().flatten().is_some() {
+                            let _ = self.storage.update_thread_status(&tid, ThreadStatus::Idle);
                         }
                     }
-                    self.emit_tui(TuiEngineEvent::PtyExited {
+                    self.emit_tui(EngineStreamEvent::PtyExited {
                         thread_id: thread_id.to_string(),
                         exit_code,
                     });
-                    self.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+                    self.emit_tui(EngineStreamEvent::ThreadStatusChanged {
                         thread_id,
                         status: "idle".to_string(),
                     });
@@ -117,7 +114,7 @@ impl EngineRuntime {
         }
         if cwd_updated {
             if let Ok(meta) = self.compute_thread_metadata() {
-                self.emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+                self.emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
             }
         }
     }
@@ -125,7 +122,7 @@ impl EngineRuntime {
     fn sync_pty_cwd_to_storage(
         &self,
         thread_id: &str,
-        session: &Arc<InteractivePtySession>,
+        session: &Arc<dyn TerminalPtyHandle>,
         raw_cwd: Option<&str>,
     ) -> bool {
         let Some(raw_dir) = raw_cwd.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -150,12 +147,12 @@ impl EngineRuntime {
             .ok()
             .is_some_and(|map| {
                 map.get(thread_id)
-                    .is_some_and(|cur| Arc::ptr_eq(cur, session))
+                    .is_some_and(|cur| std::ptr::addr_eq(Arc::as_ptr(cur), Arc::as_ptr(session)))
             });
         if !is_still_current {
             return false;
         }
-        if let Ok(Some(thread)) = self.storage.get_thread(tid) {
+        if let Ok(Some(thread)) = self.storage.get_thread(&tid) {
             if thread.cwd.as_deref() != Some(canonical_dir)
                 && self
                     .storage
@@ -280,19 +277,19 @@ impl EngineRuntime {
         cwd: PathBuf,
         rows: u16,
         cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+    ) -> Result<PtyScreenSnapshot, EngineError> {
         let target_rows = if rows == 0 { 24 } else { rows.max(4) };
         let target_cols = if cols == 0 { 80 } else { cols.max(10) };
         let session = self
             .spawn_pty_for_thread(thread_id, cwd, target_rows, target_cols)
             .await?;
-        let _ = self.storage.update_thread_status(tid, ThreadStatus::Idle);
-        let snap = pty_snapshot_to_tui(session.snapshot());
-        self.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+        let _ = self.storage.update_thread_status(&tid, ThreadStatus::Idle);
+        let snap = session.snapshot();
+        self.emit_tui(EngineStreamEvent::ThreadStatusChanged {
             thread_id: thread_id.to_string(),
             status: "idle".to_string(),
         });
-        self.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+        self.emit_tui(EngineStreamEvent::PtyScreenUpdated {
             thread_id: thread_id.to_string(),
             snapshot: snap.clone(),
         });
@@ -305,7 +302,7 @@ impl EngineRuntime {
         cwd: PathBuf,
         rows: u16,
         cols: u16,
-    ) -> Result<Arc<InteractivePtySession>, EngineError> {
+    ) -> Result<Arc<dyn TerminalPtyHandle>, EngineError> {
         self.ensure_pty_notifier_started();
         let notify_tx = self.pty_notify_tx.clone();
         let tid_for_cb = thread_id.to_string();
@@ -316,12 +313,13 @@ impl EngineRuntime {
         let clamped_cols = cols.max(10);
         let tid_env = thread_id.to_string();
         let is_wt = is_worktree_cwd(&cwd);
-        let spawned = tokio::task::spawn_blocking(move || {
+        let spawner = Arc::clone(&self.pty_spawner);
+        let session = tokio::task::spawn_blocking(move || {
             let mut extra_env: Vec<(&str, &str)> = vec![("GREIN_THREAD_ID", &tid_env)];
             if is_wt {
                 extra_env.push(("GREIN_WORKTREE", "1"));
             }
-            InteractivePtySession::spawn_with_env(
+            spawner.spawn_with_env(
                 &cwd,
                 clamped_rows,
                 clamped_cols,
@@ -334,7 +332,6 @@ impl EngineRuntime {
         .map_err(|e| EngineError::Transport(format!("PTY spawn task panicked: {e}")))?
         .map_err(|e| EngineError::Transport(format!("failed to spawn PTY session: {e}")))?;
 
-        let session = Arc::new(spawned);
         if let Ok(mut exited) = self.pty_exited_threads.lock() {
             exited.remove(thread_id);
         }
@@ -351,7 +348,7 @@ impl EngineRuntime {
         thread: &Thread,
         rows: u16,
         cols: u16,
-    ) -> Result<(Arc<InteractivePtySession>, bool), EngineError> {
+    ) -> Result<(Arc<dyn TerminalPtyHandle>, bool), EngineError> {
         if let Some(existing) = self
             .active_pty_sessions
             .lock()
@@ -412,7 +409,7 @@ impl EngineRuntime {
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         let thread = self
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         if thread.kind != ThreadKind::Terminal {
@@ -440,7 +437,7 @@ impl InProcessEngine {
                 let thread = self
                     .runtime
                     .storage
-                    .get_thread(parent_tid)
+                    .get_thread(&parent_tid)
                     .map_err(storage_err)?
                     .ok_or_else(|| EngineError::NotFound(format!("thread {raw}")))?;
                 Some(thread)
@@ -484,15 +481,15 @@ impl InProcessEngine {
             if let Ok(mut pending) = self.runtime.pending_pty_sizes.lock() {
                 pending.remove(&tid_str);
             }
-            let _ = self.runtime.storage.delete_thread(tid);
+            let _ = self.runtime.storage.delete_thread(&tid);
             return Err(err);
         }
 
         let summary = thread_to_summary(&created, false);
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
-        self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
+        self.runtime.emit_tui(EngineStreamEvent::ThreadCreated {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
@@ -564,7 +561,7 @@ impl InProcessEngine {
         thread_id: &str,
         rows: u16,
         cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+    ) -> Result<PtyScreenSnapshot, EngineError> {
         let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
         let (session, used_pending) = self
             .runtime
@@ -595,25 +592,25 @@ impl InProcessEngine {
         {
             if let Ok(meta) = self.runtime.compute_thread_metadata() {
                 self.runtime
-                    .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+                    .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
             }
         }
-        Ok(pty_snapshot_to_tui(final_snap))
+        Ok(final_snap)
     }
 
     pub(super) async fn pty_scroll_impl(
         &self,
         thread_id: &str,
         delta: isize,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+    ) -> Result<PtyScreenSnapshot, EngineError> {
         let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
         let (session, _) = self
             .runtime
             .ensure_pty_session(thread_id, &thread, 24, 80)
             .await?;
-        session.scroll_by(delta);
-        let snap = pty_snapshot_to_tui(session.snapshot());
-        self.runtime.emit_tui(TuiEngineEvent::PtyScreenUpdated {
+        session.scroll(delta);
+        let snap = session.snapshot();
+        self.runtime.emit_tui(EngineStreamEvent::PtyScreenUpdated {
             thread_id: thread_id.to_string(),
             snapshot: snap.clone(),
         });
@@ -625,7 +622,7 @@ impl InProcessEngine {
         thread_id: &str,
         rows: u16,
         cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+    ) -> Result<PtyScreenSnapshot, EngineError> {
         let (tid, _) = self.runtime.require_terminal_thread(thread_id)?;
         let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
         let (_, thread) = self.runtime.require_terminal_thread(thread_id)?;
@@ -638,7 +635,7 @@ impl InProcessEngine {
             .await?;
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
         Ok(snap)
     }
 }

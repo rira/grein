@@ -1,18 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use grein_core::model::{Thread, ThreadId, ThreadKind};
-use grein_tui::engine_port::{TuiEngineEvent, WorktreeEntry};
-use grein_workspace::allocator::{ThreadId as WorkspaceThreadId, WorktreeAllocator};
-use grein_workspace::git::{GitError, GitRepository};
-use grein_workspace::git_status::inspect_git_status;
-use grein_workspace::pty_session::live_process_cwd;
-use grein_workspace::worktrees::{
-    list_worktrees_across_paths, prune_worktrees as workspace_prune_worktrees,
-    remove_worktree as workspace_remove_worktree, resolve_primary_repo_root,
-    resolve_worktree_toplevel, worktree_diff_preview as workspace_worktree_diff_preview,
-    DiscoveredWorktree,
-};
+use grein_core::port::dto::{EngineStreamEvent, WorktreeEntry};
+use grein_workspace::allocator::WorkspaceError;
+use grein_workspace::worktrees::DiscoveredWorktree;
 
 use super::super::types::{parse_typed_id, storage_err, EngineError};
 use super::{EngineRuntime, InProcessEngine};
@@ -43,7 +36,7 @@ impl EngineRuntime {
                 {
                     push_unique(PathBuf::from(cwd));
                 }
-                if let Some(os_cwd) = live_process_cwd(session.child_pid()) {
+                if let Some(os_cwd) = session.live_cwd() {
                     push_unique(os_cwd);
                 }
             }
@@ -91,7 +84,7 @@ impl InProcessEngine {
         let _initial = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
 
@@ -99,57 +92,30 @@ impl InProcessEngine {
         let thread = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
 
         let cur_cwd_opt = thread.cwd.clone();
         let runtime_cwd = self.runtime.cwd.clone();
         let tid_owned = thread_id.to_string();
+        let workspace = Arc::clone(&self.runtime.workspace);
         let worktree_path = tokio::task::spawn_blocking(move || -> Result<PathBuf, EngineError> {
-            let primary_root = match resolve_primary_repo_root(&runtime_cwd) {
-                Some(root) => root,
-                None => {
-                    let repo = GitRepository::discover(&runtime_cwd).map_err(|err| match err {
-                        GitError::NotFound => EngineError::InvalidParams(format!(
-                            "workspace {} is not inside a git repository",
-                            runtime_cwd.display()
-                        )),
-                        GitError::CommandFailed(msg) => EngineError::Transport(msg),
-                    })?;
-                    std::fs::canonicalize(repo.root()).unwrap_or_else(|_| repo.root().to_path_buf())
-                }
-            };
-
-            let worktrees_base = primary_root.join(".grein").join("worktrees");
-            let canonical_wt_base =
-                std::fs::canonicalize(&worktrees_base).unwrap_or_else(|_| worktrees_base.clone());
-
-            if let Some(cur_cwd) = cur_cwd_opt.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                let cur_path = Path::new(cur_cwd);
-                if cur_path.is_dir() {
-                    if let Some(toplevel) = resolve_worktree_toplevel(cur_path) {
-                        if toplevel.starts_with(&canonical_wt_base) && toplevel.join(".git").exists()
-                        {
-                            return Ok(toplevel);
-                        }
+            let cur_path_opt = cur_cwd_opt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            workspace
+                .open_thread_worktree(&runtime_cwd, &tid_owned, cur_path_opt.as_deref())
+                .map_err(|err| match err {
+                    WorkspaceError::GitError(msg)
+                        if msg.contains("not inside a git repository") =>
+                    {
+                        EngineError::InvalidParams(msg)
                     }
-                }
-            }
-
-            let legacy_dir = worktrees_base.join(&tid_owned);
-            if legacy_dir.is_dir() && legacy_dir.join(".git").exists() {
-                return Ok(legacy_dir);
-            }
-
-            let allocator = WorktreeAllocator::new(GitRepository::new(primary_root));
-            let mut session =
-                allocator.open_session_auto_named(WorkspaceThreadId::from(tid_owned));
-            session
-                .transition_to_isolated_worktree()
-                .map_err(|e| EngineError::Transport(format!("failed to create worktree: {e}")))?;
-            Ok(session.working_directory().to_path_buf())
+                    other => EngineError::Transport(format!("failed to create worktree: {other}")),
+                })
         })
         .await
         .map_err(|e| EngineError::Transport(format!("worktree task panicked: {e}")))??;
@@ -200,7 +166,7 @@ impl InProcessEngine {
 
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
         Ok(path_str)
     }
 
@@ -212,16 +178,18 @@ impl InProcessEngine {
             .iter()
             .map(|t| (t.id.0.to_string(), self.runtime.effective_thread_dir(t)))
             .collect();
+        let workspace = Arc::clone(&self.runtime.workspace);
+        let git_inspector = Arc::clone(&self.runtime.git_inspector);
 
         tokio::task::spawn_blocking(move || {
-            let discovered = list_worktrees_across_paths(&search_paths, Some(&preferred_hint));
+            let discovered = workspace.list_worktrees(&search_paths, Some(&preferred_hint));
             let mut attached: Vec<Vec<String>> = vec![Vec::new(); discovered.len()];
             let mut toplevel_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
 
             for (tid_str, t_dir) in thread_dirs {
                 let toplevel = toplevel_cache
                     .entry(t_dir.clone())
-                    .or_insert_with(|| resolve_worktree_toplevel(&t_dir))
+                    .or_insert_with(|| git_inspector.resolve_worktree_toplevel(&t_dir))
                     .as_deref();
                 if let Some(idx) =
                     EngineRuntime::longest_matching_worktree_index(&t_dir, toplevel, &discovered)
@@ -268,7 +236,7 @@ impl InProcessEngine {
         let _initial = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
 
@@ -276,7 +244,7 @@ impl InProcessEngine {
         let thread = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
 
@@ -291,6 +259,8 @@ impl InProcessEngine {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.runtime.cwd.clone());
+        let workspace = Arc::clone(&self.runtime.workspace);
+        let git_inspector = Arc::clone(&self.runtime.git_inspector);
 
         let (canonical_target, changed) = tokio::task::spawn_blocking(move || -> Result<(PathBuf, bool), EngineError> {
             let canonical_target = std::fs::canonicalize(&raw_target).map_err(|_| {
@@ -305,7 +275,7 @@ impl InProcessEngine {
                     canonical_target.display()
                 )));
             }
-            let discovered = list_worktrees_across_paths(&search_paths, Some(&preferred_hint));
+            let discovered = workspace.list_worktrees(&search_paths, Some(&preferred_hint));
             if !discovered.iter().any(|wt| wt.path == canonical_target) {
                 return Err(EngineError::InvalidParams(format!(
                     "path is not a registered worktree: {}",
@@ -313,7 +283,7 @@ impl InProcessEngine {
                 )));
             }
 
-            let cur_toplevel = resolve_worktree_toplevel(&cur_cwd);
+            let cur_toplevel = git_inspector.resolve_worktree_toplevel(&cur_cwd);
             let changed = cur_toplevel.as_ref() != Some(&canonical_target);
             Ok((canonical_target, changed))
         })
@@ -359,7 +329,7 @@ impl InProcessEngine {
 
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
         Ok(target_str)
     }
 
@@ -379,6 +349,8 @@ impl InProcessEngine {
         let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
         let search_paths = self.runtime.collect_worktree_search_paths(&threads);
         let preferred_hint = self.runtime.cwd.clone();
+        let workspace_for_inspect = Arc::clone(&self.runtime.workspace);
+        let git_inspector = Arc::clone(&self.runtime.git_inspector);
 
         let (entry, attached_thread_ids) = tokio::task::spawn_blocking(
             move || -> Result<(DiscoveredWorktree, Vec<String>), EngineError> {
@@ -388,7 +360,8 @@ impl InProcessEngine {
                         raw_target.display()
                     ))
                 })?;
-                let discovered = list_worktrees_across_paths(&search_paths, Some(&preferred_hint));
+                let discovered =
+                    workspace_for_inspect.list_worktrees(&search_paths, Some(&preferred_hint));
                 let Some(target_idx) =
                     discovered.iter().position(|wt| wt.path == canonical_target)
                 else {
@@ -404,7 +377,9 @@ impl InProcessEngine {
                     ));
                 }
                 if !force
-                    && inspect_git_status(&canonical_target).is_some_and(|st| st.dirty_count > 0)
+                    && git_inspector
+                        .inspect_git_status(&canonical_target)
+                        .is_some_and(|st| st.dirty_count > 0)
                 {
                     return Err(EngineError::InvalidParams(format!(
                         "worktree {} has uncommitted changes; pass force=true to remove",
@@ -424,7 +399,7 @@ impl InProcessEngine {
                     };
                     let raw_path = PathBuf::from(raw_cwd);
                     let canon_cwd = std::fs::canonicalize(&raw_path).unwrap_or(raw_path);
-                    let toplevel = resolve_worktree_toplevel(&canon_cwd);
+                    let toplevel = git_inspector.resolve_worktree_toplevel(&canon_cwd);
                     let matched_idx = EngineRuntime::longest_matching_worktree_index(
                         &canon_cwd,
                         toplevel.as_deref(),
@@ -455,7 +430,7 @@ impl InProcessEngine {
             let Some(tid) = parse_typed_id::<ThreadId>(tid_str) else {
                 continue;
             };
-            let Some(thread) = self.runtime.storage.get_thread(tid).map_err(storage_err)? else {
+            let Some(thread) = self.runtime.storage.get_thread(&tid).map_err(storage_err)? else {
                 continue;
             };
             if thread.kind == ThreadKind::Terminal {
@@ -478,8 +453,9 @@ impl InProcessEngine {
 
         let repo_root_for_rm = entry.repo_root.clone();
         let target_for_rm = entry.path.clone();
+        let workspace_for_rm = Arc::clone(&self.runtime.workspace);
         tokio::task::spawn_blocking(move || {
-            workspace_remove_worktree(&repo_root_for_rm, &target_for_rm, force, false)
+            workspace_for_rm.remove_worktree(&repo_root_for_rm, &target_for_rm, force, false)
         })
         .await
         .map_err(|e| EngineError::Transport(format!("remove_worktree task panicked: {e}")))?
@@ -495,7 +471,7 @@ impl InProcessEngine {
         drop(turn_guards);
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
         Ok(())
     }
 
@@ -510,7 +486,8 @@ impl InProcessEngine {
             ));
         }
         let target = PathBuf::from(trimmed);
-        tokio::task::spawn_blocking(move || workspace_worktree_diff_preview(&target, 400))
+        let workspace = Arc::clone(&self.runtime.workspace);
+        tokio::task::spawn_blocking(move || workspace.diff_preview(&target, 400))
             .await
             .map_err(|e| {
                 EngineError::Transport(format!("worktree_diff_preview task panicked: {e}"))
@@ -519,7 +496,8 @@ impl InProcessEngine {
 
     pub(super) async fn prune_worktrees_impl(&self) -> Result<String, EngineError> {
         let repo_hint = self.runtime.cwd.clone();
-        tokio::task::spawn_blocking(move || workspace_prune_worktrees(&repo_hint))
+        let workspace = Arc::clone(&self.runtime.workspace);
+        tokio::task::spawn_blocking(move || workspace.prune_worktrees(&repo_hint))
             .await
             .map_err(|e| EngineError::Transport(format!("prune_worktrees task panicked: {e}")))?
             .map_err(|e| EngineError::InvalidParams(format!("failed to prune worktrees: {e}")))

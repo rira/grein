@@ -1,12 +1,15 @@
+use std::sync::Arc;
+
 use grein_core::blackboard::{BlackboardEntry as LegacyBbEntry, BlackboardEntryKind};
 use grein_core::model::ThreadId;
+use grein_core::port::dto::TuiEngineEvent;
 use grein_core::storage::sqlite::SqliteStorage;
-use grein_tui::engine_port::TuiEngineEvent;
 use serde_json::Value;
 
 use super::super::types::parse_typed_id;
-use super::super::{AcpBackendConfig, DaemonEngine, EngineError, InProcessEngine};
+use super::super::{AcpBackendConfig, EngineDependencies, EngineError, InProcessEngine};
 use super::write_executable_script;
+use crate::subagent_watch::NoopSubagentObserver;
 
 #[tokio::test]
 async fn test_sqlite_hydration_across_reopen_preserves_threads_and_ignores_legacy_blackboard() {
@@ -160,9 +163,10 @@ done
         cwd: temp.path().to_path_buf(),
     };
 
-    let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
-        .expect("open");
-    engine.set_test_subagent_brain(temp.path().join("missing-brain"));
+    let storage = Arc::new(SqliteStorage::open(&db_path).expect("open sqlite"));
+    let mut deps = EngineDependencies::for_storage(storage, temp.path().to_path_buf(), Some(cfg));
+    deps.subagent_observer = Arc::new(NoopSubagentObserver::new());
+    let engine = InProcessEngine::with_dependencies(deps).expect("open");
     let main = engine.ensure_main_thread().await.expect("main");
 
     // Sole-thread guard
@@ -289,7 +293,7 @@ done
     let main_session_id_before = engine
         .runtime
         .storage
-        .get_thread(main_tid)
+        .get_thread(&main_tid)
         .unwrap()
         .unwrap()
         .acp_session_id
@@ -305,7 +309,7 @@ done
     assert!(!engine
         .runtime
         .storage
-        .get_thread(main_tid)
+        .get_thread(&main_tid)
         .unwrap()
         .unwrap()
         .merged);
@@ -374,7 +378,7 @@ done
     let main_session_id_after = engine
         .runtime
         .storage
-        .get_thread(main_tid)
+        .get_thread(&main_tid)
         .unwrap()
         .unwrap()
         .acp_session_id
@@ -401,7 +405,7 @@ done
     assert!(!engine
         .runtime
         .storage
-        .get_thread(blank_tid)
+        .get_thread(&blank_tid)
         .unwrap()
         .unwrap()
         .merged);

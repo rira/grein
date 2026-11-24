@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use grein_core::error::CoreError;
@@ -7,9 +7,9 @@ use grein_core::model::{
     Anchor, AnchorId, AuthorRole, ConversationNode, NodeId, Thread, ThreadId, ThreadKind,
     ThreadStatus,
 };
+use grein_core::port::dto::{EngineStreamEvent, HydratedThread, HydratedTurn, ThreadMeta};
 use grein_core::sync::synthesize_thread_merge;
-use grein_tui::engine_port::{HydratedThread, HydratedTurn, ThreadMeta, TuiEngineEvent};
-use grein_workspace::git_status::{inspect_git_status, RepoGitStatus};
+use grein_workspace::git_status::RepoGitStatus;
 use tokio::sync::oneshot;
 
 use super::super::types::{
@@ -26,7 +26,7 @@ impl EngineRuntime {
     ) -> Result<Vec<TranscriptEntry>, EngineError> {
         let path = self
             .storage
-            .get_trunk_path(thread.active_leaf_id)
+            .get_trunk_path(&thread.active_leaf_id)
             .map_err(storage_err)?;
         let threads = self.storage.list_threads().map_err(storage_err)?;
         let is_first_thread = threads.first().is_some_and(|first| first.id == thread.id);
@@ -46,16 +46,6 @@ impl EngineRuntime {
     }
 
     pub(super) fn compute_thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
-        self.compute_thread_metadata_with_inspector(inspect_git_status)
-    }
-
-    pub(in crate::engine) fn compute_thread_metadata_with_inspector<F>(
-        &self,
-        mut inspector: F,
-    ) -> Result<Vec<ThreadMeta>, EngineError>
-    where
-        F: FnMut(&Path) -> Option<RepoGitStatus>,
-    {
         let threads = self.storage.list_threads().map_err(storage_err)?;
         if threads.is_empty() {
             return Ok(Vec::new());
@@ -142,7 +132,7 @@ impl EngineRuntime {
                 .unwrap_or_else(|| self.cwd.clone());
             let git_status = git_cache
                 .entry(target_path)
-                .or_insert_with_key(|path| inspector(path))
+                .or_insert_with_key(|path| self.git_inspector.inspect_git_status(path))
                 .as_ref();
             let git_branch = git_status.and_then(|s| s.branch.clone());
             let git_dirty = git_status.map_or(0, |s| s.dirty_count);
@@ -200,7 +190,7 @@ impl EngineRuntime {
         }
         self.storage.insert_thread(&thread).map_err(storage_err)?;
         self.storage
-            .get_thread(thread.id)
+            .get_thread(&thread.id)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::Storage("created thread missing".to_string()))
     }
@@ -251,14 +241,14 @@ impl InProcessEngine {
         if leaf_id != root_id {
             self.runtime
                 .storage
-                .update_thread_leaf(tid, leaf_id)
+                .update_thread_leaf(&tid, &leaf_id)
                 .map_err(storage_err)?;
         }
         state.last_node = Some(leaf_id);
         let created = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::Storage("created Main thread missing".to_string()))?;
         Ok(thread_to_summary(&created, true))
@@ -275,7 +265,7 @@ impl InProcessEngine {
                 Some(raw) => {
                     if let Some(tid) = parse_typed_id::<ThreadId>(raw) {
                         if let Some(thread) =
-                            self.runtime.storage.get_thread(tid).map_err(storage_err)?
+                            self.runtime.storage.get_thread(&tid).map_err(storage_err)?
                         {
                             if thread.kind == ThreadKind::Terminal {
                                 return Err(EngineError::InvalidParams(
@@ -287,7 +277,7 @@ impl InProcessEngine {
                         } else if let Some(node) = self
                             .runtime
                             .storage
-                            .get_node(NodeId(tid.0))
+                            .get_node(&NodeId(tid.0))
                             .map_err(storage_err)?
                         {
                             (node.id, None, None)
@@ -342,7 +332,7 @@ impl InProcessEngine {
             .collect();
 
         let summary = thread_to_summary(&created, false);
-        self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
+        self.runtime.emit_tui(EngineStreamEvent::ThreadCreated {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
@@ -352,7 +342,7 @@ impl InProcessEngine {
         });
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
         Ok(summary)
     }
 
@@ -420,7 +410,7 @@ impl InProcessEngine {
         }
 
         let summary = thread_to_summary(&created, false);
-        self.runtime.emit_tui(TuiEngineEvent::ThreadCreated {
+        self.runtime.emit_tui(EngineStreamEvent::ThreadCreated {
             thread: HydratedThread {
                 id: summary.thread_id.clone(),
                 title: summary.title.clone(),
@@ -430,7 +420,7 @@ impl InProcessEngine {
         });
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
         Ok(summary)
     }
 
@@ -453,9 +443,10 @@ impl InProcessEngine {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let inspector = Arc::clone(&self.runtime.git_inspector);
         tokio::task::spawn_blocking(move || {
             let target_root = explicit.filter(|p| p.is_dir()).unwrap_or(fallback);
-            grein_workspace::list_workspace_files(&target_root, 5_000)
+            inspector.list_workspace_files(&target_root, 5_000)
         })
         .await
         .map_err(|e| EngineError::Transport(format!("list_workspace_files task panicked: {e}")))
@@ -482,7 +473,7 @@ impl InProcessEngine {
         let updated = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         let threads = self.runtime.storage.list_threads().map_err(storage_err)?;
@@ -490,7 +481,7 @@ impl InProcessEngine {
         let summary = thread_to_summary(&updated, is_first);
 
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadCustomNameUpdated {
+            .emit_tui(EngineStreamEvent::ThreadCustomNameUpdated {
                 thread_id: summary.thread_id.clone(),
                 custom_name: summary.custom_name.clone(),
             });
@@ -528,7 +519,7 @@ impl InProcessEngine {
         let thread = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         self.runtime.load_thread_turns(&thread)
@@ -545,7 +536,7 @@ impl InProcessEngine {
         let source = self
             .runtime
             .storage
-            .get_thread(source_tid)
+            .get_thread(&source_tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {source_id}")))?;
         if source.kind == ThreadKind::Terminal {
@@ -557,7 +548,7 @@ impl InProcessEngine {
         let explicit_target = match target_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw) => match parse_typed_id::<ThreadId>(raw) {
                 Some(tid) if tid != source_tid => {
-                    self.runtime.storage.get_thread(tid).map_err(storage_err)?
+                    self.runtime.storage.get_thread(&tid).map_err(storage_err)?
                 }
                 _ => None,
             },
@@ -575,7 +566,7 @@ impl InProcessEngine {
                     .and_then(|pid| parse_typed_id::<ThreadId>(&pid))
                     .filter(|tid| *tid != source_tid);
                 match parent_tid {
-                    Some(pid) => self.runtime.storage.get_thread(pid).map_err(storage_err)?,
+                    Some(pid) => self.runtime.storage.get_thread(&pid).map_err(storage_err)?,
                     None => None,
                 }
             }
@@ -641,7 +632,7 @@ impl InProcessEngine {
         let fresh_target = self
             .runtime
             .storage
-            .get_thread(target.id)
+            .get_thread(&target.id)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {target_id_str}")))?;
         let landmark_node = synthesize_thread_merge(
@@ -657,7 +648,7 @@ impl InProcessEngine {
             .map_err(storage_err)?;
         self.runtime
             .storage
-            .update_thread_leaf(fresh_target.id, landmark_node.id)
+            .update_thread_leaf(&fresh_target.id, &landmark_node.id)
             .map_err(storage_err)?;
         {
             let mut state = self.runtime.lock()?;
@@ -674,18 +665,18 @@ impl InProcessEngine {
         let updated = self
             .runtime
             .storage
-            .get_thread(source_tid)
+            .get_thread(&source_tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {source_id}")))?;
 
-        self.runtime.emit_tui(TuiEngineEvent::ThreadMerged {
+        self.runtime.emit_tui(EngineStreamEvent::ThreadMerged {
             thread_id: updated.id.0.to_string(),
             target_thread_id: target_id_str,
             summary: resolved_summary,
         });
         let meta = self.runtime.compute_thread_metadata()?;
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta });
 
         Ok(thread_to_summary(&updated, source_is_first))
     }
@@ -736,7 +727,7 @@ impl InProcessEngine {
                 .remove(thread_id)
                 .map(|s| (s.session_id.clone(), s.driver_gen))
         };
-        self.runtime.subagent_watch().clear_thread(thread_id);
+        self.runtime.subagent_observer.clear_thread(thread_id);
 
         if let Some((session_id, driver_gen)) = removed_session {
             let driver_opt = {
@@ -765,7 +756,7 @@ impl InProcessEngine {
             .map_err(storage_err)?;
         self.runtime
             .storage
-            .delete_thread(tid)
+            .delete_thread(&tid)
             .map_err(storage_err)?;
         let remaining = self.runtime.storage.list_threads().map_err(storage_err)?;
         if let Ok(mut state) = self.runtime.lock() {
@@ -778,12 +769,12 @@ impl InProcessEngine {
             .unwrap_or_default();
 
         let meta_after = self.runtime.compute_thread_metadata()?;
-        self.runtime.emit_tui(TuiEngineEvent::ThreadDeleted {
+        self.runtime.emit_tui(EngineStreamEvent::ThreadDeleted {
             thread_id: thread_id.to_string(),
             next_active_thread_id: next_active_thread_id.clone(),
         });
         self.runtime
-            .emit_tui(TuiEngineEvent::ThreadMetadataUpdated { meta: meta_after });
+            .emit_tui(EngineStreamEvent::ThreadMetadataUpdated { meta: meta_after });
         Ok(next_active_thread_id)
     }
 }

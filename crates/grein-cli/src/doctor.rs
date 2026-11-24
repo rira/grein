@@ -2,6 +2,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_core::{default_prefs_db_path, UserPrefsStore};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::args::DoctorArgs;
 use crate::daemon::resolve_state_dir;
-use crate::discovery::{resolve_agents_configuration, AcpAgentKind};
+use crate::discovery::{resolve_agents_configuration, AcpAgent, AcpAgentKind, DiscoveryError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +31,37 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub ok: bool,
     pub checks: Vec<DoctorCheck>,
+}
+
+pub type DbProbe = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+pub type AgentDiscoverer = Arc<dyn Fn() -> Result<Vec<AcpAgent>, DiscoveryError> + Send + Sync>;
+
+pub struct DoctorDeps {
+    pub cwd: PathBuf,
+    pub prefs_db_path: Option<PathBuf>,
+    pub session_db_probe: DbProbe,
+    pub prefs_db_probe: DbProbe,
+    pub agent_discoverer: AgentDiscoverer,
+}
+
+impl DoctorDeps {
+    pub fn from_env() -> Self {
+        Self {
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            prefs_db_path: default_prefs_db_path(),
+            session_db_probe: Arc::new(|path| {
+                SqliteStorage::open(path)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }),
+            prefs_db_probe: Arc::new(|path| {
+                UserPrefsStore::open(path)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }),
+            agent_discoverer: Arc::new(|| resolve_agents_configuration(None::<&Path>, None)),
+        }
+    }
 }
 
 fn check_git() -> DoctorCheck {
@@ -85,7 +117,7 @@ fn check_shell() -> DoctorCheck {
     }
 }
 
-fn check_acp_agents() -> DoctorCheck {
+fn check_acp_agents(agent_discoverer: &AgentDiscoverer) -> DoctorCheck {
     if let Ok(bin) = std::env::var("GREIN_ACP_BIN") {
         let trimmed = bin.trim();
         if !trimmed.is_empty() {
@@ -103,7 +135,7 @@ fn check_acp_agents() -> DoctorCheck {
         }
     }
 
-    match resolve_agents_configuration(None::<&Path>, None) {
+    match (agent_discoverer)() {
         Ok(agents) if !agents.is_empty() => {
             let summary = agents
                 .into_iter()
@@ -180,15 +212,15 @@ fn check_terminal_env() -> DoctorCheck {
     }
 }
 
-fn check_workspace_state(cwd: &Path) -> DoctorCheck {
+fn check_workspace_state(cwd: &Path, probe: &DbProbe) -> DoctorCheck {
     let state_dir = resolve_state_dir(cwd);
     let db_path = state_dir.join("session.db");
     let socket_path = state_dir.join("daemon.sock");
     let socket_reachable = socket_path.exists() && UnixStream::connect(&socket_path).is_ok();
 
     if db_path.exists() {
-        match SqliteStorage::open(&db_path) {
-            Ok(_) => DoctorCheck {
+        match (probe)(&db_path) {
+            Ok(()) => DoctorCheck {
                 name: "workspace_state".to_string(),
                 status: CheckStatus::Ok,
                 detail: format!(
@@ -218,7 +250,7 @@ fn check_workspace_state(cwd: &Path) -> DoctorCheck {
     }
 }
 
-fn check_preferences_db(prefs_path: Option<PathBuf>) -> DoctorCheck {
+fn check_preferences_db(prefs_path: Option<&Path>, probe: &DbProbe) -> DoctorCheck {
     let Some(path) = prefs_path else {
         return DoctorCheck {
             name: "preferences_db".to_string(),
@@ -228,8 +260,8 @@ fn check_preferences_db(prefs_path: Option<PathBuf>) -> DoctorCheck {
     };
 
     if path.exists() {
-        match UserPrefsStore::open(&path) {
-            Ok(_) => DoctorCheck {
+        match (probe)(path) {
+            Ok(()) => DoctorCheck {
                 name: "preferences_db".to_string(),
                 status: CheckStatus::Ok,
                 detail: format!("{} (ok)", path.display()),
@@ -249,22 +281,28 @@ fn check_preferences_db(prefs_path: Option<PathBuf>) -> DoctorCheck {
     }
 }
 
-pub fn collect_doctor_report() -> DoctorReport {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+pub fn collect_doctor_report_with(deps: &DoctorDeps) -> DoctorReport {
     let checks = vec![
         check_git(),
         check_shell(),
-        check_acp_agents(),
+        check_acp_agents(&deps.agent_discoverer),
         check_terminal_env(),
-        check_workspace_state(&cwd),
-        check_preferences_db(default_prefs_db_path()),
+        check_workspace_state(&deps.cwd, &deps.session_db_probe),
+        check_preferences_db(deps.prefs_db_path.as_deref(), &deps.prefs_db_probe),
     ];
     let ok = !checks.iter().any(|c| c.status == CheckStatus::Error);
     DoctorReport { ok, checks }
 }
 
-pub fn handle_doctor(args: &DoctorArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let report = collect_doctor_report();
+pub fn collect_doctor_report() -> DoctorReport {
+    collect_doctor_report_with(&DoctorDeps::from_env())
+}
+
+pub fn handle_doctor_with(
+    args: &DoctorArgs,
+    deps: &DoctorDeps,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let report = collect_doctor_report_with(deps);
     if args.json {
         let encoded = serde_json::to_string_pretty(&report)?;
         println!("{encoded}");
@@ -286,6 +324,10 @@ pub fn handle_doctor(args: &DoctorArgs) -> Result<(), Box<dyn std::error::Error 
             "doctor reported one or more critical errors",
         )))
     }
+}
+
+pub fn handle_doctor(args: &DoctorArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    handle_doctor_with(args, &DoctorDeps::from_env())
 }
 
 #[cfg(test)]
@@ -313,16 +355,17 @@ mod tests {
     #[test]
     fn test_check_preferences_db_detects_missing_and_corrupt_files() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let deps = DoctorDeps::from_env();
         let missing = temp.path().join("nonexistent.db");
-        let missing_check = check_preferences_db(Some(missing));
+        let missing_check = check_preferences_db(Some(&missing), &deps.prefs_db_probe);
         assert_eq!(missing_check.status, CheckStatus::Ok);
 
         let dir_as_db = temp.path().join("dir.db");
         std::fs::create_dir_all(&dir_as_db).expect("mkdir");
-        let corrupt_check = check_preferences_db(Some(dir_as_db));
+        let corrupt_check = check_preferences_db(Some(&dir_as_db), &deps.prefs_db_probe);
         assert_eq!(corrupt_check.status, CheckStatus::Error);
 
-        let unset_check = check_preferences_db(None);
+        let unset_check = check_preferences_db(None, &deps.prefs_db_probe);
         assert_eq!(unset_check.status, CheckStatus::Warn);
     }
 }

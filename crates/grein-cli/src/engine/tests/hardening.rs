@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_core::port::dto::TuiEngineEvent;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -9,7 +9,7 @@ use tokio::time::timeout;
 
 use super::super::rpc::rpc_error;
 use super::super::{
-    dispatch_json_rpc, AcpBackendConfig, DaemonEngine, EngineClient, EngineError, InProcessEngine,
+    dispatch_json_rpc, AcpBackendConfig, EngineClient, EngineError, InProcessEngine,
     PermissionDecisionPayload, UnixSocketEngineClient,
 };
 use super::write_executable_script;
@@ -544,7 +544,7 @@ done
     let in_proc_engine =
         InProcessEngine::open_with_config(&in_proc_db, canonical_repo.clone(), Some(cfg.clone()))
             .expect("open inproc");
-    let in_proc_client = EngineClient::InProcess(Box::new(in_proc_engine));
+    let in_proc_client = EngineClient::in_process(in_proc_engine);
     exercise_engine_client_methods(&in_proc_client, &repo_str).await;
     drop(in_proc_client);
 
@@ -565,7 +565,7 @@ done
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let sock_client = EngineClient::Socket(
+    let sock_client = EngineClient::socket(
         UnixSocketEngineClient::connect(&sock_path)
             .await
             .expect("connect socket client"),

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use crate::engine::{dispatch_json_rpc, DaemonEngine, InProcessEngine};
+use crate::engine::{dispatch_json_rpc, GreinEngine, InProcessEngine};
 
 const STATE_DIR_NAME: &str = ".grein";
 
@@ -41,7 +41,7 @@ pub async fn run_daemon_with_socket(
     run_daemon_with_socket_and_db(socket_path, db_path).await
 }
 
-async fn handle_legacy(engine: &InProcessEngine, line: &str) -> String {
+async fn handle_legacy(engine: &dyn GreinEngine, line: &str) -> String {
     if line == "ping" {
         return "pong\n".to_string();
     }
@@ -80,7 +80,7 @@ pub async fn run_daemon_with_socket_and_db(
 
 pub async fn run_daemon_with_engine(
     socket_path: PathBuf,
-    engine: Arc<InProcessEngine>,
+    engine: Arc<dyn GreinEngine>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -119,7 +119,9 @@ pub async fn run_daemon_with_engine(
                                         {
                                             break;
                                         }
-                                        let mut rx = engine.subscribe_tui_events();
+                                        let Ok(Some(mut rx)) = engine.subscribe_events().await else {
+                                            break;
+                                        };
                                         while let Some(ev) = rx.recv().await {
                                             let Ok(encoded) = serde_json::to_string(&ev) else {
                                                 continue;
@@ -173,7 +175,7 @@ mod tests {
     use super::*;
     use crate::client::connect_to_daemon;
     use crate::engine::UnixSocketEngineClient;
-    use grein_tui::engine_port::TuiEngineEvent;
+    use grein_core::port::dto::TuiEngineEvent;
     use std::time::Duration;
     use tokio::net::UnixStream;
     use tokio::time::timeout;
@@ -384,7 +386,7 @@ mod tests {
                 .session_pty_snapshot(&term_id, 26, 96)
                 .await
                 .expect("session_pty_snapshot");
-            let snap: grein_tui::engine_port::PtyScreenSnapshot =
+            let snap: grein_core::port::dto::PtyScreenSnapshot =
                 serde_json::from_value(snap_rpc["result"].clone()).expect("decode PtyScreenSnapshot");
             assert_eq!(snap.rows, 26);
             assert_eq!(snap.cols, 96);
@@ -485,7 +487,7 @@ mod tests {
             .session_pty_scroll(&term.thread_id, 10)
             .await
             .expect("session_pty_scroll rpc");
-        let scroll_snap: grein_tui::engine_port::PtyScreenSnapshot =
+        let scroll_snap: grein_core::port::dto::PtyScreenSnapshot =
             serde_json::from_value(scroll_rpc["result"].clone()).expect("decode scroll snapshot");
         assert_eq!(scroll_snap.scrollback_offset, 10);
 
@@ -518,7 +520,7 @@ mod tests {
             .session_pty_restart(&term.thread_id, 28, 100)
             .await
             .expect("session_pty_restart rpc");
-        let restart_snap: grein_tui::engine_port::PtyScreenSnapshot =
+        let restart_snap: grein_core::port::dto::PtyScreenSnapshot =
             serde_json::from_value(restart_rpc["result"].clone()).expect("decode restart snapshot");
         assert!(!restart_snap.exited);
         assert_eq!(restart_snap.exit_code, None);
@@ -559,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_socket_worktree_rpc_round_trip() {
-        use crate::engine::{DaemonEngine as _, InProcessEngine};
+        use crate::engine::InProcessEngine;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_dir = temp.path().join("repo");
@@ -723,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_daemon_socket_rename_thread_dedicated_and_blank_clear() {
-        use crate::engine::{AcpBackendConfig, DaemonEngine as _, InProcessEngine};
+        use crate::engine::{AcpBackendConfig, InProcessEngine};
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");

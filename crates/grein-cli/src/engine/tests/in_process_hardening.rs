@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use super::super::{AcpBackendConfig, DaemonEngine, EngineError, InProcessEngine};
+use super::super::{AcpBackendConfig, EngineError, InProcessEngine};
 use super::write_executable_script;
 
 fn init_git_repo(dir: &std::path::Path) {

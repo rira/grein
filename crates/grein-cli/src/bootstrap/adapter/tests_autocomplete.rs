@@ -1,8 +1,10 @@
 use std::process::Command;
 
-use grein_cli::engine::{
-    DaemonEngine, EngineError, EngineEvent, InProcessEngine, PermissionDecisionPayload,
-    SessionSnapshot, ShellCommandResult, ThreadSummary, TranscriptEntry, TurnDispatchResult,
+use crate::engine::{
+    AgentTurnPort, AutocompleteContextPort, EngineError, EngineEvent, EngineEventPort,
+    InProcessEngine, PermissionDecisionPayload, SessionSnapshot, ShellCommandResult,
+    ShellUseCasePort, TerminalPtyUseCasePort, ThreadSummary, ThreadUseCasePort, TranscriptEntry,
+    TurnDispatchResult, WorktreeUseCasePort,
 };
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, ThreadStatus};
 use grein_core::storage::sqlite::SqliteStorage;
@@ -138,10 +140,7 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
     }
 
     #[async_trait::async_trait]
-    impl DaemonEngine for StaleMockEngine {
-        async fn ping(&self) -> Result<(), EngineError> {
-            Ok(())
-        }
+    impl ThreadUseCasePort for StaleMockEngine {
         async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
             Ok(ThreadSummary {
                 thread_id: "t-main".into(),
@@ -152,16 +151,6 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
                 merged: false,
                 status: ThreadStatus::Idle,
             })
-        }
-        async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> {
-            unreachable!()
-        }
-        async fn send_turn_for_thread(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<TurnDispatchResult, EngineError> {
-            unreachable!()
         }
         async fn fork_thread(&self, _: Option<&str>) -> Result<ThreadSummary, EngineError> {
             unreachable!()
@@ -214,6 +203,23 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
         ) -> Result<ThreadSummary, EngineError> {
             unreachable!()
         }
+        async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnPort for StaleMockEngine {
+        async fn send_turn(&self, _: &str) -> Result<TurnDispatchResult, EngineError> {
+            unreachable!()
+        }
+        async fn send_turn_for_thread(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<TurnDispatchResult, EngineError> {
+            unreachable!()
+        }
         async fn resolve_permission(
             &self,
             _: PermissionDecisionPayload,
@@ -223,12 +229,19 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
         async fn cancel_turn(&self, _: &str) -> Result<(), EngineError> {
             Ok(())
         }
+    }
+
+    #[async_trait::async_trait]
+    impl ShellUseCasePort for StaleMockEngine {
         async fn run_shell_command(&self, _: &str, _: &str) -> Result<ShellCommandResult, EngineError> {
             unreachable!()
         }
-        async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
-            unreachable!()
-        }
+    }
+    impl TerminalPtyUseCasePort for StaleMockEngine {}
+    impl WorktreeUseCasePort for StaleMockEngine {}
+
+    #[async_trait::async_trait]
+    impl AutocompleteContextPort for StaleMockEngine {
         async fn list_recent_user_prompts(&self, _: usize) -> Result<Vec<String>, EngineError> {
             if self.fail_transport {
                 Err(EngineError::Transport("broken pipe".into()))
@@ -244,6 +257,13 @@ async fn test_engine_client_port_graceful_fallback_on_32601_and_unsupported() {
             } else {
                 Err(EngineError::Protocol("-32601: unsupported".into()))
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EngineEventPort for StaleMockEngine {
+        async fn ping(&self) -> Result<(), EngineError> {
+            Ok(())
         }
     }
 

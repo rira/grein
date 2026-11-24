@@ -1,5 +1,5 @@
 use grein_core::model::ThreadKind;
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_core::port::dto::TuiEngineEvent;
 
 use super::super::{EngineError, InProcessEngine};
 

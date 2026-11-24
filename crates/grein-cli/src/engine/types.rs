@@ -2,25 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
-use grein_acp::{
-    AcpConfigOption, AcpPermissionOption, AcpSessionInfo, StdioRunnerError,
-};
-use grein_core::model::{AuthorRole, ConversationNode, NodeId, Thread, ThreadKind, ThreadStatus};
-use grein_tui::engine_port::{
-    AgentConfigChoice, AgentConfigOption, AgentOptionsSnapshot, AgentSlashCommand,
-    PtyCell as TuiPtyCell, PtyColor as TuiPtyColor, PtyMouseEncoding as TuiPtyMouseEncoding,
-    PtyMouseMode as TuiPtyMouseMode, PtyScreenSnapshot as TuiPtyScreenSnapshot, ThreadMeta,
-    TuiEngineEvent, WorktreeEntry,
-};
-use grein_workspace::pty_session::{
-    PtyCell as WsPtyCell, PtyColor as WsPtyColor, PtyMouseEncoding as WsPtyMouseEncoding,
-    PtyMouseMode as WsPtyMouseMode, PtyScreenSnapshot as WsPtyScreenSnapshot,
+use grein_acp::{AcpConfigOption, AcpPermissionOption, AcpSessionInfo, AgentDriverError};
+use grein_core::model::{AuthorRole, ConversationNode, NodeId, Thread, ThreadKind};
+pub use grein_core::port::dto::{
+    AgentConfigChoice, AgentConfigOption, AgentMetaEntry, EngineControlEvent as EngineEvent,
+    PermissionDecisionPayload, SessionSnapshot, ShellCommandResult, ThreadSummary,
+    TranscriptEntry, TurnDispatchResult,
 };
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use crate::discovery::{discover_acp_agents, AcpAgentKind};
 
@@ -126,254 +116,6 @@ impl AcpBackendConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum EngineEvent {
-    TurnRecorded { node_id: String },
-    ThreadForked { thread_id: String },
-    ThreadMerged { thread_id: String },
-    PermissionResolved { request_id: String, allow: bool },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ThreadSummary {
-    pub thread_id: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub custom_name: Option<String>,
-    pub parent_node_id: String,
-    #[serde(default)]
-    pub active_leaf_id: String,
-    pub merged: bool,
-    #[serde(default)]
-    pub status: ThreadStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TranscriptEntry {
-    pub node_id: String,
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSnapshot {
-    pub node_count: usize,
-    pub thread_count: usize,
-    pub threads: Vec<ThreadSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnDispatchResult {
-    pub node_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionDecisionPayload {
-    pub request_id: String,
-    pub allow: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShellCommandResult {
-    pub command: String,
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub timed_out: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentMetaEntry {
-    pub thread_id: String,
-    pub model: Option<String>,
-    pub mode: Option<String>,
-    #[serde(default)]
-    pub config_options: Vec<AgentConfigOption>,
-    #[serde(default)]
-    pub available_commands: Vec<AgentSlashCommand>,
-}
-
-#[async_trait]
-pub trait DaemonEngine: Send + Sync {
-    async fn ping(&self) -> Result<(), EngineError>;
-    async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError>;
-    async fn send_turn(&self, prompt: &str) -> Result<TurnDispatchResult, EngineError>;
-    async fn send_turn_for_thread(
-        &self,
-        thread_id: &str,
-        prompt: &str,
-    ) -> Result<TurnDispatchResult, EngineError>;
-    async fn fork_thread(&self, parent_node_id: Option<&str>)
-        -> Result<ThreadSummary, EngineError>;
-    async fn fork_thread_with_title(
-        &self,
-        source_thread_or_node: Option<&str>,
-        title: Option<&str>,
-    ) -> Result<ThreadSummary, EngineError>;
-    async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError>;
-    async fn create_root_thread_in_cwd(
-        &self,
-        title: Option<&str>,
-        _cwd: Option<&str>,
-    ) -> Result<ThreadSummary, EngineError> {
-        self.create_root_thread(title).await
-    }
-    async fn rename_thread(
-        &self,
-        thread_id: &str,
-        title: &str,
-    ) -> Result<ThreadSummary, EngineError>;
-    async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError>;
-    async fn get_transcript(&self) -> Result<Vec<TranscriptEntry>, EngineError>;
-    async fn get_thread_transcript(
-        &self,
-        thread_id: &str,
-    ) -> Result<Vec<TranscriptEntry>, EngineError>;
-    async fn merge_thread(&self, thread_id: &str) -> Result<ThreadSummary, EngineError>;
-    async fn merge_thread_with_summary(
-        &self,
-        source_id: &str,
-        target_id: Option<&str>,
-        summary: Option<&str>,
-    ) -> Result<ThreadSummary, EngineError>;
-    async fn resolve_permission(
-        &self,
-        decision: PermissionDecisionPayload,
-    ) -> Result<EngineEvent, EngineError>;
-    async fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError>;
-    async fn run_shell_command(
-        &self,
-        thread_id: &str,
-        command: &str,
-    ) -> Result<ShellCommandResult, EngineError>;
-    async fn snapshot(&self) -> Result<SessionSnapshot, EngineError>;
-    async fn subscribe_events(
-        &self,
-    ) -> Result<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>, EngineError> {
-        Ok(None)
-    }
-    async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
-        Ok(Vec::new())
-    }
-    async fn delete_thread(&self, _thread_id: &str) -> Result<String, EngineError> {
-        Err(EngineError::Protocol(
-            "delete_thread not supported".to_string(),
-        ))
-    }
-    async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
-        Ok(Vec::new())
-    }
-    async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
-        Ok(AgentOptionsSnapshot {
-            thread_id: thread_id.to_string(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        })
-    }
-    async fn set_agent_config(
-        &self,
-        _thread_id: &str,
-        _config_id: &str,
-        _value: &str,
-        _set_default: bool,
-    ) -> Result<AgentOptionsSnapshot, EngineError> {
-        Err(EngineError::Protocol(
-            "set_agent_config not supported".to_string(),
-        ))
-    }
-    async fn create_terminal(
-        &self,
-        _parent_thread_id: Option<&str>,
-        _title: Option<&str>,
-        _cwd: Option<&str>,
-        _rows: u16,
-        _cols: u16,
-    ) -> Result<ThreadSummary, EngineError> {
-        Err(EngineError::Protocol(
-            "create_terminal not supported".to_string(),
-        ))
-    }
-    async fn pty_write(&self, _thread_id: &str, _bytes: Vec<u8>) -> Result<(), EngineError> {
-        Err(EngineError::Protocol(
-            "pty_write not supported".to_string(),
-        ))
-    }
-    async fn pty_resize(&self, _thread_id: &str, _rows: u16, _cols: u16) -> Result<(), EngineError> {
-        Ok(())
-    }
-    async fn pty_snapshot(
-        &self,
-        _thread_id: &str,
-        _rows: u16,
-        _cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        Err(EngineError::Protocol(
-            "pty_snapshot not supported".to_string(),
-        ))
-    }
-    async fn ensure_thread_worktree(&self, _thread_id: &str) -> Result<String, EngineError> {
-        Err(EngineError::Protocol(
-            "ensure_thread_worktree not supported".to_string(),
-        ))
-    }
-    async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
-        Err(EngineError::Protocol(
-            "list_worktrees not supported".to_string(),
-        ))
-    }
-    async fn switch_thread_worktree(
-        &self,
-        _thread_id: &str,
-        _target_path: &str,
-    ) -> Result<String, EngineError> {
-        Err(EngineError::Protocol(
-            "switch_thread_worktree not supported".to_string(),
-        ))
-    }
-    async fn remove_worktree(&self, _path: &str, _force: bool) -> Result<(), EngineError> {
-        Err(EngineError::Protocol(
-            "remove_worktree not supported".to_string(),
-        ))
-    }
-    async fn worktree_diff_preview(&self, _path: &str) -> Result<String, EngineError> {
-        Err(EngineError::Protocol(
-            "worktree_diff_preview not supported".to_string(),
-        ))
-    }
-    async fn prune_worktrees(&self) -> Result<String, EngineError> {
-        Err(EngineError::Protocol(
-            "prune_worktrees not supported".to_string(),
-        ))
-    }
-    async fn pty_scroll(
-        &self,
-        _thread_id: &str,
-        _delta: isize,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        Err(EngineError::Protocol(
-            "pty_scroll not supported".to_string(),
-        ))
-    }
-    async fn pty_restart(
-        &self,
-        _thread_id: &str,
-        _rows: u16,
-        _cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        Err(EngineError::Protocol(
-            "pty_restart not supported".to_string(),
-        ))
-    }
-    async fn list_recent_user_prompts(&self, _limit: usize) -> Result<Vec<String>, EngineError> {
-        Ok(Vec::new())
-    }
-    async fn list_workspace_files(&self, _root: Option<&str>) -> Result<Vec<String>, EngineError> {
-        Ok(Vec::new())
-    }
-}
-
 pub(super) fn parse_typed_id<T: DeserializeOwned>(raw: &str) -> Option<T> {
     let trimmed = raw.trim();
     let normalized = trimmed
@@ -449,70 +191,6 @@ pub(super) fn thread_to_summary(thread: &Thread, is_first: bool) -> ThreadSummar
         active_leaf_id: thread.active_leaf_id.0.to_string(),
         merged: thread.merged,
         status: thread.status,
-    }
-}
-
-fn pty_color_to_tui(color: WsPtyColor) -> TuiPtyColor {
-    match color {
-        WsPtyColor::Default => TuiPtyColor::Default,
-        WsPtyColor::Indexed(idx) => TuiPtyColor::Indexed(idx),
-        WsPtyColor::Rgb(r, g, b) => TuiPtyColor::Rgb(r, g, b),
-    }
-}
-
-fn pty_cell_to_tui(cell: WsPtyCell) -> TuiPtyCell {
-    TuiPtyCell {
-        contents: cell.contents,
-        fg: pty_color_to_tui(cell.fg),
-        bg: pty_color_to_tui(cell.bg),
-        bold: cell.bold,
-        italic: cell.italic,
-        underline: cell.underline,
-        inverse: cell.inverse,
-        is_wide_continuation: cell.is_wide_continuation,
-    }
-}
-
-fn pty_mouse_mode_to_tui(mode: WsPtyMouseMode) -> TuiPtyMouseMode {
-    match mode {
-        WsPtyMouseMode::None => TuiPtyMouseMode::None,
-        WsPtyMouseMode::Press => TuiPtyMouseMode::Press,
-        WsPtyMouseMode::PressRelease => TuiPtyMouseMode::PressRelease,
-        WsPtyMouseMode::ButtonMotion => TuiPtyMouseMode::ButtonMotion,
-        WsPtyMouseMode::AnyMotion => TuiPtyMouseMode::AnyMotion,
-    }
-}
-
-fn pty_mouse_encoding_to_tui(encoding: WsPtyMouseEncoding) -> TuiPtyMouseEncoding {
-    match encoding {
-        WsPtyMouseEncoding::Default => TuiPtyMouseEncoding::Default,
-        WsPtyMouseEncoding::Utf8 => TuiPtyMouseEncoding::Utf8,
-        WsPtyMouseEncoding::Sgr => TuiPtyMouseEncoding::Sgr,
-    }
-}
-
-pub(super) fn pty_snapshot_to_tui(snap: WsPtyScreenSnapshot) -> TuiPtyScreenSnapshot {
-    TuiPtyScreenSnapshot {
-        rows: snap.rows,
-        cols: snap.cols,
-        cells: snap
-            .cells
-            .into_iter()
-            .map(|row| row.into_iter().map(pty_cell_to_tui).collect())
-            .collect(),
-        cursor_row: snap.cursor_row,
-        cursor_col: snap.cursor_col,
-        hide_cursor: snap.hide_cursor,
-        application_cursor: snap.application_cursor,
-        bracketed_paste: snap.bracketed_paste,
-        alternate_screen: snap.alternate_screen,
-        exited: snap.exited,
-        exit_code: snap.exit_code,
-        scrollback_offset: snap.scrollback_offset,
-        cwd: snap.cwd,
-        row_wrapped: snap.row_wrapped,
-        mouse_protocol_mode: pty_mouse_mode_to_tui(snap.mouse_protocol_mode),
-        mouse_protocol_encoding: pty_mouse_encoding_to_tui(snap.mouse_protocol_encoding),
     }
 }
 
@@ -639,7 +317,7 @@ pub(super) fn extract_tool_call_summary(
     None
 }
 
-pub(super) fn acp_config_option_to_tui(opt: &AcpConfigOption) -> AgentConfigOption {
+pub(super) fn acp_config_option_to_core(opt: &AcpConfigOption) -> AgentConfigOption {
     AgentConfigOption {
         id: opt.id.clone(),
         name: opt.name.clone(),
@@ -661,7 +339,7 @@ pub(super) fn normalize_session_config_options(info: &AcpSessionInfo) -> Vec<Age
     let mut out: Vec<AgentConfigOption> = info
         .config_options
         .iter()
-        .map(acp_config_option_to_tui)
+        .map(acp_config_option_to_core)
         .collect();
 
     let has_model = out
@@ -770,7 +448,10 @@ pub(super) fn merge_updated_config_options(
     )
 }
 
-pub(super) fn is_unsupported_method_error(err: &StdioRunnerError) -> bool {
+pub(super) fn is_unsupported_method_error(err: &AgentDriverError) -> bool {
+    if matches!(err, AgentDriverError::Unsupported(_)) {
+        return true;
+    }
     let msg = err.to_string().to_ascii_lowercase();
     msg.contains("-32601")
         || msg.contains("method not found")
@@ -780,9 +461,16 @@ pub(super) fn is_unsupported_method_error(err: &StdioRunnerError) -> bool {
         || msg.contains("unknown method")
 }
 
-pub(super) fn stdio_err_to_engine(err: StdioRunnerError) -> EngineError {
+pub(super) fn driver_err_to_engine(err: AgentDriverError) -> EngineError {
     match err {
-        StdioRunnerError::ProcessTerminated(msg) => EngineError::Transport(msg),
+        AgentDriverError::Terminated(msg) => EngineError::Transport(msg),
+        AgentDriverError::Protocol(msg) => {
+            if msg.contains("-32602") {
+                EngineError::InvalidParams(msg)
+            } else {
+                EngineError::Protocol(msg)
+            }
+        }
         other => {
             let msg = other.to_string();
             if msg.contains("-32602") {
@@ -796,37 +484,25 @@ pub(super) fn stdio_err_to_engine(err: StdioRunnerError) -> EngineError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use grein_core::port::dto::{PtyMouseEncoding, PtyMouseMode, PtyScreenSnapshot};
+    use grein_workspace::pty_session::{
+        PtyMouseEncoding as WsPtyMouseEncoding, PtyMouseMode as WsPtyMouseMode,
+        PtyScreenSnapshot as WsPtyScreenSnapshot,
+    };
 
     #[test]
-    fn pty_snapshot_to_tui_maps_row_wrapped_and_mouse_protocol() {
-        let mode_cases = [
-            (WsPtyMouseMode::None, TuiPtyMouseMode::None),
-            (WsPtyMouseMode::Press, TuiPtyMouseMode::Press),
-            (WsPtyMouseMode::PressRelease, TuiPtyMouseMode::PressRelease),
-            (WsPtyMouseMode::ButtonMotion, TuiPtyMouseMode::ButtonMotion),
-            (WsPtyMouseMode::AnyMotion, TuiPtyMouseMode::AnyMotion),
-        ];
-        for (ws_mode, tui_mode) in mode_cases {
-            let enc_cases = [
-                (WsPtyMouseEncoding::Default, TuiPtyMouseEncoding::Default),
-                (WsPtyMouseEncoding::Utf8, TuiPtyMouseEncoding::Utf8),
-                (WsPtyMouseEncoding::Sgr, TuiPtyMouseEncoding::Sgr),
-            ];
-            for (ws_enc, tui_enc) in enc_cases {
-                let ws_snap = WsPtyScreenSnapshot {
-                    rows: 2,
-                    cols: 3,
-                    row_wrapped: vec![true, false],
-                    mouse_protocol_mode: ws_mode,
-                    mouse_protocol_encoding: ws_enc,
-                    ..WsPtyScreenSnapshot::default()
-                };
-                let mapped = pty_snapshot_to_tui(ws_snap);
-                assert_eq!(mapped.row_wrapped, vec![true, false]);
-                assert_eq!(mapped.mouse_protocol_mode, tui_mode);
-                assert_eq!(mapped.mouse_protocol_encoding, tui_enc);
-            }
-        }
+    fn workspace_pty_snapshot_is_identical_to_core_dto() {
+        let ws_snap = WsPtyScreenSnapshot {
+            rows: 2,
+            cols: 3,
+            row_wrapped: vec![true, false],
+            mouse_protocol_mode: WsPtyMouseMode::AnyMotion,
+            mouse_protocol_encoding: WsPtyMouseEncoding::Sgr,
+            ..WsPtyScreenSnapshot::default()
+        };
+        let core_snap: PtyScreenSnapshot = ws_snap;
+        assert_eq!(core_snap.row_wrapped, vec![true, false]);
+        assert_eq!(core_snap.mouse_protocol_mode, PtyMouseMode::AnyMotion);
+        assert_eq!(core_snap.mouse_protocol_encoding, PtyMouseEncoding::Sgr);
     }
 }

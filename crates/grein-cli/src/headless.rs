@@ -1,13 +1,14 @@
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::args::{AgentsArgs, StatusArgs, ThreadsArgs};
 use crate::daemon::{default_db_path, default_socket_path, resolve_state_dir};
-use crate::discovery::{resolve_agents_configuration, AcpAgentKind};
-use crate::engine::{DaemonEngine, InProcessEngine};
+use crate::discovery::{resolve_agents_configuration, AcpAgent, AcpAgentKind, DiscoveryError};
+use crate::engine::{EngineError, InProcessEngine, ThreadUseCasePort};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadOutput {
@@ -37,15 +38,46 @@ pub struct AgentOutput {
     pub executable_path: PathBuf,
 }
 
-pub async fn collect_threads_output(
+pub type ThreadEngineOpener =
+    Arc<dyn Fn(&Path, &Path) -> Result<Arc<dyn ThreadUseCasePort>, EngineError> + Send + Sync>;
+pub type AgentConfigResolver =
+    Arc<dyn Fn(Option<&Path>) -> Result<Vec<AcpAgent>, DiscoveryError> + Send + Sync>;
+
+pub struct HeadlessDeps {
+    pub cwd: PathBuf,
+    pub default_db_path: PathBuf,
+    pub default_socket_path: PathBuf,
+    pub open_thread_engine: ThreadEngineOpener,
+    pub resolve_agents: AgentConfigResolver,
+}
+
+impl HeadlessDeps {
+    pub fn from_env() -> Self {
+        Self {
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            default_db_path: default_db_path(),
+            default_socket_path: default_socket_path(),
+            open_thread_engine: Arc::new(|db_path, cwd| {
+                let engine = InProcessEngine::open_with_config(db_path, cwd.to_path_buf(), None)?;
+                Ok(Arc::new(engine))
+            }),
+            resolve_agents: Arc::new(|config| resolve_agents_configuration(config, None)),
+        }
+    }
+}
+
+pub async fn collect_threads_output_with(
     args: &ThreadsArgs,
+    deps: &HeadlessDeps,
 ) -> Result<Vec<ThreadOutput>, Box<dyn std::error::Error + Send + Sync>> {
-    let db_path = args.db.clone().unwrap_or_else(default_db_path);
+    let db_path = args
+        .db
+        .clone()
+        .unwrap_or_else(|| deps.default_db_path.clone());
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let engine = InProcessEngine::open_with_config(&db_path, cwd, None)
+    let engine = (deps.open_thread_engine)(&db_path, &deps.cwd)
         .map_err(|e| io::Error::other(format!("{e:?}")))?;
     let summaries = engine
         .list_threads()
@@ -67,10 +99,17 @@ pub async fn collect_threads_output(
         .collect())
 }
 
-pub async fn handle_threads(
+pub async fn collect_threads_output(
     args: &ThreadsArgs,
+) -> Result<Vec<ThreadOutput>, Box<dyn std::error::Error + Send + Sync>> {
+    collect_threads_output_with(args, &HeadlessDeps::from_env()).await
+}
+
+pub async fn handle_threads_with(
+    args: &ThreadsArgs,
+    deps: &HeadlessDeps,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let threads = collect_threads_output(args).await?;
+    let threads = collect_threads_output_with(args, deps).await?;
 
     if args.json {
         let json = serde_json::to_string_pretty(&threads)?;
@@ -94,14 +133,25 @@ pub async fn handle_threads(
     Ok(())
 }
 
-pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let state_dir = resolve_state_dir(&cwd);
-    let db_path = args.db.clone().unwrap_or_else(default_db_path);
-    let socket_path = args.socket.clone().unwrap_or_else(default_socket_path);
+pub async fn handle_threads(
+    args: &ThreadsArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    handle_threads_with(args, &HeadlessDeps::from_env()).await
+}
+
+pub async fn collect_status_output_with(args: &StatusArgs, deps: &HeadlessDeps) -> StatusOutput {
+    let state_dir = resolve_state_dir(&deps.cwd);
+    let db_path = args
+        .db
+        .clone()
+        .unwrap_or_else(|| deps.default_db_path.clone());
+    let socket_path = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| deps.default_socket_path.clone());
 
     let workspace_mode = {
-        let env = grein_workspace::environment::detect_environment(&cwd);
+        let env = grein_workspace::environment::detect_environment(&deps.cwd);
         format!("{env:?}")
     };
 
@@ -112,7 +162,7 @@ pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
     };
 
     let thread_count = if db_path.exists() {
-        if let Ok(engine) = InProcessEngine::open_with_config(&db_path, cwd, None) {
+        if let Ok(engine) = (deps.open_thread_engine)(&db_path, &deps.cwd) {
             engine.list_threads().await.map(|t| t.len()).unwrap_or(0)
         } else {
             0
@@ -131,10 +181,15 @@ pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
     }
 }
 
-pub async fn handle_status(
+pub async fn collect_status_output(args: &StatusArgs) -> StatusOutput {
+    collect_status_output_with(args, &HeadlessDeps::from_env()).await
+}
+
+pub async fn handle_status_with(
     args: &StatusArgs,
+    deps: &HeadlessDeps,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let status = collect_status_output(args).await;
+    let status = collect_status_output_with(args, deps).await;
 
     if args.json {
         let json = serde_json::to_string_pretty(&status)?;
@@ -151,11 +206,18 @@ pub async fn handle_status(
     Ok(())
 }
 
-pub async fn handle_agents(
-    args: &AgentsArgs,
+pub async fn handle_status(
+    args: &StatusArgs,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let resolved = resolve_agents_configuration(args.config.as_deref(), None)
-        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+    handle_status_with(args, &HeadlessDeps::from_env()).await
+}
+
+pub async fn handle_agents_with(
+    args: &AgentsArgs,
+    deps: &HeadlessDeps,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let resolved =
+        (deps.resolve_agents)(args.config.as_deref()).map_err(|e| io::Error::other(format!("{e:?}")))?;
 
     let agents: Vec<AgentOutput> = resolved
         .into_iter()
@@ -182,6 +244,12 @@ pub async fn handle_agents(
     }
 
     Ok(())
+}
+
+pub async fn handle_agents(
+    args: &AgentsArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    handle_agents_with(args, &HeadlessDeps::from_env()).await
 }
 
 #[cfg(test)]

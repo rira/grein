@@ -2,10 +2,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grein_acp::{
-    AcpPermissionOption, AcpStdioDriver, DriverEvent, StdioProcessConfig, StdioProcessRunner,
+    AcpPermissionOption, AcpSpawnConfig, AgentDriver, AgentDriverFactory, DriverEvent,
+    StdioAgentDriverFactory,
 };
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, ThreadId};
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_core::port::dto::TuiEngineEvent;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -14,10 +15,10 @@ use super::super::types::parse_typed_id;
 use super::listener::spawn_session_listener;
 use super::{InProcessEngine, SessionListenerCmd};
 
-async fn dummy_driver() -> Arc<AcpStdioDriver> {
-    let cfg = StdioProcessConfig::new("sh", vec!["-c".to_string(), "cat".to_string()]);
-    let runner = StdioProcessRunner::spawn(cfg).await.expect("spawn cat");
-    Arc::new(AcpStdioDriver::new(runner))
+async fn dummy_driver() -> Arc<dyn AgentDriver> {
+    let factory = StdioAgentDriverFactory::new();
+    let cfg = AcpSpawnConfig::new("sh", ["-c", "cat"]);
+    factory.spawn(&cfg).await.expect("spawn cat")
 }
 
 #[tokio::test]
@@ -187,7 +188,7 @@ async fn test_listener_driver_error_prepare_solicited_permission_and_tool_fallba
     // 4. ToolCall & ToolCallUpdate fallbacks (empty name + empty title -> "tool", empty name -> active_tool_names, failed + empty output -> status)
     let user_node = ConversationNode::new(NodeId::new(), Some(flushed_leaf), AuthorRole::User, "u".into());
     engine.runtime.storage.insert_node(&user_node).unwrap();
-    engine.runtime.storage.update_thread_leaf(tid, user_node.id).unwrap();
+    engine.runtime.storage.update_thread_leaf(&tid, &user_node.id).unwrap();
 
     let (done_tx, done_rx) = oneshot::channel();
     let (ack_tx, ack_rx) = oneshot::channel();

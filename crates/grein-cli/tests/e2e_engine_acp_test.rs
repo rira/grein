@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grein_cli::engine::{
-    AcpBackendConfig, DaemonEngine, EngineError, InProcessEngine, PermissionDecisionPayload,
+    AcpBackendConfig, EngineError, InProcessEngine, PermissionDecisionPayload,
 };
 use grein_core::blackboard::{BlackboardEntry, BlackboardEntryKind};
 use grein_core::storage::sqlite::SqliteStorage;

@@ -1,18 +1,22 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use grein_acp::{AcpStdioDriver, DriverEvent};
+use grein_acp::{
+    AgentDriver, DriverEvent, PolicyDecision, SessionId as AcpSessionId,
+    ThreadId as AcpThreadId, ToolInvocationRequest,
+};
 use grein_core::model::{NodeId, ThreadId, ThreadStatus};
-use grein_tui::engine_port::{
-    AgentConfigOption, AgentSlashCommand, SubagentSnapshot, SubagentStatus, TuiEngineEvent,
+use grein_core::port::dto::{
+    AgentConfigOption, AgentSlashCommand, EngineStreamEvent, SubagentSnapshot, SubagentStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use super::super::types::{
-    acp_config_option_to_tui, extract_model_and_mode_from_options, extract_subagent_role,
+    acp_config_option_to_core, extract_model_and_mode_from_options, extract_subagent_role,
     extract_subagent_type, extract_tool_call_summary, format_permission_description,
-    merge_updated_config_options, now_epoch_ms, EngineError,
+    merge_updated_config_options, now_epoch_ms, select_permission_option, EngineError,
 };
 use super::{EngineRuntime, PendingPermissionRecord, SessionListenerCmd, TrackedLayer1Subagent};
 
@@ -24,7 +28,7 @@ fn finalize_eligible_subagents(
     current_wakeup_seq: u64,
     is_unsolicited: bool,
 ) {
-    let watch = runtime.subagent_watch();
+    let watch = runtime.subagent_observer.as_ref();
     let eligible_ids: Vec<String> = active_subagents
         .iter()
         .filter(|(_, sa)| {
@@ -50,13 +54,32 @@ fn finalize_eligible_subagents(
     }
 }
 
+fn is_thread_in_isolated_worktree(runtime: &EngineRuntime, tid: ThreadId) -> bool {
+    let Ok(Some(thread)) = runtime.storage.get_thread(&tid) else {
+        return false;
+    };
+    let Some(raw) = thread.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let path = Path::new(raw);
+    if let Some(status) = runtime.git_inspector.inspect_git_status(path) {
+        if status.is_worktree {
+            return true;
+        }
+    }
+    raw.contains("/.grein/worktrees/")
+        || raw.contains("\\.grein\\worktrees\\")
+        || raw.contains("/.grein/shadow/")
+        || raw.contains("\\.grein\\shadow\\")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_session_listener(
     runtime: Arc<EngineRuntime>,
     tid: ThreadId,
     thread_id: String,
     session_id: String,
-    driver: Arc<AcpStdioDriver>,
+    driver: Arc<dyn AgentDriver>,
     initial_leaf_id: NodeId,
     mut events: mpsc::UnboundedReceiver<DriverEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionListenerCmd>,
@@ -92,11 +115,11 @@ pub(super) fn spawn_session_listener(
             } else {
                 accumulated_text.clear();
             }
-            let _ = runtime.storage.update_thread_status(tid, ThreadStatus::Idle);
-            runtime.emit_tui(TuiEngineEvent::TurnCompleted {
+            let _ = runtime.storage.update_thread_status(&tid, ThreadStatus::Idle);
+            runtime.emit_tui(EngineStreamEvent::TurnCompleted {
                 thread_id: thread_id.clone(),
             });
-            runtime.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+            runtime.emit_tui(EngineStreamEvent::ThreadStatusChanged {
                 thread_id: thread_id.clone(),
                 status: "idle".to_string(),
             });
@@ -144,7 +167,7 @@ pub(super) fn spawn_session_listener(
                                 quiet_deadline = None;
                                 wakeup_active = false;
                             }
-                            if let Ok(Some(t)) = runtime.storage.get_thread(tid) {
+                            if let Ok(Some(t)) = runtime.storage.get_thread(&tid) {
                                 current_leaf_id = t.active_leaf_id;
                             }
                             let _ = reply_tx.send(current_leaf_id);
@@ -207,8 +230,8 @@ pub(super) fn spawn_session_listener(
                                 }
                                 if !unsolicited_streaming_emitted {
                                     unsolicited_streaming_emitted = true;
-                                    let _ = runtime.storage.update_thread_status(tid, ThreadStatus::Streaming);
-                                    runtime.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+                                    let _ = runtime.storage.update_thread_status(&tid, ThreadStatus::Streaming);
+                                    runtime.emit_tui(EngineStreamEvent::ThreadStatusChanged {
                                         thread_id: thread_id.clone(),
                                         status: "streaming".to_string(),
                                     });
@@ -216,7 +239,7 @@ pub(super) fn spawn_session_listener(
                                 quiet_deadline = Some(tokio::time::Instant::now() + runtime.quiet_timeout());
                             }
                             accumulated_text.push_str(&text);
-                            runtime.emit_tui(TuiEngineEvent::StreamChunk {
+                            runtime.emit_tui(EngineStreamEvent::StreamChunk {
                                 thread_id: thread_id.clone(),
                                 content: text,
                             });
@@ -231,7 +254,7 @@ pub(super) fn spawn_session_listener(
                                     quiet_deadline = Some(tokio::time::Instant::now() + runtime.quiet_timeout());
                                 }
                             }
-                            runtime.emit_tui(TuiEngineEvent::ThoughtChunk {
+                            runtime.emit_tui(EngineStreamEvent::ThoughtChunk {
                                 thread_id: thread_id.clone(),
                                 content: text,
                             });
@@ -255,14 +278,14 @@ pub(super) fn spawn_session_listener(
                             };
                             active_tool_names.insert(tool_call_id.clone(), tool_name.clone());
                             let summary = extract_tool_call_summary(&tool_name, &title, &args);
-                            runtime.emit_tui(TuiEngineEvent::ToolInvoked {
+                            runtime.emit_tui(EngineStreamEvent::ToolInvoked {
                                 thread_id: thread_id.clone(),
                                 tool_name: tool_name.clone(),
                                 tool_call_id: (!tool_call_id.is_empty())
                                     .then(|| tool_call_id.clone()),
                                 summary,
                             });
-                            runtime.emit_tui(TuiEngineEvent::ToolActivityUpdated {
+                            runtime.emit_tui(EngineStreamEvent::ToolActivityUpdated {
                                 thread_id: thread_id.clone(),
                                 tool_name: Some(tool_name.clone()),
                             });
@@ -289,11 +312,11 @@ pub(super) fn spawn_session_listener(
                                         launched_wakeup_seq: wakeup_seq,
                                     },
                                 );
-                                runtime.emit_tui(TuiEngineEvent::SubagentUpdated {
+                                runtime.emit_tui(EngineStreamEvent::SubagentUpdated {
                                     thread_id: thread_id.clone(),
                                     subagent: snap.clone(),
                                 });
-                                runtime.subagent_watch().register_subagent(&thread_id, snap);
+                                runtime.subagent_observer.register_subagent(&thread_id, snap);
                             }
                         }
                         DriverEvent::ToolCallUpdate {
@@ -325,7 +348,7 @@ pub(super) fn spawn_session_listener(
                                 } else {
                                     output.clone()
                                 };
-                                runtime.emit_tui(TuiEngineEvent::ToolResult {
+                                runtime.emit_tui(EngineStreamEvent::ToolResult {
                                     thread_id: thread_id.clone(),
                                     tool_name: resolved_name,
                                     output: resolved_output.clone(),
@@ -333,12 +356,12 @@ pub(super) fn spawn_session_listener(
                                         .then(|| tool_call_id.clone()),
                                     is_error: is_failed,
                                 });
-                                runtime.emit_tui(TuiEngineEvent::ToolActivityUpdated {
+                                runtime.emit_tui(EngineStreamEvent::ToolActivityUpdated {
                                     thread_id: thread_id.clone(),
                                     tool_name: None,
                                 });
 
-                                let watch = runtime.subagent_watch();
+                                let watch = runtime.subagent_observer.as_ref();
                                 if let Some(sa) = active_subagents.get_mut(&tool_call_id) {
                                     if is_failed {
                                         let reason = if resolved_output.trim().is_empty() {
@@ -370,7 +393,7 @@ pub(super) fn spawn_session_listener(
                             if !trimmed.is_empty()
                                 && runtime.storage.update_thread_title(&tid, trimmed).is_ok()
                             {
-                                runtime.emit_tui(TuiEngineEvent::ThreadTitleUpdated {
+                                runtime.emit_tui(EngineStreamEvent::ThreadTitleUpdated {
                                     thread_id: thread_id.clone(),
                                     title: trimmed.to_string(),
                                 });
@@ -402,6 +425,31 @@ pub(super) fn spawn_session_listener(
                             if !solicited_in_flight {
                                 quiet_deadline = None;
                             }
+                            let tool_request = ToolInvocationRequest::new(&tool_name, args.clone())
+                                .with_isolated_worktree(is_thread_in_isolated_worktree(&runtime, tid));
+                            if let Some(policy) = runtime.policy.as_ref() {
+                                match policy.evaluate_scoped(
+                                    &AcpSessionId::new(&session_id),
+                                    &AcpThreadId::new(&thread_id),
+                                    &tool_request,
+                                ) {
+                                    PolicyDecision::Allow => {
+                                        let option_id = select_permission_option(&options, true);
+                                        let _ = driver
+                                            .respond_permission(request_id, Some(&option_id))
+                                            .await;
+                                        continue;
+                                    }
+                                    PolicyDecision::Deny => {
+                                        let option_id = select_permission_option(&options, false);
+                                        let _ = driver
+                                            .respond_permission(request_id, Some(&option_id))
+                                            .await;
+                                        continue;
+                                    }
+                                    PolicyDecision::PromptUser => {}
+                                }
+                            }
                             let seq = runtime.next_perm_seq.fetch_add(1, Ordering::Relaxed);
                             let request_key = format!("{session_id}:{seq}");
                             let description = format_permission_description(&tool_name, &title, &args);
@@ -412,17 +460,20 @@ pub(super) fn spawn_session_listener(
                                         driver: Arc::clone(&driver),
                                         json_rpc_id: request_id,
                                         options,
+                                        session_id: session_id.clone(),
+                                        thread_id: thread_id.clone(),
+                                        request: tool_request,
                                     },
                                 );
                             }
                             let _ = runtime
                                 .storage
-                                .update_thread_status(tid, ThreadStatus::PermissionRequired);
-                            runtime.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+                                .update_thread_status(&tid, ThreadStatus::PermissionRequired);
+                            runtime.emit_tui(EngineStreamEvent::ThreadStatusChanged {
                                 thread_id: thread_id.clone(),
                                 status: "permission_required".to_string(),
                             });
-                            runtime.emit_tui(TuiEngineEvent::PermissionRequested {
+                            runtime.emit_tui(EngineStreamEvent::PermissionRequested {
                                 request_id: request_key,
                                 description,
                             });
@@ -444,11 +495,11 @@ pub(super) fn spawn_session_listener(
                                     }
                                 }
                             }
-                            let _ = runtime.storage.update_thread_status(tid, ThreadStatus::Idle);
-                            runtime.emit_tui(TuiEngineEvent::TurnCompleted {
+                            let _ = runtime.storage.update_thread_status(&tid, ThreadStatus::Idle);
+                            runtime.emit_tui(EngineStreamEvent::TurnCompleted {
                                 thread_id: thread_id.clone(),
                             });
-                            runtime.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+                            runtime.emit_tui(EngineStreamEvent::ThreadStatusChanged {
                                 thread_id: thread_id.clone(),
                                 status: "idle".to_string(),
                             });
@@ -512,14 +563,14 @@ pub(super) fn spawn_session_listener(
                                 }
                             }
                             if let Some((model, mode)) = updated_meta {
-                                runtime.emit_tui(TuiEngineEvent::AgentMetaUpdated {
+                                runtime.emit_tui(EngineStreamEvent::AgentMetaUpdated {
                                     thread_id: thread_id.clone(),
                                     model,
                                     mode,
                                 });
                             }
                             if let Some(config_options) = updated_opts {
-                                runtime.emit_tui(TuiEngineEvent::AgentConfigUpdated {
+                                runtime.emit_tui(EngineStreamEvent::AgentConfigUpdated {
                                     thread_id: thread_id.to_string(),
                                     config_options,
                                 });
@@ -528,7 +579,7 @@ pub(super) fn spawn_session_listener(
                         DriverEvent::ConfigOptionUpdate { config_options, .. } => {
                             let incoming: Vec<AgentConfigOption> = config_options
                                 .iter()
-                                .map(acp_config_option_to_tui)
+                                .map(acp_config_option_to_core)
                                 .collect();
                             let mut emit_opts = None;
                             let mut emit_meta = None;
@@ -564,13 +615,13 @@ pub(super) fn spawn_session_listener(
                                 }
                             }
                             if let Some(config_options) = emit_opts {
-                                runtime.emit_tui(TuiEngineEvent::AgentConfigUpdated {
+                                runtime.emit_tui(EngineStreamEvent::AgentConfigUpdated {
                                     thread_id: thread_id.clone(),
                                     config_options,
                                 });
                             }
                             if let Some((model, mode)) = emit_meta {
-                                runtime.emit_tui(TuiEngineEvent::AgentMetaUpdated {
+                                runtime.emit_tui(EngineStreamEvent::AgentMetaUpdated {
                                     thread_id: thread_id.clone(),
                                     model,
                                     mode,
@@ -595,7 +646,7 @@ pub(super) fn spawn_session_listener(
                                 }
                             }
                             if updated {
-                                runtime.emit_tui(TuiEngineEvent::AgentCommandsUpdated {
+                                runtime.emit_tui(EngineStreamEvent::AgentCommandsUpdated {
                                     thread_id: thread_id.clone(),
                                     commands: converted,
                                 });

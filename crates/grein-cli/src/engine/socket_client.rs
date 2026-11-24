@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use grein_tui::engine_port::{
-    AgentOptionsSnapshot, PtyScreenSnapshot as TuiPtyScreenSnapshot, ThreadMeta, TuiEngineEvent,
-    WorktreeEntry,
+use grein_core::port::dto::{
+    AgentOptionsSnapshot, EngineStreamEvent, PtyScreenSnapshot, ThreadMeta, WorktreeEntry,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -13,10 +12,14 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+use super::ports::{
+    AgentTurnPort, AutocompleteContextPort, EngineEventPort, ShellUseCasePort,
+    TerminalPtyUseCasePort, ThreadUseCasePort, WorktreeUseCasePort,
+};
 use super::rpc::to_json;
 use super::types::{
-    AgentMetaEntry, DaemonEngine, EngineError, EngineEvent, PermissionDecisionPayload,
-    SessionSnapshot, ShellCommandResult, ThreadSummary, TranscriptEntry, TurnDispatchResult,
+    AgentMetaEntry, EngineError, EngineEvent, PermissionDecisionPayload, SessionSnapshot,
+    ShellCommandResult, ThreadSummary, TranscriptEntry, TurnDispatchResult,
 };
 
 struct SocketIo {
@@ -182,16 +185,124 @@ impl UnixSocketEngineClient {
         serde_json::from_value(value).map_err(|e| EngineError::Protocol(e.to_string()))
     }
 
+    pub async fn ping(&self) -> Result<(), EngineError> {
+        EngineEventPort::ping(self).await
+    }
+
+    pub async fn subscribe_events(
+        &self,
+    ) -> Result<Option<mpsc::UnboundedReceiver<EngineStreamEvent>>, EngineError> {
+        EngineEventPort::subscribe_events(self).await
+    }
+
+    pub async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::ensure_main_thread(self).await
+    }
+
+    pub async fn send_turn(&self, prompt: &str) -> Result<TurnDispatchResult, EngineError> {
+        AgentTurnPort::send_turn(self, prompt).await
+    }
+
+    pub async fn send_turn_for_thread(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+    ) -> Result<TurnDispatchResult, EngineError> {
+        AgentTurnPort::send_turn_for_thread(self, thread_id, prompt).await
+    }
+
+    pub async fn fork_thread(
+        &self,
+        parent_node_id: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::fork_thread(self, parent_node_id).await
+    }
+
+    pub async fn fork_thread_with_title(
+        &self,
+        source_thread_or_node: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::fork_thread_with_title(self, source_thread_or_node, title).await
+    }
+
+    pub async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::create_root_thread(self, title).await
+    }
+
+    pub async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::rename_thread(self, thread_id, title).await
+    }
+
+    pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>, EngineError> {
+        ThreadUseCasePort::list_threads(self).await
+    }
+
+    pub async fn get_transcript(&self) -> Result<Vec<TranscriptEntry>, EngineError> {
+        ThreadUseCasePort::get_transcript(self).await
+    }
+
+    pub async fn get_thread_transcript(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<TranscriptEntry>, EngineError> {
+        ThreadUseCasePort::get_thread_transcript(self, thread_id).await
+    }
+
+    pub async fn merge_thread(&self, thread_id: &str) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::merge_thread(self, thread_id).await
+    }
+
+    pub async fn merge_thread_with_summary(
+        &self,
+        source_id: &str,
+        target_id: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ThreadSummary, EngineError> {
+        ThreadUseCasePort::merge_thread_with_summary(self, source_id, target_id, summary).await
+    }
+
+    pub async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
+        ThreadUseCasePort::snapshot(self).await
+    }
+
+    pub async fn resolve_permission(
+        &self,
+        decision: PermissionDecisionPayload,
+    ) -> Result<EngineEvent, EngineError> {
+        AgentTurnPort::resolve_permission(self, decision).await
+    }
+
+    pub async fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
+        AgentTurnPort::cancel_turn(self, thread_id).await
+    }
+
+    pub async fn run_shell_command(
+        &self,
+        thread_id: &str,
+        command: &str,
+    ) -> Result<ShellCommandResult, EngineError> {
+        ShellUseCasePort::run_shell_command(self, thread_id, command).await
+    }
+
+    pub async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
+        AgentTurnPort::agent_metadata(self).await
+    }
+
     pub async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
-        DaemonEngine::thread_metadata(self).await
+        ThreadUseCasePort::thread_metadata(self).await
     }
 
     pub async fn delete_thread(&self, thread_id: &str) -> Result<String, EngineError> {
-        DaemonEngine::delete_thread(self, thread_id).await
+        ThreadUseCasePort::delete_thread(self, thread_id).await
     }
 
     pub async fn agent_options(&self, thread_id: &str) -> Result<AgentOptionsSnapshot, EngineError> {
-        DaemonEngine::agent_options(self, thread_id).await
+        AgentTurnPort::agent_options(self, thread_id).await
     }
 
     pub async fn set_agent_config(
@@ -201,7 +312,7 @@ impl UnixSocketEngineClient {
         value: &str,
         set_default: bool,
     ) -> Result<AgentOptionsSnapshot, EngineError> {
-        DaemonEngine::set_agent_config(self, thread_id, config_id, value, set_default).await
+        AgentTurnPort::set_agent_config(self, thread_id, config_id, value, set_default).await
     }
 
     pub async fn create_terminal(
@@ -212,15 +323,16 @@ impl UnixSocketEngineClient {
         rows: u16,
         cols: u16,
     ) -> Result<ThreadSummary, EngineError> {
-        DaemonEngine::create_terminal(self, parent_thread_id, title, cwd, rows, cols).await
+        TerminalPtyUseCasePort::create_terminal(self, parent_thread_id, title, cwd, rows, cols)
+            .await
     }
 
     pub async fn pty_write(&self, thread_id: &str, bytes: Vec<u8>) -> Result<(), EngineError> {
-        DaemonEngine::pty_write(self, thread_id, bytes).await
+        TerminalPtyUseCasePort::pty_write(self, thread_id, bytes).await
     }
 
     pub async fn pty_resize(&self, thread_id: &str, rows: u16, cols: u16) -> Result<(), EngineError> {
-        DaemonEngine::pty_resize(self, thread_id, rows, cols).await
+        TerminalPtyUseCasePort::pty_resize(self, thread_id, rows, cols).await
     }
 
     pub async fn pty_snapshot(
@@ -228,16 +340,16 @@ impl UnixSocketEngineClient {
         thread_id: &str,
         rows: u16,
         cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        DaemonEngine::pty_snapshot(self, thread_id, rows, cols).await
+    ) -> Result<PtyScreenSnapshot, EngineError> {
+        TerminalPtyUseCasePort::pty_snapshot(self, thread_id, rows, cols).await
     }
 
     pub async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
-        DaemonEngine::ensure_thread_worktree(self, thread_id).await
+        WorktreeUseCasePort::ensure_thread_worktree(self, thread_id).await
     }
 
     pub async fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, EngineError> {
-        DaemonEngine::list_worktrees(self).await
+        WorktreeUseCasePort::list_worktrees(self).await
     }
 
     pub async fn switch_thread_worktree(
@@ -245,27 +357,27 @@ impl UnixSocketEngineClient {
         thread_id: &str,
         target_path: &str,
     ) -> Result<String, EngineError> {
-        DaemonEngine::switch_thread_worktree(self, thread_id, target_path).await
+        WorktreeUseCasePort::switch_thread_worktree(self, thread_id, target_path).await
     }
 
     pub async fn remove_worktree(&self, path: &str, force: bool) -> Result<(), EngineError> {
-        DaemonEngine::remove_worktree(self, path, force).await
+        WorktreeUseCasePort::remove_worktree(self, path, force).await
     }
 
     pub async fn worktree_diff_preview(&self, path: &str) -> Result<String, EngineError> {
-        DaemonEngine::worktree_diff_preview(self, path).await
+        WorktreeUseCasePort::worktree_diff_preview(self, path).await
     }
 
     pub async fn prune_worktrees(&self) -> Result<String, EngineError> {
-        DaemonEngine::prune_worktrees(self).await
+        WorktreeUseCasePort::prune_worktrees(self).await
     }
 
     pub async fn pty_scroll(
         &self,
         thread_id: &str,
         delta: isize,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        DaemonEngine::pty_scroll(self, thread_id, delta).await
+    ) -> Result<PtyScreenSnapshot, EngineError> {
+        TerminalPtyUseCasePort::pty_scroll(self, thread_id, delta).await
     }
 
     pub async fn pty_restart(
@@ -273,8 +385,8 @@ impl UnixSocketEngineClient {
         thread_id: &str,
         rows: u16,
         cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        DaemonEngine::pty_restart(self, thread_id, rows, cols).await
+    ) -> Result<PtyScreenSnapshot, EngineError> {
+        TerminalPtyUseCasePort::pty_restart(self, thread_id, rows, cols).await
     }
 
     pub async fn create_root_thread_in_cwd(
@@ -282,44 +394,23 @@ impl UnixSocketEngineClient {
         title: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<ThreadSummary, EngineError> {
-        DaemonEngine::create_root_thread_in_cwd(self, title, cwd).await
+        ThreadUseCasePort::create_root_thread_in_cwd(self, title, cwd).await
     }
 
     pub async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
-        DaemonEngine::list_recent_user_prompts(self, limit).await
+        AutocompleteContextPort::list_recent_user_prompts(self, limit).await
     }
 
     pub async fn list_workspace_files(&self, root: Option<&str>) -> Result<Vec<String>, EngineError> {
-        DaemonEngine::list_workspace_files(self, root).await
+        AutocompleteContextPort::list_workspace_files(self, root).await
     }
 }
 
 #[async_trait]
-impl DaemonEngine for UnixSocketEngineClient {
-    async fn ping(&self) -> Result<(), EngineError> {
-        self.call("session.ping", json!({})).await.map(|_| ())
-    }
-
+impl ThreadUseCasePort for UnixSocketEngineClient {
     async fn ensure_main_thread(&self) -> Result<ThreadSummary, EngineError> {
         self.call_typed("session.ensure_main_thread", json!({}))
             .await
-    }
-
-    async fn send_turn(&self, prompt: &str) -> Result<TurnDispatchResult, EngineError> {
-        self.call_typed("session.send_turn", json!({"prompt": prompt}))
-            .await
-    }
-
-    async fn send_turn_for_thread(
-        &self,
-        thread_id: &str,
-        prompt: &str,
-    ) -> Result<TurnDispatchResult, EngineError> {
-        self.call_typed(
-            "session.send_thread_turn",
-            json!({"thread_id": thread_id, "prompt": prompt}),
-        )
-        .await
     }
 
     async fn fork_thread(
@@ -346,7 +437,7 @@ impl DaemonEngine for UnixSocketEngineClient {
     }
 
     async fn create_root_thread(&self, title: Option<&str>) -> Result<ThreadSummary, EngineError> {
-        DaemonEngine::create_root_thread_in_cwd(self, title, None).await
+        ThreadUseCasePort::create_root_thread_in_cwd(self, title, None).await
     }
 
     async fn create_root_thread_in_cwd(
@@ -418,32 +509,6 @@ impl DaemonEngine for UnixSocketEngineClient {
             .await
     }
 
-    async fn resolve_permission(
-        &self,
-        decision: PermissionDecisionPayload,
-    ) -> Result<EngineEvent, EngineError> {
-        self.call_dedicated_typed("permissions.resolve", to_json(&decision)?)
-            .await
-    }
-
-    async fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
-        self.call_dedicated("session.cancel", json!({"thread_id": thread_id}))
-            .await
-            .map(|_| ())
-    }
-
-    async fn run_shell_command(
-        &self,
-        thread_id: &str,
-        command: &str,
-    ) -> Result<ShellCommandResult, EngineError> {
-        self.call_typed(
-            "session.shell",
-            json!({"thread_id": thread_id, "command": command}),
-        )
-        .await
-    }
-
     async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
         let threads = self.list_threads().await?;
         let transcript = self.get_transcript().await?;
@@ -452,63 +517,6 @@ impl DaemonEngine for UnixSocketEngineClient {
             thread_count: threads.len(),
             threads,
         })
-    }
-
-    async fn subscribe_events(
-        &self,
-    ) -> Result<Option<mpsc::UnboundedReceiver<TuiEngineEvent>>, EngineError> {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|e| EngineError::Transport(e.to_string()))?;
-        let (read, mut writer) = stream.into_split();
-        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "session.subscribe_events", "params": {}});
-        writer
-            .write_all(format!("{req}\n").as_bytes())
-            .await
-            .map_err(|e| EngineError::Transport(e.to_string()))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| EngineError::Transport(e.to_string()))?;
-
-        let mut reader = BufReader::new(read);
-        let mut ack = String::new();
-        let n = reader
-            .read_line(&mut ack)
-            .await
-            .map_err(|e| EngineError::Transport(e.to_string()))?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let ack_val: Value =
-            serde_json::from_str(ack.trim()).map_err(|e| EngineError::Protocol(e.to_string()))?;
-        if ack_val.get("error").is_some() {
-            return Ok(None);
-        }
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let _keep_writer = writer;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if let Ok(event) = serde_json::from_str::<TuiEngineEvent>(trimmed) {
-                            if tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Some(rx))
     }
 
     async fn thread_metadata(&self) -> Result<Vec<ThreadMeta>, EngineError> {
@@ -524,6 +532,40 @@ impl DaemonEngine for UnixSocketEngineClient {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| EngineError::Protocol("response missing next_active_thread_id".into()))
+    }
+}
+
+#[async_trait]
+impl AgentTurnPort for UnixSocketEngineClient {
+    async fn send_turn(&self, prompt: &str) -> Result<TurnDispatchResult, EngineError> {
+        self.call_typed("session.send_turn", json!({"prompt": prompt}))
+            .await
+    }
+
+    async fn send_turn_for_thread(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+    ) -> Result<TurnDispatchResult, EngineError> {
+        self.call_typed(
+            "session.send_thread_turn",
+            json!({"thread_id": thread_id, "prompt": prompt}),
+        )
+        .await
+    }
+
+    async fn resolve_permission(
+        &self,
+        decision: PermissionDecisionPayload,
+    ) -> Result<EngineEvent, EngineError> {
+        self.call_dedicated_typed("permissions.resolve", to_json(&decision)?)
+            .await
+    }
+
+    async fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
+        self.call_dedicated("session.cancel", json!({"thread_id": thread_id}))
+            .await
+            .map(|_| ())
     }
 
     async fn agent_metadata(&self) -> Result<Vec<AgentMetaEntry>, EngineError> {
@@ -553,7 +595,25 @@ impl DaemonEngine for UnixSocketEngineClient {
         )
         .await
     }
+}
 
+#[async_trait]
+impl ShellUseCasePort for UnixSocketEngineClient {
+    async fn run_shell_command(
+        &self,
+        thread_id: &str,
+        command: &str,
+    ) -> Result<ShellCommandResult, EngineError> {
+        self.call_typed(
+            "session.shell",
+            json!({"thread_id": thread_id, "command": command}),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl TerminalPtyUseCasePort for UnixSocketEngineClient {
     async fn create_terminal(
         &self,
         parent_thread_id: Option<&str>,
@@ -601,7 +661,7 @@ impl DaemonEngine for UnixSocketEngineClient {
         thread_id: &str,
         rows: u16,
         cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
+    ) -> Result<PtyScreenSnapshot, EngineError> {
         self.call_dedicated_typed(
             "session.pty_snapshot",
             json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
@@ -609,6 +669,34 @@ impl DaemonEngine for UnixSocketEngineClient {
         .await
     }
 
+    async fn pty_scroll(
+        &self,
+        thread_id: &str,
+        delta: isize,
+    ) -> Result<PtyScreenSnapshot, EngineError> {
+        self.call_dedicated_typed(
+            "session.pty_scroll",
+            json!({"thread_id": thread_id, "delta": delta}),
+        )
+        .await
+    }
+
+    async fn pty_restart(
+        &self,
+        thread_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtyScreenSnapshot, EngineError> {
+        self.call_dedicated_typed(
+            "session.pty_restart",
+            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl WorktreeUseCasePort for UnixSocketEngineClient {
     async fn ensure_thread_worktree(&self, thread_id: &str) -> Result<String, EngineError> {
         let val = self
             .call_dedicated(
@@ -672,32 +760,10 @@ impl DaemonEngine for UnixSocketEngineClient {
             .map(str::to_string)
             .ok_or_else(|| EngineError::Protocol("response missing summary".into()))
     }
+}
 
-    async fn pty_scroll(
-        &self,
-        thread_id: &str,
-        delta: isize,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        self.call_dedicated_typed(
-            "session.pty_scroll",
-            json!({"thread_id": thread_id, "delta": delta}),
-        )
-        .await
-    }
-
-    async fn pty_restart(
-        &self,
-        thread_id: &str,
-        rows: u16,
-        cols: u16,
-    ) -> Result<TuiPtyScreenSnapshot, EngineError> {
-        self.call_dedicated_typed(
-            "session.pty_restart",
-            json!({"thread_id": thread_id, "rows": rows, "cols": cols}),
-        )
-        .await
-    }
-
+#[async_trait]
+impl AutocompleteContextPort for UnixSocketEngineClient {
     async fn list_recent_user_prompts(&self, limit: usize) -> Result<Vec<String>, EngineError> {
         self.call_dedicated_typed("session.list_recent_prompts", json!({"limit": limit}))
             .await
@@ -710,5 +776,69 @@ impl DaemonEngine for UnixSocketEngineClient {
         }
         self.call_dedicated_typed("session.list_workspace_files", Value::Object(params))
             .await
+    }
+}
+
+#[async_trait]
+impl EngineEventPort for UnixSocketEngineClient {
+    async fn ping(&self) -> Result<(), EngineError> {
+        self.call("session.ping", json!({})).await.map(|_| ())
+    }
+
+    async fn subscribe_events(
+        &self,
+    ) -> Result<Option<mpsc::UnboundedReceiver<EngineStreamEvent>>, EngineError> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        let (read, mut writer) = stream.into_split();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "session.subscribe_events", "params": {}});
+        writer
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+
+        let mut reader = BufReader::new(read);
+        let mut ack = String::new();
+        let n = reader
+            .read_line(&mut ack)
+            .await
+            .map_err(|e| EngineError::Transport(e.to_string()))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let ack_val: Value =
+            serde_json::from_str(ack.trim()).map_err(|e| EngineError::Protocol(e.to_string()))?;
+        if ack_val.get("error").is_some() {
+            return Ok(None);
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _keep_writer = writer;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Ok(event) = serde_json::from_str::<EngineStreamEvent>(trimmed) {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Some(rx))
     }
 }

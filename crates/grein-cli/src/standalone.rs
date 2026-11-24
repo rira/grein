@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use grein_core::model::{AnchorId, NodeId, ThreadId};
@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::engine::{dispatch_json_rpc, DaemonEngine, InProcessEngine};
+use crate::engine::{dispatch_json_rpc, GreinEngine, InProcessEngine};
 
 #[derive(Debug)]
 pub enum StandaloneError {
@@ -79,12 +79,11 @@ fn parse_id<T: DeserializeOwned>(raw: &str) -> Result<T, StandaloneError> {
         .map_err(|e| StandaloneError::Storage(e.to_string()))
 }
 
-pub async fn run_standalone_with_channel(
+pub async fn run_standalone_with_engine(
+    engine: Arc<dyn GreinEngine>,
     mut rx: mpsc::Receiver<InProcessRequest>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(), StandaloneError> {
-    let engine = InProcessEngine::in_memory().map_err(|e| StandaloneError::Storage(e.to_string()))?;
-
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
@@ -129,7 +128,7 @@ pub async fn run_standalone_with_channel(
                         let _ = responder.send(res);
                     }
                     Some(InProcessRequest::JsonRpc { request, responder }) => {
-                        let response = dispatch_json_rpc(&engine, &request).await;
+                        let response = dispatch_json_rpc(engine.as_ref(), &request).await;
                         let _ = responder.send(response);
                     }
                     None => {
@@ -143,7 +142,29 @@ pub async fn run_standalone_with_channel(
     Ok(())
 }
 
+pub async fn run_standalone_with_channel(
+    rx: mpsc::Receiver<InProcessRequest>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), StandaloneError> {
+    let engine = InProcessEngine::in_memory()
+        .map_err(|e| StandaloneError::Storage(e.to_string()))?;
+    run_standalone_with_engine(Arc::new(engine), rx, shutdown_rx).await
+}
+
 pub async fn run_standalone(shutdown_rx: oneshot::Receiver<()>) -> Result<(), StandaloneError> {
+    run_standalone_with_engine_and_register(
+        Arc::new(
+            InProcessEngine::in_memory().map_err(|e| StandaloneError::Storage(e.to_string()))?,
+        ),
+        shutdown_rx,
+    )
+    .await
+}
+
+pub async fn run_standalone_with_engine_and_register(
+    engine: Arc<dyn GreinEngine>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), StandaloneError> {
     let (tx, rx) = mpsc::channel(32);
     let daemon_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -155,7 +176,7 @@ pub async fn run_standalone(shutdown_rx: oneshot::Receiver<()>) -> Result<(), St
     }
     let _guard = DaemonGuard(daemon_id);
 
-    run_standalone_with_channel(rx, shutdown_rx).await
+    run_standalone_with_engine(engine, rx, shutdown_rx).await
 }
 
 pub fn spawn_standalone_pair() -> (
@@ -166,6 +187,20 @@ pub fn spawn_standalone_pair() -> (
     let (tx, rx) = mpsc::channel(32);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = tokio::spawn(async move { run_standalone_with_channel(rx, shutdown_rx).await });
+    (InProcessClient::new(tx), shutdown_tx, handle)
+}
+
+pub fn spawn_standalone_pair_with_engine(
+    engine: Arc<dyn GreinEngine>,
+) -> (
+    InProcessClient,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), StandaloneError>>,
+) {
+    let (tx, rx) = mpsc::channel(32);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle =
+        tokio::spawn(async move { run_standalone_with_engine(engine, rx, shutdown_rx).await });
     (InProcessClient::new(tx), shutdown_tx, handle)
 }
 

@@ -1,13 +1,16 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use grein_acp::{AcpConfigChoice, AcpConfigOption, AcpModeOption, AcpModelOption, AcpSessionInfo};
-use grein_tui::engine_port::{SubagentStatus, TuiEngineEvent};
+use grein_core::port::dto::{SubagentStatus, TuiEngineEvent};
+use grein_core::storage::sqlite::SqliteStorage;
 use serde_json::json;
 use tokio::time::timeout;
 
 use super::super::types::{extract_tool_call_summary, normalize_session_config_options};
-use super::super::{AcpBackendConfig, DaemonEngine, InProcessEngine};
+use super::super::{AcpBackendConfig, EngineDependencies, InProcessEngine};
 use super::write_executable_script;
+use crate::subagent_watch::SubagentWatcher;
 
 #[tokio::test]
 async fn test_persistent_acp_unsolicited_wakeups_subagents_and_agent_meta() {
@@ -59,9 +62,14 @@ done
         cwd: temp.path().to_path_buf(),
     };
 
-    let engine = InProcessEngine::open_with_config(&db_path, temp.path().to_path_buf(), Some(cfg))
-        .expect("open");
-    engine.set_test_subagent_brain(temp.path().join("missing-brain"));
+    let storage = Arc::new(SqliteStorage::open(&db_path).expect("open sqlite"));
+    let mut deps = EngineDependencies::for_storage(storage, temp.path().to_path_buf(), Some(cfg));
+    deps.subagent_observer = SubagentWatcher::with_timings_unattached(
+        temp.path().join("missing-brain"),
+        Duration::from_millis(20),
+        Duration::from_millis(50),
+    );
+    let engine = InProcessEngine::with_dependencies(deps).expect("open");
     engine.set_test_quiet_timeout(Duration::from_millis(90));
     let main = engine.ensure_main_thread().await.expect("main");
     let mut rx = engine.subscribe_tui_events();

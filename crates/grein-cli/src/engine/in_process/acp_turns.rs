@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use grein_acp::{PermissionDecision, SessionId as AcpSessionId, ThreadId as AcpThreadId};
 use grein_core::model::{AuthorRole, ConversationNode, NodeId, ThreadId, ThreadKind, ThreadStatus};
-use grein_tui::engine_port::TuiEngineEvent;
+use grein_core::port::dto::EngineStreamEvent;
 use tokio::sync::oneshot;
 
+use super::super::ports::{AgentTurnPort, ThreadUseCasePort};
 use super::super::types::{
-    parse_typed_id, select_permission_option, storage_err, DaemonEngine, EngineError, EngineEvent,
+    parse_typed_id, select_permission_option, storage_err, EngineError, EngineEvent,
     PermissionDecisionPayload, ShellCommandResult, TurnDispatchResult, SHELL_COMMAND_TIMEOUT,
     SHELL_MAX_OUTPUT_BYTES,
 };
@@ -35,7 +37,7 @@ impl InProcessEngine {
             if let Some(agent_thread) = target_agent {
                 self.runtime
                     .storage
-                    .update_thread_leaf(agent_thread.id, node_id)
+                    .update_thread_leaf(&agent_thread.id, &node_id)
                     .map_err(storage_err)?;
             }
             state.last_node = Some(node_id);
@@ -44,8 +46,8 @@ impl InProcessEngine {
             });
         }
 
-        let main = DaemonEngine::ensure_main_thread(self).await?;
-        DaemonEngine::send_turn_for_thread(self, &main.thread_id, prompt).await
+        let main = ThreadUseCasePort::ensure_main_thread(self).await?;
+        AgentTurnPort::send_turn_for_thread(self, &main.thread_id, prompt).await
     }
 
     pub(super) async fn send_turn_for_thread_impl(
@@ -64,7 +66,7 @@ impl InProcessEngine {
         let existing_thread = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
         if existing_thread.kind == ThreadKind::Terminal {
@@ -75,7 +77,6 @@ impl InProcessEngine {
 
         let _turn_guard = self.runtime.acquire_thread_turn_lock(thread_id).await?;
 
-        // Flush any buffered unsolicited wakeup on an existing active session before inserting user node.
         let existing_cmd_tx = {
             let state = self.runtime.lock()?;
             state
@@ -96,7 +97,7 @@ impl InProcessEngine {
         let thread = self
             .runtime
             .storage
-            .get_thread(tid)
+            .get_thread(&tid)
             .map_err(storage_err)?
             .ok_or_else(|| EngineError::NotFound(format!("thread {thread_id}")))?;
 
@@ -113,18 +114,18 @@ impl InProcessEngine {
             .map_err(storage_err)?;
         self.runtime
             .storage
-            .update_thread_leaf(tid, user_node_id)
+            .update_thread_leaf(&tid, &user_node_id)
             .map_err(storage_err)?;
         self.runtime
             .storage
-            .update_thread_status(tid, ThreadStatus::Streaming)
+            .update_thread_status(&tid, ThreadStatus::Streaming)
             .map_err(storage_err)?;
         {
             let mut state = self.runtime.lock()?;
             state.last_node = Some(user_node_id);
         }
 
-        self.runtime.emit_tui(TuiEngineEvent::ThreadStatusChanged {
+        self.runtime.emit_tui(EngineStreamEvent::ThreadStatusChanged {
             thread_id: thread_id.to_string(),
             status: "streaming".to_string(),
         });
@@ -291,6 +292,19 @@ impl InProcessEngine {
             state.pending_permissions.remove(&decision.request_id)
         };
         if let Some(record) = pending {
+            if let Some(policy) = self.runtime.policy.as_ref() {
+                let recorded = if decision.allow {
+                    PermissionDecision::AllowOnce
+                } else {
+                    PermissionDecision::Deny
+                };
+                policy.record_decision(
+                    &AcpSessionId::new(&record.session_id),
+                    &AcpThreadId::new(&record.thread_id),
+                    &record.request,
+                    recorded,
+                );
+            }
             let option_id = select_permission_option(&record.options, decision.allow);
             record
                 .driver
@@ -339,30 +353,20 @@ impl InProcessEngine {
             ));
         }
         let cwd = parse_typed_id::<ThreadId>(thread_id)
+            .as_ref()
             .and_then(|tid| self.runtime.storage.get_thread(tid).ok().flatten())
             .map(|t| self.runtime.resolve_thread_cwd(&t))
             .unwrap_or_else(|| self.runtime.cwd.clone());
         let cmd = command.to_string();
-        let output = tokio::task::spawn_blocking(move || {
-            grein_workspace::shell::run_shell_command_with_pty_blocking(
-                &cwd,
-                &cmd,
-                SHELL_COMMAND_TIMEOUT,
-                SHELL_MAX_OUTPUT_BYTES,
-            )
+        let shell = Arc::clone(&self.runtime.shell);
+        let result = tokio::task::spawn_blocking(move || {
+            shell.run_shell_command(&cwd, &cmd, SHELL_COMMAND_TIMEOUT, SHELL_MAX_OUTPUT_BYTES)
         })
         .await
         .map_err(|e| EngineError::Transport(format!("shell task panicked: {e}")))?
         .map_err(|e| EngineError::Transport(format!("shell execution failed: {e}")))?;
 
-        let result = ShellCommandResult {
-            command: output.command,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            exit_code: output.exit_code,
-            timed_out: output.timed_out,
-        };
-        self.runtime.emit_tui(TuiEngineEvent::ShellOutput {
+        self.runtime.emit_tui(EngineStreamEvent::ShellOutput {
             thread_id: thread_id.to_string(),
             command: result.command.clone(),
             stdout: result.stdout.clone(),
