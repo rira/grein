@@ -168,28 +168,73 @@ fn check_acp_agents(agent_discoverer: &AgentDiscoverer) -> DoctorCheck {
     }
 }
 
-fn check_terminal_env() -> DoctorCheck {
-    let term = std::env::var("TERM")
+fn read_trimmed_env(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let colorterm = std::env::var("COLORTERM")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-        .into_iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
+        .filter(|s| !s.is_empty())
+}
 
-    let term_ok = term
-        .as_deref()
-        .is_some_and(|t| !t.eq_ignore_ascii_case("dumb"));
-    let utf8_ok = locale.as_deref().is_some_and(|loc| {
+fn clean_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn has_truecolor_value(value: Option<&str>) -> bool {
+    clean_non_empty(value).is_some_and(|raw| {
+        let lower = raw.to_ascii_lowercase();
+        lower.contains("truecolor") || lower.contains("24bit")
+    })
+}
+
+pub fn detect_color_mode_label(
+    term: Option<&str>,
+    term_program: Option<&str>,
+    colorterm: Option<&str>,
+    kitty_window_id: Option<&str>,
+    ghostty_resources_dir: Option<&str>,
+) -> &'static str {
+    if has_truecolor_value(colorterm) {
+        return "truecolor";
+    }
+
+    if let Some(tp) = clean_non_empty(term_program) {
+        if tp.eq_ignore_ascii_case("iTerm.app")
+            || tp.eq_ignore_ascii_case("WezTerm")
+            || tp.eq_ignore_ascii_case("ghostty")
+            || tp.eq_ignore_ascii_case("vscode")
+        {
+            return "truecolor";
+        }
+    }
+
+    if clean_non_empty(kitty_window_id).is_some()
+        || clean_non_empty(ghostty_resources_dir).is_some()
+    {
+        return "truecolor";
+    }
+
+    if has_truecolor_value(term) {
+        return "truecolor";
+    }
+
+    "256-color fallback"
+}
+
+pub fn check_terminal_env_from(
+    term: Option<&str>,
+    term_program: Option<&str>,
+    colorterm: Option<&str>,
+    kitty_window_id: Option<&str>,
+    ghostty_resources_dir: Option<&str>,
+    locale: Option<&str>,
+) -> DoctorCheck {
+    let term = clean_non_empty(term);
+    let term_program = clean_non_empty(term_program);
+    let colorterm = clean_non_empty(colorterm);
+    let locale = clean_non_empty(locale);
+
+    let term_ok = term.is_some_and(|t| !t.eq_ignore_ascii_case("dumb"));
+    let utf8_ok = locale.is_some_and(|loc| {
         let lower = loc.to_ascii_lowercase();
         lower.contains("utf-8") || lower.contains("utf8")
     });
@@ -200,16 +245,55 @@ fn check_terminal_env() -> DoctorCheck {
         CheckStatus::Warn
     };
 
+    let color_mode = detect_color_mode_label(
+        term,
+        term_program,
+        colorterm,
+        kitty_window_id,
+        ghostty_resources_dir,
+    );
+    let apple_terminal_fallback = term_program
+        .is_some_and(|tp| tp.eq_ignore_ascii_case("Apple_Terminal"))
+        && !has_truecolor_value(colorterm);
+
+    let mut detail = format!(
+        "TERM={}, TERM_PROGRAM={}, COLORTERM={} (color={color_mode}), locale={}",
+        term.unwrap_or("<unset>"),
+        term_program.unwrap_or("<unset>"),
+        colorterm.unwrap_or("<unset>"),
+        locale.unwrap_or("<unset>"),
+    );
+    if apple_terminal_fallback {
+        detail.push_str(
+            "; Apple_Terminal uses 256-color palette fallback automatically — prefer Ctrl+G manage mode if Shift/Option modifiers vary, or run `grein keys` to inspect modifiers",
+        );
+    }
+
     DoctorCheck {
         name: "terminal_env".to_string(),
         status,
-        detail: format!(
-            "TERM={}, COLORTERM={}, locale={}",
-            term.as_deref().unwrap_or("<unset>"),
-            colorterm.as_deref().unwrap_or("<unset>"),
-            locale.as_deref().unwrap_or("<unset>"),
-        ),
+        detail,
     }
+}
+
+fn check_terminal_env() -> DoctorCheck {
+    let term = read_trimmed_env("TERM");
+    let term_program = read_trimmed_env("TERM_PROGRAM");
+    let colorterm = read_trimmed_env("COLORTERM");
+    let kitty_window_id = read_trimmed_env("KITTY_WINDOW_ID");
+    let ghostty_resources_dir = read_trimmed_env("GHOSTTY_RESOURCES_DIR");
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(read_trimmed_env);
+
+    check_terminal_env_from(
+        term.as_deref(),
+        term_program.as_deref(),
+        colorterm.as_deref(),
+        kitty_window_id.as_deref(),
+        ghostty_resources_dir.as_deref(),
+        locale.as_deref(),
+    )
 }
 
 fn check_workspace_state(cwd: &Path, probe: &DbProbe) -> DoctorCheck {
@@ -367,5 +451,93 @@ mod tests {
 
         let unset_check = check_preferences_db(None, &deps.prefs_db_probe);
         assert_eq!(unset_check.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn test_detect_color_mode_label_identifies_truecolor_and_fallback() {
+        assert_eq!(
+            detect_color_mode_label(Some("xterm-256color"), None, Some("truecolor"), None, None),
+            "truecolor"
+        );
+        assert_eq!(
+            detect_color_mode_label(Some("xterm-256color"), None, Some("24bit"), None, None),
+            "truecolor"
+        );
+        for term_prog in ["iTerm.app", "WezTerm", "ghostty", "vscode"] {
+            assert_eq!(
+                detect_color_mode_label(Some("xterm-256color"), Some(term_prog), None, None, None),
+                "truecolor",
+                "expected truecolor for {term_prog}"
+            );
+        }
+        assert_eq!(
+            detect_color_mode_label(Some("xterm-256color"), None, None, Some("1"), None),
+            "truecolor"
+        );
+        assert_eq!(
+            detect_color_mode_label(
+                Some("xterm-256color"),
+                None,
+                None,
+                None,
+                Some("/Applications/Ghostty.app/Contents/Resources/ghostty")
+            ),
+            "truecolor"
+        );
+        assert_eq!(
+            detect_color_mode_label(Some("xterm-truecolor"), None, None, None, None),
+            "truecolor"
+        );
+        assert_eq!(
+            detect_color_mode_label(
+                Some("xterm-256color"),
+                Some("Apple_Terminal"),
+                None,
+                None,
+                None
+            ),
+            "256-color fallback"
+        );
+    }
+
+    #[test]
+    fn test_check_terminal_env_from_apple_terminal_vs_truecolor() {
+        let apple = check_terminal_env_from(
+            Some("xterm-256color"),
+            Some("Apple_Terminal"),
+            None,
+            None,
+            None,
+            Some("en_US.UTF-8"),
+        );
+        assert_eq!(apple.status, CheckStatus::Ok);
+        assert!(apple.detail.contains("TERM_PROGRAM=Apple_Terminal"));
+        assert!(apple.detail.contains("256-color fallback"));
+        assert!(apple.detail.contains("256-color palette fallback"));
+        assert!(apple.detail.contains("Ctrl+G"));
+        assert!(apple.detail.contains("grein keys"));
+
+        let iterm = check_terminal_env_from(
+            Some("xterm-256color"),
+            Some("iTerm.app"),
+            None,
+            None,
+            None,
+            Some("en_US.UTF-8"),
+        );
+        assert_eq!(iterm.status, CheckStatus::Ok);
+        assert!(iterm.detail.contains("TERM_PROGRAM=iTerm.app"));
+        assert!(iterm.detail.contains("truecolor"));
+        assert!(!iterm.detail.contains("256-color fallback"));
+
+        let dumb = check_terminal_env_from(
+            Some("dumb"),
+            Some("Apple_Terminal"),
+            None,
+            None,
+            None,
+            Some("C"),
+        );
+        assert_eq!(dumb.status, CheckStatus::Warn);
     }
 }

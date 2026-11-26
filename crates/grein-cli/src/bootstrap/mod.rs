@@ -12,7 +12,7 @@ use grein_core::prefs::{default_prefs_db_path, JsonSettingsCodec, TomlSettingsCo
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_workspace::port::{GitCliInspector, GitWorktreeDriver, PtyShellExecutor, UnixPtySpawner};
 
-use crate::args::{AttachArgs, Cli, Command, DaemonArgs, SettingsCommand, ThemeCommand};
+use crate::args::{AttachArgs, Cli, Command, DaemonArgs, KeysArgs, SettingsCommand, ThemeCommand};
 use crate::daemon::{resolve_state_dir, run_daemon_with_engine};
 use crate::discovery::{discover_acp_agents, resolve_agents_configuration, AcpAgent, AcpAgentKind};
 use crate::doctor::{handle_doctor_with, DoctorDeps};
@@ -403,6 +403,11 @@ async fn dispatch_cli(
         Some(Command::Doctor(args)) => {
             let deps = build_doctor_deps(config, registry);
             handle_doctor_with(&args, &deps)?;
+        }
+        Some(Command::Keys(KeysArgs { no_enhance })) => {
+            grein_tui::run_key_inspector(grein_tui::KeyInspectorOptions {
+                enhance_keyboard: !no_enhance,
+            })?;
         }
         Some(Command::Settings(args)) => {
             let read_only = matches!(args.command, SettingsCommand::Export(_));

@@ -1,9 +1,11 @@
 mod dispatch;
 mod engine_events;
+pub mod key_inspector;
 mod transcript_sync;
 mod tree_order;
 
 pub use engine_events::{apply_engine_event, apply_hydrated_session};
+pub use key_inspector::{run_key_inspector, KeyInspectorOptions};
 pub use transcript_sync::{collect_turns, now_epoch_ms, render_node, sync_thread_blocks_md};
 pub use tree_order::{
     compute_ordered_thread_entries, compute_ordered_thread_entries_with_folds,

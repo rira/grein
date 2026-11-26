@@ -30,6 +30,8 @@ pub enum Command {
     Agents(AgentsArgs),
     #[command(about = "Run environment and workspace diagnostics")]
     Doctor(DoctorArgs),
+    /// Inspect raw terminal key events and macOS modifier support
+    Keys(KeysArgs),
     #[command(about = "Export or import global user settings")]
     Settings(SettingsArgs),
     #[command(about = "Export or import theme presets and color overrides")]
@@ -88,6 +90,13 @@ pub struct AgentsArgs {
 pub struct DoctorArgs {
     #[arg(long, help = "Output in JSON format")]
     pub json: bool,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq, Default)]
+pub struct KeysArgs {
+    /// Disable kitty/CSI-u keyboard enhancement protocol probing
+    #[arg(long)]
+    pub no_enhance: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -183,4 +192,25 @@ pub struct ThemeImportArgs {
     pub format: InputFormatArg,
     #[arg(long, help = "Replace theme overrides instead of merging")]
     pub replace: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_keys_subcommand_and_no_enhance_flag() {
+        let default = Cli::try_parse_from(["grein", "keys"]).expect("parse grein keys");
+        assert_eq!(
+            default.command,
+            Some(Command::Keys(KeysArgs { no_enhance: false }))
+        );
+
+        let no_enhance =
+            Cli::try_parse_from(["grein", "keys", "--no-enhance"]).expect("parse --no-enhance");
+        assert_eq!(
+            no_enhance.command,
+            Some(Command::Keys(KeysArgs { no_enhance: true }))
+        );
+    }
 }
