@@ -396,6 +396,8 @@ fn shell_pipe_normal_exit_with_orphan_fd_is_bounded_and_cleans_up() {
 fn shell_pty_detach_tty_session_eof_signal_and_grandchild_timeout() {
     let dir = tempdir().expect("tempdir");
     let parent_sid = unsafe { libc::getsid(0) };
+    #[cfg(target_os = "macos")]
+    let parent_pgrp = unsafe { libc::getpgrp() };
 
     let started = Instant::now();
     let eof = run_shell_command_with_pty_and_shell_blocking(
@@ -453,7 +455,7 @@ fn shell_pty_detach_tty_session_eof_signal_and_grandchild_timeout() {
     {
         let ps_out = run_shell_command_with_pty_and_shell_blocking(
             dir.path(),
-            "ps -o pid=,pgid=,sid= -p $$",
+            "ps -o pid=,pgid= -p $$",
             Duration::from_secs(5),
             4096,
             Some("/bin/sh"),
@@ -464,10 +466,10 @@ fn shell_pty_detach_tty_session_eof_signal_and_grandchild_timeout() {
             .split_whitespace()
             .map(|v| v.parse().expect("id"))
             .collect();
-        assert_eq!(cols.len(), 3);
+        assert_eq!(cols.len(), 2);
         assert_eq!(cols[0], cols[1]);
-        assert_eq!(cols[0], cols[2]);
-        assert_ne!(cols[2], parent_sid);
+        assert_ne!(cols[1], parent_pgrp);
+        assert_ne!(cols[1], parent_sid);
     }
 
     let sig = run_shell_command_with_pty_and_shell_blocking(

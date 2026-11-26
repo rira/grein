@@ -1,4 +1,6 @@
-use std::ffi::{c_char, CStr};
+#[cfg(target_os = "linux")]
+use std::ffi::c_char;
+use std::ffi::CStr;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

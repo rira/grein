@@ -111,7 +111,9 @@ jobs:
 
       - name: Run Apple Silicon macOS PTY tests
         if: matrix.target == 'aarch64-apple-darwin'
-        run: cargo test --locked -p grein-workspace --lib shell --test pty_session_test --test workspace_coverage_hardening_test --test port_contracts_test
+        run: |
+          cargo test --locked -p grein-workspace --lib shell
+          cargo test --locked -p grein-workspace --test pty_session_test --test workspace_coverage_hardening_test --test port_contracts_test
 
       - name: Build release binary
         env:
