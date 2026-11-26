@@ -42,6 +42,13 @@ const RESET_CHILD_SIGNALS: &[libc::c_int] = &[
 
 #[cfg(all(unix, not(target_os = "linux")))]
 static PTSNAME_LOCK: Mutex<()> = Mutex::new(());
+static PTY_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_pty_spawn() -> std::sync::MutexGuard<'static, ()> {
+    PTY_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub(super) struct ChildProcess {
     pub(super) pid: libc::pid_t,
@@ -272,7 +279,7 @@ pub(super) fn create_wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 pub(super) fn send_signal_to_process_group(pid: libc::pid_t, sig: libc::c_int) {
     let pgid_rc = unsafe { libc::kill(-pid, sig) };
-    if pgid_rc < 0 {
+    if pgid_rc < 0 || sig == libc::SIGKILL {
         let _ = unsafe { libc::kill(pid, sig) };
     }
 }

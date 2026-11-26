@@ -1,8 +1,10 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use grein_workspace::pty_session::live_process_cwd;
 use grein_workspace::pty_session::{
-    live_process_cwd, InteractivePtySession, PtyCell, PtyColor, PtyScreenSnapshot,
+    InteractivePtySession, PtyCell, PtyColor, PtyScreenSnapshot,
 };
 
 struct UpdateSignal {

@@ -369,7 +369,11 @@ fn run_pipe_command(
     #[cfg(unix)]
     attach_session_isolation(&mut cmd);
 
-    let mut child = cmd.spawn()?;
+    let mut child = {
+        #[cfg(unix)]
+        let _spawn_guard = crate::pty_session::unix::lock_pty_spawn();
+        cmd.spawn()?
+    };
     let stdout_reader = PipeReader::spawn(child.stdout.take(), max_output_bytes, false);
     let stderr_reader = PipeReader::spawn(child.stderr.take(), max_output_bytes, false);
     wait_and_collect(
@@ -403,37 +407,38 @@ pub fn run_shell_command_with_pty_and_shell_blocking(
 
     #[cfg(unix)]
     {
-        let (master_fd, slave_fd) = match crate::pty_session::unix::open_pty_pair(40, 120) {
-            Ok(pair) => pair,
-            Err(_) => {
-                return run_pipe_command(
-                    cwd,
-                    command,
-                    timeout,
-                    max_output_bytes,
-                    shell_override,
-                    true,
-                );
-            }
+        let (master_file, mut child) = {
+            let spawn_guard = crate::pty_session::unix::lock_pty_spawn();
+            let (master_fd, slave_fd) = match crate::pty_session::unix::open_pty_pair(40, 120) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    drop(spawn_guard);
+                    return run_pipe_command(
+                        cwd,
+                        command,
+                        timeout,
+                        max_output_bytes,
+                        shell_override,
+                        true,
+                    );
+                }
+            };
+            let master_file = File::from(master_fd);
+            let shell = resolve_shell(shell_override);
+            let script = build_pty_shell_script(&shell, command);
+            let mut cmd = Command::new(&shell);
+            cmd.arg("-c")
+                .arg(&script)
+                .current_dir(cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(File::from(slave_fd)))
+                .stderr(Stdio::piped());
+            apply_color_env(&mut cmd, true);
+            attach_session_isolation(&mut cmd);
+            let spawn_result = cmd.spawn();
+            drop(cmd);
+            (master_file, spawn_result?)
         };
-        let master_file = File::from(master_fd);
-        let slave_file = File::from(slave_fd);
-
-        let shell = resolve_shell(shell_override);
-        let script = build_pty_shell_script(&shell, command);
-        let mut cmd = Command::new(&shell);
-        cmd.arg("-c")
-            .arg(&script)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(slave_file))
-            .stderr(Stdio::piped());
-        apply_color_env(&mut cmd, true);
-        attach_session_isolation(&mut cmd);
-
-        let spawn_result = cmd.spawn();
-        drop(cmd);
-        let mut child = spawn_result?;
 
         let stdout_reader = PipeReader::spawn(Some(master_file), max_output_bytes, true);
         let stderr_reader = PipeReader::spawn(child.stderr.take(), max_output_bytes, false);

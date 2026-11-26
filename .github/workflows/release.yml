@@ -111,6 +111,7 @@ jobs:
 
       - name: Run Apple Silicon macOS PTY tests
         if: matrix.target == 'aarch64-apple-darwin'
+        timeout-minutes: 5
         run: |
           cargo test --locked -p grein-workspace --lib shell
           cargo test --locked -p grein-workspace --test pty_session_test --test workspace_coverage_hardening_test --test port_contracts_test

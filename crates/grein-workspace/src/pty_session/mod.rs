@@ -29,8 +29,9 @@ use self::reader::spawn_reader_thread;
 use self::state::PtyState;
 #[cfg(unix)]
 use self::unix::{
-    build_pty_command, create_wake_pipe, open_pty_pair, reset_child_signals, resolve_shell,
-    send_signal_to_process_group, set_nonblocking, set_pty_winsize, write_all_to_fd, ChildProcess,
+    build_pty_command, create_wake_pipe, lock_pty_spawn, open_pty_pair, reset_child_signals,
+    resolve_shell, send_signal_to_process_group, set_nonblocking, set_pty_winsize,
+    write_all_to_fd, ChildProcess,
 };
 
 pub use state::{PtyCell, PtyColor, PtyMouseEncoding, PtyMouseMode, PtyScreenSnapshot};
@@ -149,42 +150,47 @@ impl InteractivePtySession {
         let cols = cols.max(1);
         let shell = resolve_shell(shell_override);
 
-        let (master_fd, slave_fd) = open_pty_pair(rows, cols)?;
-        set_nonblocking(master_fd.as_raw_fd())?;
-        let (wake_read_fd, wake_write_fd) = create_wake_pipe()?;
+        let (master_fd, wake_read_fd, wake_write_fd, child) = {
+            let _spawn_guard = lock_pty_spawn();
+            let (master_fd, slave_fd) = open_pty_pair(rows, cols)?;
+            set_nonblocking(master_fd.as_raw_fd())?;
+            let (wake_read_fd, wake_write_fd) = create_wake_pipe()?;
 
-        let slave_raw_fd = slave_fd.as_raw_fd();
-        let mut cmd = build_pty_command(&shell, cwd, extra_env);
+            let slave_raw_fd = slave_fd.as_raw_fd();
+            let mut cmd = build_pty_command(&shell, cwd, extra_env);
 
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                #[allow(clippy::unnecessary_cast)]
-                if libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let _ = libc::tcsetpgrp(slave_raw_fd, libc::getpid());
-                for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-                    if slave_raw_fd == target {
-                        if libc::fcntl(target, libc::F_SETFD, 0) < 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                    } else if libc::dup2(slave_raw_fd, target) < 0 {
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setsid() < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                }
-                if slave_raw_fd > 2 {
-                    libc::close(slave_raw_fd);
-                }
-                reset_child_signals()
-            });
-        }
+                    #[allow(clippy::unnecessary_cast)]
+                    if libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let _ = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                    let _ = libc::tcsetpgrp(slave_raw_fd, libc::getpid());
+                    for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                        if slave_raw_fd == target {
+                            if libc::fcntl(target, libc::F_SETFD, 0) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        } else if libc::dup2(slave_raw_fd, target) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    if slave_raw_fd > 2 {
+                        libc::close(slave_raw_fd);
+                    }
+                    reset_child_signals()
+                });
+            }
 
-        let spawn_result = cmd.spawn();
-        drop(slave_fd);
-        let child = spawn_result?;
+            let spawn_result = cmd.spawn();
+            drop(slave_fd);
+            let child = spawn_result?;
+            (master_fd, wake_read_fd, wake_write_fd, child)
+        };
 
         let pid = child.id();
         let pid_t = libc::pid_t::try_from(pid)
