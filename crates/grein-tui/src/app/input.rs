@@ -28,6 +28,9 @@ impl App {
         let no_ctrl_alt = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !(no_ctrl_alt && key.code == KeyCode::Char('z')) {
+            self.sidebar_unhidden_by_manage = false;
+        }
 
         match (key.code, shift) {
             (KeyCode::Down, false) | (KeyCode::Char('j'), _) if no_ctrl_alt => {
@@ -91,7 +94,7 @@ impl App {
                 None
             }
             (KeyCode::Char('z'), _) if no_ctrl_alt => {
-                self.toggle_sidebar_zoom();
+                self.toggle_manage_zoom_from_z();
                 None
             }
             (KeyCode::Char('o'), _) if no_ctrl_alt => {
@@ -355,16 +358,19 @@ impl App {
         // 3. MANAGE Mode (FocusedPane::Tree)
         if self.focused_pane == FocusedPane::Tree {
             if self.rename_prompt.is_some() {
+                self.sidebar_unhidden_by_manage = false;
                 self.handle_key_rename_prompt(key);
                 self.sync_focus_out();
                 return true;
             }
             if self.palette_active {
+                self.sidebar_unhidden_by_manage = false;
                 self.handle_key_palette(key);
                 self.sync_focus_out();
                 return true;
             }
             if self.sidebar_view == SidebarView::Worktrees && self.worktree_filter_active {
+                self.sidebar_unhidden_by_manage = false;
                 match (key.code, ctrl, alt) {
                     (KeyCode::Esc, false, false) => {
                         self.worktree_filter_active = false;
@@ -404,6 +410,7 @@ impl App {
                 return true;
             }
             if self.transcript_search.editing {
+                self.sidebar_unhidden_by_manage = false;
                 match (key.code, ctrl, alt) {
                     (KeyCode::Esc, false, false) | (KeyCode::Char('c' | 'C'), true, false) => {
                         self.transcript_search.clear();
@@ -433,12 +440,14 @@ impl App {
 
             // Tab switches between Grein and Worktrees sidebar views
             if no_ctrl_alt && key.code == KeyCode::Tab {
+                self.sidebar_unhidden_by_manage = false;
                 self.toggle_worktrees_sidebar_view();
                 return true;
             }
 
             // Help via ?
             if no_ctrl_alt && key.code == KeyCode::Char('?') {
+                self.sidebar_unhidden_by_manage = false;
                 self.help_scroll_offset = 0;
                 self.help_filter_active = false;
                 self.help_filter_query.clear();
@@ -449,6 +458,7 @@ impl App {
 
             // Sidebar Command Palette (:)
             if no_ctrl_alt && key.code == KeyCode::Char(':') {
+                self.sidebar_unhidden_by_manage = false;
                 self.open_command_palette("");
                 self.sync_focus_out();
                 return true;
@@ -458,14 +468,33 @@ impl App {
             if (no_ctrl_alt && !shift && key.code == KeyCode::Char('q'))
                 || (ctrl && !alt && matches!(key.code, KeyCode::Char('c' | 'C')))
             {
+                self.sidebar_unhidden_by_manage = false;
                 self.request_quit_with_confirm();
                 self.sync_focus_out();
                 return true;
             }
 
+            // Plain 1..9 jumps directly to depth-0 root 1..9 and enters WRITE
+            if no_ctrl_alt && !shift {
+                if let KeyCode::Char(c @ '1'..='9') = key.code {
+                    self.sidebar_unhidden_by_manage = false;
+                    if self.select_root_by_index((c as u8 - b'0') as usize) {
+                        self.sidebar_view = SidebarView::Grein;
+                        self.focused_pane = if self.active_is_terminal() {
+                            FocusedPane::Terminal
+                        } else {
+                            FocusedPane::Composer
+                        };
+                    }
+                    self.sync_focus_out();
+                    return true;
+                }
+            }
+
             // Alt+1..9 jumps directly to depth-0 root 1..9 (AltGr excluded)
             if alt && !ctrl {
                 if let KeyCode::Char(c @ '1'..='9') = key.code {
+                    self.sidebar_unhidden_by_manage = false;
                     self.select_root_by_index((c as u8 - b'0') as usize);
                     self.sync_focus_out();
                     return true;
@@ -475,32 +504,39 @@ impl App {
             // Check keymap bindings in MANAGE too (Ctrl+G exits MANAGE -> WRITE;
             // Alt+Z toggles zoom; Alt+H/L cycle siblings; Alt+K/J scroll preview target)
             if let Some(action) = self.keymap.match_write_key(key) {
+                self.sidebar_unhidden_by_manage = false;
                 self.execute_bindable_action(action);
                 self.sync_focus_out();
                 return true;
             }
 
-            // Right-pane preview scrolling (Ctrl+U/D half-page, Ctrl+B/F full-page)
-            match (key.code, ctrl, alt) {
-                (KeyCode::Char('u' | 'U'), true, false) => {
+            // Right-pane preview scrolling (Ctrl+U/D & PageUp/PageDown half-page, Ctrl+B/F full-page)
+            match (key.code, ctrl, alt, shift) {
+                (KeyCode::Char('u' | 'U'), true, false, _)
+                | (KeyCode::PageUp, false, false, false) => {
+                    self.sidebar_unhidden_by_manage = false;
                     let step = self.half_page_scroll_lines();
                     self.scroll_manage_preview(false, step);
                     self.sync_focus_out();
                     return true;
                 }
-                (KeyCode::Char('d' | 'D'), true, false) => {
+                (KeyCode::Char('d' | 'D'), true, false, _)
+                | (KeyCode::PageDown, false, false, false) => {
+                    self.sidebar_unhidden_by_manage = false;
                     let step = self.half_page_scroll_lines();
                     self.scroll_manage_preview(true, step);
                     self.sync_focus_out();
                     return true;
                 }
-                (KeyCode::Char('b' | 'B'), true, false) => {
+                (KeyCode::Char('b' | 'B'), true, false, _) => {
+                    self.sidebar_unhidden_by_manage = false;
                     let step = self.full_page_scroll_lines();
                     self.scroll_manage_preview(false, step);
                     self.sync_focus_out();
                     return true;
                 }
-                (KeyCode::Char('f' | 'F'), true, false) => {
+                (KeyCode::Char('f' | 'F'), true, false, _) => {
+                    self.sidebar_unhidden_by_manage = false;
                     let step = self.full_page_scroll_lines();
                     self.scroll_manage_preview(true, step);
                     self.sync_focus_out();
@@ -508,6 +544,15 @@ impl App {
                 }
                 _ => {}
             }
+
+            // Symmetric zoom toggle in MANAGE (both Grein and Worktrees)
+            if no_ctrl_alt && key.code == KeyCode::Char('z') {
+                self.toggle_manage_zoom_from_z();
+                self.sync_focus_out();
+                return true;
+            }
+
+            self.sidebar_unhidden_by_manage = false;
 
             // View-specific MANAGE controls
             if self.sidebar_view == SidebarView::Worktrees {
@@ -532,7 +577,7 @@ impl App {
                 return true;
             }
 
-            // Grein view: filter/search & Esc & Grein actions
+            // Grein view: filter/search & Esc & sibling stepping & Grein actions
             if no_ctrl_alt {
                 match key.code {
                     KeyCode::Char('/') => {
@@ -561,6 +606,20 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            if (ctrl && !alt && matches!(key.code, KeyCode::Char('p' | 'P')))
+                || (no_ctrl_alt && !shift && key.code == KeyCode::Char('['))
+            {
+                self.step_sibling_at_current_depth(false);
+                self.sync_focus_out();
+                return true;
+            }
+            if (ctrl && !alt && matches!(key.code, KeyCode::Char('n' | 'N')))
+                || (no_ctrl_alt && !shift && key.code == KeyCode::Char(']'))
+            {
+                self.step_sibling_at_current_depth(true);
+                self.sync_focus_out();
+                return true;
             }
             let _ = self.handle_key_tree_with_prefix(key, had_g_prefix);
             self.sync_focus_out();

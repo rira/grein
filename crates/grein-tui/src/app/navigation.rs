@@ -19,7 +19,9 @@ impl App {
         self.composer_desired_col = None;
         self.pending_g_prefix = false;
         self.focused_pane = FocusedPane::Tree;
+        let was_hidden = self.sidebar_hidden;
         self.sidebar_hidden = false;
+        self.sidebar_unhidden_by_manage = was_hidden;
         self.sync_focus_out();
         self.maybe_queue_terminal_resize();
     }
@@ -27,6 +29,7 @@ impl App {
     pub(super) fn open_or_jump_to_terminal(&mut self) {
         self.pending_rename_thread_id = None;
         self.rename_prompt = None;
+        self.sidebar_unhidden_by_manage = false;
         let target_id =
             if self.focused_pane == FocusedPane::Tree && self.sidebar_view == SidebarView::Grein {
                 self.selected_tree_thread_info().0
@@ -240,7 +243,9 @@ impl App {
             }
         }
         if prev != FocusedPane::Tree && self.focused_pane == FocusedPane::Tree {
+            let was_hidden = self.sidebar_hidden;
             self.sidebar_hidden = false;
+            self.sidebar_unhidden_by_manage = was_hidden;
         }
     }
 
@@ -280,6 +285,7 @@ impl App {
             self.focus_tree();
         } else {
             self.rename_prompt = None;
+            self.sidebar_unhidden_by_manage = false;
             self.focused_pane = pane;
             self.sync_focus_out();
         }
@@ -292,6 +298,7 @@ impl App {
     pub(super) fn activate_selected_tree_node(&mut self) -> Option<TreeAction> {
         self.pending_rename_thread_id = None;
         self.rename_prompt = None;
+        self.sidebar_unhidden_by_manage = false;
         let Some(idx) = self.tree.selected_index() else {
             self.focused_pane = if self.active_is_terminal() {
                 FocusedPane::Terminal
@@ -345,6 +352,7 @@ impl App {
         ) {
             self.focus_tree();
         } else if self.focused_pane == FocusedPane::Tree {
+            self.sidebar_unhidden_by_manage = false;
             if self.sidebar_view == SidebarView::Worktrees {
                 self.worktree_filter_active = false;
                 self.sidebar_view = SidebarView::Grein;
@@ -358,9 +366,11 @@ impl App {
                 let _ = self.activate_selected_tree_node();
             }
         } else if self.active_is_terminal() {
+            self.sidebar_unhidden_by_manage = false;
             self.focused_pane = FocusedPane::Terminal;
             self.sync_focus_out();
         } else {
+            self.sidebar_unhidden_by_manage = false;
             self.focused_pane = FocusedPane::Composer;
             self.sync_focus_out();
         }

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::keymap::BindableAction;
+use crate::keymap::{BindableAction, PRESET_PREF_KEY};
 
 use super::editing::{clamp_char_boundary, is_altgr_char, prev_word_boundary};
 use super::pickers::{find_config_option, match_config_choice};
@@ -51,6 +51,7 @@ pub fn palette_command_specs() -> &'static [(&'static str, &'static str)] {
     &[
         ("agent", "Open agent picker or spawn sibling thread"),
         ("theme", "Open theme picker or set theme"),
+        ("keymap", "Switch keymap preset (standard|macos)"),
         ("bind", "Bind WRITE key: :bind <action> <chord>"),
         ("unbind", "Reset/unbind action: :unbind <action>"),
         ("keybinds", "Show live keybindings"),
@@ -468,6 +469,10 @@ impl App {
                 self.apply_theme_by_name(rest);
                 true
             }
+            "/keymap" => {
+                self.execute_keymap_command(rest);
+                true
+            }
             "/bind" => {
                 self.execute_bind_command(rest);
                 true
@@ -776,6 +781,25 @@ impl App {
             .collect::<Vec<_>>()
             .join(" · ");
         self.status_notice = Some(format!("WRITE keybinds: {summary}"));
+    }
+
+    fn execute_keymap_command(&mut self, rest: &str) {
+        match self.keymap.apply_keymap_command(rest) {
+            Ok(Some(preset)) => {
+                self.pending_actions
+                    .push_back(AppAction::SaveKeybindingPreference {
+                        action: PRESET_PREF_KEY.to_string(),
+                        binding: preset.as_str().to_string(),
+                    });
+                self.status_notice = Some(preset.status_notice());
+            }
+            Ok(None) => {
+                self.status_notice = Some(self.keymap.preset.current_status_notice());
+            }
+            Err(err) => {
+                self.status_notice = Some(err);
+            }
+        }
     }
 
     pub(super) fn handle_key_palette(&mut self, key: KeyEvent) {

@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::transcript_ops::TranscriptScroll;
 use super::types::{App, AppAction, FocusedPane, SidebarView};
 
 pub(crate) fn is_altgr_char(c: char, ctrl: bool, alt: bool) -> bool {
@@ -384,6 +385,14 @@ impl App {
             }
             (KeyCode::Up, false, false) if !shift => self.move_composer_cursor_vertical(-1),
             (KeyCode::Down, false, false) if !shift => self.move_composer_cursor_vertical(1),
+            (KeyCode::PageUp, false, false) if !shift => {
+                self.scroll_target_transcript(TranscriptScroll::Up(10));
+                true
+            }
+            (KeyCode::PageDown, false, false) if !shift => {
+                self.scroll_target_transcript(TranscriptScroll::Down(10));
+                true
+            }
             _ => false,
         };
         if !is_vertical && (handled || self.input_buffer != prev_buf) {

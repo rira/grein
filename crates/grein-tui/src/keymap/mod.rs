@@ -1,9 +1,13 @@
+mod presets;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
+
+pub use presets::{KeymapPrefs, KeymapPreset, PRESET_PREF_KEY};
 
 pub(crate) const UNSUPPORTED_KEY_MODIFIERS: KeyModifiers = KeyModifiers::SUPER
     .union(KeyModifiers::HYPER)
@@ -107,14 +111,15 @@ impl KeyChord {
             return Ok(Self::new(KeyCode::Char('+'), KeyModifiers::NONE));
         }
 
-        let (mod_parts, key_part): (Vec<&str>, &str) = if let Some(prefix) = trimmed.strip_suffix("++") {
-            let parts: Vec<&str> = prefix.split('+').collect();
-            (parts, "+")
-        } else {
-            let mut parts: Vec<&str> = trimmed.split('+').collect();
-            let last = parts.pop().unwrap_or("");
-            (parts, last)
-        };
+        let (mod_parts, key_part): (Vec<&str>, &str) =
+            if let Some(prefix) = trimmed.strip_suffix("++") {
+                let parts: Vec<&str> = prefix.split('+').collect();
+                (parts, "+")
+            } else {
+                let mut parts: Vec<&str> = trimmed.split('+').collect();
+                let last = parts.pop().unwrap_or("");
+                (parts, last)
+            };
 
         if key_part.is_empty() {
             return Err(format!("Missing key in chord '{spec}'"));
@@ -151,7 +156,10 @@ impl KeyChord {
             "down" => KeyCode::Down,
             "left" => KeyCode::Left,
             "right" => KeyCode::Right,
-            _ if key_lower.starts_with('f') && key_lower.len() >= 2 && key_lower[1..].bytes().all(|b| b.is_ascii_digit()) => {
+            _ if key_lower.starts_with('f')
+                && key_lower.len() >= 2
+                && key_lower[1..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
                 let n: u8 = key_lower[1..]
                     .parse()
                     .map_err(|_| format!("Invalid function key '{key_part}' in '{spec}'"))?;
@@ -193,7 +201,10 @@ impl KeyChord {
             KeyCode::Esc => "esc".to_string(),
             KeyCode::Char(' ') => "space".to_string(),
             KeyCode::Char(c) => {
-                if self.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                if self
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     c.to_ascii_lowercase().to_string()
                 } else {
                     c.to_string()
@@ -235,7 +246,10 @@ impl KeyChord {
             KeyCode::Esc => "Esc".to_string(),
             KeyCode::Char(' ') => "Space".to_string(),
             KeyCode::Char(c) => {
-                if self.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                if self
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     c.to_ascii_uppercase().to_string()
                 } else {
                     c.to_string()
@@ -478,11 +492,18 @@ impl FromStr for BindableAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keymap {
+    pub preset: KeymapPreset,
     bindings: BTreeMap<BindableAction, Vec<KeyChord>>,
 }
 
 impl Default for Keymap {
     fn default() -> Self {
+        Self::with_preset(KeymapPreset::Standard)
+    }
+}
+
+impl Keymap {
+    pub fn with_preset(preset: KeymapPreset) -> Self {
         let mut bindings = BTreeMap::new();
         for &action in BindableAction::all() {
             let defaults = action.default_chords();
@@ -490,19 +511,51 @@ impl Default for Keymap {
                 bindings.insert(action, defaults);
             }
         }
-        Self { bindings }
+        Self { preset, bindings }
     }
-}
 
-impl Keymap {
-    pub fn from_prefs(prefs: &BTreeMap<String, String>) -> Self {
-        let mut keymap = Self::default();
-        for (action_name, spec) in prefs {
+    pub fn set_preset(&mut self, preset: KeymapPreset) {
+        self.preset = preset;
+    }
+
+    pub fn from_prefs<P: KeymapPrefs + ?Sized>(prefs: &P) -> Self {
+        Self::from_prefs_with_default(prefs, KeymapPreset::Standard)
+    }
+
+    pub fn from_prefs_with_default<P: KeymapPrefs + ?Sized>(
+        prefs: &P,
+        default_preset: KeymapPreset,
+    ) -> Self {
+        let entries = prefs.collect_prefs();
+        let mut preset = default_preset;
+        for &(key, val) in &entries {
+            if key.eq_ignore_ascii_case(PRESET_PREF_KEY) {
+                if let Ok(parsed) = KeymapPreset::from_str(val) {
+                    preset = parsed;
+                }
+            }
+        }
+        let mut keymap = Self::with_preset(preset);
+        for (action_name, spec) in entries {
             if let Some(action) = BindableAction::from_str(action_name) {
                 let _ = keymap.bind(action, spec);
             }
         }
         keymap
+    }
+
+    pub fn apply_keymap_command(&mut self, rest: &str) -> Result<Option<KeymapPreset>, String> {
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let preset = KeymapPreset::from_str(trimmed)?;
+        self.set_preset(preset);
+        Ok(Some(preset))
+    }
+
+    pub fn is_default_chords(&self, action: BindableAction) -> bool {
+        self.chords_for(action) == action.default_chords().as_slice()
     }
 
     pub fn parse_chord_list(spec: &str) -> Result<Vec<KeyChord>, String> {
@@ -665,7 +718,10 @@ mod tests {
             let mod_shift_up = KeyEvent::new(KeyCode::Up, extra | KeyModifiers::SHIFT);
             assert_eq!(KeyChord::from_event(mod_shift_up), None);
             assert!(!shift_up.matches(mod_shift_up));
-            assert_ne!(KeyChord::new(KeyCode::Up, extra | KeyModifiers::SHIFT), shift_up);
+            assert_ne!(
+                KeyChord::new(KeyCode::Up, extra | KeyModifiers::SHIFT),
+                shift_up
+            );
 
             let mod_tab = KeyEvent::new(KeyCode::Tab, extra);
             assert_eq!(KeyChord::from_event(mod_tab), None);
@@ -675,12 +731,18 @@ mod tests {
             let mod_shift_tab = KeyEvent::new(KeyCode::Tab, extra | KeyModifiers::SHIFT);
             assert_eq!(KeyChord::from_event(mod_shift_tab), None);
             assert!(!backtab.matches(mod_shift_tab));
-            assert_ne!(KeyChord::new(KeyCode::Tab, extra | KeyModifiers::SHIFT), backtab);
+            assert_ne!(
+                KeyChord::new(KeyCode::Tab, extra | KeyModifiers::SHIFT),
+                backtab
+            );
 
             let mod_shift_a = KeyEvent::new(KeyCode::Char('a'), extra | KeyModifiers::SHIFT);
             assert_eq!(KeyChord::from_event(mod_shift_a), None);
             assert!(!upper_a.matches(mod_shift_a));
-            assert_ne!(KeyChord::new(KeyCode::Char('a'), extra | KeyModifiers::SHIFT), upper_a);
+            assert_ne!(
+                KeyChord::new(KeyCode::Char('a'), extra | KeyModifiers::SHIFT),
+                upper_a
+            );
         }
     }
 
@@ -717,6 +779,27 @@ mod tests {
                 code: KeyCode::Char('{'),
                 modifiers: altgr | KeyModifiers::SHIFT,
             })
+        );
+    }
+
+    #[test]
+    fn from_prefs_with_default_reads_preset_first_and_ignores_invalid() {
+        let mut map = BTreeMap::new();
+        map.insert("preset".to_string(), "macos".to_string());
+        map.insert("help".to_string(), "f1".to_string());
+        let km = Keymap::from_prefs(&map);
+        assert_eq!(km.preset, KeymapPreset::MacOs);
+        assert_eq!(km.display_for(BindableAction::Help), "F1");
+        assert!(km.custom_entries().iter().all(|(a, _)| *a == BindableAction::Help));
+
+        let slice = [("preset".to_string(), "invalid_val".to_string())];
+        assert_eq!(
+            Keymap::from_prefs_with_default(&slice[..], KeymapPreset::MacOs).preset,
+            KeymapPreset::MacOs
+        );
+        assert_eq!(
+            Keymap::from_prefs_with_default(&slice[..], KeymapPreset::Standard).preset,
+            KeymapPreset::Standard
         );
     }
 }

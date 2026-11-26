@@ -1,6 +1,6 @@
 use crate::app::{active_shell_label, AppState, SidebarView};
 use crate::engine_port::{SubagentSnapshot, SubagentStatus};
-use crate::keymap::BindableAction;
+use crate::keymap::{BindableAction, KeyChord, KeymapPreset};
 use crate::runner::now_epoch_ms;
 use crate::search::{SearchDirection, TranscriptSearchState};
 use crate::theme::ThemePalette;
@@ -120,6 +120,95 @@ fn format_status_git_branch(branch: &str) -> String {
         }
     }
     clean.to_string()
+}
+
+fn pair_hint_segment(a: Option<String>, b: Option<String>, suffix: &str) -> Option<String> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(format!("{x}/{y} {suffix}")),
+        (Some(x), None) | (None, Some(x)) => Some(format!("{x} {suffix}")),
+        (None, None) => None,
+    }
+}
+
+fn join_hint_segments(segments: Vec<Option<String>>) -> String {
+    segments
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn format_write_status_hints(
+    state: &AppState,
+    active_is_terminal: bool,
+    terminal_exited: bool,
+    is_busy: bool,
+) -> String {
+    let km = &state.keymap;
+    let manage_key = km
+        .chords_for(BindableAction::EnterManageMode)
+        .first()
+        .map(KeyChord::display_label)
+        .unwrap_or_else(|| "Ctrl+G".to_string());
+    let first_chord = |action: BindableAction| -> Option<String> {
+        km.chords_for(action).first().map(KeyChord::display_label)
+    };
+    let zoom_key = first_chord(BindableAction::ToggleZoom);
+    let scroll_up_key = first_chord(BindableAction::ScrollUp);
+    let scroll_down_key = first_chord(BindableAction::ScrollDown);
+    let prev_sib_key = first_chord(BindableAction::PrevSibling);
+    let next_sib_key = first_chord(BindableAction::NextSibling);
+
+    let zoom_segment = match (km.preset, zoom_key) {
+        (_, None) => None,
+        (KeymapPreset::MacOs, Some(_)) if km.is_default_chords(BindableAction::ToggleZoom) => {
+            Some(format!("{manage_key} z sidebar"))
+        }
+        (_, Some(z)) => Some(format!("{z} sidebar")),
+    };
+
+    if active_is_terminal {
+        if terminal_exited {
+            return format!("exited · Enter restart · Esc/{manage_key} manage");
+        }
+        return match km.preset {
+            KeymapPreset::MacOs => join_hint_segments(vec![
+                Some(format!("{manage_key} manage")),
+                zoom_segment,
+                Some(format!("{manage_key} 1..9 root")),
+            ]),
+            KeymapPreset::Standard => join_hint_segments(vec![
+                Some(format!("{manage_key} manage")),
+                zoom_segment,
+                pair_hint_segment(scroll_up_key, scroll_down_key, "scroll"),
+            ]),
+        };
+    }
+
+    if is_busy {
+        return join_hint_segments(vec![
+            Some("Esc cancel".to_string()),
+            Some(format!("{manage_key} manage")),
+            zoom_segment,
+        ]);
+    }
+
+    match km.preset {
+        KeymapPreset::MacOs => join_hint_segments(vec![
+            Some(format!("{manage_key} manage")),
+            zoom_segment,
+            Some("PgUp/PgDn scroll".to_string()),
+            Some(format!("{manage_key} 1..9 root")),
+            Some("/help".to_string()),
+        ]),
+        KeymapPreset::Standard => join_hint_segments(vec![
+            Some(format!("{manage_key} manage")),
+            zoom_segment,
+            pair_hint_segment(scroll_up_key, scroll_down_key, "scroll"),
+            pair_hint_segment(prev_sib_key, next_sib_key, "sibling"),
+            Some("/help".to_string()),
+        ]),
+    }
 }
 
 pub(super) fn render_status_bar(
@@ -343,43 +432,6 @@ pub(super) fn render_status_bar(
             left_len += scrollback_badge.chars().count();
         }
     } else {
-        let manage_key = state
-            .keymap
-            .chords_for(BindableAction::EnterManageMode)
-            .first()
-            .map(|c| c.display_label())
-            .unwrap_or_else(|| "Ctrl+G".to_string());
-        let zoom_key = state
-            .keymap
-            .chords_for(BindableAction::ToggleZoom)
-            .first()
-            .map(|c| c.display_label())
-            .unwrap_or_else(|| "Alt+Z".to_string());
-        let scroll_up_key = state
-            .keymap
-            .chords_for(BindableAction::ScrollUp)
-            .first()
-            .map(|c| c.display_label())
-            .unwrap_or_else(|| "Alt+K".to_string());
-        let scroll_down_key = state
-            .keymap
-            .chords_for(BindableAction::ScrollDown)
-            .first()
-            .map(|c| c.display_label())
-            .unwrap_or_else(|| "Alt+J".to_string());
-        let prev_sib_key = state
-            .keymap
-            .chords_for(BindableAction::PrevSibling)
-            .first()
-            .map(|c| c.display_label())
-            .unwrap_or_else(|| "Alt+H".to_string());
-        let next_sib_key = state
-            .keymap
-            .chords_for(BindableAction::NextSibling)
-            .first()
-            .map(|c| c.display_label())
-            .unwrap_or_else(|| "Alt+L".to_string());
-
         let left_hint = if tree_focused {
             match state.sidebar_view {
                 SidebarView::Grein => {
@@ -391,16 +443,13 @@ pub(super) fn render_status_bar(
                         .to_string()
                 }
             }
-        } else if active_is_terminal {
-            if state.terminal_exit_code(active_id).is_some() {
-                format!("exited · Enter restart · Esc/{manage_key} manage")
-            } else {
-                format!("{manage_key} manage · {zoom_key} sidebar · {scroll_up_key}/{scroll_down_key} scroll")
-            }
-        } else if is_busy {
-            format!("Esc cancel · {manage_key} manage · {zoom_key} sidebar")
         } else {
-            format!("{manage_key} manage · {zoom_key} sidebar · {scroll_up_key}/{scroll_down_key} scroll · {prev_sib_key}/{next_sib_key} sibling · /help")
+            format_write_status_hints(
+                state,
+                active_is_terminal,
+                state.terminal_exit_code(active_id).is_some(),
+                is_busy,
+            )
         };
 
         if let Some(notice) = state.status_notice.as_deref() {

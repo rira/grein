@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::keymap::BindableAction;
+use crate::keymap::{BindableAction, KeyChord, Keymap, KeymapPreset};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -189,43 +189,137 @@ fn highlight_spans(
     spans
 }
 
+fn join_bound_chords(km: &Keymap, actions: &[BindableAction], sep: &str) -> Option<String> {
+    let parts: Vec<String> = actions
+        .iter()
+        .filter(|&&a| !km.chords_for(a).is_empty())
+        .map(|&a| km.display_for(a))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(sep))
+}
+
+fn format_tree_keys(km: &Keymap) -> Option<String> {
+    let tree_actions = [
+        BindableAction::TreeUp,
+        BindableAction::TreeDown,
+        BindableAction::TreeParent,
+        BindableAction::TreeChild,
+    ];
+    if tree_actions.iter().all(|&a| km.is_default_chords(a)) {
+        return Some("Shift+↑/↓/←/→".to_string());
+    }
+    join_bound_chords(km, &tree_actions, "/")
+}
+
+fn format_completion_keys(km: &Keymap) -> String {
+    let compact = |a: BindableAction| -> Option<String> {
+        (!km.chords_for(a).is_empty()).then(|| {
+            km.display_for(a)
+                .replace("Ctrl+", "C-")
+                .replace("Shift+Tab", "S-Tab")
+                .replace(", ", "/")
+        })
+    };
+    let accept = compact(BindableAction::AcceptCompletion);
+    let rest: Vec<String> = [
+        BindableAction::NextCompletion,
+        BindableAction::PrevCompletion,
+        BindableAction::DismissCompletion,
+    ]
+    .into_iter()
+    .filter_map(compact)
+    .collect();
+    match (accept, rest.is_empty()) {
+        (Some(a), false) => format!("{a}, {}", rest.join("/")),
+        (Some(a), true) => a,
+        (None, false) => rest.join("/"),
+        (None, true) => "unbound".to_string(),
+    }
+}
+
 pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
     let km = &state.keymap;
+    let is_macos = km.preset == KeymapPreset::MacOs;
     let enter_manage = km.display_for(BindableAction::EnterManageMode);
-    let zoom_key = km.display_for(BindableAction::ToggleZoom);
-    let scroll_up = km.display_for(BindableAction::ScrollUp);
-    let scroll_down = km.display_for(BindableAction::ScrollDown);
-    let prev_sib = km.display_for(BindableAction::PrevSibling);
-    let next_sib = km.display_for(BindableAction::NextSibling);
-    let tree_up = km.display_for(BindableAction::TreeUp);
-    let tree_down = km.display_for(BindableAction::TreeDown);
-    let tree_parent = km.display_for(BindableAction::TreeParent);
-    let tree_child = km.display_for(BindableAction::TreeChild);
-    let tree_keys = if tree_up == "Shift+↑"
-        && tree_down == "Shift+↓"
-        && tree_parent == "Shift+←"
-        && tree_child == "Shift+→"
-    {
-        "Shift+↑/↓/←/→".to_string()
+    let manage_first = km
+        .chords_for(BindableAction::EnterManageMode)
+        .first()
+        .map(KeyChord::display_label)
+        .unwrap_or_else(|| "Ctrl+G".to_string());
+    let zoom_key = if is_macos && km.is_default_chords(BindableAction::ToggleZoom) {
+        format!("{manage_first} z")
     } else {
-        format!("{tree_up}/{tree_down}/{tree_parent}/{tree_child}")
+        km.display_for(BindableAction::ToggleZoom)
     };
-    let compact_ac = |a| {
-        km.display_for(a)
-            .replace("Ctrl+", "C-")
-            .replace("Shift+Tab", "S-Tab")
-            .replace(", ", "/")
-    };
-    let ac_label = format!(
-        "{}, {}/{}/{}",
-        compact_ac(BindableAction::AcceptCompletion),
-        compact_ac(BindableAction::NextCompletion),
-        compact_ac(BindableAction::PrevCompletion),
-        compact_ac(BindableAction::DismissCompletion)
+    let scroll_pair = join_bound_chords(
+        km,
+        &[BindableAction::ScrollUp, BindableAction::ScrollDown],
+        " / ",
     );
-    let scroll_label = format!("{scroll_up} / {scroll_down}");
-    let sib_label = format!("{prev_sib} / {next_sib}, {tree_keys}");
-    let manage_scroll_desc = format!("Full/half-page preview; {scroll_up}/{scroll_down} scroll");
+    let scroll_slash = join_bound_chords(
+        km,
+        &[BindableAction::ScrollUp, BindableAction::ScrollDown],
+        "/",
+    );
+    let scroll_is_default = km.is_default_chords(BindableAction::ScrollUp)
+        && km.is_default_chords(BindableAction::ScrollDown);
+    let (scroll_label, scroll_desc) = if is_macos {
+        let keys = if scroll_is_default {
+            "PgUp/PgDn".to_string()
+        } else if let Some(ref custom) = scroll_pair {
+            format!("PgUp/PgDn, {custom}")
+        } else {
+            "PgUp/PgDn".to_string()
+        };
+        (keys, format!("Scroll agent ({manage_first} 1..9 jump root)"))
+    } else {
+        let keys = match scroll_pair {
+            Some(ref s) => format!("PgUp/PgDn, {s}"),
+            None => "PgUp/PgDn".to_string(),
+        };
+        (keys, "Scroll viewport (Alt+1..9 jump root)".to_string())
+    };
+    let sib_pair = join_bound_chords(
+        km,
+        &[BindableAction::PrevSibling, BindableAction::NextSibling],
+        " / ",
+    );
+    let tree_keys = format_tree_keys(km);
+    let sib_is_default = km.is_default_chords(BindableAction::PrevSibling)
+        && km.is_default_chords(BindableAction::NextSibling)
+        && km.is_default_chords(BindableAction::TreeUp)
+        && km.is_default_chords(BindableAction::TreeDown)
+        && km.is_default_chords(BindableAction::TreeParent)
+        && km.is_default_chords(BindableAction::TreeChild);
+    let sib_label = if is_macos && sib_is_default {
+        format!("{manage_first} Ctrl+P/N, [/]")
+    } else {
+        match (sib_pair, tree_keys) {
+            (Some(s), Some(t)) => format!("{s}, {t}"),
+            (Some(s), None) => s,
+            (None, Some(t)) => t,
+            (None, None) => {
+                if is_macos {
+                    format!("{manage_first} Ctrl+P/N, [/]")
+                } else {
+                    "unbound".to_string()
+                }
+            }
+        }
+    };
+    let ac_label = format_completion_keys(km);
+    let manage_scroll_desc = if is_macos && scroll_is_default {
+        "Full/half-page preview scroll".to_string()
+    } else if let Some(ref s) = scroll_slash {
+        format!("Full/half-page preview; {s}")
+    } else {
+        "Full/half-page preview scroll".to_string()
+    };
+    let manage_root_keys = if is_macos {
+        "gg / G, 1..9".to_string()
+    } else {
+        "gg / G, 1..9 / Alt+1..9".to_string()
+    };
 
     const WRITE_SEC: &str = "── WRITE Mode (Terminal & Composer) ──";
     const MANAGE_SEC: &str = "── MANAGE Mode (Sidebar) ──";
@@ -248,8 +342,8 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         HelpEntry {
             section: WRITE_SEC,
             keys: scroll_label,
-            description: "Scroll viewport (Alt+1..9 jump root)".to_string(),
-            keywords: "scroll viewport page root alt",
+            description: scroll_desc,
+            keywords: "scroll viewport page pgup pgdn root alt",
         },
         HelpEntry {
             section: WRITE_SEC,
@@ -289,19 +383,19 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         },
         HelpEntry {
             section: MANAGE_SEC,
-            keys: "h/←/Space, H/L, J/K".to_string(),
-            description: "Fold / fold-or-expand all / switch root".to_string(),
-            keywords: "fold collapse expand root switch",
+            keys: "h/←/Space, H/L, J/K, [/]".to_string(),
+            description: "Fold / expand all / root / sibling".to_string(),
+            keywords: "fold collapse expand root sibling switch",
         },
         HelpEntry {
             section: MANAGE_SEC,
-            keys: "Ctrl+F/B, Ctrl+U/D".to_string(),
+            keys: "Ctrl+F/B, Ctrl+U/D, PgUp/PgDn".to_string(),
             description: manage_scroll_desc,
-            keywords: "scroll preview half full page",
+            keywords: "scroll preview half full page pgup pgdn",
         },
         HelpEntry {
             section: MANAGE_SEC,
-            keys: "gg / G, Alt+1..9".to_string(),
+            keys: manage_root_keys,
             description: "Top / bottom item; jump to root 1..9".to_string(),
             keywords: "top bottom jump root",
         },
@@ -344,8 +438,8 @@ pub fn build_help_entries(state: &AppState) -> Vec<HelpEntry> {
         HelpEntry {
             section: CMD_SEC,
             keys: "/theme, /bind, /unbind".to_string(),
-            description: "Theme picker and WRITE keybindings".to_string(),
-            keywords: "theme color palette dark light swatch bind unbind keybind",
+            description: "Theme, /keymap preset, /bind keys".to_string(),
+            keywords: "theme color palette dark light swatch keymap preset macos standard bind unbind keybind",
         },
         HelpEntry {
             section: CMD_SEC,

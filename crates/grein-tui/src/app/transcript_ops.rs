@@ -160,6 +160,7 @@ impl App {
     }
 
     pub fn toggle_sidebar_zoom(&mut self) {
+        self.sidebar_unhidden_by_manage = false;
         self.clear_pane_selection();
         self.sidebar_hidden = !self.sidebar_hidden;
         if self.sidebar_hidden && self.focused_pane == FocusedPane::Tree {
@@ -179,6 +180,16 @@ impl App {
             "Sidebar shown".to_string()
         });
         self.maybe_queue_terminal_resize();
+    }
+
+    pub(crate) fn toggle_manage_zoom_from_z(&mut self) {
+        if self.sidebar_unhidden_by_manage {
+            self.sidebar_unhidden_by_manage = false;
+            self.toggle_composer_tree_focus();
+            self.status_notice = Some("Sidebar shown".to_string());
+        } else {
+            self.toggle_sidebar_zoom();
+        }
     }
 
     pub(crate) fn copy_transcript_content(&mut self, mode: CopyMode) {

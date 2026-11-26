@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine_port::{AgentConfigChoice, AgentConfigOption, UserPreferencesSnapshot};
-use crate::keymap::Keymap;
+use crate::keymap::{Keymap, KeymapPreset};
 use crate::theme::{ThemePalette, ThemePickerModal, ThemePreset};
 
 use super::editing::{clamp_char_boundary, is_altgr_char, prev_word_boundary};
@@ -286,7 +286,8 @@ impl App {
         self.theme_overrides = prefs.theme_overrides.clone();
         self.theme_palette =
             ThemePalette::from_prefs(prefs.theme.as_deref(), &prefs.theme_overrides);
-        self.keymap = Keymap::from_prefs(&prefs.keybindings);
+        self.keymap =
+            Keymap::from_prefs_with_default(&prefs.keybindings, KeymapPreset::platform_default());
         self.sidebar_layout.apply_ui_prefs(&prefs.ui);
         if let Some(val) = prefs.ui.get("composer_autocomplete") {
             match val.trim().to_ascii_lowercase().as_str() {

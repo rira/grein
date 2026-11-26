@@ -9,6 +9,7 @@ const STATIC_SLASH_COMMANDS: &[&str] = &[
     "/theme",
     "/agent",
     "/sidebar",
+    "/keymap",
     "/bind",
     "/unbind",
     "/keybinds",
