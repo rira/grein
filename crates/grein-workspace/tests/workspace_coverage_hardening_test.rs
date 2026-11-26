@@ -252,14 +252,14 @@ fn pty_session_edge_cases_resize_zero_empty_write_and_post_exit_poll() {
     assert!(format!("{session:?}").contains("InteractivePtySession"));
 
     session.write_bytes(&[]).expect("empty write is noop");
+    assert_eq!(session.set_scrollback(999), 0);
+    assert_eq!(session.scroll_by(-10), 0);
+
     session.resize(0, 0).expect("resize clamps to 1x1");
     let min_snap = session.snapshot();
     assert_eq!(min_snap.rows, 1);
     assert_eq!(min_snap.cols, 1);
     session.resize(4, 20).expect("restore 4x20 before exit");
-
-    assert_eq!(session.set_scrollback(999), 0);
-    assert_eq!(session.scroll_by(-10), 0);
 
     session.write_bytes(b"exit 0\n").expect("exit shell");
     let deadline = Instant::now() + Duration::from_secs(5);
