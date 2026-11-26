@@ -599,6 +599,7 @@ async fn test_daemon_legacy_lines_stale_socket_cleanup_and_client_helpers() {
 
 #[tokio::test]
 async fn test_daemon_legacy_send_turn_error_when_only_terminal_thread_exists() {
+    let _lock = ENV_LOCK.lock().await;
     let temp = tempfile::tempdir().expect("tempdir");
     let sock_path = temp.path().join("term_only.sock");
     let db_path = temp.path().join("term_only.db");
@@ -630,6 +631,7 @@ async fn test_daemon_legacy_send_turn_error_when_only_terminal_thread_exists() {
 
 #[tokio::test]
 async fn test_standalone_display_timeout_and_run_standalone_registration() {
+    let _lock = ENV_LOCK.lock().await;
     // StandaloneError Display & Error trait
     let e1 = StandaloneError::DaemonNotRunning;
     let e2 = StandaloneError::DaemonTerminated;
@@ -711,6 +713,7 @@ fn test_cli_binary_doctor_settings_and_theme_error_exits() {
 
 #[tokio::test]
 async fn test_unix_socket_run_shell_command_uses_dedicated_connection_nonblocking() {
+    let _lock = ENV_LOCK.lock().await;
     struct StubBlockingShellExecutor {
         started_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
         release_rx: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
