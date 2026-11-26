@@ -11,7 +11,7 @@ use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-pub(super) const POLL_TIMEOUT_MS: i32 = 100;
+pub(crate) const POLL_TIMEOUT_MS: i32 = 100;
 
 pub(crate) const SCRUBBED_TERMINAL_ENV_VARS: &[&str] = &[
     "TERM_PROGRAM",
@@ -161,7 +161,7 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
@@ -263,7 +263,7 @@ pub(crate) fn open_pty_pair(rows: u16, cols: u16) -> io::Result<(OwnedFd, OwnedF
     Ok((master_fd, slave_fd))
 }
 
-pub(super) fn create_wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn create_wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as libc::c_int; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
