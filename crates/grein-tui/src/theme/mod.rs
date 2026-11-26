@@ -1,4 +1,7 @@
+pub mod color_caps;
 mod presets;
+
+pub use color_caps::{detect_terminal_truecolor, rgb_to_xterm256, supports_truecolor_from_env};
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -173,6 +176,7 @@ pub struct ThemePalette {
     pub border_unfocused: Color,
     pub text: Color,
     pub muted: Color,
+    pub ghost_text: Color,
     pub accent: Color,
     pub accent_secondary: Color,
     pub user_accent: Color,
@@ -189,6 +193,37 @@ pub struct ThemePalette {
     pub pill_manage_fg: Color,
 }
 
+type ColorGetter = fn(&ThemePalette) -> Color;
+type ColorMutGetter = fn(&mut ThemePalette) -> &mut Color;
+
+const THEME_COLOR_FIELDS: &[(&str, ColorGetter, ColorMutGetter)] = &[
+    ("bg", |p| p.bg, |p| &mut p.bg),
+    ("panel_bg", |p| p.panel_bg, |p| &mut p.panel_bg),
+    ("status_bar_bg", |p| p.status_bar_bg, |p| &mut p.status_bar_bg),
+    ("selection_bg", |p| p.selection_bg, |p| &mut p.selection_bg),
+    ("selection_fg", |p| p.selection_fg, |p| &mut p.selection_fg),
+    ("selection_bar", |p| p.selection_bar, |p| &mut p.selection_bar),
+    ("border_focused", |p| p.border_focused, |p| &mut p.border_focused),
+    ("border_unfocused", |p| p.border_unfocused, |p| &mut p.border_unfocused),
+    ("text", |p| p.text, |p| &mut p.text),
+    ("muted", |p| p.muted, |p| &mut p.muted),
+    ("ghost_text", |p| p.ghost_text, |p| &mut p.ghost_text),
+    ("accent", |p| p.accent, |p| &mut p.accent),
+    ("accent_secondary", |p| p.accent_secondary, |p| &mut p.accent_secondary),
+    ("user_accent", |p| p.user_accent, |p| &mut p.user_accent),
+    ("dirty", |p| p.dirty, |p| &mut p.dirty),
+    ("success", |p| p.success, |p| &mut p.success),
+    ("error", |p| p.error, |p| &mut p.error),
+    ("warning", |p| p.warning, |p| &mut p.warning),
+    ("diff_add", |p| p.diff_add, |p| &mut p.diff_add),
+    ("diff_del", |p| p.diff_del, |p| &mut p.diff_del),
+    ("diff_hunk", |p| p.diff_hunk, |p| &mut p.diff_hunk),
+    ("pill_write_bg", |p| p.pill_write_bg, |p| &mut p.pill_write_bg),
+    ("pill_write_fg", |p| p.pill_write_fg, |p| &mut p.pill_write_fg),
+    ("pill_manage_bg", |p| p.pill_manage_bg, |p| &mut p.pill_manage_bg),
+    ("pill_manage_fg", |p| p.pill_manage_fg, |p| &mut p.pill_manage_fg),
+];
+
 impl Default for ThemePalette {
     fn default() -> Self {
         Self::from_preset(ThemePreset::TokyoNight)
@@ -198,6 +233,20 @@ impl Default for ThemePalette {
 impl ThemePalette {
     pub fn from_preset(preset: ThemePreset) -> Self {
         presets::palette_for_preset(preset)
+    }
+
+    pub fn adapt_for_color_support(&self, truecolor: bool) -> Self {
+        let mut adapted = self.clone();
+        if truecolor {
+            return adapted;
+        }
+        for &(_, _, mut_getter) in THEME_COLOR_FIELDS {
+            let slot = mut_getter(&mut adapted);
+            if let Color::Rgb(r, g, b) = *slot {
+                *slot = Color::Indexed(color_caps::rgb_to_xterm256(r, g, b));
+            }
+        }
+        adapted
     }
 
     pub fn swatch_colors(&self) -> [Color; 5] {
@@ -230,32 +279,12 @@ impl ThemePalette {
             let Some(color) = Self::parse_color(value) else {
                 continue;
             };
-            match key.trim().to_ascii_lowercase().as_str() {
-                "bg" => palette.bg = color,
-                "panel_bg" => palette.panel_bg = color,
-                "status_bar_bg" => palette.status_bar_bg = color,
-                "selection_bg" => palette.selection_bg = color,
-                "selection_fg" => palette.selection_fg = color,
-                "selection_bar" => palette.selection_bar = color,
-                "border_focused" => palette.border_focused = color,
-                "border_unfocused" => palette.border_unfocused = color,
-                "text" => palette.text = color,
-                "muted" => palette.muted = color,
-                "accent" => palette.accent = color,
-                "accent_secondary" => palette.accent_secondary = color,
-                "user_accent" => palette.user_accent = color,
-                "dirty" => palette.dirty = color,
-                "success" => palette.success = color,
-                "error" => palette.error = color,
-                "warning" => palette.warning = color,
-                "diff_add" => palette.diff_add = color,
-                "diff_del" => palette.diff_del = color,
-                "diff_hunk" => palette.diff_hunk = color,
-                "pill_write_bg" => palette.pill_write_bg = color,
-                "pill_write_fg" => palette.pill_write_fg = color,
-                "pill_manage_bg" => palette.pill_manage_bg = color,
-                "pill_manage_fg" => palette.pill_manage_fg = color,
-                _ => {}
+            let normalized = key.trim().to_ascii_lowercase();
+            if let Some(&(_, _, mut_getter)) = THEME_COLOR_FIELDS
+                .iter()
+                .find(|&&(field, _, _)| field == normalized)
+            {
+                *mut_getter(&mut palette) = color;
             }
         }
         palette
@@ -264,66 +293,9 @@ impl ThemePalette {
     pub fn to_color_map(&self, preset_name: &str) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("name".to_string(), preset_name.to_string());
-        map.insert("bg".to_string(), Self::format_color(self.bg));
-        map.insert("panel_bg".to_string(), Self::format_color(self.panel_bg));
-        map.insert(
-            "status_bar_bg".to_string(),
-            Self::format_color(self.status_bar_bg),
-        );
-        map.insert(
-            "selection_bg".to_string(),
-            Self::format_color(self.selection_bg),
-        );
-        map.insert(
-            "selection_fg".to_string(),
-            Self::format_color(self.selection_fg),
-        );
-        map.insert(
-            "selection_bar".to_string(),
-            Self::format_color(self.selection_bar),
-        );
-        map.insert(
-            "border_focused".to_string(),
-            Self::format_color(self.border_focused),
-        );
-        map.insert(
-            "border_unfocused".to_string(),
-            Self::format_color(self.border_unfocused),
-        );
-        map.insert("text".to_string(), Self::format_color(self.text));
-        map.insert("muted".to_string(), Self::format_color(self.muted));
-        map.insert("accent".to_string(), Self::format_color(self.accent));
-        map.insert(
-            "accent_secondary".to_string(),
-            Self::format_color(self.accent_secondary),
-        );
-        map.insert(
-            "user_accent".to_string(),
-            Self::format_color(self.user_accent),
-        );
-        map.insert("dirty".to_string(), Self::format_color(self.dirty));
-        map.insert("success".to_string(), Self::format_color(self.success));
-        map.insert("error".to_string(), Self::format_color(self.error));
-        map.insert("warning".to_string(), Self::format_color(self.warning));
-        map.insert("diff_add".to_string(), Self::format_color(self.diff_add));
-        map.insert("diff_del".to_string(), Self::format_color(self.diff_del));
-        map.insert("diff_hunk".to_string(), Self::format_color(self.diff_hunk));
-        map.insert(
-            "pill_write_bg".to_string(),
-            Self::format_color(self.pill_write_bg),
-        );
-        map.insert(
-            "pill_write_fg".to_string(),
-            Self::format_color(self.pill_write_fg),
-        );
-        map.insert(
-            "pill_manage_bg".to_string(),
-            Self::format_color(self.pill_manage_bg),
-        );
-        map.insert(
-            "pill_manage_fg".to_string(),
-            Self::format_color(self.pill_manage_fg),
-        );
+        for &(field, getter, _) in THEME_COLOR_FIELDS {
+            map.insert(field.to_string(), Self::format_color(getter(self)));
+        }
         map
     }
 

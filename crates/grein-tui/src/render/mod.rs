@@ -18,6 +18,8 @@ pub use layout::{border_style, compute_app_layout, compute_sidebar_width, render
 pub use panes::{build_transcript_wrapped_lines, build_transcript_wrapped_lines_with_meta};
 pub use sidebar::render_tree_view;
 
+use std::io::IsTerminal;
+
 use crate::app::{AppAction, AppState, PaneFocus, SidebarView};
 use crate::engine_port::SubagentSnapshot;
 use crate::layout::subagent_strip_height;
@@ -43,9 +45,31 @@ use modals::{
 use panes::{recompute_search_for_render, render_terminal_pane, render_worktree_diff_pane};
 use sidebar::{render_tree_view_inner, selected_tree_thread, TreeRenderResult};
 
+fn resolve_runtime_truecolor() -> bool {
+    let is_interactive_tty = std::io::stdout().is_terminal()
+        && !matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"))
+        && crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if is_interactive_tty {
+        crate::theme::detect_terminal_truecolor()
+    } else {
+        true
+    }
+}
+
+/// Renders the application state into the terminal frame with explicit color support control.
+pub fn render_with_color_support(f: &mut Frame, state: &AppState, truecolor: bool) {
+    if truecolor {
+        let _ = render_app_inner(f, state, false);
+    } else {
+        let mut adapted = state.clone();
+        adapted.theme_palette = state.theme_palette.adapt_for_color_support(false);
+        let _ = render_app_inner(f, &adapted, false);
+    }
+}
+
 /// Renders the application state into the terminal frame.
 pub fn render(f: &mut Frame, state: &AppState) {
-    let _ = render_app_inner(f, state, false);
+    render_with_color_support(f, state, resolve_runtime_truecolor());
 }
 
 /// Renders the application state into the terminal frame and updates viewport scroll bounds.
@@ -55,7 +79,7 @@ pub fn render_mut(f: &mut Frame, state: &mut AppState) {
 
 /// Renders all active workspace panes, auto-growing the Composer pane for multi-line input.
 pub fn render_app(f: &mut Frame, state: &AppState) {
-    let _ = render_app_inner(f, state, false);
+    render_with_color_support(f, state, resolve_runtime_truecolor());
 }
 
 struct RenderMetrics {
@@ -81,7 +105,37 @@ struct RenderMetrics {
 }
 
 pub fn render_app_mut(f: &mut Frame, state: &mut AppState) {
-    let metrics = render_app_inner(f, state, true);
+    render_app_mut_with_color_support(f, state, resolve_runtime_truecolor());
+}
+
+/// Renders all active workspace panes, updates viewport scroll bounds, and applies explicit color fallback.
+pub fn render_app_mut_with_color_support(
+    f: &mut Frame,
+    state: &mut AppState,
+    truecolor: bool,
+) {
+    struct PaletteRestore<'a> {
+        state: &'a mut AppState,
+        original: Option<crate::theme::ThemePalette>,
+    }
+
+    impl Drop for PaletteRestore<'_> {
+        fn drop(&mut self) {
+            if let Some(orig) = self.original.take() {
+                self.state.theme_palette = orig;
+            }
+        }
+    }
+
+    let restore = PaletteRestore {
+        original: (!truecolor).then(|| {
+            let adapted = state.theme_palette.adapt_for_color_support(false);
+            std::mem::replace(&mut state.theme_palette, adapted)
+        }),
+        state,
+    };
+    let metrics = render_app_inner(f, restore.state, true);
+    drop(restore);
     state
         .transcript_viewport_mut(&metrics.thread_id)
         .set_max_scroll(metrics.max_scroll as usize);

@@ -1,6 +1,6 @@
 use crate::theme::ThemePalette;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -215,7 +215,9 @@ pub(super) fn render_composer_ghost_suffix(
     if clipped.is_empty() {
         return;
     }
-    let mut style = Style::default().fg(theme.muted);
+    let mut style = Style::default()
+        .fg(theme.ghost_text)
+        .add_modifier(Modifier::ITALIC);
     if theme.panel_bg != Color::Reset {
         style = style.bg(theme.panel_bg);
     }
@@ -227,6 +229,7 @@ pub(super) fn render_composer_ghost_suffix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemePreset;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -258,5 +261,21 @@ mod tests {
                 render_composer_ghost_suffix(f, Rect::new(0, 0, 5, 2), 5, 0, "hello", &theme);
             })
             .unwrap();
+        let cell = &terminal.backend().buffer()[(2, 0)];
+        assert_eq!(cell.symbol(), "h");
+        assert_eq!(cell.fg, theme.ghost_text);
+        assert_eq!(cell.bg, theme.panel_bg);
+        assert!(cell.modifier.contains(Modifier::ITALIC));
+
+        let ansi = ThemePalette::from_preset(ThemePreset::Ansi);
+        terminal
+            .draw(|f| {
+                render_composer_ghost_suffix(f, Rect::new(0, 0, 5, 2), 1, 0, "ok", &ansi);
+            })
+            .unwrap();
+        let ansi_cell = &terminal.backend().buffer()[(1, 0)];
+        assert_eq!(ansi_cell.fg, ansi.ghost_text);
+        assert_eq!(ansi_cell.bg, Color::Reset);
+        assert!(ansi_cell.modifier.contains(Modifier::ITALIC));
     }
 }

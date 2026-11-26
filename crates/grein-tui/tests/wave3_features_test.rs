@@ -247,7 +247,7 @@ fn test_composer_ghost_autocomplete_tiers_controls_toggle_and_terminal_isolation
     let first_text = initial.active().unwrap().full_text.clone();
     assert_eq!(first_text, "Implement");
 
-    // Render frame and check muted ghost text + top-right counter hint + cursor position preserved
+    // Render frame and check distinct ghost_text + ITALIC vs written text + !ITALIC
     let mut terminal = Terminal::new(TestBackend::new(110, 26)).unwrap();
     draw_frame_mut(&mut terminal, &mut app).unwrap();
     let screen = render_screen(&terminal);
@@ -258,21 +258,31 @@ fn test_composer_ghost_autocomplete_tiers_controls_toggle_and_terminal_isolation
     );
     let palette = app.theme_palette.clone();
     let buf = terminal.backend().buffer();
-    let mut found_muted_ghost = false;
+    let mut found_distinct_ghost = false;
     for y in 0..buf.area.height {
         let mut row = String::new();
         for x in 0..buf.area.width {
             row.push_str(buf[(x, y)].symbol());
         }
         if let Some(byte_idx) = row.find("Implement") {
-            let ghost_col = row[..byte_idx].chars().count() as u16 + 5; // right after "Imple"
-            if buf[(ghost_col, y)].fg == palette.muted {
-                found_muted_ghost = true;
+            let written_col = row[..byte_idx].chars().count() as u16;
+            let ghost_col = written_col + 5; // right after "Imple"
+            let written_cell = &buf[(written_col, y)];
+            let ghost_cell = &buf[(ghost_col, y)];
+            if written_cell.fg == palette.text
+                && !written_cell.modifier.contains(Modifier::ITALIC)
+                && ghost_cell.fg == palette.ghost_text
+                && ghost_cell.modifier.contains(Modifier::ITALIC)
+            {
+                found_distinct_ghost = true;
                 break;
             }
         }
     }
-    assert!(found_muted_ghost, "Ghost suffix must render in theme.muted");
+    assert!(
+        found_distinct_ghost,
+        "Written cell must render in theme.text without ITALIC, and ghost suffix in theme.ghost_text with ITALIC"
+    );
 
     // Shift+Tab -> next, Ctrl+N -> next, Ctrl+P -> prev
     app.handle_key_event(shift(KeyCode::BackTab));

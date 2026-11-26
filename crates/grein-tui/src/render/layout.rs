@@ -28,8 +28,18 @@ pub(super) fn rounded_block(theme: &ThemePalette, is_focused: bool) -> Block<'st
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(themed_border_style(theme, is_focused));
+    let mut style = Style::default();
+    let mut has_style = false;
     if theme.panel_bg != Color::Reset {
-        block = block.style(Style::default().bg(theme.panel_bg).fg(theme.text));
+        style = style.bg(theme.panel_bg);
+        has_style = true;
+    }
+    if theme.text != Color::Reset {
+        style = style.fg(theme.text);
+        has_style = true;
+    }
+    if has_style {
+        block = block.style(style);
     }
     block
 }
@@ -164,4 +174,31 @@ pub fn compute_app_layout(
 
 pub fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
     crate::markdown::render_markdown_lines(markdown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
+    use ratatui::Terminal;
+
+    #[test]
+    fn rounded_block_applies_text_fg_even_when_panel_bg_is_reset() {
+        let mut theme = ThemePalette::from_preset(ThemePreset::Ansi);
+        theme.text = Color::White;
+        assert_eq!(theme.panel_bg, Color::Reset);
+
+        let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
+        terminal
+            .draw(|f| {
+                let widget = Paragraph::new("hi").block(rounded_block(&theme, false));
+                f.render_widget(widget, Rect::new(0, 0, 10, 4));
+            })
+            .unwrap();
+        let cell = &terminal.backend().buffer()[(1, 1)];
+        assert_eq!(cell.symbol(), "h");
+        assert_eq!(cell.fg, Color::White);
+        assert_eq!(cell.bg, Color::Reset);
+    }
 }
