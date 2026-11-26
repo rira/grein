@@ -44,7 +44,7 @@ cargo install --path crates/grein-cli --locked
 - **`⎇ Worktrees` & Non-Git Shadow Fallback:** Branch-based `<primary_repo_root>/.grein/worktrees/<branch-slug>` (`<branch>-wt`) isolation, `Target:`-synced `⎇ Worktrees` sidebar (`Tab`), live `⎇ Diff` preview, Composer `/wt` autocomplete, and copy-on-write `.grein/shadow/` snapshots outside Git.
 - **Embedded `>_` PTY Terminals:** 24-bit color VT100 terminal in `$SHELL`, 1,000-line scrollback buffer, `OSC 7` + OS `cwd` sync, `DSR`/`DA1`/`DA2`/`OSC 10`/`11` responses, Swedish `AltGr` UTF-8 input, and automatic `alternate_screen` passthrough (`nvim`/`htop`/`tmux`).
 - **Composer & Autocomplete:** Visual multiline navigation, full readline editing, and Tier 1/2/3 inline ghost-text autocomplete (`/` commands including `/ag` → `/agent`, `@files` & branches, prompt history + transcript tokens, and a 6,878-word dictionary).
-- **16 Themes, Fuzzy Help & Copy/Paste:** Live-previewed `:theme` picker with 5-dot swatches and tone tags, `?` Help with `/` fuzzy filter, and pane-scoped mouse drag/double/triple-click selection (`pbcopy`/`wl-copy`/`xclip`/`xsel` + OSC 52).
+- **16 Themes, 256-Color Auto-Fallback, Fuzzy Help & Copy/Paste:** Live-previewed `:theme` picker with 5-dot swatches and tone tags, automatic xterm 256-color downsampling on non-truecolor TTYs (such as pre-Tahoe `Terminal.app` or SSH/`tmux` without `COLORTERM=truecolor`), dedicated italic `ghost_text` styling across all 16 themes, `?` Help with `/` fuzzy filter, and pane-scoped mouse drag/double/triple-click selection (`pbcopy`/`wl-copy`/`xclip`/`xsel` + OSC 52).
 - **Multi-Provider Zero-Bundling ACP:** Discovers host `agy`, `claude-agent-acp` → `claude-code-acp` (standalone `claude` CLI is not an ACP server), `$GREIN_ACP_BIN`, or custom `[[agents]]` configs with zero API key setup, runs concurrent per-provider sessions, and spawns siblings via `/agent`, `A`, or `:<provider>` alongside `/model`, `/mode`, `/thinking`, and `/commands`.
 
 ---
@@ -56,16 +56,18 @@ cargo install --path crates/grein-cli --locked
 | Key | Scope | Action |
 | :--- | :--- | :--- |
 | `Ctrl+G` | Global (`WRITE` ↔ `MANAGE`) | Toggle sidebar focus (customizable via `:bind enter_manage_mode ...`) |
-| `Alt+Z` | Global (`WRITE` / `MANAGE`) | Hide or show sidebar (`copy zoom`) |
-| `Alt+1..9` | Global (`WRITE` / `MANAGE`) | Jump directly to root thread `1..9` (`AltGr`-safe) |
+| `Ctrl+G z` / `Alt+Z` | Global (`WRITE` / `MANAGE`) | Toggle sidebar zoom symmetrically (`Ctrl+G z` hides, or keeps visible on reopen) |
+| `Ctrl+G 1..9` / `Alt+1..9` | Global (`WRITE` / `MANAGE`) | Jump directly to root thread `1..9` (`Ctrl+G 1..9` returns to `WRITE`; `AltGr`-safe) |
+| `PageUp` / `PageDown` | `WRITE · AGENT` / `MANAGE` | Scroll transcript or right-pane preview (passes straight to PTY in `WRITE · SHELL`) |
+| `Ctrl+P`/`N`, `[`/`]` | `MANAGE · GREIN` | Step previous/next sibling thread without `Alt+` or `Shift+Arrows` |
 | `Shift+↑/↓/←/→` | `WRITE` (non-alt-screen) | Step prev/next sibling (`↑`/`↓`), ascend to parent (`←`), or descend to child (`→`) |
 | `A` / `/agent` | `MANAGE` / `Composer` | Open `Select Agent` modal (`Enter` sibling, `s` switch, `d` default), or spawn directly via `/agent <provider>` / `:<provider>` |
 | `?` | `MANAGE` (or `/?` in Composer) | Open Help modal with live `/` fuzzy filter |
-| `:` | `MANAGE` | Open Sidebar Command Palette (`:agent`, `:<provider>`, `:theme`, `:sidebar`, `:bind`, …) |
+| `:` | `MANAGE` | Open Sidebar Command Palette (`:agent`, `:<provider>`, `:keymap`, `:theme`, `:sidebar`, `:bind`, …) |
 | `Tab` | `MANAGE` / `WRITE · AGENT` | Switch `ᛇ Grein` ↔ `⎇ Worktrees` (`MANAGE`), or accept ghost text (`Composer`) |
 | Mouse drag / 2× / 3× | Right pane | Pane-scoped select & auto-copy (`Alt+drag` overrides PTY mouse; middle-click pastes) |
 
-> **macOS Terminal Tip:** Enable *Use Option as Meta key* in Terminal.app/iTerm2 for native `Alt+` shortcuts, or press `Ctrl+G` to enter `MANAGE` mode.
+> **Stock macOS & Nordic/European Keyboards:** Grein works out of the box on stock Apple `Terminal.app` without changing `Option` settings—preserving native `@ [ ] { } \ | ~` symbols—via `Ctrl+G 1..9`, `Ctrl+G z`, `Ctrl+P`/`Ctrl+N` or `[`/`]`, and `PageUp`/`PageDown`. On macOS, `:keymap macos` is the startup hint preset (switchable anytime via `:keymap standard` / `:keymap macos`, persisted in `keybinding.preset`), while `Alt+` and `Shift+Arrows` remain active whenever your terminal sends them. Run `grein keys` to diagnose terminal key events live.
 
 ---
 
@@ -79,7 +81,8 @@ grein daemon [--socket <SOCKET>]         # Run background daemon
 grein attach [--socket <SOCKET>]         # Attach TUI client to running daemon
 
 # Headless inspection & diagnostics
-grein doctor [--json]                    # Check git, $SHELL, ACP agents, terminal env, DBs
+grein doctor [--json]                    # Check git, $SHELL, ACP agents, TERM_PROGRAM/color mode, DBs
+grein keys [--no-enhance]                # Inspect live raw key events & macOS/DISAMBIGUATE_ESCAPE_CODES
 grein status [--json] [--socket <SOCKET>] [--db <DB>]
 grein threads [--json] [--db <DB>]
 grein agents [--json] [--config <CONFIG>]

@@ -22,13 +22,15 @@ On startup, `TerminalGuard` enables raw mode, alternate screen, bracketed paste,
 
 These bindings are evaluated in `WRITE` mode and also checked in `MANAGE` mode (`Ctrl+G` exits `MANAGE` back to `WRITE`, and `Alt+1..9` / `Alt+Z` / `Alt+H/L` / `Alt+K/J` work seamlessly in both modes).
 
+On **macOS**, Grein defaults to the `macos` keymap preset (when `keybinding.preset` is unset) so status bar and `?` Help hints highlight zero-config `Ctrl+G` workflows that never collide with Nordic/European `Option` symbol composition—while keeping `Alt+` and `Shift+Arrows` active whenever your terminal sends them (switchable via `:keymap standard` / `:keymap macos`).
+
 | Default Key | Action Name (`:bind`) | Scope & Behavior |
 | :--- | :--- | :--- |
-| `Ctrl+G` | `enter_manage_mode` | Toggle `WRITE` ↔ `MANAGE`. Opening `MANAGE` auto-unhides a zoomed sidebar (`sidebar_hidden = false`); exiting `MANAGE` focuses the selected thread's `Composer` or `Terminal` (or returns to `ᛇ Grein` if in `⎇ Worktrees`). Cannot be unbound or left with zero bindings. |
-| `Alt+Z` | `toggle_zoom` | Toggle sidebar visibility (`Sidebar hidden (copy zoom)` ↔ `Sidebar shown`). If zoomed while in `MANAGE`, focus returns to `WRITE`. |
-| `Alt+1` … `Alt+9` | *(built-in)* | Jump directly to depth-0 root thread `1..9`. Explicitly checks `Alt && !Ctrl` so `AltGr` (`Control+Alt`) chords never trigger root switching. |
-| `Alt+K` / `Alt+J` | `scroll_up` / `scroll_down` | Scroll active target: in `MANAGE · WORKTREES`, scrolls `⎇ Diff` (`±10` lines); on a `>_` Terminal, scrolls PTY scrollback (`+5`/`-5` lines); on an Agent thread, scrolls the transcript (`±10` lines). |
-| `Alt+H` / `Alt+L` | `prev_sibling` / `next_sibling` | Cycle to the previous or next sibling thread sharing the same `parent_thread_id` (wraps around). |
+| `Ctrl+G` | `enter_manage_mode` | Toggle `WRITE` ↔ `MANAGE`. Opening `MANAGE` auto-unhides a zoomed sidebar (`sidebar_hidden = false`); exiting `MANAGE` focuses the selected thread's `Composer` or `Terminal` (or returns to `ᛇ Grein` if in `⎇ Worktrees`). Combine as `Ctrl+G` then `1..9` to jump to a root thread, or `Ctrl+G` then `z` to toggle sidebar zoom symmetrically. Cannot be unbound or left with zero bindings. |
+| `Alt+Z` *(or `Ctrl+G z`)* | `toggle_zoom` | Toggle sidebar visibility (`Sidebar hidden (copy zoom)` ↔ `Sidebar shown`). `Ctrl+G` then `z` is symmetric in both directions: it hides the sidebar and returns to `WRITE`, and when `Ctrl+G` just unhid a hidden sidebar, pressing `z` immediately returns to `WRITE` while keeping the sidebar visible. |
+| `Alt+1` … `Alt+9` *(or `Ctrl+G 1..9`)* | *(built-in)* | Jump directly to depth-0 root thread `1..9`. `Ctrl+G` followed by plain `1..9` switches root and immediately returns to `WRITE`. `Alt+1..9` explicitly checks `Alt && !Ctrl` so `AltGr` (`Control+Alt`) chords never trigger root switching. |
+| `Alt+K` / `Alt+J` | `scroll_up` / `scroll_down` | Scroll active target: in `MANAGE · WORKTREES`, scrolls `⎇ Diff` (`±10` lines); on a `>_` Terminal, scrolls PTY scrollback (`+5`/`-5` lines); on an Agent thread, scrolls the transcript (`±10` lines). In `WRITE · AGENT` and `MANAGE`, plain `PageUp` / `PageDown` also scroll without needing `Alt+` (`WRITE · SHELL` forwards `PageUp` / `PageDown` straight to the PTY). |
+| `Alt+H` / `Alt+L` | `prev_sibling` / `next_sibling` | Cycle to the previous or next sibling thread sharing the same `parent_thread_id` (wraps around). In `MANAGE · GREIN`, `Ctrl+P` / `Ctrl+N` and `[` / `]` step siblings without `Alt+`. |
 | `Shift+↑` / `Shift+↓` | `tree_up` / `tree_down` | Step to the previous or next sibling thread at the current `parent_thread_id` depth (wraps around) and switch `sidebar_view` to `ᛇ Grein`. |
 | `Shift+←` | `tree_parent` | Ascend to the active thread's `parent_thread_id`. Records the current thread as `last_visited_child` on that parent so `Shift+→` returns to it. |
 | `Shift+→` | `tree_child` | Descend into the active thread's `last_visited_child` (if still valid) or first direct child, and automatically unfold any collapsed ancestor subtrees. |
@@ -56,6 +58,7 @@ When an Agent thread is active and focused, keystrokes first pass through active
 | `Enter` | Submit prompt, `/slash` command, or `!command` inline shell execution |
 | `Shift+Enter`, `Ctrl+J`, `Alt+Enter`, `Ctrl+Enter` | Insert newline without submitting |
 | `↑` / `↓` | Move cursor up/down across wrapped visual lines while preserving horizontal column (`composer_desired_col`) |
+| `PageUp` / `PageDown` | Scroll active thread transcript up/down (`±10` lines, without `Shift`) |
 | `Ctrl+C` | Cancel active turn if busy (`streaming`/`executing`/`thinking`); otherwise clear non-empty input buffer; if already empty, display hint (`Use Ctrl+G then q (or /quit) to exit`) |
 | `Esc` | Close `/worktree ` popup if open; else cancel active turn if busy; else clear active right-pane mouse selection |
 
@@ -120,7 +123,7 @@ Embedded terminal sessions spawn `$SHELL` (falling back to `/bin/sh`) with `GREI
 While the PTY child process is running:
 
 - **Intercept Allowlist:** Only active `write` keymap chords (defaults: `Ctrl+G`, `Alt+Z`, `Alt+K/J`, `Alt+H/L`, `Shift+↑/↓/←/→`, minus the `alternate_screen` passthrough set when applicable) and `Alt+1..9` are intercepted by Grein.
-- **Native Shell Passthrough:** `Tab`, `Shift+Tab`, `Ctrl+Y`, `Ctrl+N`, `Ctrl+P`, `Ctrl+E`, `Ctrl+T`, `Ctrl+Q`, `Ctrl+F`, `Ctrl+C`, `Esc`, `?`, and all `F1..F12`/navigation keys pass straight to `vt_input::encode_key_event` (respecting `application_cursor` `CSI`/`SS3` mode).
+- **Native Shell Passthrough:** `Tab`, `Shift+Tab`, `PageUp`, `PageDown`, `Ctrl+Y`, `Ctrl+N`, `Ctrl+P`, `Ctrl+E`, `Ctrl+T`, `Ctrl+Q`, `Ctrl+F`, `Ctrl+C`, `Esc`, `?`, and all `F1..F12`/navigation keys pass straight to `vt_input::encode_key_event` (respecting `application_cursor` `CSI`/`SS3` mode, sending `\x1b[5~` / `\x1b[6~` for `PageUp` / `PageDown`).
 - **Swedish & International `AltGr`:** Printable non-control, non-ASCII-alphabetic characters arriving with `CONTROL | ALT` (such as `@`, `£`, `$`, `{`, `}`, `[`, `]`, `\`, `|`, `~`, `€`, `µ`) encode directly as raw UTF-8 bytes instead of being mangled into `Esc+Ctrl` sequences.
 - **`Ctrl+V` Raw `\x16` Preservation:** `FocusedPane::Terminal` does **not** intercept `Ctrl+V` as a clipboard paste shortcut; it forwards raw `0x16` (`\x16`) to the PTY so shell `quoted-insert` and Vim visual-block mode work natively. Paste into a live PTY using terminal bracketed paste (`\x1b[200~...\x1b[201~`) or middle-click.
 
@@ -146,10 +149,10 @@ Pressing `Tab` in `MANAGE` mode toggles between `ᛇ Grein` (`MANAGE · GREIN`) 
 | :--- | :--- |
 | `Tab` | Switch sidebar view: `ᛇ Grein` ↔ `⎇ Worktrees` |
 | `Ctrl+G` | Return to `WRITE` mode (also switches `⎇ Worktrees` back to `ᛇ Grein`) |
-| `z` / `Alt+Z` | Toggle sidebar zoom (hides sidebar and returns focus to `WRITE`) |
-| `Alt+1..9` | Jump directly to root thread `1..9` |
+| `z` / `Alt+Z` | Toggle sidebar zoom symmetrically (`z` hides sidebar and returns to `WRITE`; if `Ctrl+G` just unhid a zoomed sidebar, immediate `z` keeps it visible and returns to `WRITE`) |
+| `1` … `9` / `Alt+1..9` | Plain `1..9` jumps directly to depth-0 root `1..9`, switches to `ᛇ Grein`, and returns to `WRITE` (2-keystroke switch via `Ctrl+G 1..9`; out-of-range digits are no-ops; text inputs still receive digits). `Alt+1..9` switches root while staying in `MANAGE`. |
 | `Alt+H` / `Alt+L` | Cycle previous/next sibling thread |
-| `Ctrl+U` / `Ctrl+D` | Scroll right-pane preview up/down half-page (transcript / `⎇ Diff`, or `±5` PTY scrollback rows) |
+| `Ctrl+U` / `Ctrl+D`, `PageUp` / `PageDown` | Scroll right-pane preview up/down half-page (transcript / `⎇ Diff`, or `±5` PTY scrollback rows) |
 | `Ctrl+B` / `Ctrl+F` | Scroll right-pane preview up/down full-page (transcript / `⎇ Diff`, or `±10` PTY scrollback rows) |
 | `Alt+K` / `Alt+J` | Scroll right-pane preview (`10` lines transcript / `⎇ Diff`, or `±5` PTY scrollback rows) |
 | `:` | Open Sidebar Command Palette (`:`) |
@@ -163,6 +166,7 @@ Pressing `Tab` in `MANAGE` mode toggles between `ᛇ Grein` (`MANAGE · GREIN`) 
 | `j` / `↓` and `k` / `↑` | Move selection down / up (requests PTY snapshot when selecting a terminal) |
 | `h` / `←` | Fold selected unfolded parent node, or jump selection to parent node/thread |
 | `l` / `→` | Unfold selected folded node, or step into its first child |
+| `Ctrl+P` / `[` and `Ctrl+N` / `]` | Step to previous (`Ctrl+P` / `[`) or next (`Ctrl+N` / `]`) sibling thread at the current `parent_thread_id` depth while staying in `MANAGE · GREIN` (works without `Alt+` or `Shift+Arrows`) |
 | `Space` | Toggle subtree collapse/expand on selected node |
 | `H` / `L` | Collapse all (`H`) or expand all (`L`) parent branches |
 | `J` / `K` | Jump to next (`J`) or previous (`K`) depth-0 root thread |
@@ -256,6 +260,7 @@ Commands work both from Composer (`/command`) and the `MANAGE` Sidebar Command P
 | `/autocomplete` | `:autocomplete` | Toggle or set Composer inline autocomplete (`on` \| `off` \| `status`) |
 | `/theme` | `:theme` | Open live-preview Theme Picker modal, or apply `/theme <preset>` (`tokyo-night`, `catppuccin-mocha`, `nord`, `gruvbox-dark`, `rose-pine`, `kanagawa`, `dracula`, `everforest`, `one-dark`, `solarized-dark`, `github-dark`, `monokai`, `catppuccin-latte`, `gruvbox-light`, `rose-pine-dawn`, `ansi`) |
 | `/sidebar` | `:sidebar` | Configure sidebar layout: `dynamic [min max]`, `fixed <cols\|pct%>`, `min <10..50%>`, `max <min..60%>`, `overflow <on\|off>`, or shorthand `<cols>` / `<pct%>` |
+| `/keymap` | `:keymap` | Show or switch keymap hint preset: `macos` (`mac`, `leader`) or `standard` (`default`, `linux`), persisted in `grein.db` (`keybinding.preset`) |
 | `/bind` | `:bind` | Bind a `WRITE` action: `:bind <action> <chords>` (persists to `grein.db`) |
 | `/unbind` | `:unbind` | Reset an action back to its built-in default: `:unbind <action>` (removes `grein.db` override) |
 | `/keybinds` | `/binds`, `:keybinds` | Display current bindings (pass `custom` to show only overridden actions) |
@@ -288,6 +293,16 @@ Commands work both from Composer (`/command`) and the `MANAGE` Sidebar Command P
   - `s` (`S`): Switch the target agent thread's provider (resets its active ACP session when changed while preserving conversation history; refuses on `>_` shell threads).
   - `d` (`D`): Set the selected provider as global default (persists `[ui].default_agent_provider` in `UserPrefsStore` `grein.db`; keeps modal open).
   - `Esc` / `q` (`Q`) / `Ctrl+C`: Close modal (`↑/↓/j/k Select · Enter New sibling · s Switch · d Default · Esc/q Close`).
+
+### Keymap Presets (`:keymap macos` / `:keymap standard`)
+
+Use `:keymap <preset>` or `/keymap <preset>` (pass no arguments to view the active preset) to switch between `macos` and `standard`, persisted in SQLite (`grein.db`, `keybinding.preset`):
+
+- **`macos` (aliases: `mac`, `leader`) — Default on macOS when `keybinding.preset` is unset:**
+  - Status bar and `?` Help modal show `Ctrl+G`-first hints (`Ctrl+G manage · Ctrl+G z sidebar · PgUp/PgDn scroll · Ctrl+G 1..9 root · /help`, plus `Ctrl+G Ctrl+P/N, [/]` in Help) without `Alt+` or `Shift+Arrow` clutter.
+  - **All `Alt+` and `Shift+Arrows` bindings stay active** whenever your terminal sends them, while `Ctrl+G` workflows work out of the box without changing macOS `Option`-key behavior—preserving Swedish/Nordic/European `Option` symbols (`@`, `[`, `]`, `{`, `}`, `\`, `|`, `~`).
+- **`standard` (aliases: `default`, `linux`) — Default on Linux/non-macOS when unset:**
+  - Status bar and `?` Help modal display `Alt+Z`, `Alt+K`/`Alt+J`, `Alt+H`/`Alt+L`, `Alt+1..9`, and `Shift+↑/↓/←/→` hints.
 
 ### Customizing Keybindings (`:bind`, `:unbind`, `grein.db`)
 
@@ -329,20 +344,22 @@ Custom keybindings are stored in `~/.config/grein/grein.db` (or `$GREIN_CONFIG_D
 
 ---
 
-## 7. Terminal & Multiplexer Notes (macOS & `tmux`)
+## 7. Terminal & Multiplexer Notes (macOS, Colors & `tmux`)
 
-- **macOS `Option` / `Meta` Keys:** Terminal.app and iTerm2 do not send `ESC` (`Alt`) prefixes for `Option+` by default. Enable **Use Option as Meta key** (Terminal.app → *Settings → Profiles → Keyboard*) or set Left/Right Option to **Esc+** (iTerm2 → *Profiles → Keys*) to use `Alt+Z`, `Alt+1..9`, and `Alt+H/J/K/L`, or use `Ctrl+G` to reach `MANAGE` mode anytime.
-- **macOS `Terminal.app` `Shift+Arrows`:**
-  - **Why plain arrows fire by default:** Apple `Terminal.app` omits modified arrow escapes for `Shift+Up` / `Shift+Down` (and `Shift+Left` / `Shift+Right`) and lacks both the Kitty keyboard protocol and `modifyOtherKeys`, so shifted arrows arrive as plain arrows unless mapped explicitly.
-  - **3-second diagnostic (`cat -v`):** Run `cat -v` and press `Shift+Up` (`Ctrl+C` to exit):
-    - `^[[A` — terminal stripped `Shift` (received as plain `Up`).
-    - `^[[1;2A` — modified arrow sequence received cleanly.
-  - **Custom `Terminal.app` mappings:** Open *Terminal → Settings → Profiles → Keyboard*, click **`+`**, and add:
-    - `Shift+Up` → `\033[1;2A`
-    - `Shift+Down` → `\033[1;2B`
-    - `Shift+Left` → `\033[1;2D`
-    - `Shift+Right` → `\033[1;2C`
-  - **Out-of-the-box terminals & fallback:** Modern macOS terminals (**Ghostty**, **iTerm2 3.5+**, **Kitty**, **WezTerm**, **Alacritty**) support `Shift+Arrows` out of the box. Even on an unconfigured `Terminal.app`, `Ctrl+G` (`MANAGE` mode with `j`/`k`/`h`/`l`) always works.
+- **Zero-Config Stock macOS & Nordic/European Keyboards:**
+  - Grein works out of the box on stock Apple `Terminal.app` and Nordic/European keyboard layouts **without** enabling *Option as Meta* or adding custom escape maps:
+    - `Ctrl+G 1..9`: Switch directly to root thread `1..9` and return to `WRITE`.
+    - `Ctrl+G z`: Toggle sidebar zoom symmetrically in both directions.
+    - `Ctrl+G` then `Ctrl+P`/`Ctrl+N` (or `[`/`]`): Step siblings in `MANAGE · GREIN`.
+    - `PageUp` / `PageDown`: Scroll transcript in `WRITE · AGENT` and preview in `MANAGE` (while passing through natively in `WRITE · SHELL`).
+  - Keeping macOS `Option` in normal composition mode preserves native `@`, `[`, `]`, `{`, `}`, `\`, `|`, and `~` symbols, and on macOS the `macos` keymap preset is selected automatically at startup unless overridden via `:keymap standard`.
+- **Diagnosing Terminal Keys & Color Capabilities (`grein keys` & `grein doctor`):**
+  - Run `grein keys` (or `grein keys --no-enhance` to disable Kitty/CSI-u `DISAMBIGUATE_ESCAPE_CODES` probing) in any interactive TTY to inspect live `crossterm` events (`code`, `modifiers`, `kind`, `state`, resolved `chord`, and matching `action`), plus `TERM`, `TERM_PROGRAM`, and `COLORTERM`. It automatically flags stripped `Shift+Arrow` escapes and macOS `Option` symbol composition without manual `cat -v` guesswork. Press `Ctrl+C` twice or `q` twice to exit.
+  - Run `grein doctor [--json]` to verify `TERM_PROGRAM` and detected color support (`truecolor` vs `256-color fallback`, automatically downsampling RGB theme colors on non-truecolor TTYs such as pre-Tahoe Apple `Terminal.app`).
+- **Optional macOS `Option` / `Meta` & `Terminal.app` `Shift+Arrows` Mapping:**
+  - If you *also* want single-chord `Alt+` shortcuts, enable **Use Option as Meta key** (Terminal.app → *Settings → Profiles → Keyboard*) or set Left/Right Option to **Esc+** (iTerm2 → *Profiles → Keys*)—though note this replaces macOS `Option`-composed characters on that key.
+  - Modern macOS terminals (**Ghostty**, **iTerm2 3.5+**, **Kitty**, **WezTerm**, **Alacritty**) send `Shift+Arrows` out of the box. Pre-Tahoe `Terminal.app` strips `Shift` from arrow escapes unless mapped manually under *Terminal → Settings → Profiles → Keyboard* (`+`):
+    - `Shift+Up` → `\033[1;2A` · `Shift+Down` → `\033[1;2B` · `Shift+Left` → `\033[1;2D` · `Shift+Right` → `\033[1;2C`
 - **Running Grein inside `tmux`:**
   - `ChainedClipboardDriver` detects `$TMUX` and automatically wraps `OSC 52` payloads in DCS passthrough (`\x1bPtmux;\x1b\x1b]52;c;...\x07\x1b\\`). Ensure `set -g allow-passthrough on` is enabled in `tmux.conf` if relying on `OSC 52` without a native clipboard binary.
   - Add both `set -s extended-keys on` **and** `set -g extended-keys-format csi-u` (alongside `escape-time 10`) in `tmux.conf` if `Shift+Enter` or `Shift+Arrows` are swallowed by `tmux`—`tmux 3.5+` defaults to `extended-keys-format xterm`, which emits `CSI 27;...~` sequences that `crossterm 0.28.1` ignores.
