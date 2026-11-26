@@ -17,7 +17,7 @@ use grein_cli::discovery::{
     discover_acp_agents, resolve_agents_configuration, AcpAgentKind, DiscoveryError,
 };
 use grein_cli::doctor::{collect_doctor_report, handle_doctor, CheckStatus};
-use grein_cli::engine::InProcessEngine;
+use grein_cli::engine::{EngineDependencies, InProcessEngine, UnixSocketEngineClient};
 use grein_cli::headless::{handle_agents, handle_status, handle_threads};
 use grein_cli::settings_cmd::{handle_settings, handle_theme};
 use grein_cli::standalone::{
@@ -707,4 +707,104 @@ fn test_cli_binary_doctor_settings_and_theme_error_exits() {
     }
     let out = child.wait_with_output().unwrap();
     assert!(!out.status.success());
+}
+
+#[tokio::test]
+async fn test_unix_socket_run_shell_command_uses_dedicated_connection_nonblocking() {
+    struct StubBlockingShellExecutor {
+        started_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release_rx: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl grein_workspace::port::ShellExecutorPort for StubBlockingShellExecutor {
+        fn run_shell_command(
+            &self,
+            _cwd: &Path,
+            command: &str,
+            _timeout: Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<grein_core::port::dto::ShellCommandResult> {
+            if let Some(tx) = self.started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = self.release_rx.lock().unwrap().take() {
+                let _ = rx.blocking_recv();
+            }
+            Ok(grein_core::port::dto::ShellCommandResult {
+                command: command.to_string(),
+                stdout: "unblocked".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+                timed_out: false,
+            })
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let sock_path = temp.path().join("shell_dedicated.sock");
+    let db_path = temp.path().join("shell_dedicated.db");
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+
+    let storage = Arc::new(grein_core::storage::sqlite::SqliteStorage::open(&db_path).expect("open"));
+    let mut deps = EngineDependencies::for_storage(storage, temp.path().to_path_buf(), None);
+    deps.shell = Arc::new(StubBlockingShellExecutor {
+        started_tx: std::sync::Mutex::new(Some(started_tx)),
+        release_rx: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let engine = Arc::new(InProcessEngine::with_dependencies(deps).expect("with_dependencies"));
+
+    let sock_clone = sock_path.clone();
+    let server = tokio::spawn(async move {
+        let _ = run_daemon_with_engine(sock_clone, engine).await;
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() && UnixStream::connect(&sock_path).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let client = Arc::new(
+        UnixSocketEngineClient::connect(&sock_path)
+            .await
+            .expect("connect"),
+    );
+    let main = client.ensure_main_thread().await.expect("ensure main");
+
+    let shell_client = Arc::clone(&client);
+    let shell_tid = main.thread_id.clone();
+    let shell_task = tokio::spawn(async move {
+        shell_client
+            .run_shell_command(&shell_tid, "sleep 10")
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), started_rx)
+        .await
+        .expect("shell command must reach executor")
+        .expect("started_tx");
+
+    tokio::time::timeout(Duration::from_millis(500), client.ping())
+        .await
+        .expect("shared-socket ping must not block behind in-flight run_shell_command")
+        .expect("ping");
+
+    let threads = tokio::time::timeout(Duration::from_millis(500), client.list_threads())
+        .await
+        .expect("shared-socket list_threads must not block behind in-flight run_shell_command")
+        .expect("list_threads");
+    assert_eq!(threads.len(), 1);
+
+    let _ = release_tx.send(());
+    let shell_res = tokio::time::timeout(Duration::from_secs(2), shell_task)
+        .await
+        .expect("run_shell_command must complete after release")
+        .expect("join")
+        .expect("shell result");
+    assert_eq!(shell_res.stdout, "unblocked");
+    assert_eq!(shell_res.exit_code, 0);
+
+    server.abort();
 }

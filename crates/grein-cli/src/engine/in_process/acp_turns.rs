@@ -372,12 +372,25 @@ impl InProcessEngine {
             .unwrap_or_else(|| self.runtime.cwd.clone());
         let cmd = command.to_string();
         let shell = Arc::clone(&self.runtime.shell);
-        let result = tokio::task::spawn_blocking(move || {
+        let mut result = tokio::task::spawn_blocking(move || {
             shell.run_shell_command(&cwd, &cmd, SHELL_COMMAND_TIMEOUT, SHELL_MAX_OUTPUT_BYTES)
         })
         .await
         .map_err(|e| EngineError::Transport(format!("shell task panicked: {e}")))?
         .map_err(|e| EngineError::Transport(format!("shell execution failed: {e}")))?;
+
+        if result.timed_out {
+            let notice = format!(
+                "[command timed out after {}s]",
+                SHELL_COMMAND_TIMEOUT.as_secs()
+            );
+            let trimmed_stderr = result.stderr.trim_end_matches(['\r', '\n']);
+            if trimmed_stderr.trim().is_empty() {
+                result.stderr = notice;
+            } else {
+                result.stderr = format!("{trimmed_stderr}\n{notice}");
+            }
+        }
 
         self.runtime.emit_tui(EngineStreamEvent::ShellOutput {
             thread_id: thread_id.to_string(),

@@ -141,6 +141,22 @@ fn test_release_workflow_hardening_and_tap_formula() {
         content.contains("Run Apple Silicon macOS PTY tests"),
         "release.yml must run Apple Silicon macOS PTY tests before packaging"
     );
+    let mac_pty_start = content
+        .find("Run Apple Silicon macOS PTY tests")
+        .expect("release.yml must have Run Apple Silicon macOS PTY tests step");
+    let mac_pty_end = content[mac_pty_start..]
+        .find("Build release binary")
+        .map(|offset| mac_pty_start + offset)
+        .unwrap_or(content.len());
+    let mac_pty_step = &content[mac_pty_start..mac_pty_end];
+    assert!(
+        mac_pty_step.contains("matrix.target == 'aarch64-apple-darwin'")
+            && mac_pty_step.contains("--lib shell")
+            && mac_pty_step.contains("--test pty_session_test")
+            && mac_pty_step.contains("--test workspace_coverage_hardening_test")
+            && mac_pty_step.contains("--test port_contracts_test"),
+        "Apple Silicon macOS PTY test step must execute shell and PTY targets, got:\n{mac_pty_step}"
+    );
     assert!(
         content.contains("Smoke-test native binary version"),
         "release.yml must smoke-test native binary --version"

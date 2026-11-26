@@ -268,7 +268,7 @@ impl ShellUseCasePort for UnixSocketEngineClient {
         thread_id: &str,
         command: &str,
     ) -> Result<ShellCommandResult, EngineError> {
-        self.call_typed(
+        self.call_dedicated_typed(
             "session.shell",
             json!({"thread_id": thread_id, "command": command}),
         )

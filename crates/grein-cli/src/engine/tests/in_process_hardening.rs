@@ -1,9 +1,16 @@
+use std::collections::VecDeque;
+use std::io;
+use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use grein_core::port::dto::{ShellCommandResult, TuiEngineEvent};
+use grein_core::storage::sqlite::SqliteStorage;
+use grein_workspace::port::ShellExecutorPort;
 use tokio::time::timeout;
 
-use super::super::{AcpBackendConfig, EngineError, InProcessEngine};
+use super::super::{AcpBackendConfig, EngineDependencies, EngineError, InProcessEngine};
 use super::write_executable_script;
 
 fn init_git_repo(dir: &std::path::Path) {
@@ -491,4 +498,118 @@ async fn test_worktree_guards_non_git_legacy_reuse_and_subdir_cleanup() {
         Some(canonical_repo.to_string_lossy().as_ref())
     );
     let _ = timeout(Duration::from_millis(100), rx.recv()).await;
+}
+
+struct StubSequenceShellExecutor {
+    responses: Mutex<VecDeque<ShellCommandResult>>,
+}
+
+impl ShellExecutorPort for StubSequenceShellExecutor {
+    fn run_shell_command(
+        &self,
+        _cwd: &Path,
+        command: &str,
+        _timeout: Duration,
+        _max_output_bytes: usize,
+    ) -> io::Result<ShellCommandResult> {
+        let mut res = self
+            .responses
+            .lock()
+            .expect("lock responses")
+            .pop_front()
+            .expect("queued shell response");
+        res.command = command.to_string();
+        Ok(res)
+    }
+}
+
+#[tokio::test]
+async fn test_run_shell_command_surfaces_timeout_indicator_in_stderr() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let storage = Arc::new(SqliteStorage::in_memory().expect("in_memory storage"));
+    let shell = Arc::new(StubSequenceShellExecutor {
+        responses: Mutex::new(VecDeque::from([
+            ShellCommandResult {
+                command: String::new(),
+                stdout: "partial out\n".to_string(),
+                stderr: String::new(),
+                exit_code: -1,
+                timed_out: true,
+            },
+            ShellCommandResult {
+                command: String::new(),
+                stdout: String::new(),
+                stderr: "err line\n".to_string(),
+                exit_code: -1,
+                timed_out: true,
+            },
+            ShellCommandResult {
+                command: String::new(),
+                stdout: String::new(),
+                stderr: "  \r\n".to_string(),
+                exit_code: -1,
+                timed_out: true,
+            },
+            ShellCommandResult {
+                command: String::new(),
+                stdout: String::new(),
+                stderr: "normal err\n".to_string(),
+                exit_code: 1,
+                timed_out: false,
+            },
+        ])),
+    });
+    let mut deps = EngineDependencies::for_storage(storage, temp.path().to_path_buf(), None);
+    deps.shell = shell;
+    let engine = InProcessEngine::with_dependencies(deps).expect("with_dependencies");
+    let main = engine.ensure_main_thread().await.expect("main");
+    let mut rx = engine.subscribe_tui_events();
+
+    let res_empty = engine
+        .run_shell_command(&main.thread_id, "sleep 60")
+        .await
+        .expect("timed out empty stderr");
+    assert!(res_empty.timed_out);
+    assert_eq!(res_empty.stderr, "[command timed out after 30s]");
+    let ev_empty = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("event timeout")
+        .expect("event");
+    assert!(matches!(
+        ev_empty,
+        TuiEngineEvent::ShellOutput { stderr, .. } if stderr == "[command timed out after 30s]"
+    ));
+
+    let res_non_empty = engine
+        .run_shell_command(&main.thread_id, "sleep 60 && echo err >&2")
+        .await
+        .expect("timed out non-empty stderr");
+    assert!(res_non_empty.timed_out);
+    assert_eq!(
+        res_non_empty.stderr,
+        "err line\n[command timed out after 30s]"
+    );
+    let ev_non_empty = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("event timeout")
+        .expect("event");
+    assert!(matches!(
+        ev_non_empty,
+        TuiEngineEvent::ShellOutput { stderr, .. }
+            if stderr == "err line\n[command timed out after 30s]"
+    ));
+
+    let res_ws = engine
+        .run_shell_command(&main.thread_id, "sleep 60")
+        .await
+        .expect("timed out whitespace stderr");
+    assert_eq!(res_ws.stderr, "[command timed out after 30s]");
+    let _ = timeout(Duration::from_secs(1), rx.recv()).await;
+
+    let res_normal = engine
+        .run_shell_command(&main.thread_id, "false")
+        .await
+        .expect("non-timeout stderr");
+    assert!(!res_normal.timed_out);
+    assert_eq!(res_normal.stderr, "normal err\n");
 }
