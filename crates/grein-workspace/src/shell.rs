@@ -1,6 +1,10 @@
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -8,10 +12,11 @@ use std::time::{Duration, Instant};
 const TRUNCATED_SUFFIX: &str = "\n...[truncated]";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TIMEOUT_DRAIN_WAIT: Duration = Duration::from_millis(25);
-#[cfg(unix)]
 const PTY_EXIT_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const DEFAULT_LS_COLORS: &str =
     "di=01;34:ln=01;36:pi=33:so=01;35:bd=01;33:cd=01;33:or=01;31:ex=01;32:";
+#[cfg(target_os = "macos")]
+const DEFAULT_MACOS_LSCOLORS: &str = "ExFxBxDxCxegedabagacad";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommandOutput {
@@ -179,180 +184,44 @@ impl PipeReader {
     }
 }
 
-#[cfg(unix)]
-mod pty {
-    use std::ffi::{c_char, c_int, c_ulong, c_ushort, CStr};
-    use std::fs::{File, OpenOptions};
-    use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::path::PathBuf;
-
-    const O_RDWR: c_int = 2;
-    #[cfg(target_os = "linux")]
-    const O_NOCTTY: c_int = 0o400;
-    #[cfg(target_os = "macos")]
-    const O_NOCTTY: c_int = 0x20000;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const O_NOCTTY: c_int = 0;
-
-    #[cfg(target_os = "linux")]
-    const O_CLOEXEC: c_int = 0o2000000;
-
-    const F_SETFD: c_int = 2;
-    const FD_CLOEXEC: c_int = 1;
-
-    #[cfg(all(
-        target_os = "linux",
-        any(
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "x86",
-            target_arch = "arm",
-            target_arch = "riscv64",
-            target_arch = "s390x",
-            target_arch = "loongarch64"
-        )
-    ))]
-    const TIOCSWINSZ: c_ulong = 0x5414;
-
-    #[cfg(target_env = "musl")]
-    #[allow(dead_code)]
-    type IoctlRequest = c_int;
-    #[cfg(not(target_env = "musl"))]
-    #[allow(dead_code)]
-    type IoctlRequest = c_ulong;
-
-    #[repr(C)]
-    #[allow(dead_code)]
-    struct WinSize {
-        ws_row: c_ushort,
-        ws_col: c_ushort,
-        ws_xpixel: c_ushort,
-        ws_ypixel: c_ushort,
+fn resolve_shell(shell_override: Option<&str>) -> String {
+    #[cfg(unix)]
+    {
+        crate::pty_session::unix::resolve_shell(shell_override)
     }
-
-    extern "C" {
-        fn posix_openpt(flags: c_int) -> c_int;
-        fn grantpt(fd: c_int) -> c_int;
-        fn unlockpt(fd: c_int) -> c_int;
-        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-        #[cfg(target_os = "linux")]
-        fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
-        #[cfg(not(target_os = "linux"))]
-        fn ptsname(fd: c_int) -> *const c_char;
-        #[cfg(all(
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "x86",
-                target_arch = "arm",
-                target_arch = "riscv64",
-                target_arch = "s390x",
-                target_arch = "loongarch64"
-            )
-        ))]
-        fn ioctl(fd: c_int, request: IoctlRequest, ...) -> c_int;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    static PTSNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn open_master_fd() -> io::Result<OwnedFd> {
-        #[cfg(target_os = "linux")]
-        let raw_fd = {
-            let fd = unsafe { posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC) };
-            if fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::InvalidInput {
-                unsafe { posix_openpt(O_RDWR | O_NOCTTY) }
-            } else {
-                fd
+    #[cfg(not(unix))]
+    {
+        if let Some(shell) = shell_override.filter(|s| !s.trim().is_empty()) {
+            return shell.to_string();
+        }
+        if let Ok(shell) = std::env::var("SHELL") {
+            if !shell.trim().is_empty() {
+                return shell;
             }
-        };
-        #[cfg(not(target_os = "linux"))]
-        let raw_fd = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
-
-        if raw_fd < 0 {
-            return Err(io::Error::last_os_error());
         }
-        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        let _ = unsafe { fcntl(owned.as_raw_fd(), F_SETFD, FD_CLOEXEC) };
-        Ok(owned)
+        "sh".to_string()
     }
+}
 
-    fn slave_pty_path(master_fd: &OwnedFd) -> io::Result<PathBuf> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut buf = [0 as c_char; 256];
-            let rc = unsafe { ptsname_r(master_fd.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
-            if rc != 0 {
-                return Err(if rc > 0 {
-                    io::Error::from_raw_os_error(rc)
-                } else {
-                    io::Error::last_os_error()
-                });
-            }
-            let path = unsafe { CStr::from_ptr(buf.as_ptr()) }
-                .to_str()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(PathBuf::from(path))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _guard = PTSNAME_LOCK
-                .lock()
-                .map_err(|_| io::Error::other("ptsname lock poisoned"))?;
-            let ptr = unsafe { ptsname(master_fd.as_raw_fd()) };
-            if ptr.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let path = unsafe { CStr::from_ptr(ptr) }
-                .to_str()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(PathBuf::from(path))
-        }
+fn exit_status_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        crate::pty_session::unix::exit_status_code(status)
     }
-
-    pub fn open_pty_pair() -> io::Result<(File, File)> {
-        let master_fd = open_master_fd()?;
-        if unsafe { grantpt(master_fd.as_raw_fd()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { unlockpt(master_fd.as_raw_fd()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let slave_path = slave_pty_path(&master_fd)?;
-
-        #[cfg(all(
-            target_os = "linux",
-            any(
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "x86",
-                target_arch = "arm",
-                target_arch = "riscv64",
-                target_arch = "s390x",
-                target_arch = "loongarch64"
-            )
-        ))]
-        {
-            let ws = WinSize {
-                ws_row: 40,
-                ws_col: 120,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            let _ = unsafe { ioctl(master_fd.as_raw_fd(), TIOCSWINSZ as IoctlRequest, &ws) };
-        }
-
-        let slave_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NOCTTY)
-            .open(&slave_path)?;
-
-        Ok((File::from(master_fd), slave_file))
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(-1)
     }
+}
+
+fn is_posix_shell(shell: &str) -> bool {
+    let Some(stem) = Path::new(shell.trim()).file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "mksh"
+    )
 }
 
 fn validate_command(command: &str) -> io::Result<()> {
@@ -365,29 +234,62 @@ fn validate_command(command: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn apply_color_env(cmd: &mut Command) {
+fn apply_color_env(cmd: &mut Command, is_pty: bool) {
+    #[cfg(unix)]
+    for &var in crate::pty_session::unix::SCRUBBED_TERMINAL_ENV_VARS {
+        cmd.env_remove(var);
+    }
     cmd.env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env("GREIN", "1")
         .env("CLICOLOR", "1")
-        .env("CLICOLOR_FORCE", "1")
         .env("FORCE_COLOR", "1")
         .env("CARGO_TERM_COLOR", "always")
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat");
+    if is_pty {
+        cmd.env_remove("CLICOLOR_FORCE");
+    } else {
+        cmd.env("CLICOLOR_FORCE", "1");
+    }
     if std::env::var_os("LS_COLORS").is_none() {
         cmd.env("LS_COLORS", DEFAULT_LS_COLORS);
     }
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("LSCOLORS").is_none() {
+        cmd.env("LSCOLORS", DEFAULT_MACOS_LSCOLORS);
+    }
 }
 
-fn build_pty_shell_script(command: &str) -> String {
+fn build_pty_shell_script(shell: &str, command: &str) -> String {
+    if !is_posix_shell(shell) {
+        return command.to_string();
+    }
     #[cfg(target_os = "linux")]
     {
         format!(
             "ls() {{ command ls --color=auto \"$@\"; }}; grep() {{ command grep --color=auto \"$@\"; }}; {command}"
         )
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        format!("grep() {{ command grep --color=auto \"$@\"; }}; {command}")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         command.to_string()
+    }
+}
+
+#[cfg(unix)]
+fn attach_session_isolation(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            crate::pty_session::unix::reset_child_signals()
+        });
     }
 }
 
@@ -418,10 +320,18 @@ fn wait_and_collect(
             command: command.to_string(),
             stdout: stdout_reader.finish_until(drain_deadline),
             stderr: stderr_reader.finish_until(drain_deadline),
-            exit_code: status.code().unwrap_or(-1),
+            exit_code: exit_status_code(status),
             timed_out: false,
         })
     } else {
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            if pid > 0 {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
         let _ = child.kill();
         let _ = child.wait();
         let drain_deadline = Instant::now() + TIMEOUT_DRAIN_WAIT;
@@ -435,22 +345,29 @@ fn wait_and_collect(
     }
 }
 
-fn run_shell_command_with_color_pipes(
+fn run_pipe_command(
     cwd: &Path,
     command: &str,
     timeout: Duration,
     max_output_bytes: usize,
+    shell_override: Option<&str>,
+    with_color_env: bool,
 ) -> io::Result<ShellCommandOutput> {
     validate_command(command)?;
 
-    let mut cmd = Command::new("sh");
+    let shell = resolve_shell(shell_override);
+    let mut cmd = Command::new(&shell);
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_color_env(&mut cmd);
+    if with_color_env {
+        apply_color_env(&mut cmd, false);
+    }
+    #[cfg(unix)]
+    attach_session_isolation(&mut cmd);
 
     let mut child = cmd.spawn()?;
     let stdout_reader = PipeReader::spawn(child.stdout.take(), max_output_bytes, false);
@@ -461,44 +378,62 @@ fn run_shell_command_with_color_pipes(
         stdout_reader,
         stderr_reader,
         timeout,
-        None,
+        Some(PTY_EXIT_DRAIN_WAIT),
     )
 }
 
-pub fn run_shell_command_with_pty_blocking(
+#[cfg(test)]
+fn run_shell_command_with_color_pipes(
     cwd: &Path,
     command: &str,
     timeout: Duration,
     max_output_bytes: usize,
 ) -> io::Result<ShellCommandOutput> {
+    run_pipe_command(cwd, command, timeout, max_output_bytes, None, true)
+}
+
+pub fn run_shell_command_with_pty_and_shell_blocking(
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    max_output_bytes: usize,
+    shell_override: Option<&str>,
+) -> io::Result<ShellCommandOutput> {
     validate_command(command)?;
 
     #[cfg(unix)]
     {
-        let (master_file, slave_file) = match pty::open_pty_pair() {
+        let (master_fd, slave_fd) = match crate::pty_session::unix::open_pty_pair(40, 120) {
             Ok(pair) => pair,
             Err(_) => {
-                return run_shell_command_with_color_pipes(
+                return run_pipe_command(
                     cwd,
                     command,
                     timeout,
                     max_output_bytes,
+                    shell_override,
+                    true,
                 );
             }
         };
+        let master_file = File::from(master_fd);
+        let slave_file = File::from(slave_fd);
 
-        let script = build_pty_shell_script(command);
-        let mut cmd = Command::new("sh");
+        let shell = resolve_shell(shell_override);
+        let script = build_pty_shell_script(&shell, command);
+        let mut cmd = Command::new(&shell);
         cmd.arg("-c")
             .arg(&script)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::from(slave_file))
             .stderr(Stdio::piped());
-        apply_color_env(&mut cmd);
+        apply_color_env(&mut cmd, true);
+        attach_session_isolation(&mut cmd);
 
-        let mut child = cmd.spawn()?;
+        let spawn_result = cmd.spawn();
         drop(cmd);
+        let mut child = spawn_result?;
 
         let stdout_reader = PipeReader::spawn(Some(master_file), max_output_bytes, true);
         let stderr_reader = PipeReader::spawn(child.stderr.take(), max_output_bytes, false);
@@ -514,8 +449,17 @@ pub fn run_shell_command_with_pty_blocking(
 
     #[cfg(not(unix))]
     {
-        run_shell_command_with_color_pipes(cwd, command, timeout, max_output_bytes)
+        run_pipe_command(cwd, command, timeout, max_output_bytes, shell_override, true)
     }
+}
+
+pub fn run_shell_command_with_pty_blocking(
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> io::Result<ShellCommandOutput> {
+    run_shell_command_with_pty_and_shell_blocking(cwd, command, timeout, max_output_bytes, None)
 }
 
 pub fn run_shell_command_blocking(
@@ -524,27 +468,7 @@ pub fn run_shell_command_blocking(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> io::Result<ShellCommandOutput> {
-    validate_command(command)?;
-
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let stdout_reader = PipeReader::spawn(child.stdout.take(), max_output_bytes, false);
-    let stderr_reader = PipeReader::spawn(child.stderr.take(), max_output_bytes, false);
-    wait_and_collect(
-        child,
-        command,
-        stdout_reader,
-        stderr_reader,
-        timeout,
-        None,
-    )
+    run_pipe_command(cwd, command, timeout, max_output_bytes, None, false)
 }
 
 #[cfg(test)]
@@ -815,16 +739,22 @@ mod tests {
 
         let env_out = run_shell_command_with_pty_blocking(
             dir.path(),
-            "printf '%s|%s|%s|%s|%s|%s\\n' \"$TERM\" \"$CLICOLOR\" \"$CLICOLOR_FORCE\" \"$FORCE_COLOR\" \"$CARGO_TERM_COLOR\" \"$PAGER\"; test -n \"$LS_COLORS\" && echo has_ls_colors; test -t 1 && echo is_tty || echo not_tty",
+            "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$TERM\" \"$COLORTERM\" \"$GREIN\" \"$CLICOLOR\" \"$CLICOLOR_FORCE\" \"$FORCE_COLOR\" \"$CARGO_TERM_COLOR\" \"$GIT_PAGER\" \"$PAGER\"; test -n \"$LS_COLORS\" && echo has_ls_colors; test -n \"$LSCOLORS\" && echo has_macos_lscolors; test -t 1 && echo is_tty || echo not_tty",
             Duration::from_secs(5),
             4096,
         )
         .expect("env command runs");
         assert_eq!(env_out.exit_code, 0);
-        assert!(env_out
-            .stdout
-            .contains("xterm-256color|1|1|1|always|cat"));
+        assert!(
+            env_out
+                .stdout
+                .contains("xterm-256color|truecolor|1|1||1|always|cat|cat"),
+            "unexpected env output: {:?}",
+            env_out.stdout
+        );
         assert!(env_out.stdout.contains("has_ls_colors"));
+        #[cfg(target_os = "macos")]
+        assert!(env_out.stdout.contains("has_macos_lscolors"));
 
         let is_tty = env_out.stdout.lines().any(|l| l == "is_tty");
         let ls_out = run_shell_command_with_pty_blocking(
@@ -845,6 +775,22 @@ mod tests {
             );
         }
 
+        let cat_piped = run_shell_command_with_pty_blocking(
+            dir.path(),
+            "ls -1 | cat",
+            Duration::from_secs(5),
+            4096,
+        )
+        .expect("ls | cat runs");
+        assert_eq!(cat_piped.exit_code, 0);
+        assert!(
+            !cat_piped.stdout.contains("\x1b["),
+            "ls | cat had ANSI: {:?}",
+            cat_piped.stdout
+        );
+        assert!(cat_piped.stdout.contains("subdir"));
+        assert!(cat_piped.stdout.contains("file.txt"));
+
         let piped_out = run_shell_command_with_pty_blocking(
             dir.path(),
             "ls -1 | wc -l",
@@ -858,11 +804,185 @@ mod tests {
 
         let pipe_fallback = run_shell_command_with_color_pipes(
             dir.path(),
-            "printf '%s|%s' \"$TERM\" \"$FORCE_COLOR\"",
+            "printf '%s|%s|%s|%s|%s|%s' \"$TERM\" \"$COLORTERM\" \"$GREIN\" \"$CLICOLOR\" \"$CLICOLOR_FORCE\" \"$FORCE_COLOR\"",
             Duration::from_secs(5),
             1024,
         )
         .expect("color pipes fallback runs");
-        assert_eq!(pipe_fallback.stdout, "xterm-256color|1");
+        assert_eq!(
+            pipe_fallback.stdout,
+            "xterm-256color|truecolor|1|1|1|1"
+        );
+    }
+
+    #[test]
+    fn test_is_posix_shell_and_build_pty_shell_script() {
+        for shell in [
+            "sh",
+            "bash",
+            "zsh",
+            "dash",
+            "ash",
+            "ksh",
+            "mksh",
+            "/bin/zsh",
+            "/usr/local/bin/BASH",
+        ] {
+            assert!(is_posix_shell(shell), "expected POSIX shell: {shell}");
+        }
+        for shell in ["/usr/bin/fish", "fish", "nushell", "pwsh", "csh", "tcsh", "", "/"] {
+            assert!(!is_posix_shell(shell), "expected non-POSIX shell: {shell}");
+        }
+
+        assert_eq!(
+            build_pty_shell_script("/usr/bin/fish", "ls | cat"),
+            "ls | cat"
+        );
+        let posix_script = build_pty_shell_script("/bin/zsh", "echo hi");
+        assert!(posix_script.ends_with("; echo hi"));
+        #[cfg(target_os = "linux")]
+        assert!(posix_script.contains("ls() { command ls --color=auto \"$@\"; }"));
+        #[cfg(target_os = "macos")]
+        assert!(!posix_script.contains("ls() {"));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(posix_script.contains("grep() { command grep --color=auto \"$@\"; }"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pty_and_pipe_scrub_terminal_env_vars_isolated() {
+        const FLAG: &str = "GREIN_SHELL_ENV_SUBPROCESS";
+        if std::env::var_os(FLAG).is_none() {
+            let exe = std::env::current_exe().expect("test binary");
+            let mut cmd = Command::new(exe);
+            cmd.arg("--exact")
+                .arg("shell::tests::test_pty_and_pipe_scrub_terminal_env_vars_isolated")
+                .arg("--nocapture")
+                .env(FLAG, "1")
+                .env("CLICOLOR_FORCE", "1")
+                .env("GREIN_KEEP_TEST", "yes");
+            for &var in crate::pty_session::unix::SCRUBBED_TERMINAL_ENV_VARS {
+                cmd.env(var, format!("outer_{var}"));
+            }
+            let out = cmd.output().expect("run isolated test");
+            assert!(
+                out.status.success(),
+                "isolated test failed: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut script = String::new();
+        for &var in crate::pty_session::unix::SCRUBBED_TERMINAL_ENV_VARS {
+            script.push_str(&format!(
+                "eval \"v=\\${{{var}+SET}}\"; printf '{var}=%s\\n' \"${{v:-UNSET}}\"; "
+            ));
+        }
+        script.push_str(
+            "printf 'KEEP=%s|TERM=%s|COLORTERM=%s|GREIN=%s|CF=%s\\n' \"$GREIN_KEEP_TEST\" \"$TERM\" \"$COLORTERM\" \"$GREIN\" \"${CLICOLOR_FORCE:-UNSET}\"",
+        );
+
+        let pty_out = run_shell_command_with_pty_and_shell_blocking(
+            dir.path(),
+            &script,
+            Duration::from_secs(5),
+            8192,
+            Some("/bin/sh"),
+        )
+        .expect("pty env check");
+        let pipe_out = run_pipe_command(
+            dir.path(),
+            &script,
+            Duration::from_secs(5),
+            8192,
+            Some("/bin/sh"),
+            true,
+        )
+        .expect("pipe env check");
+
+        for (label, out, expected_cf) in [
+            ("pty", &pty_out, "UNSET"),
+            ("pipe", &pipe_out, "1"),
+        ] {
+            assert_eq!(out.exit_code, 0, "{label} failed: {}", out.stderr);
+            for &var in crate::pty_session::unix::SCRUBBED_TERMINAL_ENV_VARS {
+                let needle = format!("{var}=UNSET");
+                assert!(
+                    out.stdout.lines().any(|l| l.trim() == needle),
+                    "{label} did not scrub {var}: {:?}",
+                    out.stdout
+                );
+            }
+            let expected_tail =
+                format!("KEEP=yes|TERM=xterm-256color|COLORTERM=truecolor|GREIN=1|CF={expected_cf}");
+            assert!(
+                out.stdout.lines().any(|l| l.trim() == expected_tail),
+                "{label} env mismatch: {:?}",
+                out.stdout
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pipe_command_session_isolation_signal_exit_and_grandchild_kill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent_sid = unsafe { libc::getsid(0) };
+
+        let sig = run_pipe_command(
+            dir.path(),
+            "kill -9 $$",
+            Duration::from_secs(5),
+            1024,
+            Some("/bin/sh"),
+            false,
+        )
+        .expect("pipe kill -9");
+        assert!(!sig.timed_out);
+        assert_eq!(sig.exit_code, 137);
+
+        let tty = run_pipe_command(
+            dir.path(),
+            "( exec < /dev/tty ) 2>/dev/null && echo HAS_TTY || echo NO_TTY",
+            Duration::from_secs(5),
+            1024,
+            Some("/bin/sh"),
+            false,
+        )
+        .expect("pipe tty check");
+        assert_eq!(tty.stdout.trim(), "NO_TTY");
+        assert_ne!(parent_sid, 0);
+
+        let timeout_out = run_pipe_command(
+            dir.path(),
+            "sleep 30 & printf 'GC=%s\\n' \"$!\"; wait",
+            Duration::from_millis(250),
+            4096,
+            Some("/bin/sh"),
+            false,
+        )
+        .expect("pipe timeout");
+        assert!(timeout_out.timed_out);
+        assert_eq!(timeout_out.exit_code, -1);
+        let gc_pid: libc::pid_t = timeout_out
+            .stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("GC="))
+            .expect("gc pid")
+            .trim()
+            .parse()
+            .expect("valid pid");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let rc = unsafe { libc::kill(gc_pid, 0) };
+            if rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "grandchild {gc_pid} survived");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }

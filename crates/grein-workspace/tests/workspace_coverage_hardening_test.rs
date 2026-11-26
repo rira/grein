@@ -13,7 +13,10 @@ use grein_workspace::environment::{detect_environment, EnvironmentDetector, Work
 use grein_workspace::git::{GitError, GitRepository, MergeResult};
 use grein_workspace::pty_session::{InteractivePtySession, PtyScreenSnapshot};
 use grein_workspace::shadow::{detect_git_environment, ShadowSnapshot};
-use grein_workspace::shell::run_shell_command_with_pty_blocking;
+use grein_workspace::shell::{
+    run_shell_command_blocking, run_shell_command_with_pty_and_shell_blocking,
+    run_shell_command_with_pty_blocking,
+};
 use grein_workspace::teardown::{TeardownAction, TeardownOutcome};
 use tempfile::{tempdir, TempDir};
 
@@ -287,4 +290,315 @@ fn pty_session_edge_cases_resize_zero_empty_write_and_post_exit_poll() {
         Arc::new(|| {})
     )
     .is_err());
+}
+
+#[test]
+fn shell_pty_and_interactive_session_concurrent_stress_test() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let handles: Vec<_> = (0..6)
+        .map(|worker_idx| {
+            let cwd = root.clone();
+            std::thread::spawn(move || {
+                for iter in 0..3 {
+                    let expected = format!("worker-{worker_idx}-iter-{iter}");
+                    let cmd = format!("printf '{expected}\\n'");
+                    let out = run_shell_command_with_pty_blocking(
+                        &cwd,
+                        &cmd,
+                        Duration::from_secs(5),
+                        4096,
+                    )
+                    .expect("concurrent pty command runs");
+                    assert_eq!(out.exit_code, 0);
+                    assert!(!out.timed_out);
+                    assert_eq!(out.stdout, format!("{expected}\n"));
+
+                    let signal_state = Arc::new((Mutex::new(0u64), Condvar::new()));
+                    let signal_cb = {
+                        let st = Arc::clone(&signal_state);
+                        Arc::new(move || {
+                            let mut g = st.0.lock().expect("lock");
+                            *g += 1;
+                            st.1.notify_all();
+                        })
+                    };
+                    let session = InteractivePtySession::spawn(
+                        &cwd,
+                        24,
+                        80,
+                        Some("/bin/sh"),
+                        signal_cb,
+                    )
+                    .expect("concurrent interactive pty spawn");
+                    session.write_bytes(b"exit 0\n").expect("exit shell");
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut guard = signal_state.0.lock().expect("lock");
+                    loop {
+                        let snap = session.snapshot();
+                        if snap.exited {
+                            assert_eq!(snap.exit_code, Some(0));
+                            break;
+                        }
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        assert!(!rem.is_zero(), "timed out waiting for interactive exit");
+                        let (next, _) = signal_state
+                            .1
+                            .wait_timeout(guard, rem.min(Duration::from_millis(25)))
+                            .expect("wait");
+                        guard = next;
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("worker thread succeeds");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_pipe_normal_exit_with_orphan_fd_is_bounded_and_cleans_up() {
+    let dir = tempdir().expect("tempdir");
+    let started = Instant::now();
+    let out = run_shell_command_blocking(
+        dir.path(),
+        "sleep 2 & printf 'ORPHAN_PID=%s\\n' \"$!\"",
+        Duration::from_secs(5),
+        4096,
+    )
+    .expect("pipe command returns cleanly");
+    let elapsed = started.elapsed();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(!out.timed_out);
+    assert!(
+        elapsed < Duration::from_millis(1200),
+        "normal pipe exit with open orphan fd must be bounded by drain wait, took {elapsed:?}"
+    );
+    let pid: libc::pid_t = out
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("ORPHAN_PID="))
+        .expect("orphan pid printed")
+        .trim()
+        .parse()
+        .expect("valid pid");
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_pty_detach_tty_session_eof_signal_and_grandchild_timeout() {
+    let dir = tempdir().expect("tempdir");
+    let parent_sid = unsafe { libc::getsid(0) };
+
+    let started = Instant::now();
+    let eof = run_shell_command_with_pty_and_shell_blocking(
+        dir.path(),
+        "cat",
+        Duration::from_secs(5),
+        1024,
+        Some("/bin/sh"),
+    )
+    .expect("cat eof");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(eof.exit_code, 0);
+    assert_eq!(eof.stdout, "");
+
+    let tty_out = run_shell_command_with_pty_and_shell_blocking(
+        dir.path(),
+        "( exec < /dev/tty ) 2>/dev/null && echo HAS_TTY || echo NO_TTY",
+        Duration::from_secs(5),
+        1024,
+        Some("/bin/sh"),
+    )
+    .expect("tty check");
+    assert_eq!(tty_out.stdout.trim(), "NO_TTY");
+
+    #[cfg(target_os = "linux")]
+    {
+        let stat_out = run_shell_command_with_pty_and_shell_blocking(
+            dir.path(),
+            "exec cat /proc/self/stat",
+            Duration::from_secs(5),
+            4096,
+            Some("/bin/sh"),
+        )
+        .expect("proc stat");
+        let after = stat_out.stdout.rsplit_once(')').expect("comm end").1;
+        let cols: Vec<&str> = after.split_whitespace().collect();
+        let pid: libc::pid_t = stat_out
+            .stdout
+            .split_once('(')
+            .expect("comm start")
+            .0
+            .trim()
+            .parse()
+            .expect("pid");
+        let pgrp: libc::pid_t = cols[2].parse().expect("pgrp");
+        let sid: libc::pid_t = cols[3].parse().expect("sid");
+        let tty_nr: i64 = cols[4].parse().expect("tty_nr");
+        assert_eq!(pid, pgrp);
+        assert_eq!(pid, sid);
+        assert_eq!(tty_nr, 0);
+        assert_ne!(sid, parent_sid);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let ps_out = run_shell_command_with_pty_and_shell_blocking(
+            dir.path(),
+            "ps -o pid=,pgid=,sid= -p $$",
+            Duration::from_secs(5),
+            4096,
+            Some("/bin/sh"),
+        )
+        .expect("ps stat");
+        let cols: Vec<libc::pid_t> = ps_out
+            .stdout
+            .split_whitespace()
+            .map(|v| v.parse().expect("id"))
+            .collect();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0], cols[1]);
+        assert_eq!(cols[0], cols[2]);
+        assert_ne!(cols[2], parent_sid);
+    }
+
+    let sig = run_shell_command_with_pty_and_shell_blocking(
+        dir.path(),
+        "kill -9 $$",
+        Duration::from_secs(5),
+        1024,
+        Some("/bin/sh"),
+    )
+    .expect("kill -9 $$");
+    assert!(!sig.timed_out);
+    assert_eq!(sig.exit_code, 137);
+
+    let timeout_out = run_shell_command_with_pty_and_shell_blocking(
+        dir.path(),
+        "sleep 30 & printf 'GC=%s\\n' \"$!\"; wait",
+        Duration::from_millis(250),
+        4096,
+        Some("/bin/sh"),
+    )
+    .expect("timeout returns output");
+    assert!(timeout_out.timed_out);
+    assert_eq!(timeout_out.exit_code, -1);
+    let gc_pid: libc::pid_t = timeout_out
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("GC="))
+        .expect("grandchild pid printed")
+        .trim()
+        .parse()
+        .expect("valid gc pid");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let rc = unsafe { libc::kill(gc_pid, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild {gc_pid} survived timeout kill"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn shell_pty_shell_override_supports_posix_shells_and_stty_size() {
+    let dir = tempdir().expect("tempdir");
+    let stty_out = run_shell_command_with_pty_and_shell_blocking(
+        dir.path(),
+        "if command -v stty >/dev/null 2>&1; then stty size <&1; else echo NO_STTY; fi",
+        Duration::from_secs(5),
+        1024,
+        Some("/bin/sh"),
+    )
+    .expect("stty size command runs");
+    assert_eq!(stty_out.exit_code, 0);
+    if stty_out.stdout.trim() != "NO_STTY" {
+        assert_eq!(stty_out.stdout.trim(), "40 120");
+    }
+
+    for candidate in ["bash", "zsh"] {
+        if let Some(bin) = std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(candidate))
+                .find(|c| c.is_file())
+        }) {
+            for shell_arg in [candidate, bin.to_string_lossy().as_ref()] {
+                let out = run_shell_command_with_pty_and_shell_blocking(
+                    dir.path(),
+                    "[[ 1 -eq 1 ]] && echo ok",
+                    Duration::from_secs(5),
+                    1024,
+                    Some(shell_arg),
+                )
+                .expect("override shell runs");
+                assert_eq!(out.exit_code, 0);
+                assert_eq!(out.stdout.trim(), "ok");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_respects_user_shell_env_var_isolated() {
+    const FLAG: &str = "GREIN_TEST_USER_SHELL_ENV";
+    if let Some(expected_shell) = std::env::var_os(FLAG) {
+        let expected_shell = expected_shell.to_string_lossy();
+        let dir = tempdir().expect("tempdir");
+        let cmd = if expected_shell.ends_with("bash") {
+            "[[ 1 -eq 1 ]] && printf '%s' \"$0\""
+        } else {
+            "printf '%s' \"$0\""
+        };
+        let pty_out =
+            run_shell_command_with_pty_blocking(dir.path(), cmd, Duration::from_secs(5), 1024)
+                .expect("pty runs with SHELL");
+        assert_eq!(pty_out.exit_code, 0);
+        assert_eq!(pty_out.stdout.trim(), expected_shell.as_ref());
+
+        let pipe_out =
+            run_shell_command_blocking(dir.path(), cmd, Duration::from_secs(5), 1024)
+                .expect("pipe runs with SHELL");
+        assert_eq!(pipe_out.exit_code, 0);
+        assert_eq!(pipe_out.stdout.trim(), expected_shell.as_ref());
+        return;
+    }
+
+    let target_shell = std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("bash"))
+                .find(|c| c.is_file())
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+
+    let exe = std::env::current_exe().expect("test binary");
+    let out = Command::new(exe)
+        .arg("--exact")
+        .arg("shell_respects_user_shell_env_var_isolated")
+        .arg("--nocapture")
+        .env(FLAG, &target_shell)
+        .env("SHELL", &target_shell)
+        .output()
+        .expect("run isolated SHELL test");
+    assert!(
+        out.status.success(),
+        "isolated SHELL test failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

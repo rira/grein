@@ -6,7 +6,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 #[cfg(unix)]
-mod unix;
+pub(crate) mod unix;
 
 use std::io;
 #[cfg(unix)]

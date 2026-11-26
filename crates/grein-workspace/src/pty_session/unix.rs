@@ -3,14 +3,15 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 pub(super) const POLL_TIMEOUT_MS: i32 = 100;
 
-pub(super) const SCRUBBED_TERMINAL_ENV_VARS: &[&str] = &[
+pub(crate) const SCRUBBED_TERMINAL_ENV_VARS: &[&str] = &[
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "KITTY_WINDOW_ID",
@@ -99,7 +100,7 @@ impl ChildProcess {
     }
 }
 
-pub(super) fn resolve_shell(shell_override: Option<&str>) -> String {
+pub(crate) fn resolve_shell(shell_override: Option<&str>) -> String {
     if let Some(shell) = shell_override.filter(|s| !s.trim().is_empty()) {
         return shell.to_string();
     }
@@ -126,7 +127,7 @@ pub(super) fn build_pty_command(shell: &str, cwd: &Path, extra_env: &[(&str, &st
     cmd
 }
 
-pub(super) unsafe fn reset_child_signals() -> io::Result<()> {
+pub(crate) unsafe fn reset_child_signals() -> io::Result<()> {
     let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
     if libc::sigemptyset(set.as_mut_ptr()) < 0 {
         return Err(io::Error::last_os_error());
@@ -231,7 +232,7 @@ pub(super) fn set_pty_winsize(fd: RawFd, rows: u16, cols: u16) -> io::Result<()>
     Ok(())
 }
 
-pub(super) fn open_pty_pair(rows: u16, cols: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn open_pty_pair(rows: u16, cols: u16) -> io::Result<(OwnedFd, OwnedFd)> {
     let master_fd = open_master_fd()?;
     if unsafe { libc::grantpt(master_fd.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -279,6 +280,16 @@ fn decode_wait_status(status: libc::c_int) -> i32 {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
         128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
+}
+
+pub(crate) fn exit_status_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        code
+    } else if let Some(sig) = status.signal() {
+        128 + sig
     } else {
         -1
     }

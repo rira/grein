@@ -266,6 +266,90 @@ fn pty_shell_executor_implements_shell_executor_port() {
     assert!(!res.timed_out);
 }
 
+#[cfg(unix)]
+#[test]
+fn pty_shell_executor_enforces_parity_contracts() {
+    let dir = tempdir().expect("tempdir");
+    fs::create_dir(dir.path().join("alpha_dir")).expect("mkdir");
+    fs::write(dir.path().join("beta.txt"), "hi\n").expect("write");
+
+    let executor: Arc<dyn ShellExecutorPort> = Arc::new(PtyShellExecutor::new());
+
+    let tty_and_size = executor
+        .run_shell_command(
+            dir.path(),
+            "if command -v stty >/dev/null 2>&1; then stty size <&1; else echo NO_STTY; fi",
+            Duration::from_secs(5),
+            4096,
+        )
+        .expect("stty size check");
+    assert_eq!(tty_and_size.exit_code, 0);
+    if tty_and_size.stdout.trim() != "NO_STTY" {
+        assert_eq!(tty_and_size.stdout.trim(), "40 120");
+    }
+
+    let ls_pipe = executor
+        .run_shell_command(dir.path(), "ls -1 | cat", Duration::from_secs(5), 4096)
+        .expect("ls pipe");
+    assert_eq!(ls_pipe.exit_code, 0);
+    assert!(
+        !ls_pipe.stdout.contains("\x1b["),
+        "pipe ls had ANSI: {:?}",
+        ls_pipe.stdout
+    );
+    assert!(ls_pipe.stdout.contains("alpha_dir"));
+    assert!(ls_pipe.stdout.contains("beta.txt"));
+
+    let eof_res = executor
+        .run_shell_command(dir.path(), "cat", Duration::from_secs(5), 1024)
+        .expect("cat eof");
+    assert_eq!(eof_res.exit_code, 0);
+    assert!(!eof_res.timed_out);
+    assert_eq!(eof_res.stdout, "");
+
+    let sig_res = executor
+        .run_shell_command(
+            dir.path(),
+            "sh -c 'kill -9 $$'",
+            Duration::from_secs(5),
+            1024,
+        )
+        .expect("sigkill exit");
+    assert!(!sig_res.timed_out);
+    assert_eq!(sig_res.exit_code, 137);
+
+    let timeout_res = executor
+        .run_shell_command(
+            dir.path(),
+            "sh -c 'sleep 30 & printf \"GC=%s\\n\" \"$!\"; wait'",
+            Duration::from_millis(250),
+            4096,
+        )
+        .expect("timeout kills grandchild");
+    assert!(timeout_res.timed_out);
+    assert_eq!(timeout_res.exit_code, -1);
+    let gc_pid: libc::pid_t = timeout_res
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("GC="))
+        .expect("grandchild pid printed")
+        .trim()
+        .parse()
+        .expect("valid gc pid");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let rc = unsafe { libc::kill(gc_pid, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild process {gc_pid} survived session timeout kill"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[allow(dead_code)]
 fn assert_workspace_port_object_safety(
     _iso: Arc<dyn WorkspaceIsolationPort>,
