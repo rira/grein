@@ -82,7 +82,12 @@ When an Agent thread is active and focused, keystrokes first pass through active
 
 ### `!command` Inline Shell Prefix
 
-Prefixing a Composer submission with `!` (for example `!cargo test`) runs the command in the thread's `cwd` via `PtyShellExecutor` (30 s timeout, 64 KiB output cap) and renders a collapsible `ShellExecution` transcript card without leaving `WRITE · AGENT`.
+Prefixing a `WRITE · AGENT` (`Composer`) submission with `!` (for example `!cargo test` or `!git status -sb`) runs the command via `PtyShellExecutor` and renders a collapsible `ShellExecution` transcript card without leaving `WRITE · AGENT`:
+
+- **PTY & `$SHELL` Parity:** Executes via the user's configured `$SHELL -c` (falling back to `/bin/sh`) inside a `40×120` PTY session, inheriting your terminal's `PATH` and supporting `$SHELL` syntax (pipes, redirections, globs, subshells, and `zsh`/`bash` expressions) plus color TTY detection (without breaking downstream pipes via `CLICOLOR_FORCE`).
+- **Non-Interactive I/O Guardrails:** Binds `stdin` to `/dev/null` and detaches `/dev/tty` via `setsid` so commands never hang on hidden terminal prompts.
+- **Stateless in Thread `cwd`:** Each `!command` invocation is **stateless** in the thread's `cwd` (`cd` and shell variables do not persist across runs). Use `/wt` or `/worktree` to switch directories, or open a `>_` embedded terminal tab with `s`/`S` in `MANAGE` (or `/term`) for persistent stateful shells, interactive prompts/TUIs, or interactive rc aliases.
+- **Timeouts, Truncation & Card Controls:** Enforces a **30 s** process-group timeout (terminating child pipelines cleanly and surfacing a timeout notice in `stderr`), a **64 KiB per-stream** truncation cap (`stdout` and `stderr`), and collapsing/expanding cards via `o` in `MANAGE` mode.
 
 ### `/worktree ` & `/wt ` Popup
 

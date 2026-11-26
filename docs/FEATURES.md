@@ -71,12 +71,21 @@ Launching `grein` opens directly into `WRITE · SHELL` inside `$SHELL`:
 
 ## 4. Composer & Autocomplete
 
-- **Visual Multiline & Readline Editing:** `Shift+Enter`, `Ctrl+J`, or `Alt+Enter` inserts a newline; `Enter` submits prompts, `/slash` commands, or `!cmd` inline shell commands. `↑`/`↓` navigate wrapped visual lines while preserving horizontal column (`composer_desired_col`), and `PageUp`/`PageDown` scroll the active transcript (`±10` lines). Full readline bindings (`Ctrl+A/E/B/F/D/K/U/W`, `Alt+←/→/B/F/D/Backspace`, `Ctrl+Y` kill-ring yank, `Ctrl+V` clipboard paste, `Ctrl+C` cancel/clear) are supported.
+- **Visual Multiline & Readline Editing:** `Shift+Enter`, `Ctrl+J`, or `Alt+Enter` inserts a newline; `Enter` submits prompts, `/slash` commands, or `!command` inline shell commands. `↑`/`↓` navigate wrapped visual lines while preserving horizontal column (`composer_desired_col`), and `PageUp`/`PageDown` scroll the active transcript (`±10` lines). Full readline bindings (`Ctrl+A/E/B/F/D/K/U/W`, `Alt+←/→/B/F/D/Backspace`, `Ctrl+Y` kill-ring yank, `Ctrl+V` clipboard paste, `Ctrl+C` cancel/clear) are supported.
 - **3-Tier Inline Ghost-Text Word Autocomplete (`WRITE · AGENT`):**
   1. **Tier 1 (`SlashOrWorkspace`):** Built-in & ACP `/slash` commands, `@file` paths, workspace files (up to 5,000 files via `git ls-files` or directory walk), and Git branches/worktrees.
   2. **Tier 2 (`TranscriptOrHistory`):** Col-0 full-line recent prompt recall from SQLite history, plus identifiers from the active transcript (last 256 KB) and prompt history words (`>= 2` chars).
   3. **Tier 3 (`DictionaryWord`):** Embedded **6,878-word** English & software engineering wordlist (`>= 3` ASCII alphabetic chars, matching typed `lower`/`Title`/`UPPER` casing).
 - **Completion Controls & Ghost-Text Styling:** `Tab` or `Ctrl+Y` accepts, `Shift+Tab` or `Ctrl+N` cycles next, `Ctrl+P` cycles previous, and `Ctrl+E` dismisses active ghost text (or moves to line end when inactive). Inline suggestions render in the active theme's italic `ghost_text` slot for crisp separation from typed input. Toggle and persist via `/autocomplete [on|off|status]` or `:autocomplete`.
+
+### `!command` Inline Shell Execution (`WRITE · AGENT`)
+
+Prefixing a `Composer` submission with `!` in `WRITE · AGENT` executes an inline shell command and renders a collapsible `ShellExecution` transcript card without switching panes:
+
+- **PTY & `$SHELL` Parity:** Runs in the user's configured `$SHELL -c` (falling back to `/bin/sh`) inside a `40×120` PTY session, inheriting your terminal's `PATH` with full `$SHELL` syntax (pipes, redirections, globs, subshells, and `zsh`/`bash` expressions) and color TTY detection (without breaking downstream pipes via `CLICOLOR_FORCE`).
+- **Non-Interactive I/O Guardrails:** Binds `stdin` to `/dev/null` and detaches `/dev/tty` via `setsid` so commands never block on interactive prompts.
+- **Stateless in Thread `cwd`:** Every `!command` invocation is **stateless** in the thread's `cwd` (`cd` and transient shell state do not carry over between commands). Use `/wt` or `/worktree` to switch directories, or open a `>_` embedded terminal tab with `s`/`S` in `MANAGE` (or `/term`) for persistent stateful shells, interactive prompts/TUIs, or interactive rc aliases.
+- **Timeouts, Truncation & Card Controls:** Enforces a **30 s** process-group timeout (terminating child pipelines cleanly and surfacing a timeout notice in `stderr`), a **64 KiB per-stream** truncation cap (`stdout` and `stderr`), and collapsing/expanding transcript cards via `o` in `MANAGE` mode.
 
 ---
 
