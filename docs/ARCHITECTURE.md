@@ -33,8 +33,8 @@ flowchart TB
 | **`grein-core`** | [`crates/grein-core`](../crates/grein-core) | *(none — zero sibling or UI/async runtime deps)* | Pure-tree DAG domain (`model`, `dag`, `sync`, `anchor`, `blackboard`, `error`), shared DTOs & outbound persistence/codec traits (`port::{dto, outbound}`), SQLite DAG storage (`storage::sqlite`), and global preferences (`prefs`) |
 | **`grein-acp`** | [`crates/grein-acp`](../crates/grein-acp) | `grein-core` | ACP v1 protocol framing/types, `AgentDriver` / `AgentDriverFactory` SPI, `AcpStdioDriver` / `StdioAgentDriverFactory`, and `PermissionPolicyPort` / `PolicyGate` |
 | **`grein-workspace`** | [`crates/grein-workspace`](../crates/grein-workspace) | `grein-core` | Branch-named Git worktrees (`allocator`, `worktrees`, `git`, `git_status`), non-Git `.grein/shadow/` copy-on-write snapshots (`shadow`, `diff`), environment detection (`environment`), workspace file enumeration (`files`), interactive VT100 PTY (`pty_session`), and bounded shell execution (`shell`) |
-| **`grein-tui`** | [`crates/grein-tui`](../crates/grein-tui) | `grein-core` | Ratatui 2-mode (`WRITE` / `MANAGE`) application state (`app`), runner loop (`runner`), rendering (`render`), `AgentPickerModal` (`app/agent_picker.rs`, `render/agent_picker.rs`), 3-tier autocomplete (`autocomplete`), customizable `Keymap` (`keymap`), 16 theme presets (`theme`), pane-scoped selection (`selection`), `ClipboardPort`, `PagerRunner`, `TuiServices`, and `TuiEnginePort` / `PreferencesPort` |
-| **`grein-cli`** | [`crates/grein-cli`](../crates/grein-cli) | `grein-core`, `grein-acp`, `grein-workspace`, `grein-tui` | Unified `grein` binary: composition root (`bootstrap`), host discovery (`discovery.rs`), typestate `PluginRegistry`, pairwise adapters (`bootstrap/adapter`), segregated inbound engine ports (`engine/ports.rs`), provider-agnostic `InProcessEngine` (`engine/in_process/`), `UnixSocketEngineClient`, Unix socket daemon (`daemon.rs`), `SubagentWatcher`, headless commands, and `doctor` |
+| **`grein-tui`** | [`crates/grein-tui`](../crates/grein-tui) | `grein-core` | Ratatui 2-mode (`WRITE` / `MANAGE`) application state (`app`), runner loop (`runner`), rendering (`render`), `AgentPickerModal` (`app/agent_picker.rs`, `render/agent_picker.rs`), 3-tier autocomplete (`autocomplete`), customizable `Keymap` (`keymap`), 16 theme presets (`theme`), pane-scoped selection (`selection`), Two-Tier Runtime Terminal Engine (`terminal`, `terminal_decoder`), `ClipboardPort`, `PagerRunner`, `TuiServices`, and `TuiEnginePort` / `PreferencesPort` |
+| **`grein-cli`** | [`crates/grein-cli`](../crates/grein-cli) | `grein-core`, `grein-acp`, `grein-workspace`, `grein-tui` | Unified `grein` binary: composition root (`bootstrap`), host discovery (`discovery.rs`), typestate `PluginRegistry`, pairwise adapters (`bootstrap/adapter`), segregated inbound engine ports (`engine/ports.rs`), provider-agnostic `InProcessEngine` (`engine/in_process/`), `UnixSocketEngineClient`, Unix socket daemon (`daemon.rs`), `SubagentWatcher`, Two-Tier Host Terminal Setup Engine (`terminal/`), headless commands, and `doctor` |
 
 Notice that `grein-core` uses only synchronous foundational crates (`chrono`, `rusqlite`, `serde`, `serde_json`, `thiserror`, `tracing`, `uuid`) and does **not** depend on `tokio`, `ratatui`, `crossterm`, `grein-acp`, `grein-workspace`, or `grein-tui`. Neither `grein-tui`, `grein-acp`, nor `grein-workspace` depends on any sibling outer crate.
 
@@ -151,7 +151,7 @@ flowchart LR
   1. Explicit `thread.agent_provider` resolves case-insensitively across `id` → `plugin_id` → `display_name` (`find_provider`). Unregistered IDs return `EngineError::InvalidParams`; registered unavailable providers (`!p.available`) return `EngineError::InvalidParams` including `install_hint` when present.
   2. When `thread.agent_provider` is `None`, `effective_available_default_provider()` checks `prefs.get("ui", "default_agent_provider")` (requiring `p.available`), then falls back to `default_provider_id` / first available entry in `provider_order`.
   - `ensure_main_thread`, `create_agent_thread` (when `agent_provider` is omitted), and `fork_thread_with_provider` (inheriting parent's `agent_provider` when omitted or overriding when provided) persist the resolved `agent_provider` on the created thread.
-- **`TuiServices`** (`crates/grein-tui/src/app/types.rs`): Injects `clipboard: Arc<dyn ClipboardPort>`, `pager: Arc<dyn PagerRunner>`, and `preferences: Arc<dyn PreferencesPort>` into `App::with_services` / `run_with_engine_events_and_services` (defaulting to `ChainedClipboardDriver::default()`, `DefaultPagerRunner::new()`, and `NoopPreferencesPort`).
+- **`TuiServices`** (`crates/grein-tui/src/app/types.rs`): Injects `clipboard: Arc<dyn ClipboardPort>`, `pager: Arc<dyn PagerRunner>`, `preferences: Arc<dyn PreferencesPort>`, and `terminal: Arc<dyn TerminalAdapter>` into `App::with_services` / `run_with_engine_and_services` (defaulting to `ChainedClipboardDriver::default()`, `DefaultPagerRunner::new()`, `NoopPreferencesPort`, and `terminal::providers::default_adapter(&TerminalEnv::from_env())`).
 
 ### Tier 2: Discovery Priority, `AgentPlugin` Metadata & Typestate `PluginRegistry`
 
@@ -188,11 +188,79 @@ stateDiagram-v2
 | **`AgyAgentPlugin`** | `agent.agy` | `agy` / `Antigravity (agy)` | `AgentPlugin` | Discovered `agy` (`acp --stdio`, default `oauth-personal` auth); `install_hint: None`; pairs with `StdioAgentDriverFactory` + `AntigravityBrainObserver` (`SubagentWatcher`), shutting down the watcher on `shutdown()` |
 | **`ClaudeAgentPlugin`** | `agent.claude` | `claude` / `Claude Code` | `AgentPlugin` | Discovered `claude-agent-acp` → `claude-code-acp` → `claude` (`[]` vs `["--acp"]`); `install_hint: Some("nix shell --impure nixpkgs#claude-agent-acp")`; pairs with `StdioAgentDriverFactory` + `NoopSubagentObserver` |
 
-`run_cli` builds `BootstrapConfig::from_env`, constructs and freezes the registry via `build_registry(&config)`, runs `registry.start_all().await`, dispatches the active CLI subcommand (standalone TUI, daemon, attach, headless inspection, doctor, settings/theme), and guarantees `registry.shutdown_all().await` before returning.
+`run_cli` builds `BootstrapConfig::from_env`, constructs and freezes the registry via `build_registry(&config)`, runs `registry.start_all().await`, dispatches the active CLI subcommand (standalone TUI, daemon, attach, headless inspection, `terminal`, `keys`, `doctor`, settings/theme), and guarantees `registry.shutdown_all().await` before returning.
 
 ---
 
-## 4. Daemon & Standalone JSON-RPC 2.0 Transport
+## 4. Two-Tier Terminal Architecture (Runtime & Host Setup)
+
+Terminal integration follows the Universal Two-Tier Component Architecture across both the interactive TUI runtime (`grein-tui`) and host configuration CLI (`grein-cli`), keeping Tier 1 lifecycle hosts, registries, and byte decoders completely decoupled from concrete Tier 2 terminal/multiplexer implementations.
+
+### Two-Tier Runtime Terminal Engine (`crates/grein-tui/src/terminal/` & `terminal_decoder/`)
+
+```mermaid
+flowchart LR
+    subgraph T2["Tier 2: terminal/providers/ (Pluggable Leaf Adapters)"]
+        GEN["GenericXtermProvider<br/>(generic.rs)"]
+        APPS["Terminal & Multiplexer Adapters<br/>(apple-terminal, iterm2, ghostty, kitty,<br/>wezterm, alacritty, tmux, zellij)"]
+        DEF["default_registry() / default_adapter()"]
+        GEN --> DEF
+        APPS --> DEF
+    end
+
+    subgraph T1["Tier 1: terminal/ & terminal_decoder/ (Provider-Agnostic Runtime)"]
+        ENV["TerminalEnv<br/>(env.rs + $GREIN_TERMINAL)"]
+        REG["TerminalRegistry<br/>(registry.rs)"]
+        SPI["TerminalAdapter SPI<br/>(port.rs)"]
+        HOST["TerminalSessionHost<br/>(host.rs + panic restore)"]
+        DEC["UnixRawInputReader +<br/>TerminalInputDecoder +<br/>KittyProbeScanner"]
+        ENV --> REG
+        DEF --> REG
+        REG --> SPI --> HOST
+        HOST <-->|"bounded KKP probe &<br/>pending_input_bytes"| DEC
+    end
+```
+
+- **Tier 1 SPI & Environment Model ([`crates/grein-tui/src/terminal/port.rs`](../crates/grein-tui/src/terminal/port.rs), [`env.rs`](../crates/grein-tui/src/terminal/env.rs)):**
+  - **`TerminalAdapter`**: Defines `kind() -> TerminalKind`, `display_name()`, `matches(&TerminalEnv) -> Option<u8>`, `capabilities(&TerminalEnv) -> TerminalCapabilities` (`ColorCapability::{TrueColor, Xterm256}`, `KeyboardProtocolPolicy::{None, KittyDisambiguate, ModifyOtherKeys, BoundedProbeKitty { timeout_ms }}`, `osc52_clipboard`, `focus_events`, `bracketed_paste`), `protocol_plan(&TerminalEnv, &TerminalSessionOptions) -> TerminalProtocolPlan`, `encode_osc52(&str) -> String`, and `diagnostic_hints(&TerminalEnv) -> Vec<TerminalHint>`.
+  - **`TerminalKind`**: Covers `AppleTerminal` (`apple-terminal`), `ITerm2` (`iterm2`), `Ghostty` (`ghostty`), `Kitty` (`kitty`), `WezTerm` (`wezterm`), `Alacritty` (`alacritty`), `Tmux` (`tmux`), `Zellij` (`zellij`), and `GenericXterm` (`generic-xterm`) with kebab-case `FromStr`/`Display` parsing.
+  - **`TerminalEnv`**: Captures `TERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `COLORTERM`, `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`, `WEZTERM_EXECUTABLE`, `TMUX`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`, `STY`, locale (`LC_ALL`/`LC_CTYPE`/`LANG`), and `$GREIN_TERMINAL` (`grein_terminal_override`).
+- **Tier 1 Registry & Session Host ([`registry.rs`](../crates/grein-tui/src/terminal/registry.rs), [`host.rs`](../crates/grein-tui/src/terminal/host.rs)):**
+  - **`TerminalRegistry`**: Holds `Vec<Arc<dyn TerminalAdapter>>`, honoring `$GREIN_TERMINAL` (`resolve_by_kind`) before selecting the highest-scoring `matches(&TerminalEnv)` candidate (`resolve` / `resolve_or_err`), with zero concrete provider imports.
+  - **`TerminalSessionHost`**: Enters raw mode, writes alternate-screen/bracketed-paste/mouse-capture/focus-change sequences plus `TerminalProtocolPlan::enter_bytes`, executes bounded KKP probing when `probe_kitty_timeout_ms` is set (clearing `enter_bytes`/`leave_bytes` when unsupported and preserving early input in `take_pending_input_bytes()`), tracks `ActiveTerminalModes`, installs a global panic-restore hook, and guarantees `leave_bytes` + mode teardown flush before `disable_raw_mode` (`restore_with_writer`). `run_with_engine_and_services` (`lib.rs`) and `TerminalGuard` (`runner/mod.rs`) wrap `TerminalSessionHost`.
+- **Pure-Byte Unix Input Decoder ([`crates/grein-tui/src/terminal_decoder/`](../crates/grein-tui/src/terminal_decoder/mod.rs)):**
+  - **`TerminalInputDecoder`** (`parser.rs`): Byte-at-a-time state machine (`Ground`, `EscPending`, `Csi`, `Ss3`, `Delimited`, `X10Mouse`, `BracketedPaste`, `Utf8`) producing `DecodedInput { event: Event, raw_bytes: Vec<u8> }`. Decodes `modifyOtherKeys` format 2 (`CSI 27;<mod>;<code>~`), rxvt Shift/Ctrl arrows (`CSI a..d`, `SS3 a..d`), standard/modified `SS3` sequences (`\x1bO2A`, `\x1bO1;2C`), leading-semicolon `CSI` params (`\x1b[;2A`), Kitty Keyboard Protocol (`CSI <cp>[:<shifted>];<mod>[:<kind>]u` with Press/Repeat/Release, functional/keypad/media/modifier codepoints), SGR/X10 mouse events, bracketed paste (`\x1b[200~...\x1b[201~`), focus events, and UTF-8/`Alt+char` chords.
+  - **`KittyProbeScanner`** (`parser.rs`): Scans `CSI ?<flags>u` (`KittyFlags(u8)`) and Primary Device Attributes `CSI ?...c` (`PrimaryDeviceAttributes`) while preserving interleaved user keystrokes in `buffered_bytes`.
+  - **`UnixRawInputReader`** (`unix_reader.rs`): Uses `libc::poll` + `libc::read` with `25 ms` `ESC_IDLE_TIMEOUT` to distinguish lone `Esc` from split-packet escape sequences, `SA_RESTART`-free `SIGWINCH` resize wakeup, `push_initial_bytes` replay, and `probe_kitty_keyboard(timeout_ms)` sending `\x1b[?u\x1b[c` bounded by `DA1` or timeout.
+- **Tier 2 Leaf Providers (`crates/grein-tui/src/terminal/providers/`):**
+  - Concrete `TerminalAdapter` implementations (including baseline `GenericXtermProvider` in `generic.rs` and app/multiplexer-specific adapters) wired at the composition boundary via `default_registry()` / `default_adapter(&TerminalEnv)`.
+
+### Two-Tier Host Terminal Setup Engine (`crates/grein-cli/src/terminal/`)
+
+```mermaid
+flowchart LR
+    subgraph T2["Tier 2: crates/grein-cli/src/terminal/providers/"]
+        INST["8 Declarative Terminal Installers<br/>(apple-terminal, iterm2, ghostty, kitty,<br/>wezterm, alacritty, tmux, zellij)"]
+    end
+
+    subgraph T1["Tier 1: crates/grein-cli/src/terminal/"]
+        SPI["TerminalSetupProvider &<br/>ConfigFsPort SPIs"]
+        HOST["TerminalSetupHost<br/>(status, dry-run, apply, revert)"]
+        CLI["grein terminal status / setup"]
+        INST --> SPI --> HOST --> CLI
+    end
+```
+
+- **Tier 1 Setup SPIs & Host (`crates/grein-cli/src/terminal/`):**
+  - **`TerminalSetupProvider` SPI:** Abstracts terminal/multiplexer host config inspection, readiness evaluation, and idempotent apply/revert planning behind a trait boundary.
+  - **`ConfigFsPort` SPI:** Abstracts host configuration filesystem reads, writes, and backups so dry-run previews and integration tests execute deterministically without mutating real user config directories.
+  - **`TerminalSetupHost`:** Resolves `<app|auto>` providers solely through `TerminalSetupProvider` and executes `grein terminal status [--json]` and `grein terminal setup <app|auto> [--dry-run | --apply | --revert] [--json]` without referencing concrete Tier 2 installer structs.
+- **Tier 2 Declarative Installers (`crates/grein-cli/src/terminal/providers/`):**
+  - Implements declarative configuration inspection, backups, apply rules, and revert rules across all 8 supported terminals and multiplexers (`apple-terminal`, `iterm2`, `ghostty`, `kitty`, `wezterm`, `alacritty`, `tmux`, `zellij`).
+
+---
+
+## 5. Daemon & Standalone JSON-RPC 2.0 Transport
 
 **grein** supports three runtime execution topologies over the same `GreinEngine` interface:
 
@@ -253,7 +321,7 @@ Long-running agent turns (`session.send_turn` / `session.send_thread_turn`) stay
 
 ---
 
-## 5. Persistence & Modular Guardrails
+## 6. Persistence & Modular Guardrails
 
 ### Session DAG Database (`.grein/session.db`)
 
@@ -303,7 +371,9 @@ CREATE TABLE IF NOT EXISTS preferences (
 
 | Suite / Module | Location | Verified Contracts & Invariants |
 | :--- | :--- | :--- |
-| **`arch_rules_test`** | [`crates/grein-cli/tests/arch_rules_test.rs`](../crates/grein-cli/tests/arch_rules_test.rs) | DIP `grein_tui` isolation, pure domain `rusqlite` ban, `TTC-004` test-double segregation, `< 1,000`-line source ceiling, `< 100`-line `main.rs` |
+| **`arch_rules_test`** | [`crates/grein-cli/tests/arch_rules_test.rs`](../crates/grein-cli/tests/arch_rules_test.rs) | DIP `grein_tui` isolation (Rule 1), pure domain `rusqlite` ban (Rule 2), `TTC-004` test-double segregation (Rule 3), `< 1,000`-line source ceiling (Rule 4), `< 100`-line `main.rs` (Rule 5), and **Rule 6 (`TTC-003` Terminal Tier 1 Hosts No Concrete Providers)** forbidding `providers` or concrete provider structs (`GenericXtermProvider`, `AppleTerminalProvider`, `ITerm2Provider`, `GhosttyProvider`, `KittyProvider`, `WezTermProvider`, `AlacrittyProvider`, `TmuxProvider`, `ZellijProvider`) in `grein-tui/src/terminal/{host,registry}.rs` and `grein-cli/src/terminal/host.rs` |
+| **`terminal_host_contract_test`** | [`crates/grein-tui/tests/terminal_host_contract_test.rs`](../crates/grein-tui/tests/terminal_host_contract_test.rs) | `TerminalRegistry` priority & `$GREIN_TERMINAL` override resolution, `TerminalKind` kebab-case round-trips, `TerminalSessionHost` enter/leave flush ordering before `disable_raw_mode`, and `TerminalGuard` / `TuiServices::terminal` wiring |
+| **`terminal_decoder_test`** | [`crates/grein-tui/tests/terminal_decoder_test.rs`](../crates/grein-tui/tests/terminal_decoder_test.rs) | `TerminalInputDecoder` & `UnixRawInputReader`: `modifyOtherKeys` format 2, rxvt arrows, modified `SS3`, leading-semicolon `CSI`, split-packet `ESC` buffering (`25 ms` idle flush), Kitty Press/Repeat/Release & `KittyProbeScanner`, SGR/X10 mouse, bracketed paste, and `raw_bytes` preservation |
 | **`hex_bootstrap_di_test`** | [`crates/grein-cli/tests/hex_bootstrap_di_test.rs`](../crates/grein-cli/tests/hex_bootstrap_di_test.rs) | Typestate `PluginRegistry` rollback/drain, `EngineDependencies` constructor DI, and `ChainedClipboardDriver` trait objects |
 | **`multi_provider_acp_test`** | [`crates/grein-cli/tests/multi_provider_acp_test.rs`](../crates/grein-cli/tests/multi_provider_acp_test.rs) | `FrozenPluginRegistry` → `EngineDependencies::{providers, prefs}` injection, concurrent multi-provider turns & shutdown, per-provider `default_config` isolation, `switch_thread_provider` SQLite persistence & session reset, `("ui", "default_agent_provider")` precedence, JSON-RPC / `UnixSocketEngineClient` roundtrips, `-32601 -> []` stale fallback, and `EngineClientPort` event emission |
 | **`agent_provider_picker_test`** | [`crates/grein-tui/tests/agent_provider_picker_test.rs`](../crates/grein-tui/tests/agent_provider_picker_test.rs) | `/agent` composer autocomplete & sibling creation, `A` / `:agent` / dynamic `:<provider>` palette suggestions & windowed scroll, `AgentPickerModal` rendering & `install_hint` notices, `[<provider>]` sidebar/status badges, and runner persistence of `default_agent_provider` strictly via `TuiServices::preferences` (`PreferencesPort`) |

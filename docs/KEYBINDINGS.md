@@ -14,7 +14,7 @@
 | **`WRITE`** | `WRITE · SHELL` or `WRITE · AGENT` | Embedded `>_` Terminal PTY or Agent `Composer` | Primary workspace input |
 | **`MANAGE`** | `MANAGE · GREIN` or `MANAGE · WORKTREES` | `ᛇ Grein` context tree or `⎇ Worktrees` list | Sidebar tree navigation & actions |
 
-On startup, `TerminalGuard` enables raw mode, alternate screen, bracketed paste, mouse capture, and (when supported by the host terminal) `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` so `Shift+Enter` and modified navigation chords are distinguished cleanly.
+On startup, `TerminalGuard` / `TerminalSessionHost` resolves a `TerminalAdapter` via `TerminalRegistry` (from `$TERM_PROGRAM`, `$TERM`, multiplexer variables, or `$GREIN_TERMINAL`), enables raw mode, alternate screen, bracketed paste, mouse capture, and focus change, and runs a bounded Kitty Keyboard Protocol probe (`\x1b[?u\x1b[c`) so `Shift+Enter` and modified navigation chords are distinguished cleanly across terminals while Unix stdin runs through the pure-byte `TerminalInputDecoder`.
 
 ---
 
@@ -349,8 +349,15 @@ Custom keybindings are stored in `~/.config/grein/grein.db` (or `$GREIN_CONFIG_D
 
 ---
 
-## 7. Terminal & Multiplexer Notes (macOS, Colors & `tmux`)
+## 7. Terminal & Multiplexer Notes (macOS, Pure-Byte Decoder, Setup & `tmux`)
 
+- **Pure-Byte Unix `TerminalInputDecoder` & Bounded KKP Probing:**
+  - On Unix, **grein** reads raw bytes via `UnixRawInputReader` + `TerminalInputDecoder` (`crates/grein-tui/src/terminal_decoder/`) instead of relying solely on `crossterm`'s parser, resolving long-standing terminal/multiplexer edge cases:
+    - **`modifyOtherKeys` format 2 (`CSI 27;<mod>;<code>~`):** Decodes `Shift+Enter` (`\x1b[27;2;13~`), `Ctrl+Enter` (`\x1b[27;5;13~`), `Alt+Tab`, and modified keys emitted by `tmux` (`extended-keys-format xterm`) and `xterm`.
+    - **rxvt & `SS3` Modified Arrows:** Decodes rxvt Shift/Ctrl arrows (`\x1b[a`..`d`, `\x1bOa`..`d`) and modified `SS3` sequences (`\x1bO2A`, `\x1bO1;2C`, `\x1bO1;5D`, etc.).
+    - **Leading-Semicolon `CSI` Sequences:** Decodes `\x1b[;2A`..`D` alongside standard `\x1b[1;2A`..`D` and `1:2`/`1:3` repeat/release suffixes.
+    - **Split-Packet `ESC` Buffering:** Buffers partial `ESC`/`CSI`/`SS3` sequences across `read(2)` chunks and waits for `ESC_IDLE_TIMEOUT` (`25 ms`) before flushing a standalone `Esc`, preventing `Shift+Arrow` or `Alt+` chords from splitting into `Esc` + `[...`.
+    - **Bounded Kitty Keyboard Protocol (KKP) Probing:** `TerminalSessionHost` sends `\x1b[?u\x1b[c` (`CSI ?u` + `DA1`) bounded by `DA1` or `probe_kitty_timeout_ms` via `KittyProbeScanner`, enabling Kitty disambiguation only when confirmed and replaying any buffered user keystrokes into the event loop.
 - **Zero-Config Stock macOS & Nordic/European Keyboards:**
   - Grein works out of the box on stock Apple `Terminal.app` and Nordic/European keyboard layouts **without** enabling *Option as Meta* or adding custom escape maps:
     - `Ctrl+G 1..9`: Switch directly to root thread `1..9` and return to `WRITE`.
@@ -358,14 +365,17 @@ Custom keybindings are stored in `~/.config/grein/grein.db` (or `$GREIN_CONFIG_D
     - `Ctrl+G` then `Ctrl+P`/`Ctrl+N` (or `[`/`]`): Step siblings in `MANAGE · GREIN`.
     - `PageUp` / `PageDown`: Scroll transcript in `WRITE · AGENT` and preview in `MANAGE` (while passing through natively in `WRITE · SHELL`).
   - Keeping macOS `Option` in normal composition mode preserves native `@`, `[`, `]`, `{`, `}`, `\`, `|`, and `~` symbols, and on macOS the `macos` keymap preset is selected automatically at startup unless overridden via `:keymap standard`.
-- **Diagnosing Terminal Keys & Color Capabilities (`grein keys` & `grein doctor`):**
-  - Run `grein keys` (or `grein keys --no-enhance` to disable Kitty/CSI-u `DISAMBIGUATE_ESCAPE_CODES` probing) in any interactive TTY to inspect live `crossterm` events (`code`, `modifiers`, `kind`, `state`, resolved `chord`, and matching `action`), plus `TERM`, `TERM_PROGRAM`, and `COLORTERM`. It automatically flags stripped `Shift+Arrow` escapes and macOS `Option` symbol composition without manual `cat -v` guesswork. Press `Ctrl+C` twice or `q` twice to exit.
+- **Diagnosing Terminal Keys, Raw Stdin Bytes & Capabilities (`grein keys`, `grein keys --raw`, `grein doctor`):**
+  - Run `grein keys` (or `grein keys --no-enhance` to disable Kitty/CSI-u probing) in any interactive TTY to inspect live decoded `KeyEvent`s (`code`, `modifiers`, `kind`, `state`, resolved `chord`, and matching `action`), plus `TERM`, `TERM_PROGRAM`, and `COLORTERM`. It automatically flags stripped `Shift+Arrow` escapes and macOS `Option` symbol composition without manual `cat -v` guesswork. Press `Ctrl+C` twice or `q` twice to exit.
+  - Run `grein keys --raw` to inspect exact stdin hex and escaped byte sequences (via `DecodedInput::raw_bytes`) alongside each decoded `KeyEvent`—making it immediate to verify whether a terminal or multiplexer sends `\x1b[27;2;13~`, `\x1b[13;2u`, `\x1b[1;2A`, or plain `\r` / `\x1b[A`.
   - Run `grein doctor [--json]` to verify `TERM_PROGRAM` and detected color support (`truecolor` vs `256-color fallback`, automatically downsampling RGB theme colors on non-truecolor TTYs such as pre-Tahoe Apple `Terminal.app`).
-- **Optional macOS `Option` / `Meta` & `Terminal.app` `Shift+Arrows` Mapping:**
-  - If you *also* want single-chord `Alt+` shortcuts, enable **Use Option as Meta key** (Terminal.app → *Settings → Profiles → Keyboard*) or set Left/Right Option to **Esc+** (iTerm2 → *Profiles → Keys*)—though note this replaces macOS `Option`-composed characters on that key.
-  - Modern macOS terminals (**Ghostty**, **iTerm2 3.5+**, **Kitty**, **WezTerm**, **Alacritty**) send `Shift+Arrows` out of the box. Pre-Tahoe `Terminal.app` strips `Shift` from arrow escapes unless mapped manually under *Terminal → Settings → Profiles → Keyboard* (`+`):
-    - `Shift+Up` → `\033[1;2A` · `Shift+Down` → `\033[1;2B` · `Shift+Left` → `\033[1;2D` · `Shift+Right` → `\033[1;2C`
-- **Running Grein inside `tmux`:**
-  - `ChainedClipboardDriver` detects `$TMUX` and automatically wraps `OSC 52` payloads in DCS passthrough (`\x1bPtmux;\x1b\x1b]52;c;...\x07\x1b\\`). Ensure `set -g allow-passthrough on` is enabled in `tmux.conf` if relying on `OSC 52` without a native clipboard binary.
-  - Add both `set -s extended-keys on` **and** `set -g extended-keys-format csi-u` (alongside `escape-time 10`) in `tmux.conf` if `Shift+Enter` or `Shift+Arrows` are swallowed by `tmux`—`tmux 3.5+` defaults to `extended-keys-format xterm`, which emits `CSI 27;...~` sequences that `crossterm 0.28.1` ignores.
+- **Declarative Host Terminal Status & Setup (`grein terminal status` / `grein terminal setup`):**
+  - Run `grein terminal status [--json]` to inspect the detected host terminal/multiplexer, protocol capabilities, and configuration readiness across the **8 supported terminal apps and multiplexers**: `apple-terminal`, `iterm2`, `ghostty`, `kitty`, `wezterm`, `alacritty`, `tmux`, and `zellij`.
+  - Run `grein terminal setup <app|auto> [--dry-run | --apply | --revert] [--json]` to preview (`--dry-run`), apply (`--apply`), or revert (`--revert`) Grein-compatible keybinding and passthrough settings for a specific target or the auto-detected terminal (`auto`):
+    - **Apple `Terminal.app` (`apple-terminal`):** On pre-Tahoe `Terminal.app`, maps `Shift+Up`/`Down`/`Left`/`Right` (`\033[1;2A`/`B`/`D`/`C`) in `com.apple.Terminal.plist` (Option composition stays untouched unless you explicitly opt into *Use Option as Meta key* in *Settings → Profiles → Keyboard*). **macOS `cfprefsd` warning:** Quit `Terminal.app` completely (`Cmd+Q`) before/after `--apply` or `--revert` and relaunch it so `cfprefsd` reloads the plist instead of overwriting changes from its in-memory cache.
+    - **iTerm2 (`iterm2`):** Writes an isolated **iTerm2 Dynamic Profile** JSON file (`~/Library/Application Support/iTerm2/DynamicProfiles/`) instead of mutating `com.googlecode.iterm2.plist`, keeping your existing profiles clean and making `--revert` non-destructive. (If you also want single-chord `Alt+` shortcuts, set Left/Right Option to **Esc+** under *Profiles → Keys*, noting this replaces Option symbol composition on that key.)
+    - **Ghostty (`ghostty`):** Updates Ghostty's configuration file—located on macOS at `~/Library/Application Support/com.mitchellh.ghostty/config` (or `$XDG_CONFIG_HOME/ghostty/config` / `~/.config/ghostty/config` on Linux).
+    - **Kitty (`kitty`), WezTerm (`wezterm`), Alacritty (`alacritty`):** Send `Shift+Arrows` and `truecolor` out of the box; `grein terminal setup` ensures `Shift+Enter` / extended key reporting is enabled cleanly with reversible backups.
+    - **`tmux` (`tmux`):** Configures `set -s extended-keys always`, `set -g extended-keys-format csi-u`, `set -sg escape-time 10`, and `set -g allow-passthrough on` in `tmux.conf`. While `TerminalInputDecoder` now decodes `modifyOtherKeys` format 2 (`CSI 27;...~`), pairing `extended-keys always` with `extended-keys-format csi-u` gives full Kitty/CSI-u disambiguation across `tmux` panes, and `allow-passthrough on` enables `ChainedClipboardDriver`'s `\x1bPtmux;...\x1b\\` `OSC 52` clipboard fallback.
+    - **`zellij` (`zellij`):** Configures Zellij pane/keybinding compatibility in Zellij's config directory cleanly and reversibly.
 - **Running `tmux` inside Grein's embedded `>_` PTY:** Embedded shells scrub `TMUX` and `TMUX_PANE` on spawn and trigger `alternate_screen` passthrough automatically when you launch nested `tmux`, `nvim`, or `helix` inside a Grein terminal.
