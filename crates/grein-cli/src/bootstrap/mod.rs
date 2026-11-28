@@ -23,6 +23,7 @@ use crate::engine::{
 use crate::headless::{handle_agents_with, handle_status_with, handle_threads_with, HeadlessDeps};
 use crate::settings_cmd::{handle_settings_with, handle_theme_with, SettingsDeps};
 use crate::subagent_watch::{NoopSubagentObserver, SubagentObserverPort};
+use crate::terminal::cmd::handle_terminal_command;
 
 use adapter::{EngineClientPort, InitialSessionMode, LazyPrefsRepository};
 use plugins::{
@@ -362,7 +363,12 @@ async fn dispatch_cli(
                     config.initial_mode,
                     prefs,
                 ));
-                grein_tui::run_with_engine(port).await?;
+                let services = grein_tui::TuiServices::default().with_terminal(
+                    grein_tui::terminal::providers::default_adapter(
+                        &grein_tui::terminal::TerminalEnv::from_env(),
+                    ),
+                );
+                grein_tui::run_with_engine_and_services(port, services).await?;
             }
         }
         Some(Command::Daemon(DaemonArgs { socket })) => {
@@ -385,7 +391,12 @@ async fn dispatch_cli(
                     config.initial_mode,
                     prefs,
                 ));
-                grein_tui::run_with_engine(port).await?;
+                let services = grein_tui::TuiServices::default().with_terminal(
+                    grein_tui::terminal::providers::default_adapter(
+                        &grein_tui::terminal::TerminalEnv::from_env(),
+                    ),
+                );
+                grein_tui::run_with_engine_and_services(port, services).await?;
             }
         }
         Some(Command::Threads(args)) => {
@@ -404,11 +415,14 @@ async fn dispatch_cli(
             let deps = build_doctor_deps(config, registry);
             handle_doctor_with(&args, &deps)?;
         }
-        Some(Command::Keys(KeysArgs { no_enhance })) => {
+        Some(Command::Keys(KeysArgs { no_enhance, raw: _ })) => {
             grein_tui::run_key_inspector(grein_tui::KeyInspectorOptions {
                 enhance_keyboard: !no_enhance,
                 ..Default::default()
             })?;
+        }
+        Some(Command::Terminal(args)) => {
+            handle_terminal_command(&args)?;
         }
         Some(Command::Settings(args)) => {
             let read_only = matches!(args.command, SettingsCommand::Export(_));

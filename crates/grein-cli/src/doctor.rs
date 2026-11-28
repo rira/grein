@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use grein_core::storage::sqlite::SqliteStorage;
 use grein_core::{default_prefs_db_path, UserPrefsStore};
+use grein_tui::terminal::providers::default_registry;
+use grein_tui::terminal::{ColorCapability, TerminalEnv, TerminalKind};
 use serde::{Deserialize, Serialize};
 
 use crate::args::DoctorArgs;
@@ -168,22 +170,62 @@ fn check_acp_agents(agent_discoverer: &AgentDiscoverer) -> DoctorCheck {
     }
 }
 
-fn read_trimmed_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 fn clean_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn has_truecolor_value(value: Option<&str>) -> bool {
-    clean_non_empty(value).is_some_and(|raw| {
-        let lower = raw.to_ascii_lowercase();
-        lower.contains("truecolor") || lower.contains("24bit")
-    })
+fn build_terminal_env(
+    term: Option<&str>,
+    term_program: Option<&str>,
+    colorterm: Option<&str>,
+    kitty_window_id: Option<&str>,
+    ghostty_resources_dir: Option<&str>,
+    locale: Option<&str>,
+) -> TerminalEnv {
+    let mut env = TerminalEnv::default();
+    if let Some(v) = clean_non_empty(term) {
+        env = env.with_term(v);
+    }
+    if let Some(v) = clean_non_empty(term_program) {
+        env = env.with_term_program(v);
+    }
+    if let Some(v) = clean_non_empty(colorterm) {
+        env = env.with_colorterm(v);
+    }
+    if let Some(v) = clean_non_empty(kitty_window_id) {
+        env = env.with_kitty_window_id(v);
+    }
+    if let Some(v) = clean_non_empty(ghostty_resources_dir) {
+        env = env.with_ghostty_resources_dir(v);
+    }
+    if let Some(v) = clean_non_empty(locale) {
+        env = env.with_locale(v);
+    }
+    env
+}
+
+fn resolve_color_capability(env: &TerminalEnv) -> ColorCapability {
+    let registry = default_registry();
+    if let Some(adapter) = registry.resolve(env) {
+        if adapter.capabilities(env).color == ColorCapability::TrueColor {
+            return ColorCapability::TrueColor;
+        }
+    }
+
+    if env.supports_truecolor_hint()
+        || env.kitty_window_id.is_some()
+        || env.ghostty_resources_dir.is_some()
+        || env.term_program.as_deref().is_some_and(|tp| {
+            tp.eq_ignore_ascii_case("iTerm.app")
+                || tp.eq_ignore_ascii_case("WezTerm")
+                || tp.eq_ignore_ascii_case("ghostty")
+                || tp.eq_ignore_ascii_case("vscode")
+        })
+    {
+        return ColorCapability::TrueColor;
+    }
+
+    ColorCapability::Xterm256
 }
 
 pub fn detect_color_mode_label(
@@ -193,45 +235,25 @@ pub fn detect_color_mode_label(
     kitty_window_id: Option<&str>,
     ghostty_resources_dir: Option<&str>,
 ) -> &'static str {
-    if has_truecolor_value(colorterm) {
-        return "truecolor";
+    let env = build_terminal_env(
+        term,
+        term_program,
+        colorterm,
+        kitty_window_id,
+        ghostty_resources_dir,
+        None,
+    );
+    match resolve_color_capability(&env) {
+        ColorCapability::TrueColor => "truecolor",
+        ColorCapability::Xterm256 => "256-color fallback",
     }
-
-    if let Some(tp) = clean_non_empty(term_program) {
-        if tp.eq_ignore_ascii_case("iTerm.app")
-            || tp.eq_ignore_ascii_case("WezTerm")
-            || tp.eq_ignore_ascii_case("ghostty")
-            || tp.eq_ignore_ascii_case("vscode")
-        {
-            return "truecolor";
-        }
-    }
-
-    if clean_non_empty(kitty_window_id).is_some()
-        || clean_non_empty(ghostty_resources_dir).is_some()
-    {
-        return "truecolor";
-    }
-
-    if has_truecolor_value(term) {
-        return "truecolor";
-    }
-
-    "256-color fallback"
 }
 
-pub fn check_terminal_env_from(
-    term: Option<&str>,
-    term_program: Option<&str>,
-    colorterm: Option<&str>,
-    kitty_window_id: Option<&str>,
-    ghostty_resources_dir: Option<&str>,
-    locale: Option<&str>,
-) -> DoctorCheck {
-    let term = clean_non_empty(term);
-    let term_program = clean_non_empty(term_program);
-    let colorterm = clean_non_empty(colorterm);
-    let locale = clean_non_empty(locale);
+pub fn check_terminal_env_with_env(env: &TerminalEnv) -> DoctorCheck {
+    let term = env.term.as_deref();
+    let term_program = env.term_program.as_deref();
+    let colorterm = env.colorterm.as_deref();
+    let locale = env.locale.as_deref();
 
     let term_ok = term.is_some_and(|t| !t.eq_ignore_ascii_case("dumb"));
     let utf8_ok = locale.is_some_and(|loc| {
@@ -245,16 +267,19 @@ pub fn check_terminal_env_from(
         CheckStatus::Warn
     };
 
-    let color_mode = detect_color_mode_label(
-        term,
-        term_program,
-        colorterm,
-        kitty_window_id,
-        ghostty_resources_dir,
-    );
-    let apple_terminal_fallback = term_program
-        .is_some_and(|tp| tp.eq_ignore_ascii_case("Apple_Terminal"))
-        && !has_truecolor_value(colorterm);
+    let color_cap = resolve_color_capability(env);
+    let color_mode = match color_cap {
+        ColorCapability::TrueColor => "truecolor",
+        ColorCapability::Xterm256 => "256-color fallback",
+    };
+
+    let registry = default_registry();
+    let resolved_adapter = registry.resolve(env);
+    let apple_terminal_fallback = (resolved_adapter
+        .as_ref()
+        .is_some_and(|a| a.kind() == TerminalKind::AppleTerminal)
+        || term_program.is_some_and(|tp| tp.eq_ignore_ascii_case("Apple_Terminal")))
+        && color_cap != ColorCapability::TrueColor;
 
     let mut detail = format!(
         "TERM={}, TERM_PROGRAM={}, COLORTERM={} (color={color_mode}), locale={}",
@@ -264,9 +289,19 @@ pub fn check_terminal_env_from(
         locale.unwrap_or("<unset>"),
     );
     if apple_terminal_fallback {
-        detail.push_str(
-            "; Apple_Terminal uses 256-color palette fallback automatically — prefer Ctrl+G manage mode if Shift/Option modifiers vary, or run `grein keys` to inspect modifiers",
-        );
+        let hint_suffix = resolved_adapter
+            .and_then(|adapter| {
+                adapter
+                    .diagnostic_hints(env)
+                    .into_iter()
+                    .find(|h| h.message.contains("Ctrl+G") && h.message.contains("grein keys"))
+                    .map(|h| h.message)
+            })
+            .unwrap_or_else(|| {
+                "Apple_Terminal uses 256-color palette fallback automatically — prefer Ctrl+G manage mode if Shift/Option modifiers vary, or run `grein keys` to inspect modifiers".to_string()
+            });
+        detail.push_str("; ");
+        detail.push_str(&hint_suffix);
     }
 
     DoctorCheck {
@@ -276,24 +311,27 @@ pub fn check_terminal_env_from(
     }
 }
 
-fn check_terminal_env() -> DoctorCheck {
-    let term = read_trimmed_env("TERM");
-    let term_program = read_trimmed_env("TERM_PROGRAM");
-    let colorterm = read_trimmed_env("COLORTERM");
-    let kitty_window_id = read_trimmed_env("KITTY_WINDOW_ID");
-    let ghostty_resources_dir = read_trimmed_env("GHOSTTY_RESOURCES_DIR");
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-        .into_iter()
-        .find_map(read_trimmed_env);
+pub fn check_terminal_env_from(
+    term: Option<&str>,
+    term_program: Option<&str>,
+    colorterm: Option<&str>,
+    kitty_window_id: Option<&str>,
+    ghostty_resources_dir: Option<&str>,
+    locale: Option<&str>,
+) -> DoctorCheck {
+    let env = build_terminal_env(
+        term,
+        term_program,
+        colorterm,
+        kitty_window_id,
+        ghostty_resources_dir,
+        locale,
+    );
+    check_terminal_env_with_env(&env)
+}
 
-    check_terminal_env_from(
-        term.as_deref(),
-        term_program.as_deref(),
-        colorterm.as_deref(),
-        kitty_window_id.as_deref(),
-        ghostty_resources_dir.as_deref(),
-        locale.as_deref(),
-    )
+fn check_terminal_env() -> DoctorCheck {
+    check_terminal_env_with_env(&TerminalEnv::from_env())
 }
 
 fn check_workspace_state(cwd: &Path, probe: &DbProbe) -> DoctorCheck {

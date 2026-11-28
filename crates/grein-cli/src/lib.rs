@@ -9,11 +9,13 @@ pub mod headless;
 pub mod settings_cmd;
 pub mod standalone;
 pub mod subagent_watch;
+pub mod terminal;
 
 pub use args::{
     AgentsArgs, AttachArgs, Cli, Command, DaemonArgs, DoctorArgs, InputFormatArg, OutputFormatArg,
-    SettingsArgs, SettingsCommand, SettingsExportArgs, SettingsImportArgs, StatusArgs, ThemeArgs,
-    ThemeCommand, ThemeExportArgs, ThemeImportArgs, ThreadsArgs,
+    SettingsArgs, SettingsCommand, SettingsExportArgs, SettingsImportArgs, StatusArgs,
+    TerminalArgs, TerminalCommand, TerminalSetupArgs, TerminalStatusArgs, ThemeArgs, ThemeCommand,
+    ThemeExportArgs, ThemeImportArgs, ThreadsArgs,
 };
 pub use client::{connect_to_daemon, DaemonClient};
 pub use daemon::{

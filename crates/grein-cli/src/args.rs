@@ -32,6 +32,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Inspect raw terminal key events and macOS modifier support
     Keys(KeysArgs),
+    #[command(about = "Inspect terminal capabilities and configure native terminal settings")]
+    Terminal(TerminalArgs),
     #[command(about = "Export or import global user settings")]
     Settings(SettingsArgs),
     #[command(about = "Export or import theme presets and color overrides")]
@@ -97,6 +99,59 @@ pub struct KeysArgs {
     /// Disable kitty/CSI-u keyboard enhancement protocol probing
     #[arg(long)]
     pub no_enhance: bool,
+    /// Print raw hex and escape bytes for each key event
+    #[arg(long)]
+    pub raw: bool,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct TerminalArgs {
+    #[command(subcommand)]
+    pub command: TerminalCommand,
+}
+
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+pub enum TerminalCommand {
+    #[command(about = "Show active terminal capabilities and setup status")]
+    Status(TerminalStatusArgs),
+    #[command(about = "Plan, apply, or revert native terminal configuration")]
+    Setup(TerminalSetupArgs),
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq, Default)]
+pub struct TerminalStatusArgs {
+    #[arg(long, help = "Output in JSON format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq, Default)]
+pub struct TerminalSetupArgs {
+    #[arg(
+        value_name = "APP",
+        default_value = "auto",
+        help = "Terminal target (auto, apple-terminal, iterm2, ghostty, kitty, wezterm, alacritty, tmux, zellij)"
+    )]
+    pub app: String,
+    #[arg(
+        long,
+        conflicts_with_all = ["apply", "revert"],
+        help = "Preview planned changes without writing files (default)"
+    )]
+    pub dry_run: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["dry_run", "revert"],
+        help = "Apply configuration changes with .grein.bak backups"
+    )]
+    pub apply: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["dry_run", "apply"],
+        help = "Revert configuration changes and restore backups"
+    )]
+    pub revert: bool,
+    #[arg(long, help = "Output in JSON format")]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -199,18 +254,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_keys_subcommand_and_no_enhance_flag() {
+    fn parses_keys_subcommand_and_flags() {
         let default = Cli::try_parse_from(["grein", "keys"]).expect("parse grein keys");
         assert_eq!(
             default.command,
-            Some(Command::Keys(KeysArgs { no_enhance: false }))
+            Some(Command::Keys(KeysArgs {
+                no_enhance: false,
+                raw: false,
+            }))
         );
 
         let no_enhance =
-            Cli::try_parse_from(["grein", "keys", "--no-enhance"]).expect("parse --no-enhance");
+            Cli::try_parse_from(["grein", "keys", "--no-enhance", "--raw"]).expect("parse flags");
         assert_eq!(
             no_enhance.command,
-            Some(Command::Keys(KeysArgs { no_enhance: true }))
+            Some(Command::Keys(KeysArgs {
+                no_enhance: true,
+                raw: true,
+            }))
         );
+    }
+
+    #[test]
+    fn parses_terminal_subcommands_and_rejects_conflicting_setup_flags() {
+        let status = Cli::try_parse_from(["grein", "terminal", "status", "--json"])
+            .expect("parse terminal status");
+        assert_eq!(
+            status.command,
+            Some(Command::Terminal(TerminalArgs {
+                command: TerminalCommand::Status(TerminalStatusArgs { json: true }),
+            }))
+        );
+
+        let setup = Cli::try_parse_from(["grein", "terminal", "setup", "ghostty", "--dry-run", "--json"])
+            .expect("parse terminal setup");
+        assert_eq!(
+            setup.command,
+            Some(Command::Terminal(TerminalArgs {
+                command: TerminalCommand::Setup(TerminalSetupArgs {
+                    app: "ghostty".to_string(),
+                    dry_run: true,
+                    apply: false,
+                    revert: false,
+                    json: true,
+                }),
+            }))
+        );
+
+        assert!(Cli::try_parse_from(["grein", "terminal", "setup", "kitty", "--apply", "--revert"]).is_err());
     }
 }

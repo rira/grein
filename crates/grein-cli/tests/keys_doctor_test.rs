@@ -16,14 +16,20 @@ fn test_cli_parses_keys_subcommand_and_no_enhance_flag() {
     let default_keys = Cli::try_parse_from(["grein", "keys"]).expect("parse grein keys");
     assert_eq!(
         default_keys.command,
-        Some(CliCommand::Keys(KeysArgs { no_enhance: false }))
+        Some(CliCommand::Keys(KeysArgs {
+            no_enhance: false,
+            raw: false,
+        }))
     );
 
-    let no_enhance_keys =
-        Cli::try_parse_from(["grein", "keys", "--no-enhance"]).expect("parse grein keys --no-enhance");
+    let no_enhance_keys = Cli::try_parse_from(["grein", "keys", "--no-enhance", "--raw"])
+        .expect("parse grein keys --no-enhance --raw");
     assert_eq!(
         no_enhance_keys.command,
-        Some(CliCommand::Keys(KeysArgs { no_enhance: true }))
+        Some(CliCommand::Keys(KeysArgs {
+            no_enhance: true,
+            raw: true,
+        }))
     );
 }
 
