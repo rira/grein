@@ -54,13 +54,17 @@ pub async fn run_with_engine_and_services(
     engine: Arc<dyn TuiEnginePort>,
     services: TuiServices,
 ) -> std::io::Result<()> {
-    let _host = terminal::TerminalSessionHost::new(
+    let mut host = terminal::TerminalSessionHost::new(
         Arc::clone(&services.terminal),
         terminal::TerminalEnv::from_env(),
         terminal::TerminalSessionOptions::default(),
     )?;
+    let initial_bytes = host.take_pending_input_bytes();
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let app = app::App::with_services(services);
-    runner::run_with_engine(&mut terminal, app, engine).await
+    let res =
+        runner::run_with_engine_with_initial_bytes(&mut terminal, app, engine, initial_bytes).await;
+    drop(host);
+    res
 }

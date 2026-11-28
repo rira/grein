@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -151,19 +151,23 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<TreeActio
 fn spawn_key_reader(
     stop: Arc<AtomicBool>,
     tx: mpsc::UnboundedSender<Event>,
+    initial_bytes: Vec<u8>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        let Ok(mut reader) = crate::terminal_decoder::UnixRawInputReader::new() else {
+            return;
+        };
+        if !initial_bytes.is_empty() {
+            reader.push_initial_bytes(&initial_bytes);
+        }
         while !stop.load(Ordering::Relaxed) {
-            match event::poll(Duration::from_millis(25)) {
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        if tx.send(ev).is_err() {
-                            break;
-                        }
+            match reader.read_next(Duration::from_millis(25)) {
+                Ok(Some(decoded)) => {
+                    if tx.send(decoded.event).is_err() {
+                        break;
                     }
-                    Err(_) => break,
-                },
-                Ok(false) => {}
+                }
+                Ok(None) => {}
                 Err(_) => break,
             }
         }
@@ -175,9 +179,18 @@ pub async fn run_with_engine<B: Backend>(
     app: App,
     engine: Arc<dyn TuiEnginePort>,
 ) -> io::Result<()> {
+    run_with_engine_with_initial_bytes(terminal, app, engine, Vec::new()).await
+}
+
+pub async fn run_with_engine_with_initial_bytes<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: App,
+    engine: Arc<dyn TuiEnginePort>,
+    initial_bytes: Vec<u8>,
+) -> io::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let (key_tx, key_rx) = mpsc::unbounded_channel::<Event>();
-    let reader = spawn_key_reader(Arc::clone(&stop), key_tx);
+    let reader = spawn_key_reader(Arc::clone(&stop), key_tx, initial_bytes);
     let result = run_with_engine_events(terminal, app, engine, key_rx).await;
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();

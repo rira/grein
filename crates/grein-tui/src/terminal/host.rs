@@ -132,11 +132,28 @@ impl TerminalSessionHost {
         }
 
         let capabilities = adapter.capabilities(&env);
-        let plan = adapter.protocol_plan(&env, &opts);
+        let mut plan = adapter.protocol_plan(&env, &opts);
         let host_id = NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed);
         install_panic_restore_hook();
 
         enable_raw_mode()?;
+        let mut pending_input_bytes = Vec::new();
+        if let Some(timeout_ms) = plan.probe_kitty_timeout_ms {
+            if let Ok(probe) =
+                crate::terminal::decoder::UnixRawInputReader::probe_kitty_keyboard(timeout_ms)
+            {
+                pending_input_bytes = probe.buffered_bytes;
+                if !probe.supported {
+                    plan.enter_bytes.clear();
+                    plan.leave_bytes.clear();
+                    plan.expects_kitty_pop = false;
+                }
+            } else {
+                plan.enter_bytes.clear();
+                plan.leave_bytes.clear();
+                plan.expects_kitty_pop = false;
+            }
+        }
         let mut active_modes = ActiveTerminalModes {
             raw_mode: true,
             alternate_screen: opts.alternate_screen,
@@ -171,7 +188,7 @@ impl TerminalSessionHost {
             capabilities,
             plan,
             active_modes,
-            pending_input_bytes: Vec::new(),
+            pending_input_bytes,
             active: true,
             owns_real_tty: true,
             host_id,

@@ -4,6 +4,7 @@ pub mod port;
 pub mod providers;
 pub mod registry;
 
+pub use crate::terminal_decoder as decoder;
 pub use env::TerminalEnv;
 pub use host::TerminalSessionHost;
 pub use port::{
