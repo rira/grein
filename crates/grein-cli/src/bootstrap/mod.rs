@@ -415,10 +415,10 @@ async fn dispatch_cli(
             let deps = build_doctor_deps(config, registry);
             handle_doctor_with(&args, &deps)?;
         }
-        Some(Command::Keys(KeysArgs { no_enhance, raw: _ })) => {
+        Some(Command::Keys(KeysArgs { no_enhance, raw })) => {
             grein_tui::run_key_inspector(grein_tui::KeyInspectorOptions {
                 enhance_keyboard: !no_enhance,
-                ..Default::default()
+                raw_bytes: raw,
             })?;
         }
         Some(Command::Terminal(args)) => {

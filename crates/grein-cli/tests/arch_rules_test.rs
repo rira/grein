@@ -734,11 +734,9 @@ fn rule_6_ttc_003_terminal_tier1_hosts_no_concrete_providers() {
     assert!(tui_host.is_file(), "missing {}", tui_host.display());
     assert!(tui_registry.is_file(), "missing {}", tui_registry.display());
 
-    let mut targets = vec![tui_host, tui_registry];
     let cli_host = root.join("crates/grein-cli/src/terminal/host.rs");
-    if cli_host.exists() {
-        targets.push(cli_host);
-    }
+    assert!(cli_host.is_file(), "missing {}", cli_host.display());
+    let targets = vec![tui_host, tui_registry, cli_host];
 
     let forbidden = [
         "providers",
@@ -751,6 +749,14 @@ fn rule_6_ttc_003_terminal_tier1_hosts_no_concrete_providers() {
         "AlacrittyProvider",
         "TmuxProvider",
         "ZellijProvider",
+        "AppleTerminalInstaller",
+        "ITerm2Installer",
+        "GhosttyInstaller",
+        "KittyInstaller",
+        "WezTermInstaller",
+        "AlacrittyInstaller",
+        "TmuxInstaller",
+        "ZellijInstaller",
     ];
 
     let mut violations = Vec::new();

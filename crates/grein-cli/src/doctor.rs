@@ -205,27 +205,10 @@ fn build_terminal_env(
 }
 
 fn resolve_color_capability(env: &TerminalEnv) -> ColorCapability {
-    let registry = default_registry();
-    if let Some(adapter) = registry.resolve(env) {
-        if adapter.capabilities(env).color == ColorCapability::TrueColor {
-            return ColorCapability::TrueColor;
-        }
-    }
-
-    if env.supports_truecolor_hint()
-        || env.kitty_window_id.is_some()
-        || env.ghostty_resources_dir.is_some()
-        || env.term_program.as_deref().is_some_and(|tp| {
-            tp.eq_ignore_ascii_case("iTerm.app")
-                || tp.eq_ignore_ascii_case("WezTerm")
-                || tp.eq_ignore_ascii_case("ghostty")
-                || tp.eq_ignore_ascii_case("vscode")
-        })
-    {
-        return ColorCapability::TrueColor;
-    }
-
-    ColorCapability::Xterm256
+    default_registry()
+        .resolve(env)
+        .map(|adapter| adapter.capabilities(env).color)
+        .unwrap_or(ColorCapability::Xterm256)
 }
 
 pub fn detect_color_mode_label(
@@ -275,11 +258,9 @@ pub fn check_terminal_env_with_env(env: &TerminalEnv) -> DoctorCheck {
 
     let registry = default_registry();
     let resolved_adapter = registry.resolve(env);
-    let apple_terminal_fallback = (resolved_adapter
+    let is_apple_terminal = resolved_adapter
         .as_ref()
-        .is_some_and(|a| a.kind() == TerminalKind::AppleTerminal)
-        || term_program.is_some_and(|tp| tp.eq_ignore_ascii_case("Apple_Terminal")))
-        && color_cap != ColorCapability::TrueColor;
+        .is_some_and(|a| a.kind() == TerminalKind::AppleTerminal);
 
     let mut detail = format!(
         "TERM={}, TERM_PROGRAM={}, COLORTERM={} (color={color_mode}), locale={}",
@@ -288,20 +269,17 @@ pub fn check_terminal_env_with_env(env: &TerminalEnv) -> DoctorCheck {
         colorterm.unwrap_or("<unset>"),
         locale.unwrap_or("<unset>"),
     );
-    if apple_terminal_fallback {
-        let hint_suffix = resolved_adapter
-            .and_then(|adapter| {
-                adapter
-                    .diagnostic_hints(env)
-                    .into_iter()
-                    .find(|h| h.message.contains("Ctrl+G") && h.message.contains("grein keys"))
-                    .map(|h| h.message)
-            })
-            .unwrap_or_else(|| {
-                "Apple_Terminal uses 256-color palette fallback automatically — prefer Ctrl+G manage mode if Shift/Option modifiers vary, or run `grein keys` to inspect modifiers".to_string()
-            });
-        detail.push_str("; ");
-        detail.push_str(&hint_suffix);
+    if is_apple_terminal {
+        if color_cap != ColorCapability::TrueColor {
+            detail.push_str("; Apple_Terminal uses 256-color palette fallback automatically");
+        }
+        if let Some(hint) = resolved_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.diagnostic_hints(env).into_iter().next())
+        {
+            detail.push_str("; ");
+            detail.push_str(&hint.message);
+        }
     }
 
     DoctorCheck {
