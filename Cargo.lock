@@ -481,6 +481,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "grein-core",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

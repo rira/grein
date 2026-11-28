@@ -1,12 +1,17 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use grein_core::ThreadKind;
-use grein_tui::app::{App, AppAction, FocusedPane, PendingPermission, SidebarView};
+use grein_tui::app::{
+    App, AppAction, ConfigPickerModal, FocusedPane, PendingPermission, RenamePromptState,
+    SidebarView,
+};
 use grein_tui::engine_port::{
-    HydratedSession, HydratedThread, PtyScreenSnapshot, ThreadMeta, TuiEngineEvent, WorktreeEntry,
+    AgentConfigChoice, AgentProviderInfo, HydratedSession, HydratedThread, PtyScreenSnapshot,
+    ThreadMeta, TuiEngineEvent, WorktreeEntry,
 };
 use grein_tui::keymap::{BindableAction, KeyChord, Keymap};
 use grein_tui::render::render_app_mut;
 use grein_tui::runner::{apply_engine_event, apply_hydrated_session};
+use grein_tui::theme::{ThemePickerModal, ThemePreset};
 use grein_tui::ui::tree::TreeNode;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -661,4 +666,162 @@ fn test_super_hyper_meta_modifiers_never_alias_shift_or_plain_arrows() {
     assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SUPER)));
     assert!(app.pending_permission.is_some());
     assert!(app.pending_actions.is_empty());
+}
+
+
+#[test]
+fn test_shift_arrows_are_not_treated_as_plain_movement_in_pickers_modals_and_composer() {
+    use grein_tui::app::AgentPickerModal;
+
+    // 1. Config Picker
+    let mut app = build_tree_app();
+    app.config_picker = Some(ConfigPickerModal {
+        thread_id: "r1".to_string(),
+        config_id: "model".to_string(),
+        title: "Model".to_string(),
+        current_value: "b".to_string(),
+        options: vec![
+            AgentConfigChoice {
+                value: "a".to_string(),
+                name: "A".to_string(),
+                description: None,
+            },
+            AgentConfigChoice {
+                value: "b".to_string(),
+                name: "B".to_string(),
+                description: None,
+            },
+            AgentConfigChoice {
+                value: "c".to_string(),
+                name: "C".to_string(),
+                description: None,
+            },
+        ],
+        selected_index: 1,
+        set_default: false,
+    });
+    app.handle_key_event(shift(KeyCode::Up));
+    app.handle_key_event(shift(KeyCode::Down));
+    assert_eq!(app.config_picker.as_ref().unwrap().selected_index, 1);
+    app.handle_key_event(key(KeyCode::Down));
+    assert_eq!(app.config_picker.as_ref().unwrap().selected_index, 2);
+
+    // 2. Theme Picker
+    let mut app = build_tree_app();
+    app.theme_picker = Some(ThemePickerModal {
+        selected_idx: 1,
+        original_preset: ThemePreset::TokyoNight,
+        original_overrides: Default::default(),
+    });
+    app.handle_key_event(shift(KeyCode::Up));
+    app.handle_key_event(shift(KeyCode::Down));
+    assert_eq!(app.theme_picker.as_ref().unwrap().selected_idx, 1);
+    app.handle_key_event(key(KeyCode::Down));
+    assert_eq!(app.theme_picker.as_ref().unwrap().selected_idx, 2);
+
+    // 3. Agent Picker
+    let mut app = build_tree_app();
+    app.agent_providers = vec![
+        AgentProviderInfo {
+            id: "a".to_string(),
+            plugin_id: "p.a".to_string(),
+            display_name: "A".to_string(),
+            kind: "a".to_string(),
+            available: true,
+            executable: None,
+            is_default: true,
+            install_hint: None,
+        },
+        AgentProviderInfo {
+            id: "b".to_string(),
+            plugin_id: "p.b".to_string(),
+            display_name: "B".to_string(),
+            kind: "b".to_string(),
+            available: true,
+            executable: None,
+            is_default: false,
+            install_hint: None,
+        },
+        AgentProviderInfo {
+            id: "c".to_string(),
+            plugin_id: "p.c".to_string(),
+            display_name: "C".to_string(),
+            kind: "c".to_string(),
+            available: true,
+            executable: None,
+            is_default: false,
+            install_hint: None,
+        },
+    ];
+    app.agent_picker = Some(AgentPickerModal {
+        selected_idx: 1,
+        target_thread_id: "r1".to_string(),
+    });
+    app.handle_key_event(shift(KeyCode::Up));
+    app.handle_key_event(shift(KeyCode::Down));
+    assert_eq!(app.agent_picker.as_ref().unwrap().selected_idx, 1);
+    app.handle_key_event(key(KeyCode::Down));
+    assert_eq!(app.agent_picker.as_ref().unwrap().selected_idx, 2);
+
+    // 4. Help Modal (normal and filter mode)
+    let mut app = build_tree_app();
+    app.show_help_modal = true;
+    app.help_max_scroll = 20;
+    app.help_scroll_offset = 5;
+    app.handle_key_event(shift(KeyCode::Up));
+    app.handle_key_event(shift(KeyCode::Down));
+    assert_eq!(app.help_scroll_offset, 5);
+    app.help_filter_active = true;
+    app.handle_key_event(shift(KeyCode::Up));
+    app.handle_key_event(shift(KeyCode::Down));
+    assert_eq!(app.help_scroll_offset, 5);
+    app.handle_key_event(key(KeyCode::Down));
+    assert_eq!(app.help_scroll_offset, 6);
+
+    // 5. Command Palette
+    let mut app = build_tree_app();
+    app.set_focus(FocusedPane::Tree);
+    app.palette_active = true;
+    app.palette_input = "theme".to_string();
+    app.palette_cursor = 2;
+    app.palette_match_idx = 0;
+    app.handle_key_event(shift(KeyCode::Left));
+    app.handle_key_event(shift(KeyCode::Right));
+    app.handle_key_event(shift(KeyCode::Up));
+    app.handle_key_event(shift(KeyCode::Down));
+    assert_eq!(app.palette_cursor, 2);
+    assert_eq!(app.palette_match_idx, 0);
+
+    // 6. Inline Rename Prompt
+    let mut app = build_tree_app();
+    app.set_focus(FocusedPane::Tree);
+    app.rename_prompt = Some(RenamePromptState {
+        thread_id: "r1".to_string(),
+        buffer: "hello".to_string(),
+        cursor: 2,
+    });
+    app.handle_key_event(shift(KeyCode::Left));
+    app.handle_key_event(shift(KeyCode::Right));
+    assert_eq!(app.rename_prompt.as_ref().unwrap().cursor, 2);
+    app.handle_key_event(key(KeyCode::Right));
+    assert_eq!(app.rename_prompt.as_ref().unwrap().cursor, 3);
+
+    // 7. Composer Ctrl/Alt+Shift+Left/Right must not strip Shift
+    let mut app = build_tree_app();
+    app.set_focus(FocusedPane::Composer);
+    app.input_buffer = "alpha beta gamma".to_string();
+    app.cursor_position = 8;
+    for mods in [
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ] {
+        assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Left, mods)));
+        assert_eq!(app.cursor_position, 8);
+        assert!(!app.handle_key_event(KeyEvent::new(KeyCode::Right, mods)));
+        assert_eq!(app.cursor_position, 8);
+    }
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)));
+    assert_eq!(app.cursor_position, 6);
+    assert!(app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+    assert_eq!(app.cursor_position, 10);
 }

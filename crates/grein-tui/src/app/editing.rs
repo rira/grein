@@ -325,13 +325,17 @@ impl App {
             }
             (KeyCode::Left, true, false)
             | (KeyCode::Left, false, true)
-            | (KeyCode::Char('b' | 'B'), false, true) => {
+            | (KeyCode::Char('b' | 'B'), false, true)
+                if !shift || matches!(key.code, KeyCode::Char(_)) =>
+            {
                 self.cursor_position = prev_word_boundary(&self.input_buffer, pos);
                 true
             }
             (KeyCode::Right, true, false)
             | (KeyCode::Right, false, true)
-            | (KeyCode::Char('f' | 'F'), false, true) => {
+            | (KeyCode::Char('f' | 'F'), false, true)
+                if !shift || matches!(key.code, KeyCode::Char(_)) =>
+            {
                 self.cursor_position = next_word_boundary(&self.input_buffer, pos);
                 true
             }

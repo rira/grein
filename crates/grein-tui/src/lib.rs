@@ -20,6 +20,7 @@ pub mod state;
 pub mod status;
 pub mod syntax;
 pub mod terminal;
+pub mod terminal_decoder;
 pub mod theme;
 pub mod transcript;
 pub mod ui;

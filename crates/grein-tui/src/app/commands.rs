@@ -805,6 +805,7 @@ impl App {
     pub(super) fn handle_key_palette(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let pos = clamp_char_boundary(&self.palette_input, self.palette_cursor);
         let suggestions = self.palette_suggestions();
 
@@ -832,14 +833,18 @@ impl App {
                     self.palette_match_idx = 0;
                 }
             }
-            (KeyCode::Up, false, false) | (KeyCode::Char('p' | 'P'), true, false) => {
+            (KeyCode::Up, false, false) | (KeyCode::Char('p' | 'P'), true, false)
+                if !shift || key.code != KeyCode::Up =>
+            {
                 if !suggestions.is_empty() {
                     let len = suggestions.len();
                     let cur = self.palette_match_idx.min(len - 1);
                     self.palette_match_idx = (cur + len - 1) % len;
                 }
             }
-            (KeyCode::Down, false, false) | (KeyCode::Char('n' | 'N'), true, false) => {
+            (KeyCode::Down, false, false) | (KeyCode::Char('n' | 'N'), true, false)
+                if !shift || key.code != KeyCode::Down =>
+            {
                 if !suggestions.is_empty() {
                     let len = suggestions.len();
                     let cur = self.palette_match_idx.min(len - 1);
@@ -863,12 +868,12 @@ impl App {
                 self.palette_cursor = start;
                 self.palette_match_idx = 0;
             }
-            (KeyCode::Left, false, false) if pos > 0 => {
+            (KeyCode::Left, false, false) if !shift && pos > 0 => {
                 if let Some((idx, _)) = self.palette_input[..pos].char_indices().next_back() {
                     self.palette_cursor = idx;
                 }
             }
-            (KeyCode::Right, false, false) if pos < self.palette_input.len() => {
+            (KeyCode::Right, false, false) if !shift && pos < self.palette_input.len() => {
                 if let Some(ch) = self.palette_input[pos..].chars().next() {
                     self.palette_cursor = pos + ch.len_utf8();
                 }

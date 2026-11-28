@@ -247,35 +247,36 @@ impl App {
         use crossterm::event::{KeyCode, KeyModifiers};
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let no_ctrl_alt = !ctrl && !alt;
         let count = self.agent_providers.len();
 
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
+        match (key.code, shift) {
+            (KeyCode::Up, false) | (KeyCode::Char('k' | 'K'), _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.agent_picker {
                     picker.selected_idx = picker.selected_idx.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
+            (KeyCode::Down, false) | (KeyCode::Char('j' | 'J'), _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.agent_picker {
                     if count > 0 {
                         picker.selected_idx = (picker.selected_idx + 1).min(count - 1);
                     }
                 }
             }
-            KeyCode::Home if no_ctrl_alt => {
+            (KeyCode::Home, _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.agent_picker {
                     picker.selected_idx = 0;
                 }
             }
-            KeyCode::End if no_ctrl_alt => {
+            (KeyCode::End, _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.agent_picker {
                     if count > 0 {
                         picker.selected_idx = count - 1;
                     }
                 }
             }
-            KeyCode::Enter if no_ctrl_alt => {
+            (KeyCode::Enter, _) if no_ctrl_alt => {
                 let Some(idx) = self.agent_picker.as_ref().map(|p| p.selected_idx) else {
                     return;
                 };
@@ -300,7 +301,7 @@ impl App {
                 };
                 self.spawn_sibling_with_provider(&target_id, &provider, None);
             }
-            KeyCode::Char('s' | 'S') if no_ctrl_alt => {
+            (KeyCode::Char('s' | 'S'), _) if no_ctrl_alt => {
                 let Some(idx) = self.agent_picker.as_ref().map(|p| p.selected_idx) else {
                     return;
                 };
@@ -337,7 +338,7 @@ impl App {
                         provider: provider.id,
                     });
             }
-            KeyCode::Char('d' | 'D') if no_ctrl_alt => {
+            (KeyCode::Char('d' | 'D'), _) if no_ctrl_alt => {
                 let Some(idx) = self.agent_picker.as_ref().map(|p| p.selected_idx) else {
                     return;
                 };
@@ -364,10 +365,10 @@ impl App {
                 self.pending_actions
                     .push_back(AppAction::SaveDefaultAgentProvider { provider: id });
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'Q') if no_ctrl_alt => {
+            (KeyCode::Esc | KeyCode::Char('q' | 'Q'), _) if no_ctrl_alt => {
                 self.agent_picker = None;
             }
-            KeyCode::Char('c' | 'C') if ctrl && !alt => {
+            (KeyCode::Char('c' | 'C'), _) if ctrl && !alt => {
                 self.agent_picker = None;
             }
             _ => {}

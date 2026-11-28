@@ -201,15 +201,16 @@ impl App {
     pub(super) fn handle_key_config_picker(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let no_ctrl_alt = !ctrl && !alt;
 
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
+        match (key.code, shift) {
+            (KeyCode::Up, false) | (KeyCode::Char('k' | 'K'), _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.config_picker {
                     picker.selected_index = picker.selected_index.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
+            (KeyCode::Down, false) | (KeyCode::Char('j' | 'J'), _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.config_picker {
                     if !picker.options.is_empty() {
                         picker.selected_index =
@@ -217,12 +218,12 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('d' | 'D') if no_ctrl_alt => {
+            (KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('d' | 'D'), _) if no_ctrl_alt => {
                 if let Some(ref mut picker) = self.config_picker {
                     picker.set_default = !picker.set_default;
                 }
             }
-            KeyCode::Enter if no_ctrl_alt => {
+            (KeyCode::Enter, _) if no_ctrl_alt => {
                 if let Some(picker) = self.config_picker.take() {
                     if let Some(choice) = picker
                         .options
@@ -238,10 +239,10 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'Q') if no_ctrl_alt => {
+            (KeyCode::Esc | KeyCode::Char('q' | 'Q'), _) if no_ctrl_alt => {
                 self.config_picker = None;
             }
-            KeyCode::Char('c' | 'C') if ctrl && !alt => {
+            (KeyCode::Char('c' | 'C'), _) if ctrl && !alt => {
                 self.config_picker = None;
             }
             _ => {}
@@ -377,16 +378,17 @@ impl App {
     pub(super) fn handle_key_theme_picker(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let no_ctrl_alt = !ctrl && !alt;
         let count = ThemePreset::all().len();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
+        match (key.code, shift) {
+            (KeyCode::Up, false) | (KeyCode::Char('k' | 'K'), _) if no_ctrl_alt => {
                 if let Some(ref picker) = self.theme_picker {
                     let next = picker.selected_idx.saturating_sub(1);
                     self.preview_theme_at(next);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
+            (KeyCode::Down, false) | (KeyCode::Char('j' | 'J'), _) if no_ctrl_alt => {
                 if let Some(ref picker) = self.theme_picker {
                     let next = if count == 0 {
                         0
@@ -396,15 +398,15 @@ impl App {
                     self.preview_theme_at(next);
                 }
             }
-            KeyCode::Home if no_ctrl_alt => {
+            (KeyCode::Home, _) if no_ctrl_alt => {
                 self.preview_theme_at(0);
             }
-            KeyCode::End if no_ctrl_alt => {
+            (KeyCode::End, _) if no_ctrl_alt => {
                 if count > 0 {
                     self.preview_theme_at(count - 1);
                 }
             }
-            KeyCode::Enter if no_ctrl_alt => {
+            (KeyCode::Enter, _) if no_ctrl_alt => {
                 if let Some(picker) = self.theme_picker.take() {
                     let preset = ThemePreset::all()
                         .get(picker.selected_idx)
@@ -420,7 +422,7 @@ impl App {
                     self.status_notice = Some(format!("Theme: {}", preset.display_name()));
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q' | 'Q') if no_ctrl_alt => {
+            (KeyCode::Esc | KeyCode::Char('q' | 'Q'), _) if no_ctrl_alt => {
                 if let Some(picker) = self.theme_picker.take() {
                     self.theme_preset = picker.original_preset;
                     self.theme_overrides = picker.original_overrides;
@@ -431,7 +433,7 @@ impl App {
                     self.status_notice = Some("Theme preview cancelled".to_string());
                 }
             }
-            KeyCode::Char('c' | 'C') if ctrl && !alt => {
+            (KeyCode::Char('c' | 'C'), _) if ctrl && !alt => {
                 if let Some(picker) = self.theme_picker.take() {
                     self.theme_preset = picker.original_preset;
                     self.theme_overrides = picker.original_overrides;
@@ -449,6 +451,7 @@ impl App {
     pub(super) fn handle_key_rename_prompt(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let Some(ref mut prompt) = self.rename_prompt else {
             return;
         };
@@ -482,12 +485,12 @@ impl App {
                 prompt.buffer.drain(start..pos);
                 prompt.cursor = start;
             }
-            (KeyCode::Left, false, false) if pos > 0 => {
+            (KeyCode::Left, false, false) if !shift && pos > 0 => {
                 if let Some((idx, _)) = prompt.buffer[..pos].char_indices().next_back() {
                     prompt.cursor = idx;
                 }
             }
-            (KeyCode::Right, false, false) if pos < prompt.buffer.len() => {
+            (KeyCode::Right, false, false) if !shift && pos < prompt.buffer.len() => {
                 if let Some(ch) = prompt.buffer[pos..].chars().next() {
                     prompt.cursor = pos + ch.len_utf8();
                 }
@@ -516,6 +519,7 @@ impl App {
     pub(super) fn handle_key_modals(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let no_ctrl_alt = !ctrl && !alt;
 
         if self.pending_permission.is_some() {
@@ -661,10 +665,14 @@ impl App {
                         self.help_filter_query.truncate(start);
                         self.help_scroll_offset = 0;
                     }
-                    (KeyCode::Up, false, false) | (KeyCode::Char('p' | 'P'), true, false) => {
+                    (KeyCode::Up, false, false) | (KeyCode::Char('p' | 'P'), true, false)
+                        if !shift || key.code != KeyCode::Up =>
+                    {
                         self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
                     }
-                    (KeyCode::Down, false, false) | (KeyCode::Char('n' | 'N'), true, false) => {
+                    (KeyCode::Down, false, false) | (KeyCode::Char('n' | 'N'), true, false)
+                        if !shift || key.code != KeyCode::Down =>
+                    {
                         self.help_scroll_offset =
                             clamp_help(self, self.help_scroll_offset.saturating_add(1));
                     }
@@ -688,11 +696,11 @@ impl App {
                     _ => {}
                 }
             } else {
-                match key.code {
-                    KeyCode::Char('/') if no_ctrl_alt => {
+                match (key.code, shift) {
+                    (KeyCode::Char('/'), _) if no_ctrl_alt => {
                         self.help_filter_active = true;
                     }
-                    KeyCode::Esc if no_ctrl_alt => {
+                    (KeyCode::Esc, _) if no_ctrl_alt => {
                         if !self.help_filter_query.is_empty() {
                             self.help_filter_query.clear();
                             self.help_scroll_offset = 0;
@@ -702,50 +710,50 @@ impl App {
                             self.help_filter_active = false;
                         }
                     }
-                    KeyCode::Enter | KeyCode::Char('q' | 'Q' | '?') if no_ctrl_alt => {
+                    (KeyCode::Enter | KeyCode::Char('q' | 'Q' | '?'), _) if no_ctrl_alt => {
                         self.show_help_modal = false;
                         self.help_scroll_offset = 0;
                         self.help_filter_active = false;
                         self.help_filter_query.clear();
                     }
-                    KeyCode::Char('c' | 'C') if ctrl && !alt => {
+                    (KeyCode::Char('c' | 'C'), _) if ctrl && !alt => {
                         self.show_help_modal = false;
                         self.help_scroll_offset = 0;
                         self.help_filter_active = false;
                         self.help_filter_query.clear();
                     }
-                    KeyCode::Down | KeyCode::Char('j' | 'J') if no_ctrl_alt => {
+                    (KeyCode::Down, false) | (KeyCode::Char('j' | 'J'), _) if no_ctrl_alt => {
                         self.help_scroll_offset =
                             clamp_help(self, self.help_scroll_offset.saturating_add(1));
                     }
-                    KeyCode::Up | KeyCode::Char('k' | 'K') if no_ctrl_alt => {
+                    (KeyCode::Up, false) | (KeyCode::Char('k' | 'K'), _) if no_ctrl_alt => {
                         self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
                     }
-                    KeyCode::PageDown if no_ctrl_alt => {
+                    (KeyCode::PageDown, _) if no_ctrl_alt => {
                         self.help_scroll_offset =
                             clamp_help(self, self.help_scroll_offset.saturating_add(10));
                     }
-                    KeyCode::Char('d' | 'D') if ctrl && !alt => {
+                    (KeyCode::Char('d' | 'D'), _) if ctrl && !alt => {
                         self.help_scroll_offset =
                             clamp_help(self, self.help_scroll_offset.saturating_add(10));
                     }
-                    KeyCode::Char('f' | 'F') if ctrl && !alt => {
+                    (KeyCode::Char('f' | 'F'), _) if ctrl && !alt => {
                         self.help_scroll_offset =
                             clamp_help(self, self.help_scroll_offset.saturating_add(20));
                     }
-                    KeyCode::PageUp if no_ctrl_alt => {
+                    (KeyCode::PageUp, _) if no_ctrl_alt => {
                         self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
                     }
-                    KeyCode::Char('u' | 'U') if ctrl && !alt => {
+                    (KeyCode::Char('u' | 'U'), _) if ctrl && !alt => {
                         self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
                     }
-                    KeyCode::Char('b' | 'B') if ctrl && !alt => {
+                    (KeyCode::Char('b' | 'B'), _) if ctrl && !alt => {
                         self.help_scroll_offset = self.help_scroll_offset.saturating_sub(20);
                     }
-                    KeyCode::Home | KeyCode::Char('g') if no_ctrl_alt => {
+                    (KeyCode::Home | KeyCode::Char('g'), _) if no_ctrl_alt => {
                         self.help_scroll_offset = 0;
                     }
-                    KeyCode::End | KeyCode::Char('G') if no_ctrl_alt => {
+                    (KeyCode::End | KeyCode::Char('G'), _) if no_ctrl_alt => {
                         self.help_scroll_offset = self.help_max_scroll;
                     }
                     _ => {}
