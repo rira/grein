@@ -1,71 +1,71 @@
 use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
 
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 use crate::keymap::{KeyChord, Keymap};
+use crate::terminal::providers::default_adapter;
+use crate::terminal::{
+    KeyboardProtocolPolicy, TerminalCapabilities, TerminalEnv, TerminalSessionHost,
+    TerminalSessionOptions,
+};
+use crate::terminal_decoder::{DecodedInput, UnixRawInputReader};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyInspectorOptions {
     pub enhance_keyboard: bool,
+    pub raw_bytes: bool,
 }
 
 struct RawInspectorGuard {
-    raw_mode: bool,
-    keyboard_enhanced: bool,
+    host: TerminalSessionHost,
     enhancement_status: String,
 }
 
-impl RawInspectorGuard {
-    fn enter(enhance_keyboard: bool) -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut guard = Self {
-            raw_mode: true,
-            keyboard_enhanced: false,
-            enhancement_status: String::new(),
-        };
-
-        if enhance_keyboard {
-            let supported = supports_keyboard_enhancement().unwrap_or(false);
-            let pushed = if supported {
-                execute!(
-                    io::stdout(),
-                    PushKeyboardEnhancementFlags(
-                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    )
-                )
-                .is_ok()
-            } else {
-                false
-            };
-            guard.keyboard_enhanced = pushed;
-            guard.enhancement_status = if pushed {
-                "supported=true, active=true (DISAMBIGUATE_ESCAPE_CODES)".to_string()
-            } else {
-                format!("supported={supported}, active=false")
-            };
-        } else {
-            guard.enhancement_status = "disabled (--no-enhance), active=false".to_string();
+fn format_enhancement_status(
+    enhance_keyboard: bool,
+    policy: KeyboardProtocolPolicy,
+    keyboard_enhanced: bool,
+) -> String {
+    if !enhance_keyboard {
+        return "disabled (--no-enhance), active=false".to_string();
+    }
+    match policy {
+        KeyboardProtocolPolicy::None => "policy=None, active=false".to_string(),
+        KeyboardProtocolPolicy::ModifyOtherKeys => {
+            "policy=ModifyOtherKeys, active=true".to_string()
         }
-
-        Ok(guard)
+        KeyboardProtocolPolicy::KittyDisambiguate => {
+            "policy=KittyDisambiguate, active=true (DISAMBIGUATE_ESCAPE_CODES)".to_string()
+        }
+        KeyboardProtocolPolicy::BoundedProbeKitty { timeout_ms } => format!(
+            "policy=BoundedProbeKitty({timeout_ms}ms), active={keyboard_enhanced}"
+        ),
     }
 }
 
-impl Drop for RawInspectorGuard {
-    fn drop(&mut self) {
-        if self.keyboard_enhanced {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
-        if self.raw_mode {
-            let _ = disable_raw_mode();
-        }
+impl RawInspectorGuard {
+    fn enter(options: KeyInspectorOptions) -> io::Result<Self> {
+        let env = TerminalEnv::from_env();
+        let adapter = default_adapter(&env);
+        let session_opts = TerminalSessionOptions {
+            alternate_screen: false,
+            mouse_capture: false,
+            bracketed_paste: false,
+            focus_change: false,
+            enhance_keyboard: options.enhance_keyboard,
+            raw_bytes: options.raw_bytes,
+        };
+        let host = TerminalSessionHost::new(adapter, env, session_opts)?;
+        let enhancement_status = format_enhancement_status(
+            options.enhance_keyboard,
+            host.capabilities().keyboard_protocol,
+            host.active_modes().keyboard_enhanced,
+        );
+        Ok(Self {
+            host,
+            enhancement_status,
+        })
     }
 }
 
@@ -112,18 +112,13 @@ impl PendingExitKey {
     }
 }
 
-fn read_non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 pub fn format_inspector_header(
     term: Option<&str>,
     term_program: Option<&str>,
     colorterm: Option<&str>,
     enhancement_status: &str,
+    adapter_name: &str,
+    capabilities: &TerminalCapabilities,
 ) -> String {
     [
         "Grein Key Inspector".to_string(),
@@ -133,8 +128,17 @@ pub fn format_inspector_header(
             term_program.unwrap_or("<unset>"),
             colorterm.unwrap_or("<unset>"),
         ),
+        format!(
+            "adapter={}  color={:?}  keyboard_protocol={:?}  osc52={}  focus={}  paste={}",
+            adapter_name,
+            capabilities.color,
+            capabilities.keyboard_protocol,
+            capabilities.osc52_clipboard,
+            capabilities.focus_events,
+            capabilities.bracketed_paste,
+        ),
         format!("keyboard_enhancement={enhancement_status}"),
-        "Press any key to inspect raw crossterm events (press Ctrl+C twice or q twice to exit)"
+        "Press any key to inspect raw terminal events (press Ctrl+C twice or q twice to exit)"
             .to_string(),
     ]
     .join("\n")
@@ -194,6 +198,31 @@ fn format_unsupported_modifiers(modifiers: KeyModifiers) -> String {
     }
 }
 
+pub fn format_raw_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "hex=<none> escaped=\"\"".to_string();
+    }
+    let hex = bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut escaped = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        match b {
+            b'\x1b' => escaped.push_str("\\x1b"),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            b'\\' => escaped.push_str("\\\\"),
+            b'"' => escaped.push_str("\\\""),
+            0x20..=0x7e => escaped.push(b as char),
+            _ => escaped.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    format!("hex={hex} escaped=\"{escaped}\"")
+}
+
 pub fn format_inspected_key_event(key: KeyEvent, keymap: &Keymap) -> String {
     let chord_str = match KeyChord::from_event(key) {
         Some(chord) => format!("{} ({})", chord.display_label(), chord.canonical_string()),
@@ -242,6 +271,25 @@ pub fn format_inspected_key_event(key: KeyEvent, keymap: &Keymap) -> String {
     out
 }
 
+pub fn format_decoded_input(
+    decoded: &DecodedInput,
+    keymap: &Keymap,
+    include_raw_bytes: bool,
+) -> String {
+    let base = match decoded.event {
+        Event::Key(key) => format_inspected_key_event(key, keymap),
+        ref other => format!("event={other:?}"),
+    };
+    if !include_raw_bytes {
+        return base;
+    }
+    let raw = format_raw_bytes(&decoded.raw_bytes);
+    match base.split_once('\n') {
+        Some((first, rest)) => format!("{first} raw=[{raw}]\n{rest}"),
+        None => format!("{base} raw=[{raw}]"),
+    }
+}
+
 fn write_raw_lines(out: &mut impl Write, text: &str) -> io::Result<()> {
     let normalized = text.replace("\r\n", "\n").replace('\n', "\r\n");
     write!(out, "{normalized}\r\n")?;
@@ -256,15 +304,19 @@ pub fn run_key_inspector(options: KeyInspectorOptions) -> io::Result<()> {
         ));
     }
 
-    let guard = RawInspectorGuard::enter(options.enhance_keyboard)?;
-    let term = read_non_empty_env("TERM");
-    let term_program = read_non_empty_env("TERM_PROGRAM");
-    let colorterm = read_non_empty_env("COLORTERM");
+    let mut guard = RawInspectorGuard::enter(options)?;
+    let initial_bytes = guard.host.take_pending_input_bytes();
+    let mut reader = UnixRawInputReader::new()?;
+    reader.push_initial_bytes(&initial_bytes);
+
+    let env = guard.host.env();
     let header = format_inspector_header(
-        term.as_deref(),
-        term_program.as_deref(),
-        colorterm.as_deref(),
+        env.term.as_deref(),
+        env.term_program.as_deref(),
+        env.colorterm.as_deref(),
         &guard.enhancement_status,
+        guard.host.adapter().display_name(),
+        guard.host.capabilities(),
     );
 
     let mut stdout = io::stdout();
@@ -274,24 +326,35 @@ pub fn run_key_inspector(options: KeyInspectorOptions) -> io::Result<()> {
     let mut exit_tracker = PendingExitKey::default();
 
     loop {
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Release => continue,
+        let Some(decoded) = reader.read_next(Duration::from_millis(250))? else {
+            continue;
+        };
+        match decoded.event {
             Event::Key(key) => {
-                let line = format_inspected_key_event(key, &keymap);
+                if key.kind == KeyEventKind::Release && !options.raw_bytes {
+                    continue;
+                }
+                let line = format_decoded_input(&decoded, &keymap, options.raw_bytes);
                 write_raw_lines(&mut stdout, &line)?;
-                match exit_tracker.step(key) {
-                    ExitStep::Continue => {}
-                    ExitStep::ArmCtrlC => {
-                        write_raw_lines(&mut stdout, "  hint: Press Ctrl+C again to exit.")?;
-                    }
-                    ExitStep::ArmPlainQ => {
-                        write_raw_lines(&mut stdout, "  hint: Press q again to exit.")?;
-                    }
-                    ExitStep::Exit => {
-                        write_raw_lines(&mut stdout, "Exiting key inspector.")?;
-                        break;
+                if key.kind != KeyEventKind::Release {
+                    match exit_tracker.step(key) {
+                        ExitStep::Continue => {}
+                        ExitStep::ArmCtrlC => {
+                            write_raw_lines(&mut stdout, "  hint: Press Ctrl+C again to exit.")?;
+                        }
+                        ExitStep::ArmPlainQ => {
+                            write_raw_lines(&mut stdout, "  hint: Press q again to exit.")?;
+                        }
+                        ExitStep::Exit => {
+                            write_raw_lines(&mut stdout, "Exiting key inspector.")?;
+                            break;
+                        }
                     }
                 }
+            }
+            _ if options.raw_bytes => {
+                let line = format_decoded_input(&decoded, &keymap, true);
+                write_raw_lines(&mut stdout, &line)?;
             }
             _ => continue,
         }
@@ -303,6 +366,7 @@ pub fn run_key_inspector(options: KeyInspectorOptions) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::ColorCapability;
 
     #[test]
     fn format_inspected_key_event_reports_shift_up_ctrl_g_and_alt_z() {
@@ -318,7 +382,10 @@ mod tests {
         assert!(shift_up.contains("state=NONE"), "{shift_up}");
         assert!(shift_up.contains("Shift+↑ (shift+up)"), "{shift_up}");
         assert!(shift_up.contains("tree_up"), "{shift_up}");
-        assert!(!shift_up.contains("Shift+Arrow sent without Shift?"), "{shift_up}");
+        assert!(
+            !shift_up.contains("Shift+Arrow sent without Shift?"),
+            "{shift_up}"
+        );
 
         let alt_z = format_inspected_key_event(
             KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
@@ -407,23 +474,36 @@ mod tests {
     }
 
     #[test]
-    fn format_inspector_header_lists_env_and_instructions() {
+    fn format_inspector_header_lists_env_adapter_capabilities_and_instructions() {
+        let caps = TerminalCapabilities {
+            color: ColorCapability::Xterm256,
+            keyboard_protocol: KeyboardProtocolPolicy::None,
+            osc52_clipboard: false,
+            focus_events: false,
+            bracketed_paste: true,
+            notes: vec![],
+        };
         let header = format_inspector_header(
             Some("xterm-256color"),
             Some("Apple_Terminal"),
             None,
-            "supported=false, active=false",
+            "policy=None, active=false",
+            "Apple Terminal",
+            &caps,
         );
         assert!(header.contains("TERM=xterm-256color"), "{header}");
         assert!(header.contains("TERM_PROGRAM=Apple_Terminal"), "{header}");
         assert!(header.contains("COLORTERM=<unset>"), "{header}");
+        assert!(header.contains("adapter=Apple Terminal"), "{header}");
+        assert!(header.contains("color=Xterm256"), "{header}");
+        assert!(header.contains("keyboard_protocol=None"), "{header}");
         assert!(
-            header.contains("keyboard_enhancement=supported=false, active=false"),
+            header.contains("keyboard_enhancement=policy=None, active=false"),
             "{header}"
         );
         assert!(
             header.contains(
-                "Press any key to inspect raw crossterm events (press Ctrl+C twice or q twice to exit)"
+                "Press any key to inspect raw terminal events (press Ctrl+C twice or q twice to exit)"
             ),
             "{header}"
         );

@@ -407,6 +407,7 @@ async fn dispatch_cli(
         Some(Command::Keys(KeysArgs { no_enhance })) => {
             grein_tui::run_key_inspector(grein_tui::KeyInspectorOptions {
                 enhance_keyboard: !no_enhance,
+                ..Default::default()
             })?;
         }
         Some(Command::Settings(args)) => {

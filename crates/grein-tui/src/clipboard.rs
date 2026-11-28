@@ -2,6 +2,9 @@ use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::terminal::providers::default_adapter;
+use crate::terminal::{TerminalAdapter, TerminalEnv};
+
 const BASE64_TABLE: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -40,10 +43,11 @@ pub fn encode_osc52(text: &str, in_tmux: bool) -> String {
     }
 }
 
-fn write_osc52_to<W: Write>(writer: &mut W, text: &str, in_tmux: bool) -> std::io::Result<()> {
-    let seq = encode_osc52(text, in_tmux);
-    writer.write_all(seq.as_bytes())?;
-    writer.flush()
+fn write_osc52_seq<W: Write>(writer: &mut W, seq: &str) -> Result<(), String> {
+    writer
+        .write_all(seq.as_bytes())
+        .and_then(|()| writer.flush())
+        .map_err(|err| format!("osc52: {err}"))
 }
 
 pub trait ClipboardPort: Send + Sync {
@@ -94,9 +98,9 @@ pub trait ClipboardReaderBackend: Send + Sync {
 }
 
 enum Osc52Target {
-    StdoutFromEnv,
+    Stdout(Arc<dyn TerminalAdapter>),
     Sink {
-        in_tmux: bool,
+        adapter: Arc<dyn TerminalAdapter>,
         sink: Arc<Mutex<Vec<u8>>>,
     },
 }
@@ -107,14 +111,30 @@ pub struct Osc52Backend {
 
 impl Osc52Backend {
     pub fn from_env() -> Self {
+        Self::from_adapter(default_adapter(&TerminalEnv::from_env()))
+    }
+
+    pub fn from_adapter(adapter: Arc<dyn TerminalAdapter>) -> Self {
         Self {
-            target: Osc52Target::StdoutFromEnv,
+            target: Osc52Target::Stdout(adapter),
         }
     }
 
     pub fn with_sink(in_tmux: bool, sink: Arc<Mutex<Vec<u8>>>) -> Self {
+        let env = if in_tmux {
+            TerminalEnv::default().with_tmux("1")
+        } else {
+            TerminalEnv::default()
+        };
+        Self::with_adapter_and_sink(default_adapter(&env), sink)
+    }
+
+    pub fn with_adapter_and_sink(
+        adapter: Arc<dyn TerminalAdapter>,
+        sink: Arc<Mutex<Vec<u8>>>,
+    ) -> Self {
         Self {
-            target: Osc52Target::Sink { in_tmux, sink },
+            target: Osc52Target::Sink { adapter, sink },
         }
     }
 }
@@ -131,20 +151,22 @@ impl ClipboardWriterBackend for Osc52Backend {
     }
 
     fn write(&self, text: &str) -> Result<(), String> {
+        let b64 = encode_base64(text.as_bytes());
         match &self.target {
-            Osc52Target::StdoutFromEnv => {
+            Osc52Target::Stdout(adapter) => {
                 if !std::io::stdout().is_terminal() {
                     return Err("osc52: stdout is not a terminal".to_string());
                 }
-                let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+                let seq = adapter.encode_osc52(&b64);
                 let mut stdout = std::io::stdout().lock();
-                write_osc52_to(&mut stdout, text, in_tmux).map_err(|err| format!("osc52: {err}"))
+                write_osc52_seq(&mut stdout, &seq)
             }
-            Osc52Target::Sink { in_tmux, sink } => {
+            Osc52Target::Sink { adapter, sink } => {
+                let seq = adapter.encode_osc52(&b64);
                 let mut guard = sink
                     .lock()
                     .map_err(|err| format!("osc52 sink lock: {err}"))?;
-                write_osc52_to(&mut *guard, text, *in_tmux).map_err(|err| format!("osc52: {err}"))
+                write_osc52_seq(&mut *guard, &seq)
             }
         }
     }
@@ -551,11 +573,11 @@ mod tests {
     #[test]
     fn test_write_osc52_to_writer() {
         let mut buf = Vec::new();
-        write_osc52_to(&mut buf, "abc", false).unwrap();
+        write_osc52_seq(&mut buf, &encode_osc52("abc", false)).unwrap();
         assert_eq!(buf, b"\x1b]52;c;YWJj\x07");
 
         buf.clear();
-        write_osc52_to(&mut buf, "abc", true).unwrap();
+        write_osc52_seq(&mut buf, &encode_osc52("abc", true)).unwrap();
         assert_eq!(buf, b"\x1bPtmux;\x1b\x1b]52;c;YWJj\x07\x1b\\");
     }
 

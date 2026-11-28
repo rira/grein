@@ -1,8 +1,7 @@
-const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+use crate::terminal::providers::default_registry;
+use crate::terminal::{ColorCapability, TerminalEnv};
 
-fn env_non_empty(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
 pub fn supports_truecolor_from_env(
     colorterm: Option<&str>,
@@ -11,45 +10,32 @@ pub fn supports_truecolor_from_env(
     has_kitty: bool,
     has_ghostty: bool,
 ) -> bool {
-    if let Some(ct) = colorterm.map(str::trim).filter(|v| !v.is_empty()) {
-        let lower = ct.to_ascii_lowercase();
-        if lower.contains("truecolor") || lower.contains("24bit") {
-            return true;
-        }
+    let mut env = TerminalEnv::default();
+    if let Some(ct) = colorterm {
+        env = env.with_colorterm(ct);
     }
-    if let Some(tp) = term_program.map(str::trim).filter(|v| !v.is_empty()) {
-        if matches!(
-            tp.to_ascii_lowercase().as_str(),
-            "iterm.app" | "wezterm" | "ghostty" | "vscode"
-        ) {
-            return true;
-        }
+    if let Some(tp) = term_program {
+        env = env.with_term_program(tp);
     }
-    if has_kitty || has_ghostty {
-        return true;
+    if let Some(t) = term {
+        env = env.with_term(t);
     }
-    if let Some(t) = term.map(str::trim).filter(|v| !v.is_empty()) {
-        let lower = t.to_ascii_lowercase();
-        if lower.contains("truecolor") || lower.contains("24bit") {
-            return true;
-        }
+    if has_kitty {
+        env = env.with_kitty_window_id("1");
     }
-    false
+    if has_ghostty {
+        env = env.with_ghostty_resources_dir("1");
+    }
+    default_registry()
+        .resolve(&env)
+        .is_some_and(|adapter| adapter.capabilities(&env).color == ColorCapability::TrueColor)
 }
 
 pub fn detect_terminal_truecolor() -> bool {
-    let colorterm = env_non_empty("COLORTERM");
-    let term_program = env_non_empty("TERM_PROGRAM");
-    let term = env_non_empty("TERM");
-    let has_kitty = env_non_empty("KITTY_WINDOW_ID").is_some();
-    let has_ghostty = env_non_empty("GHOSTTY_RESOURCES_DIR").is_some();
-    supports_truecolor_from_env(
-        colorterm.as_deref(),
-        term_program.as_deref(),
-        term.as_deref(),
-        has_kitty,
-        has_ghostty,
-    )
+    let env = TerminalEnv::from_env();
+    default_registry()
+        .resolve(&env)
+        .is_some_and(|adapter| adapter.capabilities(&env).color == ColorCapability::TrueColor)
 }
 
 fn sq_dist(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {

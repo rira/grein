@@ -282,7 +282,7 @@ fn tui_services_with_terminal_preserves_equality_and_debug() {
     assert!(dbg.contains("<dyn TerminalAdapter>"), "{dbg}");
 
     let reg = default_registry();
-    assert_eq!(reg.adapters().len(), 1);
+    assert_eq!(reg.adapters().len(), 9);
     assert_eq!(
         default_adapter(&TerminalEnv::default()).kind(),
         TerminalKind::GenericXterm

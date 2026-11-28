@@ -123,12 +123,17 @@ impl TerminalEnv {
 
     pub fn supports_truecolor_hint(&self) -> bool {
         let colorterm_truecolor = self.colorterm.as_deref().is_some_and(|v| {
-            v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit")
+            let lower = v.trim().to_ascii_lowercase();
+            lower.contains("truecolor") || lower.contains("24bit")
         });
         let term_truecolor = self.term.as_deref().is_some_and(|t| {
             let lower = t.to_ascii_lowercase();
-            lower.contains("truecolor") || lower.contains("direct")
+            lower.contains("truecolor") || lower.contains("24bit") || lower.contains("direct")
         });
-        colorterm_truecolor || term_truecolor
+        let term_program_truecolor = self
+            .term_program
+            .as_deref()
+            .is_some_and(|tp| tp.trim().eq_ignore_ascii_case("vscode"));
+        colorterm_truecolor || term_truecolor || term_program_truecolor
     }
 }
