@@ -13,20 +13,12 @@ pub use tree_order::{
 };
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -37,6 +29,9 @@ use crate::app::{
 };
 use crate::engine_port::{
     PreferencesPort, ThreadMeta, TuiEngineEvent, TuiEnginePort, UserPreferencesSnapshot,
+};
+use crate::terminal::{
+    TerminalAdapter, TerminalEnv, TerminalSessionHost, TerminalSessionOptions,
 };
 
 use dispatch::{
@@ -71,59 +66,23 @@ use transcript_sync::{ensure_paragraph_break, with_thread_transcript_mut};
 use tree_order::rebuild_tree_nodes as rebuild_nodes;
 
 pub struct TerminalGuard {
-    active: bool,
-    keyboard_enhanced: bool,
+    _host: TerminalSessionHost,
 }
 
 impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
-        if io::stdout().is_terminal() && io::stdin().is_terminal() {
-            enable_raw_mode()?;
-            execute!(
-                io::stdout(),
-                EnterAlternateScreen,
-                EnableBracketedPaste,
-                EnableMouseCapture
-            )?;
-            let keyboard_enhanced =
-                if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-                    execute!(
-                        io::stdout(),
-                        PushKeyboardEnhancementFlags(
-                            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        )
-                    )
-                    .is_ok()
-                } else {
-                    false
-                };
-            Ok(Self {
-                active: true,
-                keyboard_enhanced,
-            })
-        } else {
-            Ok(Self {
-                active: false,
-                keyboard_enhanced: false,
-            })
-        }
+        let env = TerminalEnv::from_env();
+        let adapter = crate::terminal::providers::default_adapter(&env);
+        Self::with_adapter(adapter, TerminalSessionOptions::default())
     }
-}
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if self.active {
-            if self.keyboard_enhanced {
-                let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-            }
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                DisableMouseCapture,
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
-        }
+    pub fn with_adapter(
+        adapter: Arc<dyn TerminalAdapter>,
+        opts: TerminalSessionOptions,
+    ) -> io::Result<Self> {
+        let env = TerminalEnv::from_env();
+        let host = TerminalSessionHost::new(adapter, env, opts)?;
+        Ok(Self { _host: host })
     }
 }
 
@@ -154,7 +113,12 @@ pub fn handle_event(app: &mut App, event: Event) -> io::Result<bool> {
             app.clear_pane_selection();
             app.maybe_queue_terminal_resize();
         }
-        _ => {}
+        Event::FocusGained => {
+            app.terminal_focused = true;
+        }
+        Event::FocusLost => {
+            app.terminal_focused = false;
+        }
     }
     Ok(app.should_quit())
 }

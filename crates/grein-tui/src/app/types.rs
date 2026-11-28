@@ -14,6 +14,7 @@ use crate::keymap::Keymap;
 use crate::markdown::LineMeta;
 use crate::pager::{DefaultPagerRunner, PagerRunner};
 use crate::selection::{PaneRects, PaneSelection};
+use crate::terminal::{TerminalAdapter, TerminalEnv};
 use crate::theme::{ThemePalette, ThemePickerModal, ThemePreset};
 use crate::transcript::{ThreadTranscript, TranscriptViewport};
 
@@ -49,6 +50,7 @@ pub struct TuiServices {
     pub clipboard: Arc<dyn ClipboardPort>,
     pub pager: Arc<dyn PagerRunner>,
     pub preferences: Arc<dyn PreferencesPort>,
+    pub terminal: Arc<dyn TerminalAdapter>,
     has_custom_preferences: bool,
 }
 
@@ -58,6 +60,7 @@ impl TuiServices {
             clipboard,
             pager,
             preferences: Arc::new(NoopPreferencesPort),
+            terminal: crate::terminal::providers::default_adapter(&TerminalEnv::from_env()),
             has_custom_preferences: false,
         }
     }
@@ -78,6 +81,11 @@ impl TuiServices {
         self
     }
 
+    pub fn with_terminal(mut self, terminal: Arc<dyn TerminalAdapter>) -> Self {
+        self.terminal = terminal;
+        self
+    }
+
     pub(crate) fn has_custom_preferences(&self) -> bool {
         self.has_custom_preferences
     }
@@ -89,6 +97,7 @@ impl Default for TuiServices {
             clipboard: Arc::new(ChainedClipboardDriver::default()),
             pager: Arc::new(DefaultPagerRunner::new()),
             preferences: Arc::new(NoopPreferencesPort),
+            terminal: crate::terminal::providers::default_adapter(&TerminalEnv::from_env()),
             has_custom_preferences: false,
         }
     }
@@ -100,6 +109,7 @@ impl std::fmt::Debug for TuiServices {
             .field("clipboard", &"<dyn ClipboardPort>")
             .field("pager", &"<dyn PagerRunner>")
             .field("preferences", &"<dyn PreferencesPort>")
+            .field("terminal", &"<dyn TerminalAdapter>")
             .finish()
     }
 }
@@ -661,6 +671,7 @@ pub struct App {
     pub pane_selection: Option<PaneSelection>,
     pub last_click_info: Option<(u64, u16, u16, u8)>,
     pub frozen_pty_snapshot: Option<(String, PtyScreenSnapshot)>,
+    pub terminal_focused: bool,
 }
 
 pub type AppState = App;
@@ -771,6 +782,7 @@ impl Default for App {
             pane_selection: None,
             last_click_info: None,
             frozen_pty_snapshot: None,
+            terminal_focused: true,
         }
     }
 }

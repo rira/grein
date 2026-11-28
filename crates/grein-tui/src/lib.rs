@@ -19,6 +19,7 @@ pub mod selection;
 pub mod state;
 pub mod status;
 pub mod syntax;
+pub mod terminal;
 pub mod theme;
 pub mod transcript;
 pub mod ui;
@@ -52,7 +53,11 @@ pub async fn run_with_engine_and_services(
     engine: Arc<dyn TuiEnginePort>,
     services: TuiServices,
 ) -> std::io::Result<()> {
-    let _guard = runner::TerminalGuard::new()?;
+    let _host = terminal::TerminalSessionHost::new(
+        Arc::clone(&services.terminal),
+        terminal::TerminalEnv::from_env(),
+        terminal::TerminalSessionOptions::default(),
+    )?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
     let app = app::App::with_services(services);

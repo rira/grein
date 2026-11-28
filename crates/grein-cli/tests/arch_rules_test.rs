@@ -727,6 +727,54 @@ fn rule_5_thin_entrypoint_main_rs() {
 }
 
 #[test]
+fn rule_6_ttc_003_terminal_tier1_hosts_no_concrete_providers() {
+    let root = workspace_root();
+    let tui_host = root.join("crates/grein-tui/src/terminal/host.rs");
+    let tui_registry = root.join("crates/grein-tui/src/terminal/registry.rs");
+    assert!(tui_host.is_file(), "missing {}", tui_host.display());
+    assert!(tui_registry.is_file(), "missing {}", tui_registry.display());
+
+    let mut targets = vec![tui_host, tui_registry];
+    let cli_host = root.join("crates/grein-cli/src/terminal/host.rs");
+    if cli_host.exists() {
+        targets.push(cli_host);
+    }
+
+    let forbidden = [
+        "providers",
+        "GenericXtermProvider",
+        "AppleTerminalProvider",
+        "ITerm2Provider",
+        "GhosttyProvider",
+        "KittyProvider",
+        "WezTermProvider",
+        "AlacrittyProvider",
+        "TmuxProvider",
+        "ZellijProvider",
+    ];
+
+    let mut violations = Vec::new();
+    for path in targets {
+        let src =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let tokens = production_tokens(&src);
+        for (line, ident) in find_forbidden_idents(&tokens, &forbidden) {
+            violations.push(format!(
+                "{}:{}: forbidden `{ident}` reference in Tier 1 terminal host/registry",
+                path.display(),
+                line
+            ));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Rule 6 (TTC-003 Terminal Tier 1 Hosts No Concrete Providers) violated:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn scanner_self_check_distinguishes_production_vs_cfg_test_and_comments() {
     let sample = r#"
         use std::sync::Arc;
